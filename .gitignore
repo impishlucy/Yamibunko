@@ -1,36 +1,142 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+```gitignore
+# =========================================================
+# Yamibunko monorepo .gitignore
+# Place this file at the repository root.
+# Patterns without a leading "/" apply recursively.
+# =========================================================
 
-# dependencies
-/node_modules
-/.pnp
-.pnp.js
 
-# testing
-/coverage
-
-# next.js
-/.next/
-/out/
-
-# production
-/build
-
-# misc
+# ---------------------------------------------------------
+# OS / misc
+# ---------------------------------------------------------
 .DS_Store
+Thumbs.db
+Desktop.ini
 *.pem
 
-# debug
+
+# ---------------------------------------------------------
+# JetBrains IDEs: WebStorm / Rider / IntelliJ
+# ---------------------------------------------------------
+.idea/
+.idea_modules/
+*.iml
+*.iws
+*.ipr
+
+# JetBrains user/workspace files
+*.sln.iml
+*.sln.DotSettings.user
+
+
+# ---------------------------------------------------------
+# Environment / local config
+# ---------------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.sample
+
+
+# ---------------------------------------------------------
+# Logs / debug
+# ---------------------------------------------------------
+*.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pnpm-debug.log*
+bun-debug.log*
 
-# local env files
-.env*.local
-.env
 
-# vercel
-.vercel
+# ---------------------------------------------------------
+# JavaScript / TypeScript / Bun / Next.js
+# Applies to webapp/ and any other nested JS workspace.
+# ---------------------------------------------------------
 
-# typescript
+# dependencies
+node_modules/
+.pnp/
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# package-manager stores / caches
+.npm/
+.pnpm-store/
+.bun/
+
+# testing
+coverage/
+
+# Next.js
+.next/
+out/
+
+# production / build outputs
+build/
+dist/
+
+# caches
+.cache/
+.turbo/
+.vercel/
+
+# TypeScript / Next generated files
 *.tsbuildinfo
 next-env.d.ts
+
+
+# ---------------------------------------------------------
+# C# / .NET / Rider launcher project
+# Applies to launcher/ and any nested .NET project.
+# ---------------------------------------------------------
+
+# Visual Studio / Rider local state
+.vs/
+
+# build output
+bin/
+obj/
+artifacts/
+
+# test output
+TestResults/
+coverage/
+coverage.cobertura.xml
+
+# NuGet
+packages/
+*.nupkg
+*.snupkg
+project.assets.json
+project.nuget.cache
+.nuget/
+.dotnet/
+
+# user-specific project files
+*.user
+*.rsuser
+*.suo
+*.userosscache
+*.sln.docstates
+
+# local app settings / secrets
+appsettings.Local.json
+appsettings.*.local.json
+
+
+# ---------------------------------------------------------
+# Release / packaged output
+# ---------------------------------------------------------
+release/
+releases/
+publish/
+*.zip
+*.7z
+*.tar
+*.tar.gz
+```
