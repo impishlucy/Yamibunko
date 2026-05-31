@@ -2,7 +2,7 @@
 
 # Yamibunko
 
-**The all-in-one self-hosted anime library that processes, organizes, enriches, and plays your local collection from one WebUI.**
+**The all-in-one anime server that processes, organizes, enriches, and plays your local collection from one WebUI.**
 
 <br />
 
@@ -23,9 +23,9 @@
 
 </div>
 
-Yamibunko is an all-in-one local anime library app for people who want a <b>singular</b> place to handle most parts of managing a collection.
+Yamibunko is an all-in-one anime app for people who want a <b>singular</b> place to handle most parts of managing a collection.
 
-Just drop episodes into an input folder and Yamibunko will optimize & organize them, and make them available through a polished WebUI.
+Just drop files into an folder and it will optimize & organize them, and make them available through a polished WebUI.
 
 It does **not** include or provide access to any copyrighted material. <ins>You bring your own local files.</ins>
 
@@ -43,7 +43,7 @@ You **need** a 64 bit OS, as Yamibunko wont work with just 4GB of Ram.
 
 If the launcher does not open you need to manually install [.NET 9](https://dotnet.microsoft.com/en-us/download/dotnet/9.0).
 
-The Yamibunko desktop launcher will download & install required frameworks and files automatically upon first launching it.
+The Yamibunko launcher will download required frameworks and files automatically upon first launching it.
 
 ### Download
 
