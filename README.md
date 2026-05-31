@@ -23,7 +23,7 @@
 
 </div>
 
-Yamibunko is an all-in-one anime app for people who want a <b>singular</b> place to handle most parts of managing a collection.
+Yamibunko is an anime app for people who want a <b>singular</b> place to handle most parts of managing a collection.
 
 Just drop files into an folder and it will optimize & organize them, and make them available through a polished WebUI.
 
