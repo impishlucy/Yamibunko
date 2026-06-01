@@ -1,75 +1,118 @@
 "use client"
 
-import { useEffect, useState } from "react"
-import { Cpu, Folder, Palette, UserRound } from "lucide-react"
+import { useEffect, useMemo, useState } from "react"
+import { KeyRound, Link2Off, UserRound } from "lucide-react"
 
+import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Skeleton } from "@/components/ui/skeleton"
-import { apiGet } from "@/lib/api"
 import type { SafeSettings } from "@/lib/types"
 
-type SettingsResponse = SafeSettings | { ok: false; issues: string[] }
-
-function isSettings(value: SettingsResponse): value is SafeSettings {
-  return "paths" in value
+type SettingsFormProps = {
+  settings: SafeSettings
 }
 
-function Field({ label, value }: { label: string; value: string | number }) {
+type AniListConnectionResponse = {
+  configured: boolean
+  connected: boolean
+  user: {
+    id: number
+    name: string
+    connectedAt: string
+  } | null
+}
+
+function isStrongPassword(password: string) {
   return (
-    <div className="space-y-1.5">
-      <Label className="text-zinc-400">{label}</Label>
-      <Input
-        value={String(value)}
-        readOnly
-        className="h-9 rounded-lg border-white/10 bg-zinc-950/70 text-zinc-100"
-      />
-    </div>
+    password.length >= 32 &&
+    /[A-Z]/.test(password) &&
+    /[a-z]/.test(password) &&
+    /\d/.test(password) &&
+    /[^A-Za-z0-9]/.test(password)
   )
 }
 
-export function SettingsForm() {
-  const [settings, setSettings] = useState<SettingsResponse | null>(null)
+export function SettingsForm({ settings }: SettingsFormProps) {
+  const [password, setPassword] = useState("")
+  const [message, setMessage] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [submitting, setSubmitting] = useState(false)
+  const [aniList, setAniList] = useState<AniListConnectionResponse | null>(null)
+
+  const canSavePassword = useMemo(() => isStrongPassword(password), [password])
 
   useEffect(() => {
-    apiGet<SettingsResponse>("/api/settings")
-      .then(setSettings)
-      .catch(() => {
-        setSettings({
-          ok: false,
-          issues: ["Settings unavailable"],
-        })
+    let cancelled = false
+
+    fetch("/api/anilist/connection", {
+      cache: "no-store",
+    })
+      .then((response) => (response.ok ? response.json() : null))
+      .then((payload: AniListConnectionResponse | null) => {
+        if (!cancelled && payload) {
+          setAniList(payload)
+        }
       })
+      .catch(() => undefined)
+
+    return () => {
+      cancelled = true
+    }
   }, [])
 
-  if (!settings) {
-    return (
-      <div className="grid gap-4 lg:grid-cols-2">
-        {Array.from({ length: 4 }).map((_, index) => (
-          <Skeleton key={index} className="h-48 rounded-lg bg-zinc-900" />
-        ))}
-      </div>
-    )
+  async function savePassword(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setMessage(null)
+    setError(null)
+
+    if (!canSavePassword) {
+      setError("Password does not meet the account policy.")
+      return
+    }
+
+    setSubmitting(true)
+
+    try {
+      const response = await fetch("/api/auth/password", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          password,
+        }),
+      })
+
+      if (!response.ok) {
+        throw new Error("Unable to update password")
+      }
+
+      setPassword("")
+      setMessage("Password updated.")
+    } catch (saveError) {
+      setError(
+        saveError instanceof Error
+          ? saveError.message
+          : "Unable to update password"
+      )
+    } finally {
+      setSubmitting(false)
+    }
   }
 
-  if (!isSettings(settings)) {
-    return (
-      <Card className="rounded-lg border-red-400/20 bg-red-950/20">
-        <CardHeader>
-          <CardTitle>Configuration unavailable</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-2 text-sm text-red-200">
-          {settings.issues.map((issue) => (
-            <p key={issue}>{issue}</p>
-          ))}
-        </CardContent>
-      </Card>
-    )
+  async function disconnectAniList() {
+    const response = await fetch("/api/anilist/connection", {
+      method: "DELETE",
+    })
+
+    if (response.ok) {
+      setAniList((await response.json()) as AniListConnectionResponse)
+    }
   }
 
   return (
-    <div className="grid gap-4 lg:grid-cols-2">
+    <div className="space-y-5">
       <Card className="rounded-lg border-white/10 bg-zinc-900/75">
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-zinc-100">
@@ -78,54 +121,89 @@ export function SettingsForm() {
           </CardTitle>
         </CardHeader>
         <CardContent>
-          <Field label="Name" value={settings.account.userName} />
-          <div className="mt-3">
-            <Field
-              label="Role"
-              value={settings.account.isAdmin ? "Admin" : "User"}
-            />
+          <form className="space-y-4" onSubmit={savePassword}>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label htmlFor="settings-username" className="text-zinc-400">
+                  Username
+                </Label>
+                <Input
+                  id="settings-username"
+                  value={settings.account.userName}
+                  readOnly
+                  className="h-9 rounded-lg border-white/10 bg-zinc-950/70 text-zinc-100"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="settings-password" className="text-zinc-400">
+                  Password
+                </Label>
+                <Input
+                  id="settings-password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  type="password"
+                  autoComplete="new-password"
+                  className="h-9 rounded-lg border-white/10 bg-zinc-950/70 text-zinc-100"
+                />
+              </div>
+            </div>
+
+            {error ? <p className="text-sm text-red-300">{error}</p> : null}
+            {message ? (
+              <p className="text-sm text-emerald-300">{message}</p>
+            ) : null}
+
+            <Button
+              type="submit"
+              disabled={!canSavePassword || submitting}
+              className="rounded-lg"
+            >
+              <KeyRound className="size-4" />
+              {submitting ? "Saving..." : "Change password"}
+            </Button>
+          </form>
+        </CardContent>
+      </Card>
+
+      <Card className="rounded-lg border-white/10 bg-zinc-900/75">
+        <CardHeader>
+          <CardTitle className="text-zinc-100">AniList</CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="text-sm font-medium text-zinc-100">
+              {aniList?.connected
+                ? `Connected as ${aniList.user?.name}`
+                : "Not connected"}
+            </p>
+            {!aniList?.configured ? (
+              <p className="text-sm text-red-300">OAuth variables missing.</p>
+            ) : null}
           </div>
-        </CardContent>
-      </Card>
 
-      <Card className="rounded-lg border-white/10 bg-zinc-900/75">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-zinc-100">
-            <Folder className="size-4 text-violet-300" />
-            Library paths
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <Field label="Input" value={settings.paths.inputDir} />
-          <Field label="Media" value={settings.paths.mediaDir} />
-        </CardContent>
-      </Card>
-
-      <Card className="rounded-lg border-white/10 bg-zinc-900/75">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-zinc-100">
-            <Cpu className="size-4 text-violet-300" />
-            Transcoding
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <Field
-            label="Acceleration"
-            value={settings.transcoding.acceleration}
-          />
-          <Field label="Capacity" value="Dynamic" />
-        </CardContent>
-      </Card>
-
-      <Card className="rounded-lg border-white/10 bg-zinc-900/75">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-zinc-100">
-            <Palette className="size-4 text-violet-300" />
-            Appearance
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <Field label="Theme" value={settings.appearance.theme} />
+          {aniList?.connected ? (
+            <Button
+              type="button"
+              variant="outline"
+              className="rounded-lg"
+              onClick={disconnectAniList}
+            >
+              <Link2Off className="size-4" />
+              Disconnect
+            </Button>
+          ) : (
+            <Button
+              type="button"
+              className="rounded-lg"
+              disabled={!aniList?.configured}
+              onClick={() => {
+                window.location.assign("/api/anilist/oauth/start")
+              }}
+            >
+              Connect AniList
+            </Button>
+          )}
         </CardContent>
       </Card>
     </div>

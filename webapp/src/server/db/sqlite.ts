@@ -92,10 +92,161 @@ const migrations = [
       CREATE INDEX episodes_anime_id_idx ON episodes(anime_id);
     `,
   },
+  {
+    version: 2,
+    sql: `
+      CREATE TABLE episodes_new (
+        anime_id INTEGER NOT NULL,
+        season_nr INTEGER NOT NULL DEFAULT 1,
+        ep_nr INTEGER NOT NULL,
+        file_path TEXT NOT NULL,
+        thumbnail_path TEXT,
+        duration_seconds REAL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (anime_id, season_nr, ep_nr),
+        FOREIGN KEY (anime_id) REFERENCES anime(id) ON DELETE CASCADE
+      );
+
+      INSERT INTO episodes_new (
+        anime_id,
+        season_nr,
+        ep_nr,
+        file_path,
+        created_at,
+        updated_at
+      )
+      SELECT
+        anime_id,
+        1,
+        ep_nr,
+        file_path,
+        created_at,
+        updated_at
+      FROM episodes;
+
+      DROP TABLE episodes;
+      ALTER TABLE episodes_new RENAME TO episodes;
+
+      CREATE INDEX episodes_anime_id_idx ON episodes(anime_id);
+      CREATE INDEX episodes_file_path_idx ON episodes(file_path);
+
+      CREATE TABLE episode_progress (
+        username TEXT NOT NULL COLLATE NOCASE,
+        anime_id INTEGER NOT NULL,
+        season_nr INTEGER NOT NULL,
+        ep_nr INTEGER NOT NULL,
+        watched_seconds REAL NOT NULL DEFAULT 0,
+        duration_seconds REAL,
+        completed INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (username, anime_id, season_nr, ep_nr),
+        FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE,
+        FOREIGN KEY (anime_id, season_nr, ep_nr)
+          REFERENCES episodes(anime_id, season_nr, ep_nr)
+          ON DELETE CASCADE
+      );
+
+      CREATE INDEX episode_progress_username_idx ON episode_progress(username);
+    `,
+  },
+  {
+    version: 3,
+    sql: `
+      CREATE TABLE anime_genres (
+        anime_id INTEGER NOT NULL,
+        genre TEXT NOT NULL,
+        PRIMARY KEY (anime_id, genre),
+        FOREIGN KEY (anime_id) REFERENCES anime(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE media_tags (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT,
+        category TEXT,
+        rank INTEGER,
+        is_adult INTEGER
+      );
+
+      CREATE TABLE anime_tags (
+        anime_id INTEGER NOT NULL,
+        tag_id INTEGER NOT NULL,
+        PRIMARY KEY (anime_id, tag_id),
+        FOREIGN KEY (anime_id) REFERENCES anime(id) ON DELETE CASCADE,
+        FOREIGN KEY (tag_id) REFERENCES media_tags(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX anime_genres_genre_idx ON anime_genres(genre);
+      CREATE INDEX anime_tags_tag_id_idx ON anime_tags(tag_id);
+
+      INSERT OR IGNORE INTO anime_genres (anime_id, genre)
+      SELECT anime.id, genre.value
+      FROM anime, json_each(
+        CASE WHEN json_valid(anime.genres) THEN anime.genres ELSE '[]' END
+      ) AS genre
+      WHERE genre.value IS NOT NULL;
+
+      INSERT OR REPLACE INTO media_tags (
+        id,
+        name,
+        description,
+        category,
+        rank,
+        is_adult
+      )
+      SELECT
+        CAST(json_extract(tag.value, '$.id') AS INTEGER),
+        COALESCE(json_extract(tag.value, '$.name'), 'Unknown'),
+        json_extract(tag.value, '$.description'),
+        json_extract(tag.value, '$.category'),
+        json_extract(tag.value, '$.rank'),
+        CASE json_extract(tag.value, '$.isAdult') WHEN 1 THEN 1 ELSE 0 END
+      FROM anime, json_each(
+        CASE WHEN json_valid(anime.tags) THEN anime.tags ELSE '[]' END
+      ) AS tag
+      WHERE json_extract(tag.value, '$.id') IS NOT NULL;
+
+      INSERT OR IGNORE INTO anime_tags (anime_id, tag_id)
+      SELECT
+        anime.id,
+        CAST(json_extract(tag.value, '$.id') AS INTEGER)
+      FROM anime, json_each(
+        CASE WHEN json_valid(anime.tags) THEN anime.tags ELSE '[]' END
+      ) AS tag
+      WHERE json_extract(tag.value, '$.id') IS NOT NULL;
+
+      ALTER TABLE anime DROP COLUMN genres;
+      ALTER TABLE anime DROP COLUMN tags;
+    `,
+  },
+  {
+    version: 4,
+    sql: `
+      CREATE TABLE anilist_connections (
+        username TEXT PRIMARY KEY COLLATE NOCASE,
+        anilist_user_id INTEGER NOT NULL,
+        anilist_username TEXT NOT NULL,
+        access_token_ciphertext TEXT NOT NULL,
+        token_type TEXT NOT NULL DEFAULT 'Bearer',
+        connected_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
+      );
+
+      CREATE INDEX anilist_connections_user_id_idx
+        ON anilist_connections(anilist_user_id);
+    `,
+  },
 ] as const
 
 function getDatabasePath() {
-  return path.resolve(process.cwd(), ".yamibunko", "yamibunko.sqlite")
+  return path.join(
+    /*turbopackIgnore: true*/ process.cwd(),
+    ".yamibunko",
+    "yamibunko.sqlite"
+  )
 }
 
 function migrate(db: YamibunkoDatabase) {

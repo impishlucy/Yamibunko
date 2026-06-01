@@ -4,6 +4,7 @@ import path from "node:path"
 import { Readable } from "node:stream"
 
 import { requireApiUser } from "@/server/auth/api"
+import { getEpisodeThumbnailPath } from "@/server/db/library"
 import { getEpisode } from "@/server/media/libraryStore"
 
 export const runtime = "nodejs"
@@ -36,7 +37,7 @@ function fallbackThumbnailResponse() {
   })
 }
 
-export async function GET(_request: Request, context: ThumbnailContext) {
+export async function GET(request: Request, context: ThumbnailContext) {
   const auth = await requireApiUser()
 
   if (!auth.ok) {
@@ -44,13 +45,17 @@ export async function GET(_request: Request, context: ThumbnailContext) {
   }
 
   const { animeId, epNr } = await context.params
-  const episode = getEpisode(animeId, epNr)
+  const url = new URL(request.url)
+  const season = url.searchParams.get("season") ?? "1"
+  const episode = getEpisode(animeId, season, epNr)
 
   if (!episode) {
     return Response.json({ ok: false, error: "NOT_FOUND" }, { status: 404 })
   }
 
-  const thumbnailPath = thumbnailPathForEpisode(episode.filePath)
+  const thumbnailPath =
+    getEpisodeThumbnailPath(animeId, season, epNr) ??
+    thumbnailPathForEpisode(episode.filePath)
 
   try {
     const fileStat = await stat(thumbnailPath)

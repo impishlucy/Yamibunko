@@ -1,6 +1,6 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -21,28 +21,52 @@ function isStrongPassword(password: string) {
   )
 }
 
-async function sha256Hex(value: string) {
-  const bytes = new TextEncoder().encode(value)
-  const digest = await crypto.subtle.digest("SHA-256", bytes)
-
-  return Array.from(new Uint8Array(digest))
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("")
-}
-
 export function AuthForm({ mode }: AuthFormProps) {
   const [username, setUsername] = useState("")
   const [password, setPassword] = useState("")
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  const [pendingPasswordSetupUsername, setPendingPasswordSetupUsername] =
+    useState<string | null>(null)
 
-  const title = mode === "admin-registration" ? "Admin registration" : "Sign in"
+  const normalizedUsername = username.trim()
+  const pendingPasswordSetup =
+    mode === "login" && pendingPasswordSetupUsername === normalizedUsername
+  const title =
+    mode === "admin-registration" || pendingPasswordSetup ? "Register" : "Login"
   const endpoint =
     mode === "admin-registration" ? "/api/auth/register" : "/api/auth/login"
   const canSubmit = useMemo(
     () => username.trim().length >= 3 && isStrongPassword(password),
     [password, username]
   )
+
+  useEffect(() => {
+    if (mode !== "login" || normalizedUsername.length < 3) {
+      return
+    }
+
+    const controller = new AbortController()
+
+    fetch(
+      `/api/auth/state?username=${encodeURIComponent(normalizedUsername)}`,
+      {
+        cache: "no-store",
+        signal: controller.signal,
+      }
+    )
+      .then((response) => (response.ok ? response.json() : null))
+      .then((payload: { pendingPasswordSetup?: boolean } | null) => {
+        setPendingPasswordSetupUsername(
+          payload?.pendingPasswordSetup ? normalizedUsername : null
+        )
+      })
+      .catch(() => undefined)
+
+    return () => {
+      controller.abort()
+    }
+  }, [mode, normalizedUsername])
 
   async function onSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -56,7 +80,6 @@ export function AuthForm({ mode }: AuthFormProps) {
     setSubmitting(true)
 
     try {
-      const passwordHash = await sha256Hex(password)
       const response = await fetch(endpoint, {
         method: "POST",
         headers: {
@@ -64,7 +87,7 @@ export function AuthForm({ mode }: AuthFormProps) {
         },
         body: JSON.stringify({
           username,
-          passwordHash,
+          password,
         }),
       })
 
@@ -117,7 +140,7 @@ export function AuthForm({ mode }: AuthFormProps) {
               onChange={(event) => setPassword(event.target.value)}
               type="password"
               autoComplete={
-                mode === "admin-registration"
+                mode === "admin-registration" || pendingPasswordSetup
                   ? "new-password"
                   : "current-password"
               }

@@ -12,8 +12,12 @@ function assertInsideRoot(root: string, candidate: string) {
   )
 }
 
-export function resolveEpisodeFile(animeId: string, epNr: string | number) {
-  const episode = getEpisode(animeId, epNr)
+export function resolveEpisodeFile(
+  animeId: string,
+  seasonNr: string | number,
+  epNr: string | number
+) {
+  const episode = getEpisode(animeId, seasonNr, epNr)
 
   if (!episode) {
     return null

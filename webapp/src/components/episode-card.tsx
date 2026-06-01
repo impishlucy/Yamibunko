@@ -16,9 +16,14 @@ function formatDuration(seconds?: number) {
 }
 
 export function EpisodeCard({ episode }: { episode: Episode }) {
+  const progressRatio = episode.progress?.completed
+    ? 1
+    : (episode.progress?.ratio ?? 0)
+
   return (
     <Link
-      href={`/watch/${episode.animeId}/${episode.episodeNumber}`}
+      href={`/watch/${episode.animeId}/${episode.episodeNumber}?season=${episode.seasonNumber}`}
+      prefetch={false}
       className="group block"
     >
       <Card className="rounded-lg border-white/10 bg-zinc-900/75 py-0 transition hover:border-violet-400/40 hover:bg-zinc-900">
@@ -36,9 +41,18 @@ export function EpisodeCard({ episode }: { episode: Episode }) {
             ) : (
               <div className="h-full w-full bg-[linear-gradient(135deg,#272333,#121217)]" />
             )}
+            {episode.progress?.completed ? (
+              <span className="absolute inset-0 bg-zinc-950/55" />
+            ) : null}
             <span className="absolute inset-0 grid place-items-center text-violet-100 opacity-0 transition group-hover:opacity-100">
               <PlayCircle className="size-8 drop-shadow" />
             </span>
+            {progressRatio > 0 ? (
+              <span
+                className="absolute bottom-0 left-0 h-1 bg-red-600"
+                style={{ width: `${Math.round(progressRatio * 100)}%` }}
+              />
+            ) : null}
           </div>
           <CardContent className="flex min-w-0 flex-col justify-between p-3">
             <div className="min-w-0 space-y-1">
@@ -46,7 +60,8 @@ export function EpisodeCard({ episode }: { episode: Episode }) {
                 variant="outline"
                 className="border-violet-400/25 text-violet-200"
               >
-                Episode {episode.episodeNumber}
+                S{String(episode.seasonNumber).padStart(2, "0")} E
+                {String(episode.episodeNumber).padStart(2, "0")}
               </Badge>
               <h3 className="truncate text-sm font-medium text-zinc-100">
                 {episode.fileName}

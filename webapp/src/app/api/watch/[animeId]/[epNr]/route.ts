@@ -1,5 +1,9 @@
-import { getAnimeInfo, getEpisode } from "@/server/media/libraryStore"
 import { requireApiUser } from "@/server/auth/api"
+import {
+  getAnimeInfo,
+  getEpisode,
+  getEpisodeNeighbors,
+} from "@/server/media/libraryStore"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -11,7 +15,7 @@ type WatchContext = {
   }>
 }
 
-export async function GET(_request: Request, context: WatchContext) {
+export async function GET(request: Request, context: WatchContext) {
   const auth = await requireApiUser()
 
   if (!auth.ok) {
@@ -19,28 +23,51 @@ export async function GET(_request: Request, context: WatchContext) {
   }
 
   const { animeId, epNr } = await context.params
+  const url = new URL(request.url)
+  const seasonNumber = Number.parseInt(
+    url.searchParams.get("season") ?? "1",
+    10
+  )
   const episodeNumber = Number.parseInt(epNr, 10)
 
-  if (!Number.isInteger(episodeNumber) || episodeNumber < 1) {
+  if (
+    !Number.isInteger(seasonNumber) ||
+    !Number.isInteger(episodeNumber) ||
+    seasonNumber < 1 ||
+    episodeNumber < 1
+  ) {
     return Response.json({ error: "Episode not found" }, { status: 404 })
   }
 
   const anime = getAnimeInfo(animeId)
-  const episode = getEpisode(animeId, episodeNumber)
+  const episode = getEpisode(
+    animeId,
+    seasonNumber,
+    episodeNumber,
+    auth.user.username
+  )
 
   if (!anime || !episode) {
     return Response.json({ error: "Episode not found" }, { status: 404 })
   }
 
+  const neighbors = getEpisodeNeighbors({
+    animeId: anime.id,
+    seasonNr: seasonNumber,
+    epNr: episodeNumber,
+    username: auth.user.username,
+  })
   const base = `/api/watch/${encodeURIComponent(animeId)}/${episodeNumber}/stream`
+  const commonQuery = `season=${seasonNumber}`
 
   return Response.json({
     anime,
     episode,
+    ...neighbors,
     playback: {
-      directUrl: `${base}?mode=direct&profile=original`,
-      originalTranscodeUrl: `${base}?mode=transcode&profile=original`,
-      dataSaverUrl: `${base}?mode=transcode&profile=dataSaver`,
+      directUrl: `${base}?${commonQuery}&mode=direct&profile=original`,
+      originalTranscodeUrl: `${base}?${commonQuery}&mode=transcode&profile=original`,
+      dataSaverUrl: `${base}?${commonQuery}&mode=transcode&profile=dataSaver`,
     },
   })
 }

@@ -1,5 +1,6 @@
 import type { CurrentUser } from "@/server/auth/session"
 import { getCurrentUser } from "@/server/auth/session"
+import { isSameOriginRequest } from "@/server/http/request"
 
 export function unauthorized() {
   return Response.json({ ok: false, error: "UNAUTHORIZED" }, { status: 401 })
@@ -7,6 +8,14 @@ export function unauthorized() {
 
 export function forbidden() {
   return Response.json({ ok: false, error: "FORBIDDEN" }, { status: 403 })
+}
+
+export async function requireSameOriginRequest(request: Request) {
+  if (await isSameOriginRequest(request)) {
+    return null
+  }
+
+  return Response.json({ ok: false, error: "BAD_ORIGIN" }, { status: 403 })
 }
 
 export async function requireApiUser(): Promise<

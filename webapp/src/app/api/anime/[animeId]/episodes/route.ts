@@ -24,5 +24,5 @@ export async function GET(_request: Request, context: EpisodesContext) {
     return Response.json({ error: "Anime not found" }, { status: 404 })
   }
 
-  return Response.json(getEpisodes(animeId))
+  return Response.json(getEpisodes(animeId, auth.user.username))
 }

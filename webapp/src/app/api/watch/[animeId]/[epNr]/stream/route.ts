@@ -88,8 +88,12 @@ function parseByteRange(
   }
 }
 
-async function resolveReadableFile(animeId: string, episodeNumber: number) {
-  const file = resolveEpisodeFile(animeId, episodeNumber)
+async function resolveReadableFile(
+  animeId: string,
+  seasonNumber: number,
+  episodeNumber: number
+) {
+  const file = resolveEpisodeFile(animeId, seasonNumber, episodeNumber)
 
   if (!file) {
     return null
@@ -163,11 +167,12 @@ async function handleTranscode(
   request: Request,
   file: string,
   animeId: string,
+  seasonNumber: number,
   episodeNumber: number,
   profile: PlaybackProfile
 ) {
   const lease = await tryAcquireLiveTranscode(
-    `${animeId}:${episodeNumber}:${profile}`
+    `${animeId}:${seasonNumber}:${episodeNumber}:${profile}`
   )
 
   if (!lease) {
@@ -291,13 +296,21 @@ export async function GET(request: Request, context: StreamContext) {
   }
 
   const url = new URL(request.url)
+  const seasonNumber = Number.parseInt(
+    url.searchParams.get("season") ?? "1",
+    10
+  )
   const mode = getMode(url.searchParams.get("mode"))
   const profile = getProfile(url.searchParams.get("profile"))
+
+  if (!Number.isInteger(seasonNumber) || seasonNumber < 1) {
+    return jsonError("Episode not found.", 404)
+  }
 
   let resolved: Awaited<ReturnType<typeof resolveReadableFile>>
 
   try {
-    resolved = await resolveReadableFile(animeId, episodeNumber)
+    resolved = await resolveReadableFile(animeId, seasonNumber, episodeNumber)
   } catch (error) {
     console.error("[watch] Unable to resolve media file.", error)
     return jsonError("Media file could not be resolved.", 500)
@@ -315,6 +328,7 @@ export async function GET(request: Request, context: StreamContext) {
     request,
     resolved.file,
     animeId,
+    seasonNumber,
     episodeNumber,
     profile
   )

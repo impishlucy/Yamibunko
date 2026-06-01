@@ -88,3 +88,7 @@ export function setUserPasswordHash(username: string, passwordHash: string) {
     )
     .run(passwordHash, nowIso(), username.trim())
 }
+
+export function deleteUser(username: string) {
+  getDb().query("DELETE FROM users WHERE username = ?").run(username.trim())
+}

@@ -10,6 +10,9 @@ const serverConfigSchema = z.object({
   ANIME_INPUT_DIR: z.string().trim().min(1),
   ANIME_MEDIA_DIR: z.string().trim().min(1),
   TRANSCODE_ACCEL: z.enum(["nvenc", "qsv", "cpu"]),
+  ANILIST_CLIENT_ID: z.string().trim().optional(),
+  ANILIST_CLIENT_SECRET: z.string().trim().optional(),
+  BASE_URL: z.string().trim().min(1),
 })
 
 export type ServerConfig = {
@@ -19,6 +22,9 @@ export type ServerConfig = {
   mediaDir: string
   tempDir: string
   transcodeAccel: "nvenc" | "qsv" | "cpu"
+  anilistClientId: string | undefined
+  anilistClientSecret: string | undefined
+  baseUrl: string
 }
 
 type ConfigResult =
@@ -58,16 +64,12 @@ function getDefaultTempDir() {
 function readEnvironment() {
   return {
     ...process.env,
-    FFMPEG_DIR:
-      process.env.FFMPEG_DIR ??
-      process.env.FFMPEG_BIN_DIR ??
-      process.env.MEDIA_BIN_DIR,
-    ANIME_INPUT_DIR:
-      process.env.ANIME_INPUT_DIR ?? process.env.INPUT_FOLDER_PATH,
-    ANIME_MEDIA_DIR:
-      process.env.ANIME_MEDIA_DIR ??
-      process.env.OUTPUT_FOLDER_PATH ??
-      process.env.MEDIA_FOLDER_PATH,
+    FFMPEG_DIR: process.env.FFMPEG_DIR,
+    ANIME_INPUT_DIR: process.env.INPUT_FOLDER_PATH,
+    ANIME_MEDIA_DIR: process.env.OUTPUT_FOLDER_PATH,
+    ANILIST_CLIENT_ID: process.env.ANILIST_CLIENT_ID,
+    ANILIST_CLIENT_SECRET: process.env.ANILIST_CLIENT_SECRET,
+    BASE_URL: process.env.BASE_URL,
   }
 }
 
@@ -81,6 +83,11 @@ function mapConfig(env: z.infer<typeof serverConfigSchema>): ServerConfig {
     mediaDir: cleanPath(env.ANIME_MEDIA_DIR),
     tempDir: getDefaultTempDir(),
     transcodeAccel: env.TRANSCODE_ACCEL,
+    anilistClientId: env.ANILIST_CLIENT_ID
+      ?? undefined,
+    anilistClientSecret: env.ANILIST_CLIENT_SECRET
+      ?? undefined,
+    baseUrl: env.BASE_URL,
   }
 }
 
@@ -126,19 +133,7 @@ export function getSafeServerSettings(
     isAdmin: false,
   }
 ): SafeSettings {
-  const config = getServerConfig()
-
   return {
     account,
-    paths: {
-      inputDir: config.inputDir,
-      mediaDir: config.mediaDir,
-    },
-    transcoding: {
-      acceleration: config.transcodeAccel,
-    },
-    appearance: {
-      theme: "dark",
-    },
   }
 }

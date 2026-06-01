@@ -13,7 +13,7 @@ type AnimeCardProps = {
 
 export function AnimeCard({ anime, priority = false }: AnimeCardProps) {
   return (
-    <Link href={`/anime/${anime.id}`} className="group block">
+    <Link href={`/anime/${anime.id}`} prefetch={false} className="group block">
       <Card className="rounded-lg border-white/10 bg-zinc-900/80 py-0 transition hover:-translate-y-0.5 hover:border-violet-400/40 hover:shadow-[0_18px_60px_rgba(124,58,237,0.18)]">
         <div className="relative aspect-[3/4] overflow-hidden bg-zinc-800">
           {anime.coverImage ? (

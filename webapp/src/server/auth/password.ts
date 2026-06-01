@@ -11,10 +11,8 @@ const params = {
   keyLength: 64,
 }
 
-const passwordProofPattern = /^[a-f0-9]{64}$/i
-
 function deriveKey(
-  passwordProof: string,
+  password: string,
   salt: Buffer,
   keyLength: number,
   options: {
@@ -25,7 +23,7 @@ function deriveKey(
   }
 ) {
   return new Promise<Buffer>((resolve, reject) => {
-    scryptCallback(passwordProof, salt, keyLength, options, (error, key) => {
+    scryptCallback(password, salt, keyLength, options, (error, key) => {
       if (error) {
         reject(error)
         return
@@ -36,17 +34,24 @@ function deriveKey(
   })
 }
 
-export function isPasswordProof(value: string) {
-  return passwordProofPattern.test(value)
+export function isStrongPassword(password: string) {
+  return (
+    password.length >= 32 &&
+    password.length <= 1024 &&
+    /[A-Z]/.test(password) &&
+    /[a-z]/.test(password) &&
+    /\d/.test(password) &&
+    /[^A-Za-z0-9]/.test(password)
+  )
 }
 
-export async function hashPasswordProof(passwordProof: string) {
-  if (!isPasswordProof(passwordProof)) {
-    throw new Error("Invalid password proof")
+export async function hashPassword(password: string) {
+  if (!isStrongPassword(password)) {
+    throw new Error("Password does not meet the account policy")
   }
 
   const salt = randomBytes(16)
-  const derived = await deriveKey(passwordProof, salt, params.keyLength, {
+  const derived = await deriveKey(password, salt, params.keyLength, {
     cost: params.cost,
     blockSize: params.blockSize,
     parallelization: params.parallelization,
@@ -63,11 +68,8 @@ export async function hashPasswordProof(passwordProof: string) {
   ].join("$")
 }
 
-export async function verifyPasswordProof(
-  passwordProof: string,
-  storedHash: string
-) {
-  if (!isPasswordProof(passwordProof)) {
+export async function verifyPassword(password: string, storedHash: string) {
+  if (!password || password.length > 1024) {
     return false
   }
 
@@ -78,23 +80,44 @@ export async function verifyPasswordProof(
     return false
   }
 
+  const parsedCost = Number.parseInt(cost, 10)
+  const parsedBlockSize = Number.parseInt(blockSize, 10)
+  const parsedParallelization = Number.parseInt(parallelization, 10)
+
+  if (
+    !Number.isInteger(parsedCost) ||
+    !Number.isInteger(parsedBlockSize) ||
+    !Number.isInteger(parsedParallelization) ||
+    parsedCost <= 0 ||
+    parsedBlockSize <= 0 ||
+    parsedParallelization <= 0
+  ) {
+    return false
+  }
+
   const expected = Buffer.from(hash ?? "", "base64url")
 
   if (!expected.length) {
     return false
   }
 
-  const derived = await deriveKey(
-    passwordProof,
-    Buffer.from(salt ?? "", "base64url"),
-    expected.length,
-    {
-      cost: Number.parseInt(cost, 10),
-      blockSize: Number.parseInt(blockSize, 10),
-      parallelization: Number.parseInt(parallelization, 10),
-      maxmem: 64 * 1024 * 1024,
-    }
-  )
+  let derived: Buffer
+
+  try {
+    derived = await deriveKey(
+      password,
+      Buffer.from(salt ?? "", "base64url"),
+      expected.length,
+      {
+        cost: parsedCost,
+        blockSize: parsedBlockSize,
+        parallelization: parsedParallelization,
+        maxmem: 64 * 1024 * 1024,
+      }
+    )
+  } catch {
+    return false
+  }
 
   return (
     expected.length === derived.length && timingSafeEqual(expected, derived)

@@ -1,21 +1,25 @@
-import { getCurrentUser } from "@/server/auth/session"
+import { requireApiUser } from "@/server/auth/api"
 import { hasAnyUsers } from "@/server/db/users"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
 export async function GET() {
-  const user = await getCurrentUser()
+  const auth = await requireApiUser()
+
+  if (!auth.ok) {
+    return auth.response
+  }
+
+  const user = auth.user
 
   return Response.json({
     hasUsers: hasAnyUsers(),
-    user: user
-      ? {
-          username: user.username,
-          name: user.name,
-          isAdmin: user.isAdmin,
-          hasPassword: user.hasPassword,
-        }
-      : null,
+    user: {
+      username: user.username,
+      name: user.name,
+      isAdmin: user.isAdmin,
+      hasPassword: user.hasPassword,
+    },
   })
 }

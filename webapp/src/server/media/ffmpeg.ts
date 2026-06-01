@@ -35,8 +35,8 @@ export function getLiveH264Args(profile: PlaybackProfile) {
     config.transcodeAccel === "nvenc"
       ? ["-c:v", "h264_nvenc", "-preset", "p5"]
       : config.transcodeAccel === "qsv"
-        ? ["-c:v", "h264_qsv", "-preset", "veryfast"]
-        : ["-c:v", "libx264", "-preset", "veryfast"]
+        ? ["-c:v", "h264_qsv", "-preset", "fast"]
+        : ["-c:v", "libx264", "-preset", "fast"]
 
   const qualityArgs =
     config.transcodeAccel === "nvenc"

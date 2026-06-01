@@ -1,8 +1,10 @@
 import { z } from "zod"
 
+import { requireSameOriginRequest } from "@/server/auth/api"
 import { createSession, setSessionCookie } from "@/server/auth/session"
-import { hashPasswordProof } from "@/server/auth/password"
+import { hashPassword, isStrongPassword } from "@/server/auth/password"
 import { createUser, hasAnyUsers } from "@/server/db/users"
+import { isSecureRequest } from "@/server/http/request"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -14,10 +16,23 @@ const registerSchema = z.object({
     .min(3)
     .max(64)
     .regex(/^[a-z0-9._-]+$/i),
-  passwordHash: z.string().regex(/^[a-f0-9]{64}$/i),
+  password: z.string().min(1).max(1024),
 })
 
 export async function POST(request: Request) {
+  const originError = await requireSameOriginRequest(request)
+
+  if (originError) {
+    return originError
+  }
+
+  if (!(await isSecureRequest(request))) {
+    return Response.json(
+      { ok: false, error: "SECURE_CONTEXT_REQUIRED" },
+      { status: 400 }
+    )
+  }
+
   if (hasAnyUsers()) {
     return Response.json(
       { ok: false, error: "REGISTRATION_CLOSED" },
@@ -35,7 +50,11 @@ export async function POST(request: Request) {
     )
   }
 
-  const passwordHash = await hashPasswordProof(parsed.data.passwordHash)
+  if (!isStrongPassword(parsed.data.password)) {
+    return Response.json({ ok: false, error: "WEAK_PASSWORD" }, { status: 400 })
+  }
+
+  const passwordHash = await hashPassword(parsed.data.password)
   const user = createUser({
     username: parsed.data.username,
     passwordHash,

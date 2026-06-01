@@ -1,8 +1,10 @@
 import Image from "next/image"
 import { notFound } from "next/navigation"
 
+import { AniListTracking } from "@/components/anilist-tracking"
 import { EpisodeCard } from "@/components/episode-card"
 import { Badge } from "@/components/ui/badge"
+import { getCurrentUser } from "@/server/auth/session"
 import { getAnimeInfo, getEpisodes } from "@/server/media/libraryStore"
 
 type AnimePageProps = {
@@ -19,7 +21,15 @@ export default async function AnimePage({ params }: AnimePageProps) {
     notFound()
   }
 
-  const episodes = getEpisodes(animeId)
+  const user = await getCurrentUser()
+  const episodes = getEpisodes(animeId, user?.username)
+  const episodesBySeason = new Map<number, typeof episodes>()
+
+  for (const episode of episodes) {
+    const seasonEpisodes = episodesBySeason.get(episode.seasonNumber) ?? []
+    seasonEpisodes.push(episode)
+    episodesBySeason.set(episode.seasonNumber, seasonEpisodes)
+  }
 
   return (
     <div className="space-y-6">
@@ -83,20 +93,28 @@ export default async function AnimePage({ params }: AnimePageProps) {
                 ))}
               </div>
             ) : null}
+            <AniListTracking animeId={anime.id} />
           </div>
         </div>
       </section>
 
       <section className="space-y-3">
         <h2 className="text-lg font-semibold text-zinc-50">Episodes</h2>
-        <div className="grid gap-3 xl:grid-cols-2">
-          {episodes.map((episode) => (
-            <EpisodeCard
-              key={`${episode.animeId}-${episode.episodeNumber}`}
-              episode={episode}
-            />
-          ))}
-        </div>
+        {[...episodesBySeason.entries()].map(([season, seasonEpisodes]) => (
+          <div key={season} className="space-y-3">
+            <h3 className="text-sm font-medium text-zinc-400">
+              Season {String(season).padStart(2, "0")}
+            </h3>
+            <div className="grid gap-3 xl:grid-cols-2">
+              {seasonEpisodes.map((episode) => (
+                <EpisodeCard
+                  key={`${episode.animeId}-${episode.seasonNumber}-${episode.episodeNumber}`}
+                  episode={episode}
+                />
+              ))}
+            </div>
+          </div>
+        ))}
       </section>
     </div>
   )

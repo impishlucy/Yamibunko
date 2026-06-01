@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto"
 
-import { cookies, headers } from "next/headers"
+import { cookies } from "next/headers"
 
 import {
   deleteSessionByTokenHash,
@@ -9,6 +9,7 @@ import {
   touchSession,
 } from "@/server/db/sessions"
 import { getUser } from "@/server/db/users"
+import { getRequestOrigin } from "@/server/http/request"
 
 export const sessionCookieName = "yamibunko_session"
 
@@ -26,8 +27,7 @@ function hashToken(token: string) {
 }
 
 async function shouldUseSecureCookies() {
-  const headerStore = await headers()
-  return headerStore.get("x-forwarded-proto") === "https"
+  return new URL(await getRequestOrigin()).protocol === "https:"
 }
 
 export async function createSession(

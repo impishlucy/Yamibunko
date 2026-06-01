@@ -1,7 +1,10 @@
 import { z } from "zod"
 
-import { requireAdminApiUser } from "@/server/auth/api"
-import { createUser, listUsers } from "@/server/db/users"
+import {
+  requireAdminApiUser,
+  requireSameOriginRequest,
+} from "@/server/auth/api"
+import { createUser, deleteUser, getUser, listUsers } from "@/server/db/users"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -13,7 +16,10 @@ const createUserSchema = z.object({
     .min(3)
     .max(64)
     .regex(/^[a-z0-9._-]+$/i),
-  isAdmin: z.boolean().optional(),
+})
+
+const deleteUserSchema = z.object({
+  username: z.string().trim().min(1).max(64),
 })
 
 function serializeUsers() {
@@ -39,6 +45,12 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
+  const originError = await requireSameOriginRequest(request)
+
+  if (originError) {
+    return originError
+  }
+
   const auth = await requireAdminApiUser()
 
   if (!auth.ok) {
@@ -58,7 +70,7 @@ export async function POST(request: Request) {
   try {
     createUser({
       username: parsed.data.username,
-      isAdmin: parsed.data.isAdmin ?? false,
+      isAdmin: false,
       passwordHash: null,
     })
   } catch {
@@ -67,6 +79,53 @@ export async function POST(request: Request) {
       { status: 409 }
     )
   }
+
+  return Response.json({
+    ok: true,
+    users: serializeUsers(),
+  })
+}
+
+export async function DELETE(request: Request) {
+  const originError = await requireSameOriginRequest(request)
+
+  if (originError) {
+    return originError
+  }
+
+  const auth = await requireAdminApiUser()
+
+  if (!auth.ok) {
+    return auth.response
+  }
+
+  const body = await request.json().catch(() => null)
+  const parsed = deleteUserSchema.safeParse(body)
+
+  if (!parsed.success) {
+    return Response.json(
+      { ok: false, error: "INVALID_USER_PAYLOAD" },
+      { status: 400 }
+    )
+  }
+
+  const target = getUser(parsed.data.username)
+
+  if (!target) {
+    return Response.json(
+      { ok: false, error: "USER_NOT_FOUND" },
+      { status: 404 }
+    )
+  }
+
+  if (target.isAdmin || target.username === auth.user.username) {
+    return Response.json(
+      { ok: false, error: "USER_DELETE_FORBIDDEN" },
+      { status: 403 }
+    )
+  }
+
+  deleteUser(target.username)
 
   return Response.json({
     ok: true,

@@ -14,22 +14,14 @@ const pathEnvironmentKeys = [
   "ANIME_MEDIA_DIR",
 ] as const
 
-const launcherAliases = new Map<string, string>([
-  ["INPUT_FOLDER_PATH", "ANIME_INPUT_DIR"],
-  ["INPUT_DIR", "ANIME_INPUT_DIR"],
-  ["ANIME_INPUT_DIR", "ANIME_INPUT_DIR"],
-  ["OUTPUT_FOLDER_PATH", "ANIME_MEDIA_DIR"],
-  ["OUTPUT_DIR", "ANIME_MEDIA_DIR"],
-  ["MEDIA_FOLDER_PATH", "ANIME_MEDIA_DIR"],
-  ["MEDIA_DIR", "ANIME_MEDIA_DIR"],
-  ["ANIME_MEDIA_DIR", "ANIME_MEDIA_DIR"],
-  ["FFMPEG_DIR", "FFMPEG_DIR"],
-  ["FFMPEG_BIN_DIR", "FFMPEG_DIR"],
-  ["MEDIA_BIN_DIR", "FFMPEG_DIR"],
-  ["TRANSCODE_ACCEL", "TRANSCODE_ACCEL"],
-  ["TRANSCODE_ACCELERATION", "TRANSCODE_ACCEL"],
-  ["PORT", "PORT"],
-])
+const launcherAliases: string[] = [
+  "FFMPEG_DIR",
+  "ANIME_INPUT_DIR",
+  "ANIME_MEDIA_DIR",
+  "TRANSCODE_ACCEL",
+  "ANILIST_CLIENT_ID",
+  "ANILIST_CLIENT_SECRET",
+]
 
 const requiredCanonicalKeys = new Set<string>(requiredEnvironmentKeys)
 
@@ -48,7 +40,7 @@ function normalizeParameterName(value: string) {
 }
 
 function setKnownEnvironmentValue(rawKey: string, rawValue: string) {
-  const key = launcherAliases.get(normalizeParameterName(rawKey))
+  const key = normalizeParameterName(rawKey)
 
   if (!key) {
     return false
@@ -77,8 +69,7 @@ function applyLauncherParameters(argv = process.argv.slice(1)) {
       continue
     }
 
-    const maybeKey = normalizeParameterName(arg)
-    const canonical = launcherAliases.get(maybeKey)
+    const canonical = normalizeParameterName(arg)
     const nextValue = argv[index + 1]
 
     if (canonical && nextValue && !nextValue.startsWith("--")) {
@@ -113,7 +104,7 @@ function loadDotEnv(dotEnvPath: string) {
 
     const key = trimmed.slice(0, equalsIndex).trim()
     const value = cleanValue(trimmed.slice(equalsIndex + 1))
-    const canonical = launcherAliases.get(normalizeParameterName(key)) ?? key
+    const canonical = normalizeParameterName(key)
 
     if (!process.env[canonical]) {
       process.env[canonical] = value

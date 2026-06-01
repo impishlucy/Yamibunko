@@ -27,15 +27,23 @@ export type AnimeInfo = AnimeSummary & {
     rank?: number | null
     isAdult?: boolean | null
   }>
+  seasons: number[]
 }
 
 export type Episode = {
   animeId: number
+  seasonNumber: number
   episodeNumber: number
   fileName: string
   filePath: string
   thumbnail?: string
   durationSeconds?: number
+  progress?: {
+    watchedSeconds: number
+    durationSeconds?: number
+    completed: boolean
+    ratio: number
+  }
 }
 
 export type TranscodeStatus = {
@@ -50,6 +58,8 @@ export type PlaybackMode = "direct" | "transcode"
 export type WatchPayload = {
   anime: AnimeInfo
   episode: Episode
+  previousEpisode?: Episode
+  nextEpisode?: Episode
   playback: {
     directUrl: string
     originalTranscodeUrl: string
@@ -61,15 +71,5 @@ export type SafeSettings = {
   account: {
     userName: string
     isAdmin: boolean
-  }
-  paths: {
-    inputDir: string
-    mediaDir: string
-  }
-  transcoding: {
-    acceleration: "nvenc" | "qsv" | "cpu"
-  }
-  appearance: {
-    theme: "dark"
   }
 }

@@ -6,7 +6,6 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Switch } from "@/components/ui/switch"
 import { apiGet } from "@/lib/api"
 
 type UserListItem = {
@@ -31,7 +30,7 @@ export function UserManagement() {
   const [me, setMe] = useState<MeResponse["user"]>(null)
   const [users, setUsers] = useState<UserListItem[]>([])
   const [username, setUsername] = useState("")
-  const [isAdmin, setIsAdmin] = useState(false)
+  const [deleteUsername, setDeleteUsername] = useState("")
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
@@ -76,7 +75,6 @@ export function UserManagement() {
       },
       body: JSON.stringify({
         username,
-        isAdmin,
       }),
     })
 
@@ -88,12 +86,52 @@ export function UserManagement() {
     const payload = (await response.json()) as { users: UserListItem[] }
     setUsers(payload.users)
     setUsername("")
-    setIsAdmin(false)
+  }
+
+  async function deleteSelectedUser() {
+    if (!deleteUsername) {
+      return
+    }
+
+    const target = users.find((user) => user.username === deleteUsername)
+
+    if (!target) {
+      return
+    }
+
+    const confirmed = window.confirm(`Delete user "${target.username}"?`)
+
+    if (!confirmed) {
+      return
+    }
+
+    setError(null)
+
+    const response = await fetch("/api/auth/users", {
+      method: "DELETE",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        username: target.username,
+      }),
+    })
+
+    if (!response.ok) {
+      setError("Unable to delete user")
+      return
+    }
+
+    const payload = (await response.json()) as { users: UserListItem[] }
+    setUsers(payload.users)
+    setDeleteUsername("")
   }
 
   if (!me?.isAdmin) {
     return null
   }
+
+  const deletableUsers = users.filter((user) => !user.isAdmin)
 
   return (
     <Card className="rounded-lg border-white/10 bg-zinc-900/75">
@@ -101,7 +139,7 @@ export function UserManagement() {
         <CardTitle className="text-zinc-100">Users</CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="grid gap-3 sm:grid-cols-[1fr_auto_auto] sm:items-end">
+        <div className="grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end">
           <div className="space-y-1.5">
             <Label htmlFor="new-username" className="text-zinc-400">
               Username
@@ -113,16 +151,41 @@ export function UserManagement() {
               className="h-9 rounded-lg border-white/10 bg-zinc-950/70 text-zinc-100"
             />
           </div>
-          <label className="flex h-9 items-center gap-2 text-sm text-zinc-300">
-            <Switch checked={isAdmin} onCheckedChange={setIsAdmin} />
-            Admin
-          </label>
           <Button
             type="button"
             onClick={createUser}
             disabled={username.trim().length < 3}
           >
             Create
+          </Button>
+        </div>
+
+        <div className="grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end">
+          <div className="space-y-1.5">
+            <Label htmlFor="delete-username" className="text-zinc-400">
+              Delete user
+            </Label>
+            <select
+              id="delete-username"
+              value={deleteUsername}
+              onChange={(event) => setDeleteUsername(event.target.value)}
+              className="h-9 w-full rounded-lg border border-white/10 bg-zinc-950/70 px-3 text-sm text-zinc-100 outline-none"
+            >
+              <option value="">Select user</option>
+              {deletableUsers.map((user) => (
+                <option key={user.username} value={user.username}>
+                  {user.username}
+                </option>
+              ))}
+            </select>
+          </div>
+          <Button
+            type="button"
+            variant="destructive"
+            onClick={deleteSelectedUser}
+            disabled={!deleteUsername}
+          >
+            Delete
           </Button>
         </div>
 

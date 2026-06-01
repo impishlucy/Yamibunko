@@ -1,16 +1,20 @@
-import { constants } from "node:fs"
 import {
-  access,
   copyFile,
   mkdir,
+  readdir,
   rename,
   rm,
+  rmdir,
   stat,
   unlink,
 } from "node:fs/promises"
 import path from "node:path"
 
-import { upsertAnime, upsertEpisode } from "@/server/db/library"
+import {
+  getStoredEpisode,
+  upsertAnime,
+  upsertEpisode,
+} from "@/server/db/library"
 import { createJob, updateJob } from "@/server/db/jobs"
 import { getServerConfig } from "@/server/config"
 import { ffprobe, getHevcFileArgs, runFfmpeg } from "@/server/media/ffmpeg"
@@ -20,62 +24,26 @@ import {
   parseAnimeFileName,
   sanitizePathPart,
 } from "@/server/media/filename"
+import {
+  generateEpisodeThumbnail,
+  isMediaFile,
+  parseDurationSeconds,
+  pathExists,
+  type ProbeResult,
+  waitForStableFile,
+} from "@/server/media/mediaFiles"
 import { findAnimeMetadata } from "@/server/metadata/anilist"
 import { acquireBackgroundTranscode } from "@/server/transcode/transcodeCapacity"
 
-const mediaExtensions = new Set([
-  ".mkv",
-  ".mp4",
-  ".m4v",
-  ".avi",
-  ".mov",
-  ".webm",
-])
-
 const hevcSkipThresholdBytes = 450 * 1024 * 1024
-const targetOutputBytes = 400 * 1024 * 1024
+const targetBytesPerMinute = 18 * 1024 * 1024
+const targetAudioKbps = 256
 
 export type ProcessInputFileResult = {
   ok: boolean
   filePath: string
   planned: boolean
   message: string
-}
-
-type ProbeStream = {
-  codec_type?: string
-  codec_name?: string
-  duration?: string
-}
-
-type ProbeResult = {
-  streams?: ProbeStream[]
-  format?: {
-    duration?: string
-    size?: string
-  }
-}
-
-function isMediaFile(filePath: string) {
-  return mediaExtensions.has(path.extname(filePath).toLowerCase())
-}
-
-function parseDurationSeconds(probe: ProbeResult) {
-  const duration = Number.parseFloat(probe.format?.duration ?? "")
-
-  if (Number.isFinite(duration) && duration > 0) {
-    return duration
-  }
-
-  for (const stream of probe.streams ?? []) {
-    const streamDuration = Number.parseFloat(stream.duration ?? "")
-
-    if (Number.isFinite(streamDuration) && streamDuration > 0) {
-      return streamDuration
-    }
-  }
-
-  return 24 * 60
 }
 
 function hasHevcVideo(probe: ProbeResult) {
@@ -97,31 +65,9 @@ function needsMp3Audio(probe: ProbeResult) {
   })
 }
 
-function calculateVideoBitrateKbps(durationSeconds: number) {
-  const totalKbps = Math.floor((targetOutputBytes * 8) / durationSeconds / 1000)
-  return Math.max(totalKbps - 256, 500)
-}
-
-async function waitForStableFile(filePath: string) {
-  let previousSize = -1
-  let stableReads = 0
-
-  while (stableReads < 3) {
-    const fileStat = await stat(filePath)
-
-    if (!fileStat.isFile()) {
-      throw new Error("Input is not a file")
-    }
-
-    if (fileStat.size === previousSize) {
-      stableReads += 1
-    } else {
-      previousSize = fileStat.size
-      stableReads = 0
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 1000))
-  }
+function calculateVideoBitrateKbps() {
+  const totalKbps = Math.floor((targetBytesPerMinute * 8) / 60 / 1000)
+  return Math.max(totalKbps - targetAudioKbps, 500)
 }
 
 async function replaceFile(source: string, destination: string) {
@@ -146,31 +92,20 @@ async function replaceFile(source: string, destination: string) {
   }
 }
 
-function thumbnailPathForEpisode(filePath: string) {
-  const extension = path.extname(filePath)
-  return `${filePath.slice(0, -extension.length)}.jpg`
-}
+async function removeEmptyInputParents(filePath: string) {
+  const inputDir = path.resolve(getServerConfig().inputDir)
+  let current = path.dirname(path.resolve(filePath))
 
-async function generateThumbnail(filePath: string, durationSeconds: number) {
-  const thumbnailPath = thumbnailPathForEpisode(filePath)
+  while (current.startsWith(inputDir) && current !== inputDir) {
+    const entries = await readdir(current).catch(() => null)
 
-  await runFfmpeg([
-    "-hide_banner",
-    "-loglevel",
-    "warning",
-    "-ss",
-    String(Math.max(durationSeconds / 2, 1)),
-    "-i",
-    filePath,
-    "-frames:v",
-    "1",
-    "-vf",
-    "scale=640:-2:force_original_aspect_ratio=decrease",
-    "-y",
-    thumbnailPath,
-  ])
+    if (!entries || entries.length > 0) {
+      return
+    }
 
-  return thumbnailPath
+    await rmdir(current).catch(() => undefined)
+    current = path.dirname(current)
+  }
 }
 
 async function transcodeFile(
@@ -223,7 +158,10 @@ export async function processInputFile(
       }
     }
 
-    await access(filePath, constants.R_OK)
+    if (!(await pathExists(filePath))) {
+      throw new Error("Input file is no longer available")
+    }
+
     await waitForStableFile(filePath)
 
     const parsed = parseAnimeFileName(filePath)
@@ -282,6 +220,20 @@ export async function processInputFile(
       jobId,
       finalName
     )
+    const existingEpisode = getStoredEpisode(
+      metadata.id,
+      parsed.season,
+      parsed.episode
+    )
+
+    if (
+      (existingEpisode && (await pathExists(existingEpisode.filePath))) ||
+      (await pathExists(finalPath))
+    ) {
+      throw new Error(
+        `Episode already exists in the library: ${safeTitle} S${String(parsed.season).padStart(2, "0")}E${String(parsed.episode).padStart(2, "0")}`
+      )
+    }
 
     if (needsTranscode) {
       updateJob(jobId, {
@@ -298,7 +250,7 @@ export async function processInputFile(
         await transcodeFile(filePath, tempPath, {
           convertVideo,
           convertAudioToMp3,
-          videoBitrateKbps: calculateVideoBitrateKbps(durationSeconds),
+          videoBitrateKbps: calculateVideoBitrateKbps(),
         })
       } finally {
         lease.release()
@@ -307,12 +259,14 @@ export async function processInputFile(
       await replaceFile(tempPath, finalPath)
       await rm(path.dirname(tempPath), { force: true, recursive: true })
       await unlink(filePath).catch(() => undefined)
+      await removeEmptyInputParents(filePath)
     } else {
       updateJob(jobId, {
         message: "Moving direct-play media file.",
       })
 
       await replaceFile(filePath, finalPath)
+      await removeEmptyInputParents(filePath)
     }
 
     updateJob(jobId, {
@@ -320,12 +274,18 @@ export async function processInputFile(
       message: "Generating thumbnail.",
     })
 
-    await generateThumbnail(finalPath, durationSeconds)
+    const thumbnailPath = await generateEpisodeThumbnail(
+      finalPath,
+      durationSeconds
+    )
 
     upsertEpisode({
       animeId: metadata.id,
+      seasonNr: parsed.season,
       epNr: parsed.episode,
       filePath: finalPath,
+      thumbnailPath,
+      durationSeconds,
     })
 
     updateJob(jobId, {
