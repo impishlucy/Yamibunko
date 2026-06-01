@@ -2,6 +2,7 @@ import { z } from "zod"
 
 import { requireApiUser, requireSameOriginRequest } from "@/server/auth/api"
 import { saveAniListProgress } from "@/server/anilist/client"
+import { serverLog } from "@/server/logger"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -39,7 +40,7 @@ export async function POST(request: Request) {
     animeId: parsed.data.animeId,
     progress: parsed.data.progress,
   }).catch((error) => {
-    console.warn("[anilist] Progress sync failed.", error)
+    serverLog.error("Anilist", "Progress sync failed.", { error })
     return "sync-failed" as const
   })
 

@@ -4,18 +4,21 @@ import { getCurrentUser } from "@/server/auth/session"
 import {
   exchangeAniListAuthorizationCode,
   getAniListViewer,
+  syncAniListLibraryProgress,
 } from "@/server/anilist/client"
 import { upsertAniListConnection } from "@/server/db/anilistConnections"
-import { getRequestOrigin } from "@/server/http/request"
+import { joinBaseUrl } from "@/server/http/baseUrl"
+import { getPublicBaseUrl, getRequestOrigin } from "@/server/http/request"
+import { serverLog } from "@/server/logger"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
 async function settingsRedirect(
-  request: Request,
+  _request: Request,
   params: Record<string, string>
 ) {
-  const url = new URL("/settings", await getRequestOrigin(request))
+  const url = new URL(joinBaseUrl(await getPublicBaseUrl(), "/settings"))
 
   for (const [key, value] of Object.entries(params)) {
     url.searchParams.set(key, value)
@@ -67,9 +70,17 @@ export async function GET(request: Request) {
       tokenType: token.tokenType,
     })
 
+    await syncAniListLibraryProgress(user.username).catch((syncError) => {
+      serverLog.error("Anilist", "Initial list sync failed.", {
+        error: syncError,
+      })
+    })
+
     return settingsRedirect(request, { anilist: "connected" })
   } catch (callbackError) {
-    console.error("[anilist] OAuth callback failed.", callbackError)
+    serverLog.error("Anilist", "OAuth callback failed.", {
+      error: callbackError,
+    })
     return settingsRedirect(request, { anilist: "failed" })
   }
 }

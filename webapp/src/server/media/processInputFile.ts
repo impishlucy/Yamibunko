@@ -17,6 +17,7 @@ import {
 } from "@/server/db/library"
 import { createJob, updateJob } from "@/server/db/jobs"
 import { getServerConfig } from "@/server/config"
+import { serverLog } from "@/server/logger"
 import { ffprobe, getHevcFileArgs, runFfmpeg } from "@/server/media/ffmpeg"
 import {
   formatEpisodeFileName,
@@ -68,6 +69,29 @@ function needsMp3Audio(probe: ProbeResult) {
 function calculateVideoBitrateKbps() {
   const totalKbps = Math.floor((targetBytesPerMinute * 8) / 60 / 1000)
   return Math.max(totalKbps - targetAudioKbps, 500)
+}
+
+function summarizeProbe(probe: ProbeResult) {
+  const streams = probe.streams ?? []
+
+  return {
+    videoCodecs: [
+      ...new Set(
+        streams
+          .filter((stream) => stream.codec_type === "video")
+          .map((stream) => stream.codec_name ?? "unknown")
+      ),
+    ],
+    audioCodecs: [
+      ...new Set(
+        streams
+          .filter((stream) => stream.codec_type === "audio")
+          .map((stream) => stream.codec_name ?? "unknown")
+      ),
+    ],
+    subtitleStreams: streams.filter((stream) => stream.codec_type === "subtitle")
+      .length,
+  }
 }
 
 async function replaceFile(source: string, destination: string) {
@@ -135,6 +159,7 @@ export async function processInputFile(
   filePath: string
 ): Promise<ProcessInputFileResult> {
   const jobId = createJob(filePath)
+  serverLog.info("Media", "Input file processing started.", { filePath, jobId })
 
   try {
     updateJob(jobId, {
@@ -144,6 +169,10 @@ export async function processInputFile(
     })
 
     if (!isMediaFile(filePath)) {
+      serverLog.info("Media", "Skipped non-media input file.", {
+        filePath,
+        jobId,
+      })
       updateJob(jobId, {
         status: "skipped",
         message: "Skipped non-media file.",
@@ -162,6 +191,10 @@ export async function processInputFile(
       throw new Error("Input file is no longer available")
     }
 
+    serverLog.info("Media", "Waiting for input file to become stable.", {
+      filePath,
+      jobId,
+    })
     await waitForStableFile(filePath)
 
     const parsed = parseAnimeFileName(filePath)
@@ -169,6 +202,14 @@ export async function processInputFile(
     if (!parsed) {
       throw new Error("Unable to extract anime title and episode number")
     }
+
+    serverLog.info("Media", "Recognized input file.", {
+      filePath,
+      jobId,
+      title: parsed.title,
+      season: parsed.season,
+      episode: parsed.episode,
+    })
 
     updateJob(jobId, {
       message: "Fetching AniList metadata.",
@@ -181,6 +222,16 @@ export async function processInputFile(
     }
 
     upsertAnime(metadata)
+    serverLog.info("Media", "Resolved AniList metadata for input file.", {
+      filePath,
+      jobId,
+      title: parsed.title,
+      anilistId: metadata.id,
+      matchedTitle:
+        metadata.title.userPreferred ??
+        metadata.title.english ??
+        metadata.title.romaji,
+    })
 
     updateJob(jobId, {
       animeId: metadata.id,
@@ -195,6 +246,7 @@ export async function processInputFile(
       !hasHevcVideo(probe) || inputStat.size >= hevcSkipThresholdBytes
     const convertAudioToMp3 = needsMp3Audio(probe)
     const needsTranscode = convertVideo || convertAudioToMp3
+    const videoBitrateKbps = calculateVideoBitrateKbps()
     const title =
       metadata.title.userPreferred ??
       metadata.title.english ??
@@ -235,9 +287,27 @@ export async function processInputFile(
       )
     }
 
+    serverLog.info("Media", "Media stream inspection completed.", {
+      filePath,
+      jobId,
+      sizeBytes: inputStat.size,
+      durationSeconds,
+      ...summarizeProbe(probe),
+      hevcUnderThreshold: hasHevcVideo(probe) && inputStat.size < hevcSkipThresholdBytes,
+      convertVideoToHevc: convertVideo,
+      convertAudioToMp3,
+      needsTranscode,
+      finalPath,
+    })
+
     if (needsTranscode) {
       updateJob(jobId, {
         message: "Waiting for transcode capacity.",
+      })
+
+      serverLog.info("Media", "Waiting for background transcode capacity.", {
+        filePath,
+        jobId,
       })
 
       const lease = await acquireBackgroundTranscode(`background:${jobId}`)
@@ -247,15 +317,30 @@ export async function processInputFile(
           message: "Transcoding media file.",
         })
 
+        serverLog.info("Media", "Starting media transcode.", {
+          filePath,
+          jobId,
+          outputPath: tempPath,
+          acceleration: getServerConfig().transcodeAccel,
+          convertVideoToHevc: convertVideo,
+          convertAudioToMp3,
+          videoBitrateKbps,
+        })
+
         await transcodeFile(filePath, tempPath, {
           convertVideo,
           convertAudioToMp3,
-          videoBitrateKbps: calculateVideoBitrateKbps(),
+          videoBitrateKbps,
         })
       } finally {
         lease.release()
       }
 
+      serverLog.info("Media", "Media transcode completed.", {
+        filePath,
+        jobId,
+        outputPath: tempPath,
+      })
       await replaceFile(tempPath, finalPath)
       await rm(path.dirname(tempPath), { force: true, recursive: true })
       await unlink(filePath).catch(() => undefined)
@@ -265,6 +350,13 @@ export async function processInputFile(
         message: "Moving direct-play media file.",
       })
 
+      serverLog.info("Media", "Skipping transcode and moving direct-play file.", {
+        filePath,
+        jobId,
+        finalPath,
+        reason: "HEVC video is under the configured size threshold and audio does not need conversion.",
+      })
+
       await replaceFile(filePath, finalPath)
       await removeEmptyInputParents(filePath)
     }
@@ -272,6 +364,12 @@ export async function processInputFile(
     updateJob(jobId, {
       outputPath: finalPath,
       message: "Generating thumbnail.",
+    })
+
+    serverLog.info("Media", "Generating episode thumbnail.", {
+      filePath: finalPath,
+      jobId,
+      durationSeconds,
     })
 
     const thumbnailPath = await generateEpisodeThumbnail(
@@ -286,6 +384,15 @@ export async function processInputFile(
       filePath: finalPath,
       thumbnailPath,
       durationSeconds,
+    })
+
+    serverLog.info("Media", "Episode added to database.", {
+      jobId,
+      animeId: metadata.id,
+      season: parsed.season,
+      episode: parsed.episode,
+      filePath: finalPath,
+      thumbnailPath,
     })
 
     updateJob(jobId, {
@@ -308,6 +415,12 @@ export async function processInputFile(
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Unknown media processing error"
+
+    serverLog.error("Media", "Input file processing failed.", {
+      filePath,
+      jobId,
+      error,
+    })
 
     updateJob(jobId, {
       status: "failed",

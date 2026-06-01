@@ -5,6 +5,7 @@ import path from "node:path"
 
 import { listEpisodeFilePaths } from "@/server/db/library"
 import { getServerConfigResult } from "@/server/config"
+import { serverLog } from "@/server/logger"
 import { isMediaFile, pathExists } from "@/server/media/mediaFiles"
 import { processInputFile } from "@/server/media/processInputFile"
 import {
@@ -19,6 +20,7 @@ type WorkerRuntime = {
 }
 
 type WorkKind = "input" | "library-sync" | "library-delete"
+type WorkTrigger = "startup-scan" | "scheduled-scan" | "watcher-add" | "watcher-unlink"
 type WorkerGlobalState = typeof globalThis & {
   __yamibunkoWorkerRuntime?: WorkerRuntime
   __yamibunkoSignalHandlersRegistered?: boolean
@@ -56,7 +58,7 @@ export function startWorkers() {
   const configResult = getServerConfigResult()
 
   if (!configResult.ok) {
-    console.warn("[workers] Background watcher not started.", {
+    serverLog.warn("Workers", "Background watcher not started.", {
       issues: configResult.issues,
     })
     return undefined
@@ -85,7 +87,13 @@ export function startWorkers() {
     },
   })
 
-  function enqueue(kind: WorkKind, filePath: string) {
+  serverLog.info("Workers", "Started background file watchers.", {
+    inputDir: config.inputDir,
+    mediaDir: config.mediaDir,
+    scanIntervalMs,
+  })
+
+  function enqueue(kind: WorkKind, filePath: string, trigger: WorkTrigger) {
     if (shuttingDown) {
       return
     }
@@ -103,23 +111,46 @@ export function startWorkers() {
     }
 
     queuedWork.add(key)
+    serverLog.info("Workers", "Queued file work.", {
+      kind,
+      trigger,
+      filePath: resolvedPath,
+      queueSize: queue.size,
+      pending: queue.pending,
+    })
+
     queue
       .add(async () => {
         try {
+          serverLog.info("Workers", "Started file work.", {
+            kind,
+            trigger,
+            filePath: resolvedPath,
+          })
+
+          let result: unknown
+
           if (kind === "input") {
-            await processInputFile(resolvedPath)
+            result = await processInputFile(resolvedPath)
           } else if (kind === "library-sync") {
-            await syncLibraryFile(resolvedPath)
+            result = await syncLibraryFile(resolvedPath)
           } else {
-            await removeLibraryFile(resolvedPath)
+            result = await removeLibraryFile(resolvedPath)
           }
+
+          serverLog.info("Workers", "Completed file work.", {
+            kind,
+            trigger,
+            filePath: resolvedPath,
+            result,
+          })
         } finally {
           queuedWork.delete(key)
         }
       })
       .catch((error: unknown) => {
         queuedWork.delete(key)
-        console.error("[workers] Background file processing failed.", {
+        serverLog.error("Workers", "Background file processing failed.", {
           kind,
           filePath: resolvedPath,
           error,
@@ -127,79 +158,113 @@ export function startWorkers() {
       })
   }
 
-  async function scanInputDirectory() {
+  async function scanInputDirectory(trigger: WorkTrigger) {
     if (shuttingDown || scanning) {
       return
     }
 
     scanning = true
+    serverLog.info("Workers", "Scanning input folder.", {
+      trigger,
+      directory: config.inputDir,
+    })
 
     try {
-      for (const filePath of await walkFiles(config.inputDir)) {
-        enqueue("input", filePath)
+      const files = await walkFiles(config.inputDir)
+      const mediaFiles = files.filter(isMediaFile)
+
+      serverLog.info("Workers", "Input folder scan completed.", {
+        trigger,
+        files: files.length,
+        mediaFiles: mediaFiles.length,
+      })
+
+      for (const filePath of mediaFiles) {
+        enqueue("input", filePath, trigger)
       }
     } catch (error) {
-      console.error("[workers] Input folder scan failed.", error)
+      serverLog.error("Workers", "Input folder scan failed.", { error })
     } finally {
       scanning = false
     }
   }
 
-  async function scanLibraryDirectory() {
+  async function scanLibraryDirectory(trigger: WorkTrigger) {
     if (shuttingDown || scanning) {
       return
     }
 
     scanning = true
+    serverLog.info("Workers", "Scanning library folder.", {
+      trigger,
+      directory: config.mediaDir,
+    })
 
     try {
-      for (const filePath of await walkFiles(config.mediaDir)) {
-        enqueue("library-sync", filePath)
+      const files = await walkFiles(config.mediaDir)
+      const mediaFiles = files.filter(isMediaFile)
+      let missingDbFiles = 0
+
+      serverLog.info("Workers", "Library folder scan found media files.", {
+        trigger,
+        files: files.length,
+        mediaFiles: mediaFiles.length,
+      })
+
+      for (const filePath of mediaFiles) {
+        enqueue("library-sync", filePath, trigger)
       }
 
       for (const filePath of listEpisodeFilePaths()) {
         if (!(await pathExists(filePath))) {
-          enqueue("library-delete", filePath)
+          missingDbFiles += 1
+          enqueue("library-delete", filePath, trigger)
         }
       }
+
+      serverLog.info("Workers", "Library folder scan completed.", {
+        trigger,
+        mediaFiles: mediaFiles.length,
+        missingDbFiles,
+      })
     } catch (error) {
-      console.error("[workers] Library folder scan failed.", error)
+      serverLog.error("Workers", "Library folder scan failed.", { error })
     } finally {
       scanning = false
     }
   }
 
-  async function scanAllDirectories() {
-    await scanInputDirectory()
-    await scanLibraryDirectory()
+  async function scanAllDirectories(trigger: WorkTrigger) {
+    await scanInputDirectory(trigger)
+    await scanLibraryDirectory(trigger)
   }
 
   inputWatcher.on("add", (filePath) => {
-    enqueue("input", filePath)
+    enqueue("input", filePath, "watcher-add")
   })
 
   inputWatcher.on("error", (error) => {
-    console.error("[workers] Input watcher failed.", error)
+    serverLog.error("Workers", "Input watcher failed.", { error })
   })
 
   libraryWatcher.on("add", (filePath) => {
-    enqueue("library-sync", filePath)
+    enqueue("library-sync", filePath, "watcher-add")
   })
 
   libraryWatcher.on("unlink", (filePath) => {
-    enqueue("library-delete", filePath)
+    enqueue("library-delete", filePath, "watcher-unlink")
   })
 
   libraryWatcher.on("error", (error) => {
-    console.error("[workers] Library watcher failed.", error)
+    serverLog.error("Workers", "Library watcher failed.", { error })
   })
 
   const scanTimer = setInterval(() => {
-    void scanAllDirectories()
+    void scanAllDirectories("scheduled-scan")
   }, scanIntervalMs)
   scanTimer.unref?.()
 
-  void scanAllDirectories()
+  void scanAllDirectories("startup-scan")
 
   async function stop() {
     if (shuttingDown) {
@@ -207,12 +272,14 @@ export function startWorkers() {
     }
 
     shuttingDown = true
+    serverLog.info("Workers", "Stopping background workers.")
     clearInterval(scanTimer)
     await Promise.all([inputWatcher.close(), libraryWatcher.close()])
     queue.pause()
     queue.clear()
     // Let active ffmpeg/ffprobe work and its DB writes finish before the process exits.
     await queue.onPendingZero()
+    serverLog.info("Workers", "Background workers stopped.")
     workerGlobal.__yamibunkoWorkerRuntime = undefined
   }
 
@@ -222,11 +289,13 @@ export function startWorkers() {
   if (!workerGlobal.__yamibunkoSignalHandlersRegistered) {
     workerGlobal.__yamibunkoSignalHandlersRegistered = true
     process.once("SIGINT", () => {
+      serverLog.info("Workers", "Received SIGINT.")
       void workerGlobal.__yamibunkoWorkerRuntime
         ?.stop()
         .finally(() => process.exit(130))
     })
     process.once("SIGTERM", () => {
+      serverLog.info("Workers", "Received SIGTERM.")
       void workerGlobal.__yamibunkoWorkerRuntime
         ?.stop()
         .finally(() => process.exit(143))

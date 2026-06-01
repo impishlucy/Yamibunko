@@ -1,8 +1,8 @@
-import { Anilist, gql } from "@api-wrappers/anilist-wrapper"
+import { gql } from "@api-wrappers/anilist-wrapper"
 
 import type { AnimeMetadataInput } from "@/server/db/library"
-
-const anilist = new Anilist()
+import { requestAniListGraphQL } from "@/server/anilist/transport"
+import { serverLog } from "@/server/logger"
 
 type AniListSearchResponse = {
   Page?: {
@@ -133,19 +133,43 @@ function getSearchCandidates(title: string, season?: number) {
 
 export async function findAnimeMetadata(title: string, season?: number) {
   for (const candidate of getSearchCandidates(title, season)) {
-    const result = await anilist.graphql.request<
+    serverLog.info("Anilist", "Searching anime metadata.", {
+      title,
+      season,
+      candidate,
+    })
+
+    const result = await requestAniListGraphQL<
       AniListSearchResponse,
       { search: string }
-    >(searchAnimeQuery, {
-      search: candidate,
+    >({
+      query: searchAnimeQuery,
+      variables: {
+        search: candidate,
+      },
     })
 
     const media = result.Page?.media?.find(Boolean)
 
     if (media) {
+      serverLog.info("Anilist", "Found anime metadata match.", {
+        title,
+        season,
+        candidate,
+        anilistId: media.id,
+        matchedTitle:
+          media.title?.userPreferred ??
+          media.title?.english ??
+          media.title?.romaji,
+      })
       return toMetadata(media)
     }
   }
+
+  serverLog.warn("Anilist", "No anime metadata match found.", {
+    title,
+    season,
+  })
 
   return null
 }

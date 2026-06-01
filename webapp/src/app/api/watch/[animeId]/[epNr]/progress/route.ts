@@ -3,6 +3,7 @@ import { z } from "zod"
 import { requireApiUser, requireSameOriginRequest } from "@/server/auth/api"
 import { saveAniListProgress } from "@/server/anilist/client"
 import { upsertEpisodeProgress } from "@/server/db/library"
+import { serverLog } from "@/server/logger"
 import { getEpisode } from "@/server/media/libraryStore"
 
 export const runtime = "nodejs"
@@ -99,7 +100,7 @@ export async function POST(request: Request, context: ProgressContext) {
       animeId: animeIdNumber,
       progress: episodeNumber,
     }).catch((error) => {
-      console.warn("[anilist] Progress sync failed.", error)
+      serverLog.error("Anilist", "Progress sync failed.", { error })
     })
   }
 

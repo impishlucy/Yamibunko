@@ -6,6 +6,7 @@ import { Readable } from "node:stream"
 import type { PlaybackMode, PlaybackProfile } from "@/lib/types"
 import { requireApiUser } from "@/server/auth/api"
 import { getServerConfig } from "@/server/config"
+import { serverLog } from "@/server/logger"
 import { getLiveH264Args } from "@/server/media/ffmpeg"
 import { resolveEpisodeFile } from "@/server/media/resolveMediaId"
 import { tryAcquireLiveTranscode } from "@/server/transcode/transcodeCapacity"
@@ -111,14 +112,32 @@ async function resolveReadableFile(
   }
 }
 
+type StreamLogContext = {
+  username: string
+  animeId: string
+  seasonNumber: number
+  episodeNumber: number
+}
+
 function jsonError(message: string, status: number) {
   return Response.json({ ok: false, message }, { status })
 }
 
-async function handleDirect(request: Request, file: string, size: number) {
+async function handleDirect(
+  request: Request,
+  file: string,
+  size: number,
+  logContext: StreamLogContext
+) {
   const range = parseByteRange(request.headers.get("range"), size)
 
   if (range === "invalid") {
+    serverLog.warn("Stream", "Invalid byte range requested.", {
+      ...logContext,
+      file,
+      size,
+      range: request.headers.get("range"),
+    })
     return new Response(null, {
       status: 416,
       headers: {
@@ -131,6 +150,12 @@ async function handleDirect(request: Request, file: string, size: number) {
   const headers = new Headers({
     "accept-ranges": "bytes",
     "content-type": "application/octet-stream",
+  })
+  serverLog.info("Stream", "Starting direct file stream.", {
+    ...logContext,
+    file,
+    size,
+    range,
   })
 
   if (range) {
@@ -169,6 +194,7 @@ async function handleTranscode(
   animeId: string,
   seasonNumber: number,
   episodeNumber: number,
+  username: string,
   profile: PlaybackProfile
 ) {
   const lease = await tryAcquireLiveTranscode(
@@ -176,6 +202,13 @@ async function handleTranscode(
   )
 
   if (!lease) {
+    serverLog.warn("Stream", "Live transcode capacity unavailable.", {
+      username,
+      animeId,
+      seasonNumber,
+      episodeNumber,
+      profile,
+    })
     return Response.json(
       {
         ok: false,
@@ -193,6 +226,16 @@ async function handleTranscode(
   }
 
   const config = getServerConfig()
+  serverLog.info("Stream", "Starting live transcode stream.", {
+    username,
+    animeId,
+    seasonNumber,
+    episodeNumber,
+    profile,
+    file,
+    acceleration: config.transcodeAccel,
+  })
+
   const child = spawn(
     config.ffmpegPath,
     [
@@ -216,11 +259,26 @@ async function handleTranscode(
 
   if (!child.stdout) {
     lease.release()
+    serverLog.error("Stream", "Unable to start live transcoder.", {
+      username,
+      animeId,
+      seasonNumber,
+      episodeNumber,
+      profile,
+      file,
+    })
     return jsonError("Unable to start transcoder.", 500)
   }
 
   child.stderr?.on("data", (chunk: Buffer) => {
-    console.warn("[transcode]", chunk.toString("utf8").trim())
+    serverLog.warn("Stream", "Live transcoder stderr.", {
+      username,
+      animeId,
+      seasonNumber,
+      episodeNumber,
+      profile,
+      message: chunk.toString("utf8").trim(),
+    })
   })
 
   let released = false
@@ -250,6 +308,16 @@ async function handleTranscode(
       })
 
       child.once("error", (error) => {
+        serverLog.error("Stream", "Live transcoder process failed.", {
+          username,
+          animeId,
+          seasonNumber,
+          episodeNumber,
+          profile,
+          file,
+          error,
+        })
+
         if (!settled) {
           settled = true
           controller.error(error)
@@ -258,7 +326,20 @@ async function handleTranscode(
         release()
       })
 
-      child.once("close", () => {
+      child.once("close", (code, signal) => {
+        if (code && code !== 0) {
+          serverLog.error("Stream", "Live transcoder exited with an error.", {
+            username,
+            animeId,
+            seasonNumber,
+            episodeNumber,
+            profile,
+            file,
+            code,
+            signal,
+          })
+        }
+
         if (!settled) {
           settled = true
           controller.close()
@@ -312,7 +393,7 @@ export async function GET(request: Request, context: StreamContext) {
   try {
     resolved = await resolveReadableFile(animeId, seasonNumber, episodeNumber)
   } catch (error) {
-    console.error("[watch] Unable to resolve media file.", error)
+    serverLog.error("Stream", "Unable to resolve media file.", { error })
     return jsonError("Media file could not be resolved.", 500)
   }
 
@@ -321,7 +402,12 @@ export async function GET(request: Request, context: StreamContext) {
   }
 
   if (mode === "direct") {
-    return handleDirect(request, resolved.file, resolved.size)
+    return handleDirect(request, resolved.file, resolved.size, {
+      username: auth.user.username,
+      animeId,
+      seasonNumber,
+      episodeNumber,
+    })
   }
 
   return await handleTranscode(
@@ -330,6 +416,7 @@ export async function GET(request: Request, context: StreamContext) {
     animeId,
     seasonNumber,
     episodeNumber,
+    auth.user.username,
     profile
   )
 }

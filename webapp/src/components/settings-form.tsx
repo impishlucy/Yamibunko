@@ -20,7 +20,9 @@ type AniListConnectionResponse = {
     id: number
     name: string
     connectedAt: string
+    lastListSyncAt: string | null
   } | null
+  callbackUrl: string
 }
 
 function isStrongPassword(password: string) {
@@ -39,6 +41,7 @@ export function SettingsForm({ settings }: SettingsFormProps) {
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [aniList, setAniList] = useState<AniListConnectionResponse | null>(null)
+  const aniListAvailable = aniList?.configured ?? false
 
   const canSavePassword = useMemo(() => isStrongPassword(password), [password])
 
@@ -166,7 +169,12 @@ export function SettingsForm({ settings }: SettingsFormProps) {
         </CardContent>
       </Card>
 
-      <Card className="rounded-lg border-white/10 bg-zinc-900/75">
+      <Card
+        className={`rounded-lg border-white/10 bg-zinc-900/75 ${
+          aniList && !aniListAvailable ? "opacity-55" : ""
+        }`}
+        aria-disabled={aniList && !aniListAvailable ? true : undefined}
+      >
         <CardHeader>
           <CardTitle className="text-zinc-100">AniList</CardTitle>
         </CardHeader>
@@ -178,11 +186,17 @@ export function SettingsForm({ settings }: SettingsFormProps) {
                 : "Not connected"}
             </p>
             {!aniList?.configured ? (
-              <p className="text-sm text-red-300">OAuth variables missing.</p>
+              <p className="text-sm text-zinc-400">
+                OAuth app id and secret are not configured.
+              </p>
+            ) : aniList.callbackUrl ? (
+              <p className="text-xs text-zinc-500">
+                Callback: {aniList.callbackUrl}
+              </p>
             ) : null}
           </div>
 
-          {aniList?.connected ? (
+          {aniListAvailable && aniList?.connected ? (
             <Button
               type="button"
               variant="outline"
@@ -196,7 +210,7 @@ export function SettingsForm({ settings }: SettingsFormProps) {
             <Button
               type="button"
               className="rounded-lg"
-              disabled={!aniList?.configured}
+              disabled={!aniListAvailable}
               onClick={() => {
                 window.location.assign("/api/anilist/oauth/start")
               }}

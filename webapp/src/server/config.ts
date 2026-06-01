@@ -4,6 +4,7 @@ import path from "node:path"
 import { z } from "zod"
 
 import type { SafeSettings } from "@/lib/types"
+import { normalizeBaseUrl } from "@/server/http/baseUrl"
 
 const serverConfigSchema = z.object({
   FFMPEG_DIR: z.string().trim().min(1),
@@ -12,7 +13,7 @@ const serverConfigSchema = z.object({
   TRANSCODE_ACCEL: z.enum(["nvenc", "qsv", "cpu"]),
   ANILIST_CLIENT_ID: z.string().trim().optional(),
   ANILIST_CLIENT_SECRET: z.string().trim().optional(),
-  BASE_URL: z.string().trim().min(1),
+  BASE_URL: z.url(),
 })
 
 export type ServerConfig = {
@@ -22,8 +23,8 @@ export type ServerConfig = {
   mediaDir: string
   tempDir: string
   transcodeAccel: "nvenc" | "qsv" | "cpu"
-  anilistClientId: string | undefined
-  anilistClientSecret: string | undefined
+  anilistClientId?: string
+  anilistClientSecret?: string
   baseUrl: string
 }
 
@@ -64,12 +65,14 @@ function getDefaultTempDir() {
 function readEnvironment() {
   return {
     ...process.env,
-    FFMPEG_DIR: process.env.FFMPEG_DIR,
-    ANIME_INPUT_DIR: process.env.INPUT_FOLDER_PATH,
-    ANIME_MEDIA_DIR: process.env.OUTPUT_FOLDER_PATH,
+    FFMPEG_DIR: process.env.FFMPEG_DIR ?? process.env.FFMPEG_BIN_DIR,
+    ANIME_INPUT_DIR:
+      process.env.ANIME_INPUT_DIR ?? process.env.INPUT_FOLDER_PATH,
+    ANIME_MEDIA_DIR:
+      process.env.ANIME_MEDIA_DIR ?? process.env.OUTPUT_FOLDER_PATH,
     ANILIST_CLIENT_ID: process.env.ANILIST_CLIENT_ID,
     ANILIST_CLIENT_SECRET: process.env.ANILIST_CLIENT_SECRET,
-    BASE_URL: process.env.BASE_URL,
+    BASE_URL: process.env.BASE_URL ?? process.env.APP_BASE_URL,
   }
 }
 
@@ -84,10 +87,12 @@ function mapConfig(env: z.infer<typeof serverConfigSchema>): ServerConfig {
     tempDir: getDefaultTempDir(),
     transcodeAccel: env.TRANSCODE_ACCEL,
     anilistClientId: env.ANILIST_CLIENT_ID
-      ?? undefined,
+      ? cleanPath(env.ANILIST_CLIENT_ID)
+      : undefined,
     anilistClientSecret: env.ANILIST_CLIENT_SECRET
-      ?? undefined,
-    baseUrl: env.BASE_URL,
+      ? cleanPath(env.ANILIST_CLIENT_SECRET)
+      : undefined,
+    baseUrl: normalizeBaseUrl(env.BASE_URL),
   }
 }
 

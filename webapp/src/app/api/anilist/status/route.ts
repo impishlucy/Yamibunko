@@ -1,5 +1,6 @@
 import { requireApiUser } from "@/server/auth/api"
 import { getAniListTrackingState } from "@/server/anilist/client"
+import { serverLog } from "@/server/logger"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -28,7 +29,7 @@ export async function GET(request: Request) {
       await getAniListTrackingState(auth.user.username, animeId)
     )
   } catch (error) {
-    console.warn("[anilist] Tracking lookup failed.", error)
+    serverLog.error("Anilist", "Tracking lookup failed.", { error })
     return Response.json(
       { ok: false, error: "ANILIST_SYNC_FAILED" },
       { status: 502 }

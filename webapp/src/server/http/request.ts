@@ -1,9 +1,15 @@
 import { headers } from "next/headers"
 
-import { getServerConfigResult } from "@/server/config"
+import { normalizeBaseUrl } from "@/server/http/baseUrl"
 
 function firstForwardedValue(value: string | null) {
   return value?.split(",")[0]?.trim() ?? null
+}
+
+export function getConfiguredBaseUrl() {
+  return normalizeBaseUrl(
+    process.env.BASE_URL ?? process.env.APP_BASE_URL ?? ""
+  )
 }
 
 function forwardedHeaderPart(headerValue: string | null, key: string) {
@@ -25,10 +31,10 @@ function forwardedHeaderPart(headerValue: string | null, key: string) {
 }
 
 export async function getRequestOrigin(request?: Request) {
-  const configured = getServerConfigResult()
+  const configuredBaseUrl = process.env.BASE_URL ?? process.env.APP_BASE_URL
 
-  if (configured.ok && configured.config.baseUrl) {
-    return new URL(configured.config.baseUrl).origin
+  if (configuredBaseUrl) {
+    return new URL(getConfiguredBaseUrl()).origin
   }
 
   const headerStore = await headers()
@@ -44,6 +50,10 @@ export async function getRequestOrigin(request?: Request) {
     new URL(request?.url ?? "http://localhost").host
 
   return `${proto}://${host}`
+}
+
+export async function getPublicBaseUrl() {
+  return getConfiguredBaseUrl()
 }
 
 export async function isSecureRequest(request?: Request) {

@@ -9,6 +9,7 @@ type AniListConnectionRow = {
   token_type: string
   connected_at: string
   updated_at: string
+  last_list_sync_at: string | null
 }
 
 export type AniListConnection = {
@@ -19,6 +20,7 @@ export type AniListConnection = {
   tokenType: string
   connectedAt: string
   updatedAt: string
+  lastListSyncAt: string | null
 }
 
 export type SafeAniListConnection = Omit<AniListConnection, "accessToken">
@@ -32,6 +34,7 @@ function toConnection(row: AniListConnectionRow): AniListConnection {
     tokenType: row.token_type,
     connectedAt: row.connected_at,
     updatedAt: row.updated_at,
+    lastListSyncAt: row.last_list_sync_at,
   }
 }
 
@@ -43,6 +46,7 @@ function toSafeConnection(row: AniListConnectionRow): SafeAniListConnection {
     tokenType: row.token_type,
     connectedAt: row.connected_at,
     updatedAt: row.updated_at,
+    lastListSyncAt: row.last_list_sync_at,
   }
 }
 
@@ -57,7 +61,8 @@ export function getAniListConnection(username: string) {
         access_token_ciphertext,
         token_type,
         connected_at,
-        updated_at
+        updated_at,
+        last_list_sync_at
       FROM anilist_connections
       WHERE username = ?
     `
@@ -78,7 +83,8 @@ export function getSafeAniListConnection(username: string) {
         access_token_ciphertext,
         token_type,
         connected_at,
-        updated_at
+        updated_at,
+        last_list_sync_at
       FROM anilist_connections
       WHERE username = ?
     `
@@ -108,9 +114,10 @@ export function upsertAniListConnection(input: {
         access_token_ciphertext,
         token_type,
         connected_at,
-        updated_at
+        updated_at,
+        last_list_sync_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
       ON CONFLICT(username) DO UPDATE SET
         anilist_user_id = excluded.anilist_user_id,
         anilist_username = excluded.anilist_username,
@@ -134,4 +141,12 @@ export function deleteAniListConnection(username: string) {
   getDb()
     .query("DELETE FROM anilist_connections WHERE username = ?")
     .run(username)
+}
+
+export function markAniListConnectionSynced(username: string) {
+  getDb()
+    .query(
+      "UPDATE anilist_connections SET last_list_sync_at = ?, updated_at = ? WHERE username = ?"
+    )
+    .run(nowIso(), nowIso(), username)
 }

@@ -1,0 +1,16 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Launcher.LogWindow"
+        Title="Server Logs"
+        Width="700" Height="400"
+        WindowStartupLocation="CenterScreen">
+    <Grid>
+        <ListBox x:Name="LogList" Name="LogList" Background="#111111" Foreground="#E4E4E7" Padding="10" FontFamily="Consolas">
+            <ListBox.Styles>
+                <Style Selector="ListBoxItem">
+                    <Setter Property="Padding" Value="2"/>
+                </Style>
+            </ListBox.Styles>
+        </ListBox>
+    </Grid>
+</Window>

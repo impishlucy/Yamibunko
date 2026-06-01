@@ -58,13 +58,13 @@ export async function GET(request: Request, context: ThumbnailContext) {
     thumbnailPathForEpisode(episode.filePath)
 
   try {
-    const fileStat = await stat(thumbnailPath)
+    const fileStat = await stat(/*turbopackIgnore: true*/ thumbnailPath)
 
     if (!fileStat.isFile()) {
       return fallbackThumbnailResponse()
     }
 
-    const fileStream = createReadStream(thumbnailPath)
+    const fileStream = createReadStream(/*turbopackIgnore: true*/ thumbnailPath)
 
     return new Response(
       Readable.toWeb(fileStream) as ReadableStream<Uint8Array>,

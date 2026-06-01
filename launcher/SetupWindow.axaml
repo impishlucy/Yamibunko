@@ -1,0 +1,37 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Launcher.SetupWindow"
+        Title="Sumire Server Initialization"
+        Icon="avares://Launcher/Assets/icon.ico"
+        Width="500" Height="560"
+        WindowStartupLocation="CenterScreen"
+        CanResize="False">
+    <Border Padding="20">
+        <StackPanel Spacing="15">
+            <TextBlock Text="Server Configuration" FontSize="24" FontWeight="Bold" Foreground="#D8B4FE" HorizontalAlignment="Center" Margin="0,0,0,10"/>
+
+            <TextBlock Text="Base URL" Foreground="#A1A1AA"/>
+            <TextBox Name="BaseUrlBox" PlaceholderText="http://localhost:3000" TextChanged="OnInputChanged"/>
+
+            <TextBlock Text="Input Folder Path" Foreground="#A1A1AA"/>
+            <Grid ColumnDefinitions="*, Auto">
+                <TextBox Name="InputFolderBox" PlaceholderText="Select input directory..." IsReadOnly="True" Focusable="False" IsHitTestVisible="False" TextChanged="OnInputChanged" VerticalAlignment="Center"/>
+                <Button Grid.Column="1" Content="..." Click="SelectInputFolder_Click" Margin="5,0,0,0" Padding="15,5"/>
+            </Grid>
+
+            <TextBlock Text="Output Folder Path" Foreground="#A1A1AA"/>
+            <Grid ColumnDefinitions="*, Auto">
+                <TextBox Name="OutputFolderBox" PlaceholderText="Select output directory..." IsReadOnly="True" Focusable="False" IsHitTestVisible="False" TextChanged="OnInputChanged" VerticalAlignment="Center"/>
+                <Button Grid.Column="1" Content="..." Click="SelectOutputFolder_Click" Margin="5,0,0,0" Padding="15,5"/>
+            </Grid>
+
+            <TextBlock Text="AniList Client ID (Optional)" Foreground="#A1A1AA"/>
+            <TextBox Name="ClientIdBox" PlaceholderText="Client ID (Numbers only)" TextChanged="OnInputChanged"/>
+
+            <TextBlock Text="AniList Client Secret (Optional)" Foreground="#A1A1AA"/>
+            <TextBox Name="ClientSecretBox" PlaceholderText="Client Secret" PasswordChar="*" TextChanged="OnInputChanged"/>
+
+            <Button Name="SaveButton" Content="Save &amp; Start Server" Click="SaveButton_Click" IsEnabled="False" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Margin="0,20,0,0"/>
+        </StackPanel>
+    </Border>
+</Window>

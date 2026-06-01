@@ -1,206 +1,137 @@
-<div align="center">
-
 # Yamibunko
 
-**The all-in-one anime server that processes, organizes, enriches, and plays your local collection from one WebUI.**
+Yamibunko is a local anime library server with a desktop launcher and a web UI. It processes your own media files, organizes them into a library, enriches entries with metadata, and plays them through the browser.
 
-<br />
+Yamibunko does not include, download, or provide access to copyrighted media. You bring your own local files.
 
-[![Project Status](https://img.shields.io/badge/status-in%20development-7c3aed?style=for-the-badge)](#)
-[![Download Latest Release](https://img.shields.io/badge/download-latest%20release-9333ea?style=for-the-badge)](https://github.com/impishlucy/Yamibunko/releases)
-
-<br />
-
-[Install](#install) • [What it does](#what-it-does) • [Development](#development-setup) • [License](#license)
-
-</div>
-
----
-
-<div align="center">
-
-## What is Yamibunko?
-
-</div>
-
-Yamibunko is an anime app for people who want a <b>singular</b> place to handle most parts of managing a collection.
-
-Just drop files into an folder and it will optimize & organize them, and make them available through a polished WebUI.
-
-It does **not** include or provide access to any copyrighted material. <ins>You bring your own local files.</ins>
-
----
-
-<div align="center">
+[Download releases](https://github.com/impishlucy/Yamibunko/releases)
 
 ## Install
 
-</div>
+### Normal Install
 
-### Prerequisites
+1. Open the [Yamibunko releases](https://github.com/impishlucy/Yamibunko/releases) page.
+2. Download the latest release ZIP for your OS.
+3. Extract the ZIP completely.
+4. Start the launcher from the extracted folder.
+5. Fill in the setup fields:
+   - Base URL, usually `http://localhost:3000` or the website url of the app.
+   - Input folder for new files
+   - Library folder for processed files
+   - AniList API client ID and secret if you want AniList login, tracking, or metadata features
+6. Save the setup and wait for the launcher to start the web UI.
 
-You **need** a 64 bit OS, as Yamibunko wont work with just 4GB of Ram.
+The launcher prepares the local runtime, starts the webapp, and downloads whats needed.
+If the web UI does not open automatically, check the launcher log window or tray status.
 
-If the launcher does not open you need to manually install [.NET 9](https://dotnet.microsoft.com/en-us/download/dotnet/9.0).
+For best results, use a 64-bit OS with more than 4 GB of RAM.
 
-The Yamibunko launcher will download required frameworks and files automatically upon first launching it.
+### AniList Setup
 
-### Download
+AniList features require an AniList API client. Configure the client redirect URL to match the Yamibunko callback URL:
 
-<div align="center">
+```text
+http://localhost:3000/api/anilist/oauth/callback
+https://your-domain.example/api/anilist/oauth/callback
+```
 
-</div>
+Use the same base URL in the launcher or `.env` file. If you host Yamibunko behind a path prefix, the callback path is appended behind that base URL.
 
-1. Open the [Yamibunko Releases](https://github.com/impishlucy/Yamibunko/releases) page.
-2. Download the latest release ZIP for your OS (Win or Linux).
-3. Unpack the ZIP fully.
-4. Start `Yamibunko.exe` from the unzipped folder.
-5. Wait for the tray icon to report the current status.
-6. The WebUI will open automatically when the app is ready.
+### Manual Webapp Install
 
-If the WebUI does not open, check the tray icon.</br>
-It will report startup status, setup progress, or problems that need attention.
+The webapp can run without the launcher, but you must provide the runtime yourself:
 
----
+- Node.js 20 or newer, with Node.js 24 recommended for development
+- Bun
+- FFmpeg and FFprobe with HEVC support
+- A configured `.env` file
 
-<div align="center" id="what-it-does">
+From the `webapp` directory:
 
-## What it does (Technical Stuff)
+```bash
+bun install
+bun run build
+bun run start
+```
 
-</div>
+Supported `TRANSCODE_ACCEL` values in env are `nvenc`, `qsv`, and `cpu`.
 
-Yamibunko is meant to replace a pile of small tools with one focused local workflow.
+## Features
 
-Core features (Planned):
+Yamibunko is built around a local media workflow:
 
-* Watches an input folder for new episode files.
-* Checks file format, codec, size, duration, and audio tracks.
-* Converts episodes to HEVC when needed.
-* Targets small, consistent file sizes based on episode length.
-* Can remove unwanted audio tracks.
-* Convert audio to MP3 when audio is in FLAC or WAV.
-* Sorts finished files into an organized library.
-* Fetches AniList metadata for new library entries.
-* Generates episode thumbnails.
-* Provides a WebUI for browsing and playback with accounts.
-* Supports Direct Play when the device can handle the file.
-* Falls back to controlled live transcoding when needed.
-* Uses transcode slots so the GPU/CPU is not overloaded.
+- Watches an input folder for new episode files.
+- Checks file format, codec, size, duration, and audio tracks.
+- Converts episodes to HEVC when needed.
+- Targets consistent file sizes based on episode length.
+- Can remove unwanted audio tracks.
+- Converts FLAC or WAV audio when needed.
+- Sorts processed files into an organized library.
+- Fetches AniList metadata for library entries.
+- Generates episode thumbnails.
+- Provides a web UI for browsing and playback with accounts.
+- Supports direct play when the client can handle the file.
+- Falls back to controlled live transcoding when needed.
+- Uses transcode slots so the GPU or CPU is not overloaded.
 
----
+## Contributing
 
-<div align="center">
-
-## Development Setup
-
-</div>
-
-This section is only for developers who want to change Yamibunko and need to run it from source.
-
-Normal users should **ALWAYS** use the release ZIP from the [Install](#install) section.
-
-### Clone the repository
+### Repository Setup
 
 ```bash
 git clone https://github.com/impishlucy/Yamibunko.git
 cd Yamibunko
 ```
 
-### Install dependencies
-
-Windows:
-https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip
-
-Linux:
-https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+### Webapp Development
 
 ```bash
+cd webapp
 bun install
-```
-
-### Environment variables
-
-While developing, create a `.env` file: (since we dont have the launcher to pass that)
-
-```env
-FFMPEG_PATH=/absolute/path/to/ffmpeg
-FFPROBE_PATH=/absolute/path/to/ffprobe
-
-ANIME_INPUT_DIR=/absolute/path/to/input
-ANIME_MEDIA_DIR=/absolute/path/to/library
-ANIME_CACHE_DIR=/absolute/path/to/cache
-
-TRANSCODE_ACCEL=nvenc
-BACKGROUND_TRANSCODE_CONCURRENCY=1
-LIVE_TRANSCODE_SLOTS=3
-```
-
-Supported `TRANSCODE_ACCEL` values:
-
-```txt
-nvenc
-qsv
-cpu
-```
-
-### Run in development
-
-```bash
+cp .env.example .env
 bun run dev
 ```
 
-### Start production server
+Before opening a pull request, run:
 
 ```bash
-bun run start
-```
-
-### Build
-
-```bash
+bun run lint
+bun run typecheck
 bun run build
 ```
 
----
+### Launcher Development
 
-<div align="center">
+The launcher is a C# Avalonia project in `launcher`.
+
+```bash
+dotnet restore launcher/Launcher.csproj
+dotnet build launcher/Launcher.csproj
+dotnet run --project launcher/Launcher.csproj
+```
+
+Use a .NET SDK that supports the launcher target framework in `launcher/Launcher.csproj`.
 
 ## References and Thanks
 
-</div>
+Yamibunko uses and is inspired by these projects:
 
-Yamibunko uses and is inspired by major open source tools and libraries:
-
-* [Next.js](https://nextjs.org/) — React framework and App Router foundation.
-* [shadcn/ui](https://ui.shadcn.com/) — UI component foundation.
-* [Bun](https://bun.sh/) — JavaScript runtime and package manager.
-* [BtbN FFmpeg Builds](https://github.com/BtbN/FFmpeg-Builds) — source for static FFmpeg builds downloaded by the launcher, when needed.
-* [Vidstack](https://www.vidstack.io/) — media player UI tooling.
-* [`@api-wrappers/anilist-wrapper`](https://github.com/Api-Wrappers/anilist-wrapper) — TypeScript AniList API wrapper.
-* [`chokidar`](https://github.com/paulmillr/chokidar) — cross-platform file watching.
-
----
-
-<div align="center">
+- [Next.js](https://nextjs.org/) for the webapp.
+- [Avalonia UI](https://avaloniaui.net/) for the desktop launcher.
+- [Bun](https://bun.sh/) for webapp package management and scripts.
+- [BtbN FFmpeg Builds](https://github.com/BtbN/FFmpeg-Builds) for FFmpeg builds used by the launcher.
+- [Vidstack](https://www.vidstack.io/) for media player UI tooling.
+- [`@api-wrappers/anilist-wrapper`](https://github.com/Api-Wrappers/anilist-wrapper) for AniList API access.
+- [`chokidar`](https://github.com/paulmillr/chokidar) for file watching.
 
 ## License
 
-This project is licensed under the
-[Creative Commons Attribution-NonCommercial 4.0 International License](https://creativecommons.org/licenses/by-nc/4.0/deed.en).
+This project is licensed under the [Creative Commons Attribution-NonCommercial 4.0 International License](https://creativecommons.org/licenses/by-nc/4.0/deed.en).
 
-You may share and adapt this project with attribution for non-commercial purposes.
-Commercial use is not permitted.
-
-</div>
-
----
-
-<div align="center">
+You may share and adapt this project with attribution for non-commercial purposes. Commercial use is not permitted.
 
 ## Disclaimer
 
 Yamibunko is intended for organizing, processing, and playing local files that you own or are allowed to use.
 
 It does not include anime files, does not provide anime files, and does not provide access to licensed media.
-
-</div>

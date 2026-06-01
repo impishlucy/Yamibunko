@@ -8,6 +8,7 @@ import {
   upsertEpisode,
 } from "@/server/db/library"
 import { getServerConfig } from "@/server/config"
+import { serverLog } from "@/server/logger"
 import { ffprobe } from "@/server/media/ffmpeg"
 import { parseAnimeFileName, sanitizePathPart } from "@/server/media/filename"
 import {
@@ -91,11 +92,21 @@ function parseLibraryPath(filePath: string): ParsedLibraryPath | null {
 export async function syncLibraryFile(filePath: string) {
   const resolvedPath = path.resolve(filePath)
 
+  serverLog.info("Media", "Library file sync started.", {
+    filePath: resolvedPath,
+  })
+
   if (!isMediaFile(resolvedPath)) {
+    serverLog.info("Media", "Skipped non-media library file.", {
+      filePath: resolvedPath,
+    })
     return null
   }
 
   if (!(await pathExists(resolvedPath))) {
+    serverLog.info("Media", "Library file no longer exists, removing DB entry.", {
+      filePath: resolvedPath,
+    })
     return removeLibraryFile(resolvedPath)
   }
 
@@ -104,13 +115,29 @@ export async function syncLibraryFile(filePath: string) {
   const parsed = parseLibraryPath(resolvedPath)
 
   if (!parsed) {
+    serverLog.warn("Media", "Library file path could not be parsed.", {
+      filePath: resolvedPath,
+    })
     return null
   }
+
+  serverLog.info("Media", "Recognized library file.", {
+    filePath: resolvedPath,
+    title: parsed.animeTitle,
+    season: parsed.season,
+    episode: parsed.episode,
+  })
 
   const existingAnime = findAnimeByTitle(parsed.animeTitle)
   let animeId = existingAnime?.id
 
-  if (!animeId) {
+  if (animeId) {
+    serverLog.info("Media", "Matched library file to existing anime.", {
+      filePath: resolvedPath,
+      title: parsed.animeTitle,
+      anilistId: animeId,
+    })
+  } else {
     const metadata = await findAnimeMetadata(parsed.animeTitle, parsed.season)
 
     if (!metadata) {
@@ -119,10 +146,24 @@ export async function syncLibraryFile(filePath: string) {
 
     upsertAnime(metadata)
     animeId = metadata.id
+    serverLog.info("Media", "Created anime from AniList metadata.", {
+      filePath: resolvedPath,
+      title: parsed.animeTitle,
+      anilistId: animeId,
+    })
   }
 
   const probe = (await ffprobe(resolvedPath)) as ProbeResult
   const durationSeconds = parseDurationSeconds(probe)
+
+  serverLog.info("Media", "Generating thumbnail for library file.", {
+    filePath: resolvedPath,
+    animeId,
+    season: parsed.season,
+    episode: parsed.episode,
+    durationSeconds,
+  })
+
   const thumbnailPath = await generateEpisodeThumbnail(
     resolvedPath,
     durationSeconds
@@ -135,6 +176,14 @@ export async function syncLibraryFile(filePath: string) {
     filePath: resolvedPath,
     thumbnailPath,
     durationSeconds,
+  })
+
+  serverLog.info("Media", "Library episode added to database.", {
+    animeId,
+    season: parsed.season,
+    episode: parsed.episode,
+    filePath: resolvedPath,
+    thumbnailPath,
   })
 
   return {
@@ -150,9 +199,19 @@ export async function removeLibraryFile(filePath: string) {
   const episode = deleteEpisodeByPath(resolvedPath)
 
   if (episode) {
+    serverLog.info("Media", "Removed deleted library file from database.", {
+      filePath: resolvedPath,
+      animeId: episode.animeId,
+      season: episode.seasonNumber,
+      episode: episode.episodeNumber,
+    })
     await rm(thumbnailPathForEpisode(resolvedPath), { force: true }).catch(
       () => undefined
     )
+  } else {
+    serverLog.info("Media", "Deleted library file was not present in database.", {
+      filePath: resolvedPath,
+    })
   }
 
   return episode
