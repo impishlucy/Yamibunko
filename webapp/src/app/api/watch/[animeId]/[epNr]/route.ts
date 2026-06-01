@@ -1,5 +1,7 @@
 import { getAnimeInfo, getEpisode } from "@/server/media/libraryStore"
+import { requireApiUser } from "@/server/auth/api"
 
+export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
 type WatchContext = {
@@ -10,6 +12,12 @@ type WatchContext = {
 }
 
 export async function GET(_request: Request, context: WatchContext) {
+  const auth = await requireApiUser()
+
+  if (!auth.ok) {
+    return auth.response
+  }
+
   const { animeId, epNr } = await context.params
   const episodeNumber = Number.parseInt(epNr, 10)
 

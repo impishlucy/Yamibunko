@@ -3,12 +3,11 @@
 import { useEffect, useState } from "react"
 import { Cpu, Folder, Palette, UserRound } from "lucide-react"
 
-import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Skeleton } from "@/components/ui/skeleton"
-import { apiGet, apiPatch } from "@/lib/api"
+import { apiGet } from "@/lib/api"
 import type { SafeSettings } from "@/lib/types"
 
 type SettingsResponse = SafeSettings | { ok: false; issues: string[] }
@@ -32,7 +31,6 @@ function Field({ label, value }: { label: string; value: string | number }) {
 
 export function SettingsForm() {
   const [settings, setSettings] = useState<SettingsResponse | null>(null)
-  const [saved, setSaved] = useState(false)
 
   useEffect(() => {
     apiGet<SettingsResponse>("/api/settings")
@@ -44,23 +42,6 @@ export function SettingsForm() {
         })
       })
   }, [])
-
-  async function saveAppearance() {
-    if (!settings || !isSettings(settings)) {
-      return
-    }
-
-    const response = await apiPatch<{ ok: true; settings: SafeSettings }>(
-      "/api/settings",
-      {
-        appearance: settings.appearance,
-      }
-    )
-
-    setSettings(response.settings)
-    setSaved(true)
-    window.setTimeout(() => setSaved(false), 1600)
-  }
 
   if (!settings) {
     return (
@@ -98,6 +79,12 @@ export function SettingsForm() {
         </CardHeader>
         <CardContent>
           <Field label="Name" value={settings.account.userName} />
+          <div className="mt-3">
+            <Field
+              label="Role"
+              value={settings.account.isAdmin ? "Admin" : "User"}
+            />
+          </div>
         </CardContent>
       </Card>
 
@@ -111,7 +98,6 @@ export function SettingsForm() {
         <CardContent className="space-y-3">
           <Field label="Input" value={settings.paths.inputDir} />
           <Field label="Media" value={settings.paths.mediaDir} />
-          <Field label="Cache" value={settings.paths.cacheDir} />
         </CardContent>
       </Card>
 
@@ -127,11 +113,7 @@ export function SettingsForm() {
             label="Acceleration"
             value={settings.transcoding.acceleration}
           />
-          <Field
-            label="Background jobs"
-            value={settings.transcoding.backgroundConcurrency}
-          />
-          <Field label="Live slots" value={settings.transcoding.liveSlots} />
+          <Field label="Capacity" value="Dynamic" />
         </CardContent>
       </Card>
 
@@ -144,9 +126,6 @@ export function SettingsForm() {
         </CardHeader>
         <CardContent className="space-y-4">
           <Field label="Theme" value={settings.appearance.theme} />
-          <Button type="button" onClick={saveAppearance}>
-            {saved ? "Saved" : "Save"}
-          </Button>
         </CardContent>
       </Card>
     </div>

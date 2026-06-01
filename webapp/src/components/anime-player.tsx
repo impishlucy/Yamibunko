@@ -137,7 +137,7 @@ export function AnimePlayer({
           className="aspect-video w-full bg-black"
           controls
           playsInline
-          preload="metadata"
+          preload="none"
           src={sourceUrl ?? undefined}
         />
       </div>

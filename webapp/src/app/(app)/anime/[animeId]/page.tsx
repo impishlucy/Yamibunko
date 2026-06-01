@@ -91,7 +91,10 @@ export default async function AnimePage({ params }: AnimePageProps) {
         <h2 className="text-lg font-semibold text-zinc-50">Episodes</h2>
         <div className="grid gap-3 xl:grid-cols-2">
           {episodes.map((episode) => (
-            <EpisodeCard key={episode.mediaId} episode={episode} />
+            <EpisodeCard
+              key={`${episode.animeId}-${episode.episodeNumber}`}
+              episode={episode}
+            />
           ))}
         </div>
       </section>

@@ -29,6 +29,7 @@ export function EpisodeCard({ episode }: { episode: Episode }) {
                 src={episode.thumbnail}
                 alt=""
                 fill
+                unoptimized
                 sizes="(min-width: 640px) 148px, 104px"
                 className="h-full w-full object-cover opacity-80 transition group-hover:opacity-100"
               />
@@ -48,7 +49,7 @@ export function EpisodeCard({ episode }: { episode: Episode }) {
                 Episode {episode.episodeNumber}
               </Badge>
               <h3 className="truncate text-sm font-medium text-zinc-100">
-                {episode.title ?? episode.fileName}
+                {episode.fileName}
               </h3>
             </div>
             <p className="mt-3 inline-flex items-center gap-1 text-xs text-zinc-500">

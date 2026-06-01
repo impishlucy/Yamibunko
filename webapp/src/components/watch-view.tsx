@@ -61,7 +61,7 @@ export function WatchView({
           <span className="text-sm text-zinc-500">{payload.anime.title}</span>
         </div>
         <h1 className="text-xl font-semibold text-zinc-50">
-          {payload.episode.title ?? payload.episode.fileName}
+          {payload.episode.fileName}
         </h1>
       </section>
     </div>

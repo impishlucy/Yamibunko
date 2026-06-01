@@ -1,5 +1,5 @@
 export type AnimeSummary = {
-  id: string
+  id: number
   title: string
   coverImage?: string
   bannerImage?: string
@@ -8,16 +8,32 @@ export type AnimeSummary = {
 }
 
 export type AnimeInfo = AnimeSummary & {
+  titles: {
+    romaji?: string
+    english?: string
+    native?: string
+    userPreferred: string
+  }
+  status?: string
   description?: string
   genres?: string[]
+  averageScore?: number
+  durationMinutes?: number
+  tags: Array<{
+    id: number
+    name: string
+    description?: string | null
+    category?: string | null
+    rank?: number | null
+    isAdult?: boolean | null
+  }>
 }
 
 export type Episode = {
-  animeId: string
+  animeId: number
   episodeNumber: number
-  title?: string
   fileName: string
-  mediaId: string
+  filePath: string
   thumbnail?: string
   durationSeconds?: number
 }
@@ -44,16 +60,14 @@ export type WatchPayload = {
 export type SafeSettings = {
   account: {
     userName: string
+    isAdmin: boolean
   }
   paths: {
     inputDir: string
     mediaDir: string
-    cacheDir: string
   }
   transcoding: {
     acceleration: "nvenc" | "qsv" | "cpu"
-    backgroundConcurrency: number
-    liveSlots: number
   }
   appearance: {
     theme: "dark"

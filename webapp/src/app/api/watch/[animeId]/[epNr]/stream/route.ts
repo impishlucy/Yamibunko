@@ -4,10 +4,11 @@ import { stat } from "node:fs/promises"
 import { Readable } from "node:stream"
 
 import type { PlaybackMode, PlaybackProfile } from "@/lib/types"
+import { requireApiUser } from "@/server/auth/api"
 import { getServerConfig } from "@/server/config"
 import { getLiveH264Args } from "@/server/media/ffmpeg"
 import { resolveEpisodeFile } from "@/server/media/resolveMediaId"
-import { tryAcquireLiveTranscode } from "@/server/transcode/liveTranscodeSlots"
+import { tryAcquireLiveTranscode } from "@/server/transcode/transcodeCapacity"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -158,14 +159,14 @@ async function handleDirect(request: Request, file: string, size: number) {
   )
 }
 
-function handleTranscode(
+async function handleTranscode(
   request: Request,
   file: string,
   animeId: string,
   episodeNumber: number,
   profile: PlaybackProfile
 ) {
-  const lease = tryAcquireLiveTranscode(
+  const lease = await tryAcquireLiveTranscode(
     `${animeId}:${episodeNumber}:${profile}`
   )
 
@@ -276,6 +277,12 @@ function handleTranscode(
 }
 
 export async function GET(request: Request, context: StreamContext) {
+  const auth = await requireApiUser()
+
+  if (!auth.ok) {
+    return auth.response
+  }
+
   const { animeId, epNr } = await context.params
   const episodeNumber = Number.parseInt(epNr, 10)
 
@@ -304,7 +311,7 @@ export async function GET(request: Request, context: StreamContext) {
     return handleDirect(request, resolved.file, resolved.size)
   }
 
-  return handleTranscode(
+  return await handleTranscode(
     request,
     resolved.file,
     animeId,

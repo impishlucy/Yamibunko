@@ -6,7 +6,12 @@ import { Badge } from "@/components/ui/badge"
 import { Card, CardContent } from "@/components/ui/card"
 import type { AnimeSummary } from "@/lib/types"
 
-export function AnimeCard({ anime }: { anime: AnimeSummary }) {
+type AnimeCardProps = {
+  anime: AnimeSummary
+  priority?: boolean
+}
+
+export function AnimeCard({ anime, priority = false }: AnimeCardProps) {
   return (
     <Link href={`/anime/${anime.id}`} className="group block">
       <Card className="rounded-lg border-white/10 bg-zinc-900/80 py-0 transition hover:-translate-y-0.5 hover:border-violet-400/40 hover:shadow-[0_18px_60px_rgba(124,58,237,0.18)]">
@@ -16,6 +21,7 @@ export function AnimeCard({ anime }: { anime: AnimeSummary }) {
               src={anime.coverImage}
               alt=""
               fill
+              priority={priority}
               sizes="(min-width: 1280px) 16vw, (min-width: 1024px) 25vw, (min-width: 640px) 33vw, 50vw"
               className="h-full w-full object-cover transition duration-300 group-hover:scale-105"
             />

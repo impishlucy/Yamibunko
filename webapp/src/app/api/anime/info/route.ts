@@ -1,8 +1,16 @@
 import { getAnimeInfo } from "@/server/media/libraryStore"
+import { requireApiUser } from "@/server/auth/api"
 
+export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
 export async function GET(request: Request) {
+  const auth = await requireApiUser()
+
+  if (!auth.ok) {
+    return auth.response
+  }
+
   const animeId = new URL(request.url).searchParams.get("animeId")
 
   if (!animeId) {

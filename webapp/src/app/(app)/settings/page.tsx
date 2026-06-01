@@ -1,4 +1,5 @@
 import { SettingsForm } from "@/components/settings-form"
+import { UserManagement } from "@/components/user-management"
 
 export default function SettingsPage() {
   return (
@@ -10,6 +11,7 @@ export default function SettingsPage() {
         </p>
       </div>
       <SettingsForm />
+      <UserManagement />
     </div>
   )
 }

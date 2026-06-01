@@ -1,5 +1,7 @@
 import { getAnimeInfo, getEpisodes } from "@/server/media/libraryStore"
+import { requireApiUser } from "@/server/auth/api"
 
+export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
 type EpisodesContext = {
@@ -9,6 +11,12 @@ type EpisodesContext = {
 }
 
 export async function GET(_request: Request, context: EpisodesContext) {
+  const auth = await requireApiUser()
+
+  if (!auth.ok) {
+    return auth.response
+  }
+
   const { animeId } = await context.params
   const anime = getAnimeInfo(animeId)
 

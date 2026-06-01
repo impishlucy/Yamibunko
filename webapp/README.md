@@ -1,21 +1,24 @@
-# Next.js template
+# Yamibunko WebApp
 
-This is a Next.js template with shadcn/ui.
+Next.js App Router WebUI for the local Yamibunko anime library.
 
-## Adding components
+## Development
 
-To add components to your app, run the following command:
+Use Bun with a Node.js 24 runtime available for Next.js server execution.
+Create `.env` from `.env.example`, then run:
 
 ```bash
-npx shadcn@latest add button
+bun install
+bun run dev
 ```
 
-This will place the ui components in the `components` directory.
+The database is created automatically at `.yamibunko/yamibunko.sqlite` inside
+the webapp directory.
 
-## Using components
+## Quality Checks
 
-To use the components in your app, import them as follows:
-
-```tsx
-import { Button } from "@/components/ui/button";
+```bash
+bun run lint
+bun run typecheck
+bun run build
 ```

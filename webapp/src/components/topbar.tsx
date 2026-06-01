@@ -5,8 +5,13 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { buttonVariants } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
 import { cn } from "@/lib/utils"
+import type { CurrentUser } from "@/server/auth/session"
 
-export function Topbar() {
+function initials(username: string) {
+  return username.slice(0, 2).toUpperCase()
+}
+
+export function Topbar({ user }: { user: CurrentUser }) {
   return (
     <header className="sticky top-0 z-30 border-b border-white/10 bg-[#0d0d12]/85 px-4 py-3 backdrop-blur sm:px-6 lg:px-8">
       <div className="flex items-center justify-between gap-3">
@@ -44,11 +49,11 @@ export function Topbar() {
           <div className="flex items-center gap-2">
             <Avatar className="size-8 border border-violet-400/25">
               <AvatarFallback className="bg-violet-500/15 text-xs text-violet-100">
-                LU
+                {initials(user.username)}
               </AvatarFallback>
             </Avatar>
             <span className="hidden text-sm text-zinc-300 sm:inline">
-              Local User
+              {user.username}
             </span>
           </div>
         </div>

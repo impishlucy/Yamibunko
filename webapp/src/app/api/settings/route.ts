@@ -1,18 +1,16 @@
-import { z } from "zod"
-
+import { requireApiUser } from "@/server/auth/api"
 import { getSafeServerSettings, getServerConfigResult } from "@/server/config"
 
+export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
-const settingsPatchSchema = z.object({
-  appearance: z
-    .object({
-      theme: z.literal("dark").optional(),
-    })
-    .optional(),
-})
-
 export async function GET() {
+  const auth = await requireApiUser()
+
+  if (!auth.ok) {
+    return auth.response
+  }
+
   const configResult = getServerConfigResult()
 
   if (!configResult.ok) {
@@ -26,30 +24,10 @@ export async function GET() {
     )
   }
 
-  return Response.json(getSafeServerSettings())
-}
-
-export async function PATCH(request: Request) {
-  const body = await request.json().catch(() => ({}))
-  const patch = settingsPatchSchema.parse(body)
-  const configResult = getServerConfigResult()
-
-  if (!configResult.ok) {
-    return Response.json(
-      {
-        ok: false,
-        error: "SERVER_CONFIG_INVALID",
-        issues: configResult.issues,
-      },
-      { status: 500 }
-    )
-  }
-
-  return Response.json({
-    ok: true,
-    settings: {
-      ...getSafeServerSettings(),
-      ...patch,
-    },
-  })
+  return Response.json(
+    getSafeServerSettings({
+      userName: auth.user.username,
+      isAdmin: auth.user.isAdmin,
+    })
+  )
 }

@@ -12,7 +12,6 @@ export async function GET() {
     user: user
       ? {
           username: user.username,
-          name: user.name,
           isAdmin: user.isAdmin,
           hasPassword: user.hasPassword,
         }

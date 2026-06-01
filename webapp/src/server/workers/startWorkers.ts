@@ -27,7 +27,7 @@ export function startWorkers() {
 
   const config = configResult.config
   const queue = new PQueue({
-    concurrency: config.backgroundTranscodeConcurrency,
+    concurrency: 1,
   })
 
   const watcher = chokidar.watch(config.inputDir, {

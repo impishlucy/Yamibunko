@@ -69,8 +69,8 @@ export function LibraryView() {
                 className="aspect-[3/4] rounded-lg bg-zinc-900"
               />
             ))
-          : filteredItems.map((anime) => (
-              <AnimeCard key={anime.id} anime={anime} />
+          : filteredItems.map((anime, index) => (
+              <AnimeCard key={anime.id} anime={anime} priority={index === 0} />
             ))}
       </div>
     </div>
