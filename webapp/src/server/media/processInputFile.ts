@@ -44,7 +44,6 @@ import {
   acquireVideoTranscode,
 } from "@/server/transcode/transcodeCapacity"
 import { errorMessage, fileName } from "@/server/utils/format"
-import { isPathInsideDirectory } from "@/server/utils/pathList"
 
 const maxHevcBytesPerMinute = 20 * 1024 * 1024
 const targetBytesPerMinute = 17 * 1024 * 1024
@@ -188,18 +187,10 @@ async function replaceFile(source: string, destination: string) {
 }
 
 async function removeEmptyInputParents(filePath: string) {
-  const config = getServerConfig()
-  const inputDir = config.inputDirs
-    .filter((directory) => isPathInsideDirectory(filePath, directory))
-    .sort((left, right) => right.length - left.length)[0]
-
-  if (!inputDir) {
-    return
-  }
-
+  const inputDir = path.resolve(getServerConfig().inputDir)
   let current = path.dirname(path.resolve(filePath))
 
-  while (isPathInsideDirectory(current, inputDir) && current !== inputDir) {
+  while (current.startsWith(inputDir) && current !== inputDir) {
     const entries = await readdir(current).catch(() => null)
 
     if (!entries || entries.length > 0) {

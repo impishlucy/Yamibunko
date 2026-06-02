@@ -4,7 +4,6 @@ using Avalonia.Markup.Xaml;
 using Avalonia.Platform.Storage;
 using System;
 using System.IO;
-using System.Linq;
 using System.Text.RegularExpressions;
 
 namespace Launcher;
@@ -13,7 +12,6 @@ public partial class SetupWindow : Window
 {
     private static readonly Regex BaseUrlRegex = new(@"^https?://\S+$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex ClientIdRegex = new(@"^\d+$", RegexOptions.Compiled);
-    private const int MaxInputFolderCount = 2;
 
     public event Action<AppSettings>? OnSetupComplete;
     private bool _isSetupComplete;
@@ -39,21 +37,20 @@ public partial class SetupWindow : Window
 
         var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
         {
-            Title = "Select up to 2 Input Folder Directories",
-            AllowMultiple = true
+            Title = "Select Input Folder Directory",
+            AllowMultiple = false
         });
 
-        if (folders.Count == 0)
+        var uri = folders[0].Path;
+        if (uri != null && uri.IsAbsoluteUri)
         {
-            return;
+            SetTextBoxValue("InputFolderBox", uri.LocalPath);
         }
-
-        var paths = folders
-            .Take(MaxInputFolderCount)
-            .Select(GetFolderPath)
-            .Where(path => !string.IsNullOrWhiteSpace(path));
-
-        SetTextBoxValue("InputFolderBox", string.Join(';', paths));
+        else
+        {
+            // fallback: show the URI string or use storage APIs to access files
+            SetTextBoxValue("InputFolderBox", uri?.ToString() ?? string.Empty);
+        }
     }
 
     private async void SelectOutputFolder_Click(object? sender, RoutedEventArgs e)
@@ -70,12 +67,16 @@ public partial class SetupWindow : Window
             AllowMultiple = false
         });
 
-        if (folders.Count == 0)
+        var uri = folders[0].Path;
+        if (uri != null && uri.IsAbsoluteUri)
         {
-            return;
+            SetTextBoxValue("OutputFolderBox", uri.LocalPath);
         }
-
-        SetTextBoxValue("OutputFolderBox", GetFolderPath(folders[0]));
+        else
+        {
+            // fallback: show the URI string or use storage APIs to access files
+            SetTextBoxValue("OutputFolderBox", uri?.ToString() ?? string.Empty);
+        }
     }
 
     private void ValidateForm()
@@ -94,7 +95,7 @@ public partial class SetupWindow : Window
         bool isBaseUrlValid = !string.IsNullOrWhiteSpace(baseUrl) &&
                               BaseUrlRegex.IsMatch(baseUrl);
 
-        bool isInputValid = AreInputFoldersValid(inputPath);
+        bool isInputValid = Directory.Exists(inputPath);
         bool isOutputValid = Directory.Exists(outputPath);
         bool isClientIdValid = string.IsNullOrWhiteSpace(clientId) || ClientIdRegex.IsMatch(clientId);
 
@@ -131,23 +132,6 @@ public partial class SetupWindow : Window
     private string GetTextBoxValue(string name)
     {
         return this.FindControl<TextBox>(name)?.Text?.Trim() ?? "";
-    }
-
-    private static bool AreInputFoldersValid(string value)
-    {
-        var folders = SplitInputFolders(value);
-        return folders.Length is > 0 and <= MaxInputFolderCount && folders.All(Directory.Exists);
-    }
-
-    private static string[] SplitInputFolders(string value)
-    {
-        return value.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-    }
-
-    private static string GetFolderPath(IStorageFolder folder)
-    {
-        var uri = folder.Path;
-        return uri.IsAbsoluteUri ? uri.LocalPath : uri.ToString();
     }
 
     private void SetTextBoxValue(string name, string value)

@@ -13,9 +13,9 @@
             <TextBlock Text="Base URL" Foreground="#A1A1AA"/>
             <TextBox Name="BaseUrlBox" PlaceholderText="http://localhost:3000" TextChanged="OnInputChanged"/>
 
-            <TextBlock Text="Input Folder Path(s)" Foreground="#A1A1AA"/>
+            <TextBlock Text="Input Folder Path" Foreground="#A1A1AA"/>
             <Grid ColumnDefinitions="*, Auto">
-                <TextBox Name="InputFolderBox" PlaceholderText="Select up to 2 input directories..." IsReadOnly="True" Focusable="False" IsHitTestVisible="False" TextChanged="OnInputChanged" VerticalAlignment="Center"/>
+                <TextBox Name="InputFolderBox" PlaceholderText="Select input directory..." IsReadOnly="True" Focusable="False" IsHitTestVisible="False" TextChanged="OnInputChanged" VerticalAlignment="Center"/>
                 <Button Grid.Column="1" Content="..." Click="SelectInputFolder_Click" Margin="5,0,0,0" Padding="15,5"/>
             </Grid>
 

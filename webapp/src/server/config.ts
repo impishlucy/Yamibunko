@@ -5,20 +5,12 @@ import { z } from "zod"
 
 import type { SafeSettings } from "@/lib/types"
 import { normalizeBaseUrl } from "@/server/http/baseUrl"
-import {
-  cleanPathValue,
-  parsePathList,
-  resolvePathList,
-} from "@/server/utils/pathList"
 
 export type TranscodeAcceleration = "nvenc" | "qsv" | "amd" | "cpu"
 
 const serverConfigSchema = z.object({
   FFMPEG_DIR: z.string().trim().min(1),
-  ANIME_INPUT_DIR: z.string().trim().min(1).refine(
-    (value) => parsePathList(value).length > 0,
-    "At least one input folder is required"
-  ),
+  ANIME_INPUT_DIR: z.string().trim().min(1),
   ANIME_MEDIA_DIR: z.string().trim().min(1),
   TRANSCODE_ACCEL: z.enum(["nvenc", "qsv", "amd", "cpu"]),
   ANILIST_CLIENT_ID: z.string().trim().optional(),
@@ -30,7 +22,6 @@ export type ServerConfig = {
   ffmpegPath: string
   ffprobePath: string
   inputDir: string
-  inputDirs: string[]
   mediaDir: string
   tempDir: string
   transcodeAccel: TranscodeAcceleration
@@ -45,6 +36,10 @@ type ConfigResult =
 
 let cachedConfig: ServerConfig | undefined
 let cachedIssues: string[] | undefined
+
+function cleanPath(value: string) {
+  return value.trim().replace(/^['"]|['"]$/g, "")
+}
 
 function executableName(name: "ffmpeg" | "ffprobe") {
   return process.platform === "win32" ? `${name}.exe` : name
@@ -87,22 +82,20 @@ function readEnvironment() {
 }
 
 function mapConfig(env: z.infer<typeof serverConfigSchema>): ServerConfig {
-  const ffmpegDir = path.resolve(cleanPathValue(env.FFMPEG_DIR))
-  const inputDirs = resolvePathList(env.ANIME_INPUT_DIR)
+  const ffmpegDir = path.resolve(cleanPath(env.FFMPEG_DIR))
 
   return {
     ffmpegPath: path.join(ffmpegDir, executableName("ffmpeg")),
     ffprobePath: path.join(ffmpegDir, executableName("ffprobe")),
-    inputDir: inputDirs[0] ?? cleanPathValue(env.ANIME_INPUT_DIR),
-    inputDirs,
-    mediaDir: path.resolve(cleanPathValue(env.ANIME_MEDIA_DIR)),
+    inputDir: cleanPath(env.ANIME_INPUT_DIR),
+    mediaDir: cleanPath(env.ANIME_MEDIA_DIR),
     tempDir: getDefaultTempDir(),
     transcodeAccel: env.TRANSCODE_ACCEL,
     anilistClientId: env.ANILIST_CLIENT_ID
-      ? cleanPathValue(env.ANILIST_CLIENT_ID)
+      ? cleanPath(env.ANILIST_CLIENT_ID)
       : undefined,
     anilistClientSecret: env.ANILIST_CLIENT_SECRET
-      ? cleanPathValue(env.ANILIST_CLIENT_SECRET)
+      ? cleanPath(env.ANILIST_CLIENT_SECRET)
       : undefined,
     baseUrl: normalizeBaseUrl(env.BASE_URL),
   }

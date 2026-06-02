@@ -441,6 +441,7 @@ public class ServerManager
         if (!process.Start())
         {
             throw new InvalidOperationException($"Failed to start command: {fileName}");
+            ShowLogsWindow();
         }
 
         AssignProcessToServerJob(process);
@@ -453,6 +454,7 @@ public class ServerManager
         if (options.ThrowOnError && result.ExitCode != 0)
         {
             throw new InvalidOperationException($"Command failed ({fileName}) with exit code {result.ExitCode}: {result.Error.Trim()}");
+            ShowLogsWindow();
         }
 
         return result;
@@ -470,6 +472,7 @@ public class ServerManager
         if (!process.Start())
         {
             throw new InvalidOperationException($"Failed to start command: {fileName}");
+            ShowLogsWindow();
         }
 
         AssignProcessToServerJob(process);
@@ -479,7 +482,7 @@ public class ServerManager
         return process;
     }
 
-    private void StopProcessTree(Process process)
+    private async void StopProcessTree(Process process)
     {
         try
         {
@@ -499,7 +502,7 @@ public class ServerManager
                     CreateNoWindow = true,
                     UseShellExecute = false
                 });
-                taskKill?.WaitForExit(5000);
+                await taskKill?.WaitForExitAsync();
             }
             else
             {
@@ -510,7 +513,7 @@ public class ServerManager
                     CreateNoWindow = true,
                     UseShellExecute = false
                 });
-                killProcess?.WaitForExit(5000);
+                await killProcess?.WaitForExitAsync();
             }
 
             if (process.WaitForExit(30000))
@@ -532,6 +535,7 @@ public class ServerManager
         }
         catch (InvalidOperationException)
         {
+            // The process already exited before we could interact with it
         }
         catch (Exception ex)
         {

@@ -2,11 +2,6 @@ import { existsSync, readFileSync, statSync } from "node:fs"
 import path from "node:path"
 
 import { normalizeBaseUrl } from "@/server/http/baseUrl"
-import {
-  cleanPathValue,
-  joinPathList,
-  resolvePathList,
-} from "@/server/utils/pathList"
 
 const requiredEnvironmentKeys = [
   "FFMPEG_DIR",
@@ -16,8 +11,9 @@ const requiredEnvironmentKeys = [
   "BASE_URL",
 ] as const
 
-const singlePathEnvironmentKeys = [
+const pathEnvironmentKeys = [
   "FFMPEG_DIR",
+  "ANIME_INPUT_DIR",
   "ANIME_MEDIA_DIR",
 ] as const
 
@@ -44,6 +40,10 @@ const loggedEnvironmentKeys = [
 
 let bootstrapped = false
 
+function cleanValue(value: string) {
+  return value.trim().replace(/^['"]|['"]$/g, "")
+}
+
 function normalizeParameterName(value: string) {
   return value
     .replace(/^--?/, "")
@@ -59,7 +59,7 @@ function setKnownEnvironmentValue(rawKey: string, rawValue: string) {
     return false
   }
 
-  process.env[key] = cleanPathValue(rawValue)
+  process.env[key] = cleanValue(rawValue)
   return requiredCanonicalKeys.has(key)
 }
 
@@ -86,7 +86,7 @@ function applyLauncherParameters(argv = process.argv.slice(1)) {
     const nextValue = argv[index + 1]
 
     if (canonical && nextValue && !nextValue.startsWith("--")) {
-      process.env[canonical] = cleanPathValue(nextValue)
+      process.env[canonical] = cleanValue(nextValue)
       applied = requiredCanonicalKeys.has(canonical) || applied
       index += 1
     }
@@ -116,7 +116,7 @@ function loadDotEnv(dotEnvPath: string) {
     }
 
     const key = trimmed.slice(0, equalsIndex).trim()
-    const value = cleanPathValue(trimmed.slice(equalsIndex + 1))
+    const value = cleanValue(trimmed.slice(equalsIndex + 1))
     const canonical = launcherAliases.get(normalizeParameterName(key)) ?? key
 
     if (!process.env[canonical]) {
@@ -132,7 +132,7 @@ function applyEnvironmentAliases() {
     const value = process.env[alias]
 
     if (value && !process.env[canonical]) {
-      process.env[canonical] = cleanPathValue(value)
+      process.env[canonical] = cleanValue(value)
     }
   }
 }
@@ -141,7 +141,7 @@ function normalizeTranscodeAcceleration() {
   const value = process.env.TRANSCODE_ACCEL
 
   if (value) {
-    process.env.TRANSCODE_ACCEL = cleanPathValue(value).toLowerCase()
+    process.env.TRANSCODE_ACCEL = cleanValue(value).toLowerCase()
   }
 }
 
@@ -181,36 +181,9 @@ function resolveRequiredPath(envVarName: string) {
     )
   }
 
-  const resolved = path.resolve(cleanPathValue(rawPath))
+  const resolved = path.resolve(cleanValue(rawPath))
   process.env[envVarName] = resolved
   return resolved
-}
-
-function resolveRequiredPathList(envVarName: string) {
-  const rawPath = process.env[envVarName]
-
-  if (!rawPath) {
-    console.error(
-      `[Error] [Startup] Required path variable is missing - environment.ts - ${envVarName}`
-    )
-    throw new Error(
-      `CRITICAL INITIALIZATION FAILURE: Environment variable '${envVarName}' is missing. Ensure the launcher is passing parameters or the local .env file contains this variable.`
-    )
-  }
-
-  const resolvedPaths = resolvePathList(rawPath)
-
-  if (resolvedPaths.length === 0) {
-    console.error(
-      `[Error] [Startup] Required path list is empty - environment.ts - ${envVarName}`
-    )
-    throw new Error(
-      `CRITICAL INITIALIZATION FAILURE: Environment variable '${envVarName}' must contain at least one path.`
-    )
-  }
-
-  process.env[envVarName] = joinPathList(resolvedPaths)
-  return resolvedPaths
 }
 
 function assertExistingDirectory(label: string, directoryPath: string) {
@@ -244,7 +217,7 @@ function assertValidBaseUrl(value: string | undefined) {
   }
 
   try {
-    process.env.BASE_URL = normalizeBaseUrl(cleanPathValue(value))
+    process.env.BASE_URL = normalizeBaseUrl(cleanValue(value))
   } catch {
     console.error(
       `[Error] [Startup] BASE_URL validation failed - environment.ts - ${value}`
@@ -293,16 +266,10 @@ export function bootstrapEnvironment() {
     }`
   )
 
-  for (const key of singlePathEnvironmentKeys) {
+  for (const key of pathEnvironmentKeys) {
     if (process.env[key]) {
-      process.env[key] = path.resolve(cleanPathValue(process.env[key]))
+      process.env[key] = path.resolve(cleanValue(process.env[key]))
     }
-  }
-
-  if (process.env.ANIME_INPUT_DIR) {
-    process.env.ANIME_INPUT_DIR = joinPathList(
-      resolvePathList(process.env.ANIME_INPUT_DIR)
-    )
   }
 
   for (const key of requiredEnvironmentKeys) {
@@ -342,9 +309,10 @@ export function bootstrapEnvironment() {
 
   assertValidBaseUrl(process.env.BASE_URL)
 
-  for (const inputFolder of resolveRequiredPathList("ANIME_INPUT_DIR")) {
-    assertExistingDirectory("Input folder", inputFolder)
-  }
+  assertExistingDirectory(
+    "Input folder",
+    resolveRequiredPath("ANIME_INPUT_DIR")
+  )
   assertExistingDirectory(
     "Media folder",
     resolveRequiredPath("ANIME_MEDIA_DIR")
