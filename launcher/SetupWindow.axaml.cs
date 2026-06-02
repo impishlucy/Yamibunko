@@ -41,12 +41,16 @@ public partial class SetupWindow : Window
             AllowMultiple = false
         });
 
-        if (folders.Count == 0)
+        var uri = folders[0].Path;
+        if (uri != null && uri.IsAbsoluteUri)
         {
-            return;
+            SetTextBoxValue("OutputFolderBox", uri.LocalPath);
         }
-
-        SetTextBoxValue("InputFolderBox", folders[0].Path.LocalPath);
+        else
+        {
+            // fallback: show the URI string or use storage APIs to access files
+            SetTextBoxValue("OutputFolderBox", uri?.ToString() ?? string.Empty);
+        }
     }
 
     private async void SelectOutputFolder_Click(object? sender, RoutedEventArgs e)
@@ -63,12 +67,16 @@ public partial class SetupWindow : Window
             AllowMultiple = false
         });
 
-        if (folders.Count == 0)
+        var uri = folders[0].Path;
+        if (uri != null && uri.IsAbsoluteUri)
         {
-            return;
+            SetTextBoxValue("OutputFolderBox", uri.LocalPath);
         }
-
-        SetTextBoxValue("OutputFolderBox", folders[0].Path.LocalPath);
+        else
+        {
+            // fallback: show the URI string or use storage APIs to access files
+            SetTextBoxValue("OutputFolderBox", uri?.ToString() ?? string.Empty);
+        }
     }
 
     private void ValidateForm()
