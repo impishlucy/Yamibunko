@@ -66,7 +66,7 @@ type GoogleCastContext = {
     autoJoinPolicy: string
     resumeSavedSession?: boolean
   }): void
-  requestSession(): Promise<GoogleCastSession>
+  requestSession(): Promise<GoogleCastSession | null | undefined>
   getCurrentSession(): GoogleCastSession | null
   addEventListener(
     type: string,
@@ -97,6 +97,11 @@ type GoogleCastFramework = {
     MEDIA_SESSION?: string
   }
   SessionState: {
+    SESSION_STARTED?: string
+    SESSION_STARTING?: string
+    SESSION_RESUMED?: string
+    SESSION_RESUME_FAILED?: string
+    SESSION_START_FAILED?: string
     SESSION_ENDED: string
     SESSION_ENDING: string
   }
@@ -148,6 +153,8 @@ export type GoogleCastMediaState = {
   positionSeconds: number
 }
 
+export type GoogleCastSessionHandle = GoogleCastSession
+
 function castWindow() {
   return window as CastWindow
 }
@@ -167,9 +174,27 @@ function getCastApis() {
   }
 }
 
+function isSecureCastSenderOrigin() {
+  if (typeof window === "undefined") {
+    return false
+  }
+
+  if (window.isSecureContext) {
+    return true
+  }
+
+  return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(
+    window.location.hostname
+  )
+}
+
 function initializeCastFramework() {
   if (castFrameworkInitialized) {
     return true
+  }
+
+  if (!isSecureCastSenderOrigin()) {
+    return false
   }
 
   const apis = getCastApis()
@@ -201,8 +226,24 @@ export function getGoogleCastSession() {
   return getGoogleCastContext()?.getCurrentSession() ?? null
 }
 
+export function getGoogleCastUnavailableReason() {
+  if (typeof window === "undefined") {
+    return "Google Cast is only available in a browser."
+  }
+
+  if (!isSecureCastSenderOrigin()) {
+    return "Google Cast requires HTTPS, or localhost during development. Use https://192.168.1.101 or open the app on localhost."
+  }
+
+  return "Google Cast is not available in this browser."
+}
+
 export async function ensureGoogleCastFramework() {
   if (typeof window === "undefined") {
+    return false
+  }
+
+  if (!isSecureCastSenderOrigin()) {
     return false
   }
 
@@ -303,7 +344,9 @@ function isFailedMediaSession(mediaSession: GoogleCastMediaSession | null) {
 function isLoadedMediaSession(mediaSession: GoogleCastMediaSession | null) {
   return (
     mediaSession?.playerState === "PLAYING" ||
-    mediaSession?.playerState === "PAUSED"
+    mediaSession?.playerState === "PAUSED" ||
+    mediaSession?.playerState === "BUFFERING" ||
+    mediaSession?.playerState === "IDLE"
   )
 }
 
@@ -328,7 +371,7 @@ export function getGoogleCastMediaState(
       isAlive: false,
       positionSeconds: 0,
       playerState: "IDLE",
-      idleReason: "FINISHED",
+      idleReason: "CANCELLED",
     }
   }
 
@@ -568,8 +611,53 @@ export function isGoogleCastEndingState(sessionState: string | undefined) {
   return (
     Boolean(sessionState) &&
     (sessionState === framework?.SessionState.SESSION_ENDING ||
-      sessionState === framework?.SessionState.SESSION_ENDED)
+      sessionState === framework?.SessionState.SESSION_ENDED ||
+      sessionState === framework?.SessionState.SESSION_START_FAILED ||
+      sessionState === framework?.SessionState.SESSION_RESUME_FAILED)
   )
+}
+
+export function isGoogleCastConnectedState(sessionState: string | undefined) {
+  const framework = getCastApis()?.framework
+
+  return (
+    Boolean(sessionState) &&
+    (sessionState === framework?.SessionState.SESSION_STARTED ||
+      sessionState === framework?.SessionState.SESSION_RESUMED)
+  )
+}
+
+export async function requestGoogleCastSession() {
+  const context = getGoogleCastContext()
+
+  if (!context) {
+    throw new Error(getGoogleCastUnavailableReason())
+  }
+
+  const requestedSession = await context.requestSession()
+  const session = requestedSession ?? context.getCurrentSession()
+
+  if (!session) {
+    throw new Error("Google Cast session was not created.")
+  }
+
+  return session
+}
+
+export function safeEndGoogleCastSession(
+  session: GoogleCastSession | null | undefined,
+  stopCasting = true
+) {
+  if (!session) {
+    return
+  }
+
+  try {
+    session.endSession(stopCasting)
+  } catch {
+    // The Cast SDK can throw while a session is already ending. Treat that as
+    // best-effort cleanup so callers do not mask the original failure.
+  }
 }
 
 export function addGoogleCastSessionStateListener(
@@ -578,7 +666,7 @@ export function addGoogleCastSessionStateListener(
   let cleanedUp = false
   let actualCleanup: (() => void) | null = null
 
-  ensureGoogleCastFramework().then((isAvailable) => {
+  void ensureGoogleCastFramework().then((isAvailable) => {
     if (cleanedUp || !isAvailable) {
       return
     }

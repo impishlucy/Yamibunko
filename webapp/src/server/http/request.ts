@@ -31,13 +31,7 @@ function forwardedHeaderPart(headerValue: string | null, key: string) {
   return null
 }
 
-export async function getRequestOrigin(request?: Request) {
-  const configuredBaseUrl = process.env.BASE_URL ?? process.env.APP_BASE_URL
-
-  if (configuredBaseUrl) {
-    return new URL(getConfiguredBaseUrl()).origin
-  }
-
+async function getHeaderDerivedOrigin(request?: Request) {
   const headerStore = await headers()
   const forwarded = headerStore.get("forwarded")
   const proto =
@@ -51,6 +45,16 @@ export async function getRequestOrigin(request?: Request) {
     new URL(request?.url ?? "http://localhost").host
 
   return `${proto}://${host}`
+}
+
+export async function getRequestOrigin(request?: Request) {
+  const configuredBaseUrl = process.env.BASE_URL ?? process.env.APP_BASE_URL
+
+  if (configuredBaseUrl) {
+    return new URL(getConfiguredBaseUrl()).origin
+  }
+
+  return getHeaderDerivedOrigin(request)
 }
 
 export async function getPublicBaseUrl() {
@@ -146,13 +150,37 @@ function allowedDevOriginMatches(candidate: string) {
   })
 }
 
+function requestUrlOrigin(request: Request) {
+  try {
+    return new URL(request.url).origin
+  } catch {
+    return null
+  }
+}
+
 export async function isSameOriginRequest(request: Request) {
-  const expectedOrigin = await getRequestOrigin(request)
   const candidate = candidateRequestOrigin(request)
 
   if (!candidate) {
     return true
   }
 
-  return sameOrigin(candidate, expectedOrigin) || allowedDevOriginMatches(candidate)
+  const expectedOrigins = new Set<string>()
+  const actualRequestOrigin = requestUrlOrigin(request)
+
+  if (actualRequestOrigin) {
+    expectedOrigins.add(actualRequestOrigin)
+  }
+
+  expectedOrigins.add(await getHeaderDerivedOrigin(request))
+
+  const configuredBaseUrl = process.env.BASE_URL ?? process.env.APP_BASE_URL
+  if (configuredBaseUrl) {
+    expectedOrigins.add(new URL(getConfiguredBaseUrl()).origin)
+  }
+
+  return (
+    Array.from(expectedOrigins).some((origin) => sameOrigin(candidate, origin)) ||
+    allowedDevOriginMatches(candidate)
+  )
 }

@@ -64,6 +64,16 @@ function getProfile(value: string | null): PlaybackProfile {
   return value === "dataSaver" ? "dataSaver" : "original"
 }
 
+function parseStartSeconds(value: string | null) {
+  if (!value) {
+    return 0
+  }
+
+  const seconds = Number(value)
+
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : 0
+}
+
 function parseByteRange(
   rangeHeader: string | null,
   size: number
@@ -338,6 +348,7 @@ async function handleTranscode(
   episodeNumber: number,
   username: string,
   profile: PlaybackProfile,
+  startSeconds: number,
   sourceBitrateKbps?: number
 ) {
   let waitLogged = false
@@ -397,6 +408,7 @@ async function handleTranscode(
       "+genpts",
       "-ignore_unknown",
       ...getLiveTranscodeInputArgs(),
+      ...(startSeconds > 0 ? ["-ss", startSeconds.toFixed(3)] : []),
       "-i",
       file,
       ...getLiveH264Args(profile, { sourceBitrateKbps }),
@@ -607,6 +619,7 @@ export async function GET(request: Request, context: StreamContext) {
   const seasonNumber = parsePositiveInt(url.searchParams.get("season") ?? "1")
   const mode = getMode(url.searchParams.get("mode"))
   const profile = getProfile(url.searchParams.get("profile"))
+  const startSeconds = parseStartSeconds(url.searchParams.get("start"))
 
   if (!seasonNumber) {
     return jsonError("Episode not found.", 404)
@@ -662,6 +675,7 @@ export async function GET(request: Request, context: StreamContext) {
     episodeNumber,
     streamUser.username,
     profile,
+    startSeconds,
     calculateSourceBitrateKbps(resolved)
   )
 }

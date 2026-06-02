@@ -91,6 +91,7 @@ export function WatchView({
           previousEpisode={payload.previousEpisode}
           nextEpisode={payload.nextEpisode}
           durationSeconds={payload.episode.durationSeconds}
+          thumbnailUrl={payload.episode.thumbnail}
           autoPlay={autoPlay}
           onEpisodeChange={openEpisode}
         />

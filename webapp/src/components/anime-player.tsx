@@ -16,23 +16,29 @@ import { PlaybackStatus, type PlaybackStatusState } from "@/components/playback-
 import { Button } from "@/components/ui/button"
 import {
   addGoogleCastMediaStateListener,
+  addGoogleCastSessionStateListener,
   createGoogleCastLoadRequest,
   ensureGoogleCastFramework,
   getGoogleCastMediaState,
   getGoogleCastContext,
   getGoogleCastSession,
+  getGoogleCastUnavailableReason,
+  isGoogleCastConnectedState,
+  isGoogleCastEndingState,
   pauseGoogleCastMedia,
   playGoogleCastMedia,
+  requestGoogleCastSession,
+  safeEndGoogleCastSession,
   seekGoogleCastMedia,
   waitForGoogleCastMediaLoad,
   type GoogleCastMediaState,
+  type GoogleCastSessionHandle,
 } from "@/lib/google-cast"
 import type {
   Episode,
   PlaybackProfile,
   WatchPayload,
 } from "@/lib/types"
-import { error } from "next/dist/build/output/log"
 
 type AnimePlayerProps = {
   animeId: string
@@ -43,6 +49,7 @@ type AnimePlayerProps = {
   previousEpisode?: Episode
   nextEpisode?: Episode
   durationSeconds?: number
+  thumbnailUrl?: string
   autoPlay?: boolean
   onEpisodeChange?: (episode: Episode, autoPlay: boolean) => void
 }
@@ -50,6 +57,12 @@ type AnimePlayerProps = {
 type SwitchSourceOptions = {
   preservePosition?: boolean
   waitForMedia?: boolean
+  transcodeStartTime?: number
+}
+
+type SeekPreviewFrame = {
+  time: number
+  leftPercent: number
 }
 
 type LocalPlaybackSnapshot = {
@@ -153,6 +166,55 @@ function formatTime(seconds: number) {
   return `${String(minutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}`
 }
 
+function isUsableDuration(seconds: number | undefined | null): seconds is number {
+  return typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0
+}
+
+function getStableDuration(
+  fileDurationSeconds: number | undefined,
+  measuredDurationSeconds?: number,
+  fallbackDurationSeconds?: number
+): number {
+  if (isUsableDuration(fileDurationSeconds)) {
+    return fileDurationSeconds
+  }
+
+  if (isUsableDuration(measuredDurationSeconds)) {
+    return measuredDurationSeconds
+  }
+
+  if (isUsableDuration(fallbackDurationSeconds)) {
+    return fallbackDurationSeconds
+  }
+
+  return 0
+}
+
+function clampTime(seconds: number, durationSeconds: number) {
+  const safeSeconds = Number.isFinite(seconds) ? seconds : 0
+  const minClamped = Math.max(safeSeconds, 0)
+
+  if (durationSeconds > 0) {
+    return Math.min(minClamped, durationSeconds)
+  }
+
+  return minClamped
+}
+
+function withTranscodeStartTime(sourceUrl: string, startTime: number) {
+  const url = new URL(sourceUrl, window.location.href)
+  const safeStartTime = Number.isFinite(startTime) ? Math.max(startTime, 0) : 0
+
+  if (safeStartTime > 0.25) {
+    url.searchParams.set("start", safeStartTime.toFixed(3))
+  } else {
+    url.searchParams.delete("start")
+  }
+
+  return `${url.pathname}${url.search}${url.hash}`
+}
+
+
 export function AnimePlayer({
   animeId,
   seasonNumber,
@@ -162,6 +224,7 @@ export function AnimePlayer({
   previousEpisode,
   nextEpisode,
   durationSeconds,
+  thumbnailUrl,
   autoPlay = false,
   onEpisodeChange,
 }: AnimePlayerProps) {
@@ -174,6 +237,8 @@ export function AnimePlayer({
   const currentTimeRef = useRef(0)
   const pendingSeekRef = useRef<number | null>(null)
   const sourceUrlRef = useRef<string | null>(null)
+  const statusRef = useRef<PlaybackStatusState>("checking")
+  const activeTranscodeStartRef = useRef(0)
   const shouldAutoPlaySourceRef = useRef(autoPlay)
   const isCastingRef = useRef(false)
   const isCastLoadingRef = useRef(false)
@@ -187,6 +252,7 @@ export function AnimePlayer({
   const castProgressTimerRef = useRef<ReturnType<typeof setInterval> | null>(
     null
   )
+  const castStartPromiseRef = useRef<Promise<boolean> | null>(null)
   const localPlaybackBeforeCastRef = useRef<LocalPlaybackSnapshot | null>(null)
   const startGoogleCastingRef = useRef<
     (
@@ -207,6 +273,9 @@ export function AnimePlayer({
   const hardwareWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null
   )
+  const seekPreviewFrameTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  )
   const [quality, setQuality] = useState<PlaybackProfile>("original")
   const [sourceUrl, setSourceUrl] = useState<string | null>(null)
   const [status, setStatus] = useState<PlaybackStatusState>("checking")
@@ -215,10 +284,14 @@ export function AnimePlayer({
   const [isWaitingForMedia, setIsWaitingForMedia] = useState(false)
   const [showHardwareWait, setShowHardwareWait] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
-  const [duration, setDuration] = useState(durationSeconds ?? 0)
+  const [seekPreview, setSeekPreview] = useState<number | null>(null)
+  const [seekPreviewFrame, setSeekPreviewFrame] =
+    useState<SeekPreviewFrame | null>(null)
+  const [duration, setDuration] = useState(getStableDuration(durationSeconds))
   const [controlsVisible, setControlsVisible] = useState(true)
   const [canCast, setCanCast] = useState(false)
   const [isCasting, setIsCasting] = useState(false)
+  const [isCastStarting, setIsCastStarting] = useState(false)
   const [castErrorFlash, setCastErrorFlash] = useState(false)
 
   const labels = useMemo(
@@ -243,11 +316,15 @@ export function AnimePlayer({
   }, [isPlaying])
 
   useEffect(() => {
+    statusRef.current = status
+  }, [status])
+
+  useEffect(() => {
     let cancelled = false
 
     void ensureGoogleCastFramework().then((available) => {
-      if (!cancelled && available) {
-        setCanCast(true)
+      if (!cancelled) {
+        setCanCast(available)
       }
     })
 
@@ -257,15 +334,21 @@ export function AnimePlayer({
   }, [])
 
   useEffect(() => {
-    // Monitor session state to handle cast ending events
-    const removeListener = (() => {
-      if (isCastingRef.current || isCastLoadingRef.current) {
+    const removeListener = addGoogleCastSessionStateListener((event) => {
+      if (isGoogleCastConnectedState(event.sessionState)) {
+        setCanCast(true)
+      }
+
+      if (
+        isGoogleCastEndingState(event.sessionState) &&
+        (isCastingRef.current || isCastLoadingRef.current)
+      ) {
         handleCastEndedRef.current()
       }
     })
 
     return () => {
-      removeListener?.()
+      removeListener()
     }
   }, [])
 
@@ -280,6 +363,13 @@ export function AnimePlayer({
     if (hardwareWaitTimerRef.current) {
       clearTimeout(hardwareWaitTimerRef.current)
       hardwareWaitTimerRef.current = null
+    }
+  }, [])
+
+  const clearSeekPreviewFrameTimer = useCallback(() => {
+    if (seekPreviewFrameTimerRef.current) {
+      clearTimeout(seekPreviewFrameTimerRef.current)
+      seekPreviewFrameTimerRef.current = null
     }
   }, [])
 
@@ -363,7 +453,11 @@ export function AnimePlayer({
     watchedSeconds: number,
     measuredDuration?: number
   ) {
-    const effectiveDuration = measuredDuration ?? durationSeconds
+    const effectiveDuration = getStableDuration(
+      durationSeconds,
+      measuredDuration,
+      duration
+    )
 
     currentTimeRef.current = watchedSeconds
     setCurrentTime(watchedSeconds)
@@ -419,17 +513,28 @@ export function AnimePlayer({
       clearHardwareWaitTimer()
       clearCastErrorFlashTimer()
       clearCastMediaSync()
+      clearSeekPreviewFrameTimer()
     },
     [
       clearControlsTimer,
       clearHardwareWaitTimer,
       clearCastErrorFlashTimer,
       clearCastMediaSync,
+      clearSeekPreviewFrameTimer,
     ]
   )
 
   function getPlaybackPosition() {
     const video = videoRef.current
+
+    if (
+      video &&
+      Number.isFinite(video.currentTime) &&
+      statusRef.current === "transcoding"
+    ) {
+      return Math.max(activeTranscodeStartRef.current + video.currentTime, 0)
+    }
+
     const seconds =
       video && Number.isFinite(video.currentTime)
         ? video.currentTime
@@ -445,10 +550,13 @@ export function AnimePlayer({
       return
     }
 
+    const knownDuration = getStableDuration(
+      durationSeconds,
+      video.duration,
+      duration
+    )
     const target =
-      Number.isFinite(video.duration) && video.duration > 0
-        ? Math.min(pendingSeek, video.duration)
-        : pendingSeek
+      knownDuration > 0 ? Math.min(pendingSeek, knownDuration) : pendingSeek
 
     if (Number.isFinite(target) && target > 0) {
       video.currentTime = target
@@ -465,27 +573,44 @@ export function AnimePlayer({
     options: SwitchSourceOptions = {}
   ) {
     const video = videoRef.current
+    const previousPosition = options.preservePosition ? getPlaybackPosition() : 0
+    const transcodeStartTime =
+      nextStatus === "transcoding"
+        ? options.transcodeStartTime ?? previousPosition
+        : 0
+    const sourceToLoad =
+      nextStatus === "transcoding"
+        ? withTranscodeStartTime(nextSourceUrl, transcodeStartTime)
+        : nextSourceUrl
+
+    activeTranscodeStartRef.current = transcodeStartTime
 
     if (options.preservePosition) {
-      const position = getPlaybackPosition()
-      pendingSeekRef.current = position
-      currentTimeRef.current = position
-      setCurrentTime(position)
+      currentTimeRef.current = previousPosition
+      setCurrentTime(previousPosition)
+      pendingSeekRef.current =
+        nextStatus === "transcoding" ? null : previousPosition
     } else {
       pendingSeekRef.current = null
+
+      if (nextStatus === "transcoding" && transcodeStartTime > 0) {
+        currentTimeRef.current = transcodeStartTime
+        setCurrentTime(transcodeStartTime)
+      }
     }
 
     video?.pause()
     setIsPlaying(false)
     setStatus(nextStatus)
+    statusRef.current = nextStatus
 
-    if (sourceUrlRef.current !== nextSourceUrl) {
-      sourceUrlRef.current = nextSourceUrl
+    if (sourceUrlRef.current !== sourceToLoad) {
+      sourceUrlRef.current = sourceToLoad
       if (video) {
-        video.src = nextSourceUrl
+        video.src = sourceToLoad
         video.load()
       }
-      setSourceUrl(nextSourceUrl)
+      setSourceUrl(sourceToLoad)
     }
 
     if (options.waitForMedia) {
@@ -509,11 +634,12 @@ export function AnimePlayer({
         playbackKeyRef.current = playbackKey
         currentTimeRef.current = 0
         pendingSeekRef.current = null
-        shouldAutoPlaySourceRef.current = autoPlay
+        shouldAutoPlaySourceRef.current = autoPlay || isPlayingRef.current
         setCurrentTime(0)
-        setDuration(durationSeconds ?? 0)
-        setIsPlaying(false)
-        setControlsVisible(true)
+        setSeekPreview(null)
+        setSeekPreviewFrame(null)
+        setDuration(getStableDuration(durationSeconds))
+        setControlsVisible(!isPlayingRef.current)
         endMediaWait()
         lastProgressSaveRef.current = 0
         completedProgressRef.current = false
@@ -719,10 +845,112 @@ export function AnimePlayer({
       return
     }
 
-    video.currentTime = Math.min(Math.max(seconds, 0), duration || seconds)
+    const target = clampTime(seconds, duration)
+
+    if (statusRef.current === "transcoding") {
+      const wasPlaying = !video.paused || isPlayingRef.current
+      const baseTranscodeUrl =
+        quality === "dataSaver"
+          ? playback.dataSaverUrl
+          : playback.originalTranscodeUrl
+
+      activeTranscodeStartRef.current = target
+      currentTimeRef.current = target
+      setCurrentTime(target)
+      shouldAutoPlaySourceRef.current = wasPlaying
+      switchSource(baseTranscodeUrl, "transcoding", {
+        transcodeStartTime: target,
+        waitForMedia: wasPlaying,
+      })
+      showControls(true)
+      return
+    }
+
+    video.currentTime = target
     currentTimeRef.current = video.currentTime
     setCurrentTime(video.currentTime)
     showControls()
+  }
+
+  function getSeekPreviewFrameUrl(seconds: number) {
+    if (!thumbnailUrl) {
+      return null
+    }
+
+    const url = new URL(thumbnailUrl, window.location.href)
+    url.searchParams.set("time", clampTime(seconds, duration).toFixed(1))
+
+    return `${url.pathname}${url.search}${url.hash}`
+  }
+
+  function scheduleSeekPreviewFrame(seconds: number) {
+    if (!duration) {
+      return
+    }
+
+    const nextTime = clampTime(seconds, duration)
+    const leftPercent = Math.min(Math.max((nextTime / duration) * 100, 0), 100)
+
+    clearSeekPreviewFrameTimer()
+    seekPreviewFrameTimerRef.current = setTimeout(() => {
+      setSeekPreviewFrame({
+        time: nextTime,
+        leftPercent,
+      })
+      seekPreviewFrameTimerRef.current = null
+    }, 140)
+  }
+
+  function getSeekTimeFromPointer(
+    input: HTMLInputElement,
+    clientX: number
+  ) {
+    if (!duration) {
+      return 0
+    }
+
+    const rect = input.getBoundingClientRect()
+    const ratio =
+      rect.width > 0
+        ? Math.min(Math.max((clientX - rect.left) / rect.width, 0), 1)
+        : 0
+
+    return ratio * duration
+  }
+
+  function updateSeekHoverPreview(
+    input: HTMLInputElement,
+    clientX: number
+  ) {
+    const hoverTime = getSeekTimeFromPointer(input, clientX)
+    scheduleSeekPreviewFrame(hoverTime)
+  }
+
+  function updateSeekDragPreview(value: string) {
+    const nextValue = Number(value)
+
+    if (!Number.isFinite(nextValue)) {
+      return
+    }
+
+    setSeekPreview(nextValue)
+    scheduleSeekPreviewFrame(nextValue)
+  }
+
+  function clearSeekPreviewFrame() {
+    clearSeekPreviewFrameTimer()
+    setSeekPreviewFrame(null)
+  }
+
+  function commitSeekInput(value: string) {
+    const nextValue = Number(value)
+
+    setSeekPreview(null)
+    clearSeekPreviewFrame()
+
+    if (Number.isFinite(nextValue)) {
+      void seekTo(nextValue)
+    }
   }
 
   function requestFullscreen() {
@@ -799,7 +1027,7 @@ export function AnimePlayer({
   }
 
   async function loadGoogleCastMedia(input: {
-    session: NonNullable<ReturnType<typeof getGoogleCastSession>>
+    session: GoogleCastSessionHandle
     url: string
     contentType: string
     shouldResume: boolean
@@ -844,8 +1072,12 @@ export function AnimePlayer({
       return
     }
 
-    const knownDuration = durationSeconds ?? duration
-    updateWatchedProgress(state.positionSeconds)
+    const knownDuration = getStableDuration(
+      durationSeconds,
+      state.durationSeconds,
+      duration
+    )
+    updateWatchedProgress(state.positionSeconds, state.durationSeconds)
 
     if (state.playerState === "PLAYING" || state.playerState === "BUFFERING") {
       setIsPlaying(true)
@@ -853,18 +1085,23 @@ export function AnimePlayer({
       setIsPlaying(false)
     }
 
-    if (
-      state.playerState === "IDLE" &&
-      state.idleReason === "FINISHED" &&
-      !castFinishedHandledRef.current
-    ) {
-      castFinishedHandledRef.current = true
-      completePlayback(state.positionSeconds, knownDuration)
+    if (state.playerState === "IDLE") {
+      if (state.idleReason === "FINISHED" && !castFinishedHandledRef.current) {
+        castFinishedHandledRef.current = true
+        completePlayback(state.positionSeconds, knownDuration)
+        return
+      }
+
+      if (state.idleReason === "ERROR") {
+        flashCastError(new Error("Google Cast receiver stopped playback."))
+      }
+
+      handleCastEndedRef.current()
     }
   }
 
   function attachCastMediaSync(
-    session: NonNullable<ReturnType<typeof getGoogleCastSession>>,
+    session: GoogleCastSessionHandle,
     contentId: string
   ) {
     clearCastMediaSync()
@@ -903,7 +1140,7 @@ export function AnimePlayer({
   }
 
   function activateGoogleCastPlayback(
-    session: NonNullable<ReturnType<typeof getGoogleCastSession>>,
+    session: GoogleCastSessionHandle,
     contentId: string,
     nextStatus: PlaybackStatusState
   ) {
@@ -952,7 +1189,7 @@ export function AnimePlayer({
     }
 
     const startTime = startTimeOverride ?? getPlaybackPosition()
-    const session = getGoogleCastSession() ?? (await context.requestSession())
+    const session = getGoogleCastSession() ?? (await requestGoogleCastSession())
     const directFirst = quality === "original"
     const directCastUrl = getCastReceiverUrl(playback.castDirectUrl)
     const transcodeCastUrl = getCastReceiverUrl(playback.castTranscodeUrl)
@@ -998,17 +1235,14 @@ export function AnimePlayer({
         }
 
         if (result === "failed") {
-          flashCastError(
-            new Error(
-              "Direct cast failed on the receiver. Switching to transcoded stream."
-            )
-          )
-          console.error(
+          const fallbackError = new Error(
             "Direct cast failed on the receiver. Switching to transcoded stream."
           )
+          reportCastError(fallbackError)
+          console.error(fallbackError)
         }
       } catch (error) {
-        flashCastError(error)
+        reportCastError(error)
         console.error(error)
       }
     }
@@ -1031,7 +1265,7 @@ export function AnimePlayer({
       } else {
         isCastLoadingRef.current = false
         endMediaWait()
-        session.endSession(true)
+        safeEndGoogleCastSession(session, true)
         restoreLocalSource({ preservePosition: true })
         flashCastError(new Error("Cast receiver could not load the stream."))
         console.error("Cast receiver could not load the stream.")
@@ -1039,7 +1273,7 @@ export function AnimePlayer({
     } catch (error) {
       isCastLoadingRef.current = false
       endMediaWait()
-      session.endSession(true)
+      safeEndGoogleCastSession(session, true)
       restoreLocalSource({ preservePosition: true })
       flashCastError(
         error instanceof Error && error.message === "CAST_RECEIVER_URL_IS_LOCALHOST"
@@ -1060,8 +1294,13 @@ export function AnimePlayer({
     const video = videoRef.current
 
     if (!video || !sourceUrl) {
-      flashCastError(new Error("Casting is not available in this browser."))
-      console.error("Casting is not available in this browser.")
+      flashCastError(new Error("Casting cannot start until media is loaded."))
+      console.error("Casting cannot start until media is loaded.")
+      return
+    }
+
+    if (castStartPromiseRef.current || isCastLoadingRef.current) {
+      showControls(true)
       return
     }
 
@@ -1069,33 +1308,53 @@ export function AnimePlayer({
       Boolean(getGoogleCastContext()) || (await ensureGoogleCastFramework())
 
     if (!googleCastReady) {
-      flashCastError(new Error("Casting is not available in this browser."))
+      flashCastError(new Error(getGoogleCastUnavailableReason()))
       return
     }
 
     showControls(true)
-    const shouldResume = !video.paused || isPlaying
+    const shouldResume = !video.paused || isPlayingRef.current
+
+    const startPromise = startGoogleCasting(video, shouldResume)
+    castStartPromiseRef.current = startPromise
+    setIsCastStarting(true)
 
     try {
-      await startGoogleCasting(video, shouldResume)
+      await startPromise
     } catch (error) {
       flashCastError(error)
       handleCastEnded()
+    } finally {
+      if (castStartPromiseRef.current === startPromise) {
+        castStartPromiseRef.current = null
+      }
+      setIsCastStarting(false)
     }
   }
 
   function handleCastEnded() {
     const video = videoRef.current
+    const castPosition = currentTimeRef.current
 
     video?.pause()
     clearCastMediaSync()
     castContentIdRef.current = null
     castFinishedHandledRef.current = false
+    castStartPromiseRef.current = null
+    setIsCastStarting(false)
     isCastLoadingRef.current = false
     isCastingRef.current = false
     setIsCasting(false)
     setIsPlaying(false)
     endMediaWait()
+
+    if (localPlaybackBeforeCastRef.current) {
+      localPlaybackBeforeCastRef.current = {
+        ...localPlaybackBeforeCastRef.current,
+        position: castPosition,
+      }
+    }
+
     restoreLocalSource({ preservePosition: true })
     showControls(true)
   }
@@ -1109,15 +1368,17 @@ export function AnimePlayer({
       return
     }
 
-    getGoogleCastSession()?.endSession(true)
+    safeEndGoogleCastSession(getGoogleCastSession(), true)
     handleCastEnded()
   }
 
   function handleTimeUpdate(event: React.SyntheticEvent<HTMLVideoElement>) {
     const video = event.currentTarget
-    const watchedSeconds = video.currentTime
+    const transcodeOffset =
+      statusRef.current === "transcoding" ? activeTranscodeStartRef.current : 0
+    const watchedSeconds = transcodeOffset + video.currentTime
     const measuredDuration = Number.isFinite(video.duration)
-      ? video.duration
+      ? video.duration + transcodeOffset
       : undefined
 
     updateWatchedProgress(watchedSeconds, measuredDuration)
@@ -1133,24 +1394,29 @@ export function AnimePlayer({
     }
 
     void saveProgress(
-      video.currentTime,
-      Number.isFinite(video.duration) ? video.duration : durationSeconds,
+      getPlaybackPosition(),
+      getStableDuration(
+        durationSeconds,
+        Number.isFinite(video.duration) ? video.duration : undefined,
+        duration
+      ),
       false
     )
   }
 
   function handleEnded() {
     const video = videoRef.current
-    const endedTime = Number.isFinite(video?.currentTime)
-      ? (video?.currentTime ?? currentTime)
-      : currentTime
-    const knownDuration = Number.isFinite(video?.duration)
-      ? video?.duration
-      : durationSeconds
+    const endedTime = video ? getPlaybackPosition() : currentTime
+    const knownDuration = getStableDuration(
+      durationSeconds,
+      Number.isFinite(video?.duration) ? video?.duration : undefined,
+      duration
+    )
 
     completePlayback(endedTime, knownDuration)
   }
 
+  const displayedCurrentTime = seekPreview ?? currentTime
   const canSkipIntro = duration > 90 && currentTime < 90
   const canSkipOutro = duration > 180 && duration - currentTime <= 120
   const controlsAreVisible = controlsVisible || !isPlaying || isCasting
@@ -1186,11 +1452,16 @@ export function AnimePlayer({
           }`}
           playsInline
           preload="none"
+          poster={thumbnailUrl}
           src={sourceUrl ?? undefined}
           onDurationChange={(event) => {
-            const nextDuration = event.currentTarget.duration
+            const nextDuration = getStableDuration(
+              durationSeconds,
+              event.currentTarget.duration,
+              duration
+            )
 
-            if (Number.isFinite(nextDuration)) {
+            if (nextDuration > 0) {
               setDuration(nextDuration)
             }
           }}
@@ -1342,8 +1613,8 @@ export function AnimePlayer({
                     ? "border-red-500/70 text-red-400 ring-2 ring-red-500/40"
                     : ""
                 }`}
-                title={canCast ? "Cast" : "Try casting"}
-                disabled={!sourceUrl && !isCasting}
+                title={canCast ? "Cast" : getGoogleCastUnavailableReason()}
+                disabled={(!sourceUrl && !isCasting) || isCastStarting}
                 onClick={startCasting}
               >
                 <Cast className="size-4" />
@@ -1373,16 +1644,51 @@ export function AnimePlayer({
           ) : null}
 
           <div className="absolute inset-x-0 bottom-0 space-y-3 bg-gradient-to-t from-black/85 via-black/45 to-transparent p-3">
-            <input
-              type="range"
-              min={0}
-              max={duration || 0}
-              step={0.25}
-              value={duration ? Math.min(currentTime, duration) : 0}
-              onChange={(event) => void seekTo(Number(event.target.value))}
-              disabled={!duration}
-              className="h-2 w-full accent-red-600"
-            />
+            <div className="relative">
+              {seekPreviewFrame ? (
+                <div
+                  className="pointer-events-none absolute bottom-5 z-10 w-40 -translate-x-1/2 overflow-hidden rounded-md border border-white/15 bg-zinc-950 shadow-xl"
+                  style={{ left: `${seekPreviewFrame.leftPercent}%` }}
+                >
+                  {getSeekPreviewFrameUrl(seekPreviewFrame.time) ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={getSeekPreviewFrameUrl(seekPreviewFrame.time) ?? undefined}
+                      alt=""
+                      className="aspect-video w-full object-cover"
+                    />
+                  ) : null}
+                  <div className="px-2 py-1 text-center text-[11px] text-zinc-200 tabular-nums">
+                    {formatTime(seekPreviewFrame.time)}
+                  </div>
+                </div>
+              ) : null}
+              <input
+                type="range"
+                min={0}
+                max={duration || 0}
+                step={0.25}
+                value={duration ? Math.min(displayedCurrentTime, duration) : 0}
+                onChange={(event) => updateSeekDragPreview(event.target.value)}
+                onPointerMove={(event) =>
+                  updateSeekHoverPreview(
+                    event.currentTarget,
+                    event.clientX
+                  )
+                }
+                onPointerLeave={() => {
+                  if (seekPreview === null) {
+                    clearSeekPreviewFrame()
+                  }
+                }}
+                onPointerUp={(event) => commitSeekInput(event.currentTarget.value)}
+                onPointerCancel={clearSeekPreviewFrame}
+                onKeyUp={(event) => commitSeekInput(event.currentTarget.value)}
+                onBlur={(event) => commitSeekInput(event.currentTarget.value)}
+                disabled={!duration}
+                className="h-2 w-full accent-red-600"
+              />
+            </div>
 
             <div className="grid gap-3 sm:grid-cols-[auto_1fr_auto] sm:items-center">
               <div className="flex items-center gap-2">
@@ -1393,7 +1699,7 @@ export function AnimePlayer({
                   className="bg-zinc-950/80"
                   onClick={() => {
                     if (previousEpisode && onEpisodeChange) {
-                      onEpisodeChange(previousEpisode, true)
+                      onEpisodeChange(previousEpisode, isPlayingRef.current)
                     }
                   }}
                   disabled={!previousEpisode}
@@ -1421,7 +1727,7 @@ export function AnimePlayer({
                   className="bg-zinc-950/80"
                   onClick={() => {
                     if (nextEpisode && onEpisodeChange) {
-                      onEpisodeChange(nextEpisode, true)
+                      onEpisodeChange(nextEpisode, isPlayingRef.current)
                     }
                   }}
                   disabled={!nextEpisode}
@@ -1432,7 +1738,7 @@ export function AnimePlayer({
               </div>
 
               <span className="text-xs text-zinc-300 tabular-nums sm:text-center">
-                {formatTime(currentTime)} / {formatTime(duration)}
+                {formatTime(displayedCurrentTime)} / {formatTime(duration)}
               </span>
 
               <Button
