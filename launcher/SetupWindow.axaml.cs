@@ -44,12 +44,12 @@ public partial class SetupWindow : Window
         var uri = folders[0].Path;
         if (uri != null && uri.IsAbsoluteUri)
         {
-            SetTextBoxValue("OutputFolderBox", uri.LocalPath);
+            SetTextBoxValue("InputFolderBox", uri.LocalPath);
         }
         else
         {
             // fallback: show the URI string or use storage APIs to access files
-            SetTextBoxValue("OutputFolderBox", uri?.ToString() ?? string.Empty);
+            SetTextBoxValue("InputFolderBox", uri?.ToString() ?? string.Empty);
         }
     }
 
