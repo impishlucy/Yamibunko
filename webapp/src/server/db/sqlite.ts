@@ -182,20 +182,6 @@ function initializeSchema(db: YamibunkoDatabase) {
       FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
     );
 
-    CREATE TABLE IF NOT EXISTS anilist_media_entries (
-      username TEXT NOT NULL COLLATE NOCASE,
-      media_id INTEGER NOT NULL,
-      list_entry_id INTEGER,
-      status TEXT,
-      progress INTEGER NOT NULL DEFAULT 0,
-      score REAL,
-      score_format TEXT,
-      fetched_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      PRIMARY KEY (username, media_id),
-      FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
-    );
-
     CREATE INDEX IF NOT EXISTS anime_library_slug_idx ON anime(library_slug);
     CREATE INDEX IF NOT EXISTS anime_relations_related_idx
       ON anime_relations(related_anime_id);
@@ -209,8 +195,6 @@ function initializeSchema(db: YamibunkoDatabase) {
     CREATE INDEX IF NOT EXISTS jobs_created_at_idx ON jobs(created_at);
     CREATE INDEX IF NOT EXISTS anilist_connections_user_id_idx
       ON anilist_connections(anilist_user_id);
-    CREATE INDEX IF NOT EXISTS anilist_media_entries_media_id_idx
-      ON anilist_media_entries(media_id);
   `)
 }
 

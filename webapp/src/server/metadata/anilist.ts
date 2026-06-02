@@ -146,14 +146,6 @@ function pickRootCandidate(metadata: AnimeMetadataInput) {
     return prequel
   }
 
-  const anyPrequel = relations.find(
-    (relation) => relation.relationType === "PREQUEL"
-  )
-
-  if (anyPrequel) {
-    return anyPrequel
-  }
-
   if (sideStoryFormats.has(format)) {
     return (
       relations.find((relation) =>
@@ -340,10 +332,4 @@ export async function findAnimeMetadata(title: string, season?: number) {
   console.warn(`[Warn] [Anilist] No anime metadata match found - ${title}`)
 
   return null
-}
-
-export async function findAnimeMetadataById(id: number) {
-  const metadata = await fetchAnimeMetadataById(id)
-
-  return metadata ? attachLibraryInfo(metadata) : null
 }

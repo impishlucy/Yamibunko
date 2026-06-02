@@ -4,7 +4,7 @@ import { getCurrentUser } from "@/server/auth/session"
 import {
   exchangeAniListAuthorizationCode,
   getAniListViewer,
-  syncAniListUserList,
+  syncAniListLibraryProgress,
 } from "@/server/anilist/client"
 import { upsertAniListConnection } from "@/server/db/anilistConnections"
 import { joinBaseUrl } from "@/server/http/baseUrl"
@@ -70,7 +70,7 @@ export async function GET(request: Request) {
       tokenType: token.tokenType,
     })
 
-    await syncAniListUserList(user.username).catch((syncError) => {
+    await syncAniListLibraryProgress(user.username).catch((syncError) => {
       console.error(
         `[Error] [Anilist] Initial list sync failed - oauth/callback/route.ts - ${errorMessage(syncError)}`
       )

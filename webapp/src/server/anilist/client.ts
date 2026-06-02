@@ -9,12 +9,6 @@ import {
   getSafeAniListConnection,
   markAniListConnectionSynced,
 } from "@/server/db/anilistConnections"
-import {
-  getAniListMediaEntry,
-  replaceAniListMediaEntries,
-  upsertAniListMediaEntry,
-  type AniListMediaEntryInput,
-} from "@/server/db/anilistMediaEntries"
 import { markEpisodesCompleteThrough } from "@/server/db/library"
 import { joinBaseUrl } from "@/server/http/baseUrl"
 import { getPublicBaseUrl } from "@/server/http/request"
@@ -256,22 +250,6 @@ function flattenListEntries(collection: AniListListCollection) {
   )
 }
 
-function toLocalListEntry(
-  entry: AniListListEntry | null | undefined
-): AniListMediaEntryInput | null {
-  if (!entry?.mediaId) {
-    return null
-  }
-
-  return {
-    mediaId: entry.mediaId,
-    listEntryId: entry.id,
-    status: entry.status,
-    progress: entry.progress ?? 0,
-    score: entry.score ?? null,
-  }
-}
-
 async function readUserInfo(input: {
   accessToken: string
   aniListUserId: number
@@ -297,30 +275,32 @@ async function readUserAnimeList(input: {
   return flattenListEntries(result as AniListListCollection)
 }
 
-async function ensureLocalAniListCache(username: string) {
-  const connection = getAniListConnection(username)
+async function readMediaListEntry(input: {
+  username: string
+  animeId: number
+  accessToken: string
+}) {
+  const connection = getAniListConnection(input.username)
 
   if (!connection) {
     return null
   }
 
-  if (!connection.lastListSyncAt) {
-    await syncAniListUserList(username)
-  }
-
-  return getAniListConnection(username)
-}
-
-function readLocalMediaListEntry(input: {
-  username: string
-  animeId: number
-}) {
-  const entry = getAniListMediaEntry(input.username, input.animeId)
+  const userInfo = await readUserInfo({
+    accessToken: input.accessToken,
+    aniListUserId: connection.aniListUserId,
+  })
+  const scoreFormat = userInfo?.mediaListOptions?.scoreFormat ?? null
+  const entries = await readUserAnimeList({
+    accessToken: input.accessToken,
+    aniListUserId: connection.aniListUserId,
+  })
 
   return {
-    entry,
-    scoreFormat: entry?.scoreFormat ?? null,
-    ratingScale: getRatingScale(entry?.scoreFormat ?? null),
+    entry:
+      entries.find((entry) => entry.mediaId === input.animeId) ?? null,
+    scoreFormat,
+    ratingScale: getRatingScale(scoreFormat),
   }
 }
 
@@ -348,11 +328,21 @@ export async function getAniListTrackingState(
     }
   }
 
-  await ensureLocalAniListCache(username)
+  const accessToken = getAniListAccessTokenForUser(username)
 
-  const listState = readLocalMediaListEntry({
+  if (!accessToken) {
+    return {
+      configured: isAniListConfigured(),
+      connected: false,
+      entry: null,
+      ratingScale: 10,
+    }
+  }
+
+  const listState = await readMediaListEntry({
     username,
     animeId,
+    accessToken,
   })
   const entry = listState?.entry ?? null
 
@@ -374,9 +364,9 @@ export async function getAniListTrackingState(
     user: safeConnection,
     entry: entry
       ? {
-          id: entry.listEntryId ?? entry.mediaId,
+          id: entry.id,
           status: entry.status,
-          progress: entry.progress,
+          progress: entry.progress ?? 0,
           score: entry.score ?? null,
           rating: scoreToRating(entry.score, listState?.scoreFormat ?? null),
         }
@@ -397,11 +387,10 @@ export async function saveAniListProgress(input: {
     return null
   }
 
-  await ensureLocalAniListCache(input.username)
-
-  const current = readLocalMediaListEntry({
+  const current = await readMediaListEntry({
     username: input.username,
     animeId: input.animeId,
+    accessToken,
   })
   const status = watchingStatuses.has(current?.entry?.status ?? "")
     ? (toMediaListStatus(current?.entry?.status) ?? mediaListStatus.Current)
@@ -414,15 +403,6 @@ export async function saveAniListProgress(input: {
       score: current?.entry?.score ?? undefined,
     })
   )
-  const savedEntry = toLocalListEntry(saved.SaveMediaListEntry as AniListListEntry)
-
-  if (savedEntry) {
-    upsertAniListMediaEntry({
-      username: input.username,
-      entry: savedEntry,
-      scoreFormat: current.scoreFormat,
-    })
-  }
 
   markEpisodesCompleteThrough({
     username: input.username,
@@ -448,11 +428,10 @@ export async function saveAniListRating(input: {
     return null
   }
 
-  await ensureLocalAniListCache(input.username)
-
-  const current = readLocalMediaListEntry({
+  const current = await readMediaListEntry({
     username: input.username,
     animeId: input.animeId,
+    accessToken,
   })
   const status = toMediaListStatus(current?.entry?.status) ?? mediaListStatus.Current
   const progress = current?.entry?.progress ?? 0
@@ -465,15 +444,6 @@ export async function saveAniListRating(input: {
       score,
     })
   )
-  const savedEntry = toLocalListEntry(saved.SaveMediaListEntry as AniListListEntry)
-
-  if (savedEntry) {
-    upsertAniListMediaEntry({
-      username: input.username,
-      entry: savedEntry,
-      scoreFormat: current.scoreFormat,
-    })
-  }
 
   console.log(
     `[Info] [Anilist] Saved rating - Anime id ${input.animeId}, Rating ${input.rating}/${current?.ratingScale ?? 10}`
@@ -482,7 +452,7 @@ export async function saveAniListRating(input: {
   return saved.SaveMediaListEntry ?? null
 }
 
-export async function syncAniListUserList(username: string) {
+export async function syncAniListLibraryProgress(username: string) {
   if (!isAniListConfigured()) {
     return { synced: false, reason: "not-configured" as const }
   }
@@ -493,25 +463,11 @@ export async function syncAniListUserList(username: string) {
     return { synced: false, reason: "not-connected" as const }
   }
 
-  const userInfo = await readUserInfo({
-    accessToken: connection.accessToken,
-    aniListUserId: connection.aniListUserId,
-  })
-  const scoreFormat = userInfo?.mediaListOptions?.scoreFormat ?? null
   const entries = await readUserAnimeList({
     accessToken: connection.accessToken,
     aniListUserId: connection.aniListUserId,
   })
-  const localEntries = entries
-    .map(toLocalListEntry)
-    .filter((entry): entry is AniListMediaEntryInput => Boolean(entry))
   let matchedEntries = 0
-
-  replaceAniListMediaEntries({
-    username,
-    entries: localEntries,
-    scoreFormat,
-  })
 
   for (const entry of entries) {
     if (!entry.mediaId || !entry.progress) {
@@ -532,10 +488,8 @@ export async function syncAniListUserList(username: string) {
   markAniListConnectionSynced(username)
 
   console.log(
-    `[Info] [Anilist] Synced user media list - User ${username}, Entries: ${entries.length}, Matched: ${matchedEntries}`
+    `[Info] [Anilist] Synced library progress - Entries: ${entries.length}, Matched: ${matchedEntries}`
   )
 
-  return { synced: true, entries: entries.length, matchedEntries }
+  return { synced: true, matchedEntries }
 }
-
-export const syncAniListLibraryProgress = syncAniListUserList

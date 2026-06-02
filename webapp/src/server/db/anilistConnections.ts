@@ -100,27 +100,6 @@ export function getSafeAniListConnection(username: string) {
   return row ? toSafeConnection(row) : null
 }
 
-export function listAniListConnections() {
-  return getDb()
-    .query<AniListConnectionRow>(
-      `
-      SELECT
-        username,
-        anilist_user_id,
-        anilist_username,
-        access_token_ciphertext,
-        token_type,
-        connected_at,
-        updated_at,
-        last_list_sync_at
-      FROM anilist_connections
-      ORDER BY username ASC
-    `
-    )
-    .all()
-    .map(toConnection)
-}
-
 export function upsertAniListConnection(input: {
   username: string
   aniListUserId: number

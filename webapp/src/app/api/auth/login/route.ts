@@ -2,12 +2,10 @@ import { z } from "zod"
 
 import { requireSameOriginRequest } from "@/server/auth/api"
 import { createSession, setSessionCookie } from "@/server/auth/session"
-import { syncAniListUserList } from "@/server/anilist/client"
 import { isStrongPassword, maxPasswordLength } from "@/lib/password-policy"
 import { hashPassword, verifyPassword } from "@/server/auth/password"
 import { getUser, setUserPasswordHash } from "@/server/db/users"
 import { isSecureRequest } from "@/server/http/request"
-import { errorMessage } from "@/server/utils/format"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -76,12 +74,6 @@ export async function POST(request: Request) {
     request.headers.get("user-agent")
   )
   await setSessionCookie(session.token, session.expires)
-
-  void syncAniListUserList(user.username).catch((error) => {
-    console.error(
-      `[Error] [Anilist] Login media list refresh failed - login/route.ts - ${errorMessage(error)}`
-    )
-  })
 
   return Response.json({
     ok: true,

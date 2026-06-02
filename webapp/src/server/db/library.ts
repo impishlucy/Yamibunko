@@ -828,21 +828,6 @@ export function listEpisodeFilePaths() {
     .map((row) => row.file_path)
 }
 
-export function listAnimeIdsForAniListRefresh() {
-  return getDb()
-    .query<{ id: number }>(
-      `
-      SELECT DISTINCT a.id
-      FROM anime a
-      INNER JOIN episodes e ON e.anime_id = a.id
-      WHERE COALESCE(a.status, '') <> 'FINISHED'
-      ORDER BY a.id ASC
-    `
-    )
-    .all()
-    .map((row) => row.id)
-}
-
 export function deleteEpisodeByPath(filePath: string) {
   const episode = getEpisodeByPath(filePath)
 
