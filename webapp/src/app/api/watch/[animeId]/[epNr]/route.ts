@@ -4,6 +4,10 @@ import {
   getEpisode,
   getEpisodeNeighbors,
 } from "@/server/media/libraryStore"
+import { joinBaseUrl } from "@/server/http/baseUrl"
+import { getPublicBaseUrl } from "@/server/http/request"
+import { createCastStreamToken } from "@/server/media/castTokens"
+import { parsePositiveInt } from "@/server/utils/format"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -24,18 +28,10 @@ export async function GET(request: Request, context: WatchContext) {
 
   const { animeId, epNr } = await context.params
   const url = new URL(request.url)
-  const seasonNumber = Number.parseInt(
-    url.searchParams.get("season") ?? "1",
-    10
-  )
-  const episodeNumber = Number.parseInt(epNr, 10)
+  const seasonNumber = parsePositiveInt(url.searchParams.get("season") ?? "1")
+  const episodeNumber = parsePositiveInt(epNr)
 
-  if (
-    !Number.isInteger(seasonNumber) ||
-    !Number.isInteger(episodeNumber) ||
-    seasonNumber < 1 ||
-    episodeNumber < 1
-  ) {
+  if (!seasonNumber || !episodeNumber) {
     return Response.json({ error: "Episode not found" }, { status: 404 })
   }
 
@@ -59,6 +55,14 @@ export async function GET(request: Request, context: WatchContext) {
   })
   const base = `/api/watch/${encodeURIComponent(animeId)}/${episodeNumber}/stream`
   const commonQuery = `season=${seasonNumber}`
+  const castBase = joinBaseUrl(await getPublicBaseUrl(), base)
+  const castToken = createCastStreamToken({
+    username: auth.user.username,
+    animeId,
+    seasonNumber,
+    episodeNumber,
+  })
+  const castTokenQuery = `castToken=${encodeURIComponent(castToken)}`
 
   return Response.json({
     anime,
@@ -68,6 +72,8 @@ export async function GET(request: Request, context: WatchContext) {
       directUrl: `${base}?${commonQuery}&mode=direct&profile=original`,
       originalTranscodeUrl: `${base}?${commonQuery}&mode=transcode&profile=original`,
       dataSaverUrl: `${base}?${commonQuery}&mode=transcode&profile=dataSaver`,
+      castDirectUrl: `${castBase}?${commonQuery}&mode=direct&profile=original&${castTokenQuery}`,
+      castTranscodeUrl: `${castBase}?${commonQuery}&mode=transcode&profile=original&${castTokenQuery}`,
     },
   })
 }

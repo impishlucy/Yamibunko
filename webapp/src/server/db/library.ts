@@ -1,8 +1,15 @@
-import type { AnimeInfo, AnimeSummary, Episode } from "@/lib/types"
+import type { AnimeInfo, AnimeSummary, AnimeVariant, Episode } from "@/lib/types"
 import { getDb, nowIso } from "@/server/db/sqlite"
+import {
+  fileName as baseFileName,
+  parsePositiveInt,
+} from "@/server/utils/format"
 
 type AnimeRow = {
   id: number
+  library_slug: string | null
+  format: string | null
+  relation_kind: string | null
   title_romaji: string | null
   title_english: string | null
   title_native: string | null
@@ -18,7 +25,22 @@ type AnimeRow = {
 }
 
 type AnimeListRow = AnimeRow & {
+  slug: string
+  library_title: string
+  primary_anime_id: number
   local_episode_count: number
+  media_count: number
+}
+
+type LibraryEntryRow = {
+  slug: string
+  title: string
+  primary_anime_id: number
+}
+
+type AnimeVariantRow = AnimeRow & {
+  local_episode_count: number
+  first_season_nr: number | null
 }
 
 type EpisodeRow = {
@@ -42,8 +64,97 @@ type AnimeTagRow = {
   isAdult: number | null
 }
 
+function animeTitle(metadata: Pick<AnimeMetadataInput, "id" | "title">) {
+  const title =
+    metadata.title.english ??
+    metadata.title.userPreferred ??
+    metadata.title.romaji ??
+    metadata.title.native
+
+  if (!title) {
+    throw new Error(`AniList media ${metadata.id} did not include a usable title`)
+  }
+
+  return title
+}
+
+function requireLibrarySlug(row: AnimeRow) {
+  if (!row.library_slug) {
+    throw new Error(`Anime ${row.id} is not linked to a library entry`)
+  }
+
+  return row.library_slug
+}
+
+function requireLibrary(metadata: AnimeMetadataInput) {
+  if (!metadata.library) {
+    throw new Error(`AniList media ${metadata.id} did not resolve a library root`)
+  }
+
+  return metadata.library
+}
+
+function ensureLibraryEntry(input: {
+  slug: string
+  title: string
+  primaryAnimeId: number
+}) {
+  if (!input.slug.trim()) {
+    throw new Error(`Library root ${input.primaryAnimeId} did not include a usable slug`)
+  }
+
+  if (!input.title.trim()) {
+    throw new Error(`Library root ${input.primaryAnimeId} did not include a usable title`)
+  }
+
+  const now = nowIso()
+  const existing = getDb()
+    .query<{ primary_anime_id: number }>(
+      "SELECT primary_anime_id FROM library_entries WHERE slug = ?"
+    )
+    .get(input.slug)
+
+  if (existing && existing.primary_anime_id !== input.primaryAnimeId) {
+    throw new Error(
+      `Library slug collision for "${input.slug}": existing root ${existing.primary_anime_id}, new root ${input.primaryAnimeId}`
+    )
+  }
+
+  getDb()
+    .query(
+      `
+      INSERT INTO library_entries (
+        slug,
+        title,
+        primary_anime_id,
+        created_at,
+        updated_at
+      )
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(slug) DO UPDATE SET
+        title = excluded.title,
+        primary_anime_id = excluded.primary_anime_id,
+        updated_at = excluded.updated_at
+    `
+    )
+    .run(input.slug, input.title, input.primaryAnimeId, now, now)
+
+  return input.slug
+}
+
 export type AnimeMetadataInput = {
   id: number
+  format?: string | null
+  library?: {
+    slug: string
+    title: string
+    primaryAnimeId: number
+    relationKind: string
+  }
+  relations?: Array<{
+    relationType: string
+    media: AnimeMetadataInput
+  }>
   title: {
     romaji?: string | null
     english?: string | null
@@ -119,11 +230,18 @@ function toAnimeInfo(
   row: AnimeRow,
   seasons = listSeasonsForAnimeId(row.id),
   genres = listGenresForAnimeId(row.id),
-  tags = listTagsForAnimeId(row.id)
+  tags = listTagsForAnimeId(row.id),
+  variants?: AnimeVariant[]
 ): AnimeInfo {
+  const librarySlug = requireLibrarySlug(row)
+
   return {
     id: row.id,
+    slug: librarySlug,
+    librarySlug,
     title: row.title_user_preferred,
+    format: row.format ?? undefined,
+    relationKind: row.relation_kind ?? undefined,
     titles: {
       romaji: row.title_romaji ?? undefined,
       english: row.title_english ?? undefined,
@@ -141,6 +259,7 @@ function toAnimeInfo(
     tags,
     description: row.description ?? undefined,
     seasons,
+    variants,
   }
 }
 
@@ -196,7 +315,6 @@ function replaceAnimeTags(
 }
 
 function toEpisode(row: EpisodeRow): Episode {
-  const fileName = row.file_path.split(/[\\/]/).at(-1) ?? row.file_path
   const durationSeconds =
     row.duration_seconds ?? row.watched_duration_seconds ?? undefined
   const watchedSeconds = row.watched_seconds ?? 0
@@ -211,7 +329,7 @@ function toEpisode(row: EpisodeRow): Episode {
     animeId: row.anime_id,
     seasonNumber: row.season_nr,
     episodeNumber: row.ep_nr,
-    fileName,
+    fileName: baseFileName(row.file_path),
     filePath: row.file_path,
     thumbnail: `/api/anime/${row.anime_id}/episodes/${row.ep_nr}/thumbnail?season=${row.season_nr}`,
     durationSeconds,
@@ -227,20 +345,18 @@ function toEpisode(row: EpisodeRow): Episode {
   }
 }
 
-export function upsertAnime(metadata: AnimeMetadataInput) {
+function upsertAnimeBase(metadata: AnimeMetadataInput) {
   const now = nowIso()
-  const titleUserPreferred =
-    metadata.title.userPreferred ??
-    metadata.title.english ??
-    metadata.title.romaji ??
-    metadata.title.native ??
-    `AniList ${metadata.id}`
+  const titleUserPreferred = animeTitle(metadata)
 
   getDb()
     .query(
       `
       INSERT INTO anime (
         id,
+        library_slug,
+        format,
+        relation_kind,
         title_romaji,
         title_english,
         title_native,
@@ -256,8 +372,11 @@ export function upsertAnime(metadata: AnimeMetadataInput) {
         created_at,
         updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
+        library_slug = COALESCE(excluded.library_slug, anime.library_slug),
+        format = excluded.format,
+        relation_kind = COALESCE(excluded.relation_kind, anime.relation_kind),
         title_romaji = excluded.title_romaji,
         title_english = excluded.title_english,
         title_native = excluded.title_native,
@@ -275,6 +394,9 @@ export function upsertAnime(metadata: AnimeMetadataInput) {
     )
     .run(
       metadata.id,
+      metadata.library?.slug ?? null,
+      metadata.format ?? null,
+      metadata.library?.relationKind ?? null,
       metadata.title.romaji ?? null,
       metadata.title.english ?? null,
       metadata.title.native ?? null,
@@ -290,9 +412,75 @@ export function upsertAnime(metadata: AnimeMetadataInput) {
       now,
       now
     )
+}
+
+function replaceAnimeRelations(
+  animeId: number,
+  relations: NonNullable<AnimeMetadataInput["relations"]>
+) {
+  getDb().query("DELETE FROM anime_relations WHERE anime_id = ?").run(animeId)
+
+  const statement = getDb().query(
+    "INSERT OR IGNORE INTO anime_relations (anime_id, related_anime_id, relation_type) VALUES (?, ?, ?)"
+  )
+
+  for (const relation of relations) {
+    statement.run(animeId, relation.media.id, relation.relationType)
+  }
+}
+
+export function upsertAnime(metadata: AnimeMetadataInput) {
+  const library = requireLibrary(metadata)
+  const relations = metadata.relations ?? []
+  const rootMetadata =
+    library.primaryAnimeId === metadata.id
+      ? metadata
+      : relations.find((relation) => relation.media.id === library.primaryAnimeId)
+          ?.media
+
+  if (!rootMetadata) {
+    throw new Error(
+      `AniList media ${metadata.id} did not include its resolved library root ${library.primaryAnimeId}`
+    )
+  }
+
+  upsertAnimeBase({
+    ...rootMetadata,
+    library: {
+      ...library,
+      relationKind:
+        rootMetadata.id === metadata.id ? library.relationKind : "self",
+    },
+  })
+
+  const librarySlug = ensureLibraryEntry(library)
+  const normalizedLibrary = {
+    ...library,
+    slug: librarySlug,
+  }
+
+  for (const relation of relations) {
+    upsertAnimeBase(
+      relation.media.id === normalizedLibrary.primaryAnimeId
+        ? {
+            ...relation.media,
+            library: {
+              ...normalizedLibrary,
+              relationKind: "self",
+            },
+          }
+        : relation.media
+    )
+  }
+
+  upsertAnimeBase({
+    ...metadata,
+    library: normalizedLibrary,
+  })
 
   replaceAnimeGenres(metadata.id, metadata.genres ?? [])
   replaceAnimeTags(metadata.id, metadata.tags ?? [])
+  replaceAnimeRelations(metadata.id, metadata.relations ?? [])
 }
 
 export function upsertEpisode(input: {
@@ -342,34 +530,147 @@ export function listAnime(): AnimeSummary[] {
   return getDb()
     .query<AnimeListRow>(
       `
-      SELECT a.*, COUNT(e.ep_nr) AS local_episode_count
-      FROM anime a
-      LEFT JOIN episodes e ON e.anime_id = a.id
-      GROUP BY a.id
+      SELECT
+        le.slug,
+        le.title AS library_title,
+        le.primary_anime_id,
+        root.id,
+        root.library_slug,
+        root.format,
+        root.relation_kind,
+        root.title_romaji,
+        root.title_english,
+        root.title_native,
+        root.title_user_preferred,
+        root.status,
+        root.description,
+        root.season_year,
+        root.episodes,
+        root.duration,
+        root.cover_image,
+        root.banner_image,
+        root.average_score,
+        COUNT(e.ep_nr) AS local_episode_count,
+        COUNT(DISTINCT a.id) AS media_count
+      FROM library_entries le
+      INNER JOIN anime a ON a.library_slug = le.slug
+      INNER JOIN episodes e ON e.anime_id = a.id
+      INNER JOIN anime root ON root.id = le.primary_anime_id
+      GROUP BY le.slug
       HAVING local_episode_count > 0
-      ORDER BY a.title_user_preferred ASC
+      ORDER BY le.title ASC
     `
     )
     .all()
     .map((row) => {
-      const anime = toAnimeInfo(row)
-
       return {
-        id: anime.id,
-        title: anime.title,
-        coverImage: anime.coverImage,
-        bannerImage: anime.bannerImage,
+        id: row.primary_anime_id,
+        slug: row.slug,
+        title: row.library_title,
+        coverImage: row.cover_image ?? undefined,
+        bannerImage: row.banner_image ?? undefined,
         episodeCount: row.local_episode_count,
-        year: anime.year,
+        mediaCount: row.media_count,
+        year: row.season_year ?? undefined,
       }
     })
 }
 
-export function getAnime(animeId: string | number) {
-  const id =
-    typeof animeId === "number" ? animeId : Number.parseInt(animeId, 10)
+function toAnimeVariant(row: AnimeVariantRow): AnimeVariant {
+  return {
+    id: row.id,
+    title: row.title_user_preferred,
+    format: row.format ?? undefined,
+    year: row.season_year ?? undefined,
+    episodeCount: row.local_episode_count,
+    seasonNumber: row.first_season_nr ?? undefined,
+  }
+}
 
-  if (!Number.isInteger(id)) {
+function listAnimeVariants(librarySlug: string) {
+  return getDb()
+    .query<AnimeVariantRow>(
+      `
+      SELECT
+        a.*,
+        COUNT(e.ep_nr) AS local_episode_count,
+        MIN(e.season_nr) AS first_season_nr
+      FROM anime a
+      INNER JOIN episodes e ON e.anime_id = a.id
+      WHERE a.library_slug = ?
+      GROUP BY a.id
+      HAVING local_episode_count > 0
+      ORDER BY
+        CASE a.format
+          WHEN 'TV' THEN 0
+          WHEN 'TV_SHORT' THEN 1
+          WHEN 'ONA' THEN 2
+          WHEN 'MOVIE' THEN 3
+          WHEN 'SPECIAL' THEN 4
+          WHEN 'OVA' THEN 5
+          ELSE 6
+        END,
+        COALESCE(a.season_year, 9999),
+        a.title_user_preferred
+    `
+    )
+    .all(librarySlug)
+    .map(toAnimeVariant)
+}
+
+export function getLibraryEntry(
+  identifier: string,
+  selectedAnimeId?: string | number
+) {
+  const entry = getDb()
+    .query<LibraryEntryRow>(
+      "SELECT slug, title, primary_anime_id FROM library_entries WHERE slug = ?"
+    )
+    .get(identifier)
+
+  if (!entry) {
+    return null
+  }
+
+  const variants = listAnimeVariants(entry.slug)
+
+  if (variants.length === 0) {
+    return null
+  }
+
+  const selectedId = parsePositiveInt(selectedAnimeId)
+  const selectedVariant =
+    variants.find((variant) => variant.id === selectedId) ??
+    variants.find((variant) => variant.id === entry.primary_anime_id) ??
+    variants[0]
+
+  if (!selectedVariant) {
+    return null
+  }
+
+  const anime = getAnime(selectedVariant.id)
+
+  if (!anime) {
+    return null
+  }
+
+  return {
+    slug: entry.slug,
+    title: entry.title,
+    variants,
+    selected: {
+      ...anime,
+      slug: entry.slug,
+      librarySlug: entry.slug,
+      variants,
+    },
+  }
+}
+
+export function getAnime(animeId: string | number) {
+  const id = parsePositiveInt(animeId)
+
+  if (!id) {
     return null
   }
 
@@ -380,35 +681,10 @@ export function getAnime(animeId: string | number) {
   return row ? toAnimeInfo(row) : null
 }
 
-export function findAnimeByTitle(title: string) {
-  const normalized = title.trim()
-
-  if (!normalized) {
-    return null
-  }
-
-  const row = getDb()
-    .query<AnimeRow>(
-      `
-      SELECT *
-      FROM anime
-      WHERE title_user_preferred = ? COLLATE NOCASE
-         OR title_english = ? COLLATE NOCASE
-         OR title_romaji = ? COLLATE NOCASE
-         OR title_native = ? COLLATE NOCASE
-      LIMIT 1
-    `
-    )
-    .get(normalized, normalized, normalized, normalized)
-
-  return row ? toAnimeInfo(row) : null
-}
-
 export function listEpisodes(animeId: string | number, username?: string) {
-  const id =
-    typeof animeId === "number" ? animeId : Number.parseInt(animeId, 10)
+  const id = parsePositiveInt(animeId)
 
-  if (!Number.isInteger(id)) {
+  if (!id) {
     return []
   }
 
@@ -459,28 +735,12 @@ export function getStoredEpisode(
   epNr?: string | number,
   username?: string
 ) {
-  const id =
-    typeof animeId === "number" ? animeId : Number.parseInt(animeId, 10)
-  const seasonNumber =
-    epNr === undefined
-      ? 1
-      : typeof seasonOrEpNr === "number"
-        ? seasonOrEpNr
-        : Number.parseInt(seasonOrEpNr, 10)
+  const id = parsePositiveInt(animeId)
+  const seasonNumber = epNr === undefined ? 1 : parsePositiveInt(seasonOrEpNr)
   const episodeNumber =
-    epNr === undefined
-      ? typeof seasonOrEpNr === "number"
-        ? seasonOrEpNr
-        : Number.parseInt(seasonOrEpNr, 10)
-      : typeof epNr === "number"
-        ? epNr
-        : Number.parseInt(epNr, 10)
+    epNr === undefined ? parsePositiveInt(seasonOrEpNr) : parsePositiveInt(epNr)
 
-  if (
-    !Number.isInteger(id) ||
-    !Number.isInteger(seasonNumber) ||
-    !Number.isInteger(episodeNumber)
-  ) {
+  if (!id || !seasonNumber || !episodeNumber) {
     return null
   }
 
@@ -540,18 +800,11 @@ export function getEpisodeThumbnailPath(
   seasonNr: string | number,
   epNr: string | number
 ) {
-  const id =
-    typeof animeId === "number" ? animeId : Number.parseInt(animeId, 10)
-  const seasonNumber =
-    typeof seasonNr === "number" ? seasonNr : Number.parseInt(seasonNr, 10)
-  const episodeNumber =
-    typeof epNr === "number" ? epNr : Number.parseInt(epNr, 10)
+  const id = parsePositiveInt(animeId)
+  const seasonNumber = parsePositiveInt(seasonNr)
+  const episodeNumber = parsePositiveInt(epNr)
 
-  if (
-    !Number.isInteger(id) ||
-    !Number.isInteger(seasonNumber) ||
-    !Number.isInteger(episodeNumber)
-  ) {
+  if (!id || !seasonNumber || !episodeNumber) {
     return null
   }
 
@@ -600,9 +853,28 @@ export function pruneAnimeIfEmpty(animeId: number) {
       }>("SELECT COUNT(*) AS count FROM episodes WHERE anime_id = ?")
       .get(animeId)?.count ?? 0
 
-  if (remaining === 0) {
-    getDb().query("DELETE FROM anime WHERE id = ?").run(animeId)
+  if (remaining > 0) {
+    return
   }
+
+  const libraryStillHasFiles =
+    getDb()
+      .query<{ count: number }>(
+        `
+        SELECT COUNT(e.ep_nr) AS count
+        FROM library_entries le
+        INNER JOIN anime a ON a.library_slug = le.slug
+        INNER JOIN episodes e ON e.anime_id = a.id
+        WHERE le.primary_anime_id = ?
+      `
+      )
+      .get(animeId)?.count ?? 0
+
+  if (libraryStillHasFiles > 0) {
+    return
+  }
+
+  getDb().query("DELETE FROM anime WHERE id = ?").run(animeId)
 }
 
 export function getAdjacentEpisodes(input: {
@@ -683,6 +955,7 @@ export function markEpisodesCompleteThrough(input: {
 }) {
   const episodes = listEpisodes(input.animeId)
   const completedEpisodes = episodes.slice(0, Math.max(input.progress, 0))
+  const now = nowIso()
 
   for (const episode of completedEpisodes) {
     upsertEpisodeProgress({
@@ -695,4 +968,20 @@ export function markEpisodesCompleteThrough(input: {
       completed: true,
     })
   }
+
+  getDb()
+    .query(
+      `
+      UPDATE episode_progress
+      SET watched_seconds = 0,
+          completed = 0,
+          updated_at = ?
+      WHERE username = ?
+        AND anime_id = ?
+        AND ep_nr > ?
+    `
+    )
+    .run(now, input.username, input.animeId, Math.max(input.progress, 0))
+
+  return completedEpisodes.length
 }

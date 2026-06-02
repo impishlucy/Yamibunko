@@ -1,7 +1,8 @@
 import { z } from "zod"
 
 import { requireApiUser, requireSameOriginRequest } from "@/server/auth/api"
-import { hashPassword, isStrongPassword } from "@/server/auth/password"
+import { isStrongPassword, maxPasswordLength } from "@/lib/password-policy"
+import { hashPassword } from "@/server/auth/password"
 import { setUserPasswordHash } from "@/server/db/users"
 import { isSecureRequest } from "@/server/http/request"
 
@@ -9,7 +10,7 @@ export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
 const passwordSchema = z.object({
-  password: z.string().min(1).max(1024),
+  password: z.string().min(1).max(maxPasswordLength),
 })
 
 export async function POST(request: Request) {

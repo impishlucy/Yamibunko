@@ -1,10 +1,15 @@
 import { randomUUID } from "node:crypto"
+import { existsSync, readdirSync, readFileSync } from "node:fs"
 import os from "node:os"
 
 import { execa } from "execa"
 
 import type { TranscodeStatus } from "@/lib/types"
-import { getServerConfigResult } from "@/server/config"
+import type { PlaybackProfile } from "@/lib/types"
+import {
+  getServerConfigResult,
+  type TranscodeAcceleration,
+} from "@/server/config"
 
 export type LiveTranscodeLease = {
   id: string
@@ -17,19 +22,52 @@ type CpuSample = {
   total: number
 }
 
+type TranscodeKind = "live" | "audio" | "background" | "video"
+
+type PendingTranscodeRequest = {
+  id: string
+  label: string
+  kind: TranscodeKind
+  profile?: PlaybackProfile
+  priority: number
+  sequence: number
+  signal?: AbortSignal
+  resolve: (lease: LiveTranscodeLease) => void
+  reject: (error: Error) => void
+}
+
+type HardwarePressureSnapshot = {
+  pressure: number
+  source: string
+}
+
 const activeTranscodes = new Map<
   string,
   {
     label: string
+    kind: TranscodeKind
+    cost: number
     startedAt: number
   }
 >()
 
 let previousCpuSample: CpuSample | null = null
+let cachedHardwarePressure:
+  | {
+      acceleration: TranscodeAcceleration
+      snapshot: HardwarePressureSnapshot
+      readAt: number
+    }
+  | undefined
 
-function delay(milliseconds: number) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds))
-}
+const pressureCacheMs = 2000
+
+const hardwarePressureLimit = 0.9
+const queueRetryMs = 2000
+let pendingSequence = 0
+let queueRetryTimer: ReturnType<typeof setTimeout> | null = null
+let drainingQueue = false
+const pendingTranscodes: PendingTranscodeRequest[] = []
 
 function availableParallelism() {
   return Math.max(os.availableParallelism?.() ?? os.cpus().length ?? 1, 1)
@@ -73,12 +111,12 @@ function getCpuPressure() {
   return Math.min(Math.max(1 - idleDelta / totalDelta, 0), 1)
 }
 
-async function getNvidiaPressure() {
+async function getNvidiaPressureSnapshot(): Promise<HardwarePressureSnapshot | null> {
   try {
     const { stdout } = await execa(
       "nvidia-smi",
       [
-        "--query-gpu=utilization.gpu,utilization.encoder",
+        "--query-gpu=utilization.gpu,utilization.encoder,utilization.decoder,memory.used,memory.total",
         "--format=csv,noheader,nounits",
       ],
       {
@@ -86,41 +124,344 @@ async function getNvidiaPressure() {
         windowsHide: true,
       }
     )
-
-    const values = stdout.split(/\r?\n/).flatMap((line) =>
-      line
+    const gpuPressures = stdout.split(/\r?\n/).map((line) => {
+      const values = line
         .split(",")
         .map((value) => Number.parseFloat(value.trim()))
-        .filter(Number.isFinite)
-    )
 
-    if (values.length === 0) {
+      if (
+        values.length < 5 ||
+        values.some((value) => !Number.isFinite(value))
+      ) {
+        return 0
+      }
+
+      const [gpu, encoder, decoder, memoryUsed, memoryTotal] = values
+      const memoryPressure = memoryTotal > 0 ? memoryUsed / memoryTotal : 0
+
+      return Math.max(gpu / 100, encoder / 100, decoder / 100, memoryPressure)
+    })
+
+    if (gpuPressures.length === 0) {
       return null
     }
 
-    return Math.min(Math.max(Math.max(...values) / 100, 0), 1)
+    return {
+      pressure: clamp01(Math.max(...gpuPressures)),
+      source: "nvidia-smi",
+    }
   } catch {
     return null
   }
 }
 
-async function getHardwarePressure(acceleration: "nvenc" | "qsv" | "cpu") {
-  if (acceleration === "nvenc") {
-    return (await getNvidiaPressure()) ?? getCpuPressure()
+async function getWindowsGpuPressureSnapshot(): Promise<HardwarePressureSnapshot | null> {
+  if (process.platform !== "win32") {
+    return null
   }
 
-  return getCpuPressure()
+  try {
+    const { stdout } = await execa(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$samples=(Get-Counter '\\GPU Engine(*)\\Utilization Percentage').CounterSamples | Where-Object { $_.InstanceName -match 'engtype_(VideoEncode|VideoDecode|Compute|3D)' } | Select-Object -ExpandProperty CookedValue; $sum=($samples | Measure-Object -Sum).Sum; $max=($samples | Measure-Object -Maximum).Maximum; [Console]::Out.Write(\"$sum,$max\")",
+      ],
+      {
+        timeout: 1800,
+        windowsHide: true,
+      }
+    )
+    const [sum, max] = stdout
+      .trim()
+      .split(",")
+      .map((value) => Number.parseFloat(value))
+
+    if (!Number.isFinite(sum) && !Number.isFinite(max)) {
+      return null
+    }
+
+    return {
+      pressure: clamp01(Math.max(sum || 0, max || 0) / 100),
+      source: "windows-gpu-counters",
+    }
+  } catch {
+    return null
+  }
 }
 
-function getBaseCapacity(acceleration: "nvenc" | "qsv" | "cpu") {
+function readLinuxGpuBusyPressure(vendorId: string) {
+  if (process.platform !== "linux") {
+    return null
+  }
+
+  try {
+    const cardNames = readdirSync("/sys/class/drm").filter((entry) =>
+      /^card\d+$/.test(entry)
+    )
+
+    for (const cardName of cardNames) {
+      const vendorPath = `/sys/class/drm/${cardName}/device/vendor`
+      const busyPath = `/sys/class/drm/${cardName}/device/gpu_busy_percent`
+
+      if (!existsSync(vendorPath) || !existsSync(busyPath)) {
+        continue
+      }
+
+      const vendor = readFileSync(vendorPath, "utf8").trim().toLowerCase()
+
+      if (vendor !== vendorId) {
+        continue
+      }
+
+      const busyPercent = Number.parseFloat(readFileSync(busyPath, "utf8"))
+
+      if (Number.isFinite(busyPercent)) {
+        return clamp01(busyPercent / 100)
+      }
+    }
+  } catch {
+    return null
+  }
+
+  return null
+}
+
+function clamp01(value: number) {
+  return Math.min(Math.max(value, 0), 1)
+}
+
+async function getHardwarePressureSnapshot(
+  acceleration: TranscodeAcceleration
+): Promise<HardwarePressureSnapshot> {
+  const cached = cachedHardwarePressure
+
+  if (
+    cached &&
+    cached.acceleration === acceleration &&
+    Date.now() - cached.readAt < pressureCacheMs
+  ) {
+    return cached.snapshot
+  }
+
+  const snapshot =
+    acceleration === "nvenc"
+      ? ((await getNvidiaPressureSnapshot()) ?? {
+          pressure: getCpuPressure(),
+          source: "cpu-fallback",
+        })
+      : acceleration === "amd"
+        ? ((await getWindowsGpuPressureSnapshot()) ??
+          amdLinuxPressureSnapshot() ?? {
+            pressure: getCpuPressure(),
+            source: "cpu-fallback",
+          })
+        : acceleration === "qsv"
+          ? ((await getWindowsGpuPressureSnapshot()) ??
+            intelLinuxPressureSnapshot() ?? {
+              pressure: getCpuPressure(),
+              source: "cpu-fallback",
+            })
+          : {
+              pressure: getCpuPressure(),
+              source: "cpu",
+            }
+
+  cachedHardwarePressure = {
+    acceleration,
+    snapshot,
+    readAt: Date.now(),
+  }
+
+  return snapshot
+}
+
+function amdLinuxPressureSnapshot(): HardwarePressureSnapshot | null {
+  const pressure = readLinuxGpuBusyPressure("0x1002")
+
+  if (pressure === null) {
+    return null
+  }
+
+  return {
+    pressure,
+    source: "linux-amd-gpu-busy",
+  }
+}
+
+function intelLinuxPressureSnapshot(): HardwarePressureSnapshot | null {
+  const pressure = readLinuxGpuBusyPressure("0x8086")
+
+  if (pressure === null) {
+    return null
+  }
+
+  return {
+    pressure,
+    source: "linux-intel-gpu-busy",
+  }
+}
+
+function getTranscodeCost(
+  acceleration: TranscodeAcceleration,
+  kind: TranscodeKind,
+  profile?: PlaybackProfile
+) {
   if (acceleration === "cpu") {
-    return Math.max(1, Math.floor(availableParallelism() / 2))
+    if (kind === "live") {
+      return 0.35
+    }
+
+    if (kind === "audio") {
+      return 0.12
+    }
+
+    return 0.65
   }
 
-  return 2
+  if (kind === "live") {
+    return profile === "dataSaver" ? 0.14 : 0.16
+  }
+
+  if (kind === "audio") {
+    return 0.08
+  }
+
+  if (kind === "background") {
+    return 0.25
+  }
+
+  if (kind === "video") {
+    return 0.38
+  }
+
+  return 0.38
 }
 
-async function getDynamicCapacity() {
+function getActiveCost() {
+  return [...activeTranscodes.values()].reduce(
+    (total, transcode) => total + transcode.cost,
+    0
+  )
+}
+
+function getTranscodePriority(kind: TranscodeKind) {
+  if (kind === "live") {
+    return 0
+  }
+
+  if (kind === "audio") {
+    return 1
+  }
+
+  if (kind === "background") {
+    return 2
+  }
+
+  return 3
+}
+
+function scheduleQueueDrain() {
+  if (queueRetryTimer) {
+    return
+  }
+
+  queueRetryTimer = setTimeout(() => {
+    queueRetryTimer = null
+    void drainPendingTranscodes()
+  }, queueRetryMs)
+  queueRetryTimer.unref?.()
+}
+
+async function getCanFitTranscode(
+  kind: TranscodeKind,
+  profile?: PlaybackProfile
+) {
+  const result = getServerConfigResult()
+
+  if (!result.ok) {
+    return false
+  }
+
+  const acceleration = result.config.transcodeAccel
+
+  if (acceleration === "cpu") {
+    return activeTranscodes.size === 0
+  }
+
+  const snapshot = await getHardwarePressureSnapshot(acceleration)
+  const candidateCost = getTranscodeCost(acceleration, kind, profile)
+  const activeCost = getActiveCost()
+  const localPressureFloor = activeCost
+  const effectivePressure = Math.max(snapshot.pressure, localPressureFloor)
+
+  return effectivePressure + candidateCost <= hardwarePressureLimit
+}
+
+function removePendingRequest(id: string) {
+  const index = pendingTranscodes.findIndex((request) => request.id === id)
+
+  if (index >= 0) {
+    pendingTranscodes.splice(index, 1)
+  }
+}
+
+function sortPendingTranscodes() {
+  pendingTranscodes.sort((left, right) => {
+    if (left.priority !== right.priority) {
+      return left.priority - right.priority
+    }
+
+    return left.sequence - right.sequence
+  })
+}
+
+async function drainPendingTranscodes() {
+  if (drainingQueue) {
+    return
+  }
+
+  drainingQueue = true
+
+  try {
+    for (;;) {
+      sortPendingTranscodes()
+      const request = pendingTranscodes[0]
+
+      if (!request) {
+        return
+      }
+
+      if (request.signal?.aborted) {
+        removePendingRequest(request.id)
+        request.reject(new Error("Transcode request was cancelled"))
+        continue
+      }
+
+      const result = getServerConfigResult()
+
+      if (!result.ok || !(await getCanFitTranscode(request.kind, request.profile))) {
+        scheduleQueueDrain()
+        return
+      }
+
+      removePendingRequest(request.id)
+      request.resolve(
+        createLease(
+          request.label,
+          request.kind,
+          getTranscodeCost(result.config.transcodeAccel, request.kind, request.profile)
+        )
+      )
+    }
+  } finally {
+    drainingQueue = false
+  }
+}
+
+async function getDynamicLiveCapacity() {
   const result = getServerConfigResult()
 
   if (!result.ok) {
@@ -128,29 +469,34 @@ async function getDynamicCapacity() {
   }
 
   const acceleration = result.config.transcodeAccel
-  const baseCapacity = getBaseCapacity(acceleration)
-  const pressure = await getHardwarePressure(acceleration)
 
-  if (pressure >= 0.9) {
-    return 0
+  if (acceleration === "cpu") {
+    return activeTranscodes.size === 0 ? 1 : 0
   }
 
-  if (pressure >= 0.75) {
-    return Math.min(baseCapacity, 1)
-  }
+  const snapshot = await getHardwarePressureSnapshot(acceleration)
+  const liveCost = getTranscodeCost(acceleration, "live")
+  const activeCost = getActiveCost()
+  const effectivePressure = Math.max(snapshot.pressure, activeCost)
+  const remainingPressure = Math.max(
+    hardwarePressureLimit - effectivePressure,
+    0
+  )
 
-  if (pressure >= 0.55) {
-    return Math.min(baseCapacity, 2)
-  }
-
-  return baseCapacity
+  return Math.floor(remainingPressure / liveCost)
 }
 
-function createLease(label: string): LiveTranscodeLease {
+function createLease(
+  label: string,
+  kind: TranscodeKind,
+  cost: number
+): LiveTranscodeLease {
   const id = randomUUID()
   let released = false
   activeTranscodes.set(id, {
     label,
+    kind,
+    cost,
     startedAt: Date.now(),
   })
 
@@ -164,42 +510,96 @@ function createLease(label: string): LiveTranscodeLease {
 
       released = true
       activeTranscodes.delete(id)
+      void drainPendingTranscodes()
     },
   }
 }
 
 export async function getLiveTranscodeStatus(): Promise<TranscodeStatus> {
-  const dynamicCapacity = await getDynamicCapacity()
+  const available = await getDynamicLiveCapacity()
   const active = activeTranscodes.size
-  const max = Math.max(dynamicCapacity, active)
 
   return {
-    max,
+    max: active + available,
     active,
-    available: Math.max(dynamicCapacity - active, 0),
+    available,
+    queued: pendingTranscodes.filter((request) => request.kind === "live")
+      .length,
   }
 }
 
-export async function tryAcquireLiveTranscode(
-  label: string
-): Promise<LiveTranscodeLease | null> {
-  const status = await getLiveTranscodeStatus()
+function acquireQueuedTranscode(input: {
+  label: string,
+  kind: TranscodeKind
+  profile?: PlaybackProfile
+  signal?: AbortSignal
+}) {
+  const id = randomUUID()
 
-  if (status.available <= 0) {
-    return null
-  }
-
-  return createLease(label)
-}
-
-export async function acquireBackgroundTranscode(label: string) {
-  for (;;) {
-    const lease = await tryAcquireLiveTranscode(label)
-
-    if (lease) {
-      return lease
+  return new Promise<LiveTranscodeLease>((resolve, reject) => {
+    const request: PendingTranscodeRequest = {
+      id,
+      label: input.label,
+      kind: input.kind,
+      profile: input.profile,
+      priority: getTranscodePriority(input.kind),
+      sequence: pendingSequence++,
+      signal: input.signal,
+      resolve,
+      reject,
     }
 
-    await delay(5000)
-  }
+    const onAbort = () => {
+      removePendingRequest(id)
+      reject(new Error("Transcode request was cancelled"))
+    }
+
+    if (input.signal?.aborted) {
+      reject(new Error("Transcode request was cancelled"))
+      return
+    }
+
+    input.signal?.addEventListener("abort", onAbort, { once: true })
+    pendingTranscodes.push(request)
+
+    void drainPendingTranscodes().finally(() => {
+      if (!pendingTranscodes.some((pending) => pending.id === id)) {
+        input.signal?.removeEventListener("abort", onAbort)
+      }
+    })
+  })
+}
+
+export function acquireLiveTranscode(
+  label: string,
+  profile?: PlaybackProfile,
+  signal?: AbortSignal
+) {
+  return acquireQueuedTranscode({
+    label,
+    kind: "live",
+    profile,
+    signal,
+  })
+}
+
+export function acquireAudioTranscode(label: string) {
+  return acquireQueuedTranscode({
+    label,
+    kind: "audio",
+  })
+}
+
+export function acquireOtherTranscode(label: string) {
+  return acquireQueuedTranscode({
+    label,
+    kind: "background",
+  })
+}
+
+export function acquireVideoTranscode(label: string) {
+  return acquireQueuedTranscode({
+    label,
+    kind: "video",
+  })
 }

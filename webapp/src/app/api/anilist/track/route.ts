@@ -1,8 +1,11 @@
 import { z } from "zod"
 
 import { requireApiUser, requireSameOriginRequest } from "@/server/auth/api"
-import { saveAniListProgress } from "@/server/anilist/client"
-import { serverLog } from "@/server/logger"
+import {
+  saveAniListProgress,
+  saveAniListRating,
+} from "@/server/anilist/client"
+import { errorMessage } from "@/server/utils/format"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -10,6 +13,7 @@ export const dynamic = "force-dynamic"
 const trackSchema = z.object({
   animeId: z.number().int().positive(),
   progress: z.number().int().min(0).default(0),
+  rating: z.number().int().positive().optional(),
 })
 
 export async function POST(request: Request) {
@@ -35,12 +39,21 @@ export async function POST(request: Request) {
     )
   }
 
-  const entry = await saveAniListProgress({
-    username: auth.user.username,
-    animeId: parsed.data.animeId,
-    progress: parsed.data.progress,
-  }).catch((error) => {
-    serverLog.error("Anilist", "Progress sync failed.", { error })
+  const entry = await (parsed.data.rating
+    ? saveAniListRating({
+        username: auth.user.username,
+        animeId: parsed.data.animeId,
+        rating: parsed.data.rating,
+      })
+    : saveAniListProgress({
+        username: auth.user.username,
+        animeId: parsed.data.animeId,
+        progress: parsed.data.progress,
+      })
+  ).catch((error) => {
+    console.error(
+      `[Error] [Anilist] Sync failed - track/route.ts - ${errorMessage(error)}`
+    )
     return "sync-failed" as const
   })
 

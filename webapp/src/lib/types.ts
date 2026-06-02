@@ -1,13 +1,27 @@
 export type AnimeSummary = {
   id: number
+  slug: string
   title: string
   coverImage?: string
   bannerImage?: string
   episodeCount: number
+  mediaCount?: number
   year?: number
 }
 
+export type AnimeVariant = {
+  id: number
+  title: string
+  format?: string
+  year?: number
+  episodeCount: number
+  seasonNumber?: number
+}
+
 export type AnimeInfo = AnimeSummary & {
+  librarySlug: string
+  format?: string
+  relationKind?: string
   titles: {
     romaji?: string
     english?: string
@@ -28,6 +42,7 @@ export type AnimeInfo = AnimeSummary & {
     isAdult?: boolean | null
   }>
   seasons: number[]
+  variants?: AnimeVariant[]
 }
 
 export type Episode = {
@@ -50,6 +65,7 @@ export type TranscodeStatus = {
   max: number
   active: number
   available: number
+  queued: number
 }
 
 export type PlaybackProfile = "original" | "dataSaver"
@@ -64,6 +80,8 @@ export type WatchPayload = {
     directUrl: string
     originalTranscodeUrl: string
     dataSaverUrl: string
+    castDirectUrl: string
+    castTranscodeUrl: string
   }
 }
 

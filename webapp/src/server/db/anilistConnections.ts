@@ -12,6 +12,11 @@ type AniListConnectionRow = {
   last_list_sync_at: string | null
 }
 
+type SafeAniListConnectionRow = Omit<
+  AniListConnectionRow,
+  "access_token_ciphertext"
+>
+
 export type AniListConnection = {
   username: string
   aniListUserId: number
@@ -38,7 +43,9 @@ function toConnection(row: AniListConnectionRow): AniListConnection {
   }
 }
 
-function toSafeConnection(row: AniListConnectionRow): SafeAniListConnection {
+function toSafeConnection(
+  row: SafeAniListConnectionRow
+): SafeAniListConnection {
   return {
     username: row.username,
     aniListUserId: row.anilist_user_id,
@@ -74,13 +81,12 @@ export function getAniListConnection(username: string) {
 
 export function getSafeAniListConnection(username: string) {
   const row = getDb()
-    .query<AniListConnectionRow>(
+    .query<SafeAniListConnectionRow>(
       `
       SELECT
         username,
         anilist_user_id,
         anilist_username,
-        access_token_ciphertext,
         token_type,
         connected_at,
         updated_at,

@@ -9,7 +9,7 @@ import {
 import { upsertAniListConnection } from "@/server/db/anilistConnections"
 import { joinBaseUrl } from "@/server/http/baseUrl"
 import { getPublicBaseUrl, getRequestOrigin } from "@/server/http/request"
-import { serverLog } from "@/server/logger"
+import { errorMessage } from "@/server/utils/format"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -71,16 +71,16 @@ export async function GET(request: Request) {
     })
 
     await syncAniListLibraryProgress(user.username).catch((syncError) => {
-      serverLog.error("Anilist", "Initial list sync failed.", {
-        error: syncError,
-      })
+      console.error(
+        `[Error] [Anilist] Initial list sync failed - oauth/callback/route.ts - ${errorMessage(syncError)}`
+      )
     })
 
     return settingsRedirect(request, { anilist: "connected" })
   } catch (callbackError) {
-    serverLog.error("Anilist", "OAuth callback failed.", {
-      error: callbackError,
-    })
+    console.error(
+      `[Error] [Anilist] OAuth callback failed - oauth/callback/route.ts - ${errorMessage(callbackError)}`
+    )
     return settingsRedirect(request, { anilist: "failed" })
   }
 }

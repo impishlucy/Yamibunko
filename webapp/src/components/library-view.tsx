@@ -61,7 +61,7 @@ export function LibraryView() {
 
       {error ? <p className="text-sm text-red-300">{error}</p> : null}
 
-      <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6">
+      <div className="grid grid-cols-3 gap-3 sm:grid-cols-5 lg:grid-cols-7 xl:grid-cols-8 2xl:grid-cols-9">
         {loading
           ? Array.from({ length: 8 }).map((_, index) => (
               <Skeleton

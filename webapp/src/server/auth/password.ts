@@ -4,6 +4,8 @@ import {
   timingSafeEqual,
 } from "node:crypto"
 
+import { isStrongPassword, maxPasswordLength } from "@/lib/password-policy"
+
 const params = {
   cost: 16384,
   blockSize: 8,
@@ -34,17 +36,6 @@ function deriveKey(
   })
 }
 
-export function isStrongPassword(password: string) {
-  return (
-    password.length >= 32 &&
-    password.length <= 1024 &&
-    /[A-Z]/.test(password) &&
-    /[a-z]/.test(password) &&
-    /\d/.test(password) &&
-    /[^A-Za-z0-9]/.test(password)
-  )
-}
-
 export async function hashPassword(password: string) {
   if (!isStrongPassword(password)) {
     throw new Error("Password does not meet the account policy")
@@ -69,7 +60,7 @@ export async function hashPassword(password: string) {
 }
 
 export async function verifyPassword(password: string, storedHash: string) {
-  if (!password || password.length > 1024) {
+  if (!password || password.length > maxPasswordLength) {
     return false
   }
 

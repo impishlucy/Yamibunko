@@ -7,6 +7,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Net.Http;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -22,7 +23,11 @@ public class ServerManager
     private static readonly TimeSpan HardwareDetectionTimeout = TimeSpan.FromSeconds(8);
 
     private Process? _serverProcess;
+    private IntPtr _serverJobHandle = IntPtr.Zero;
+    private readonly object _shutdownLock = new();
     private readonly string _pidFile = Path.Combine(AppContext.BaseDirectory, "server.pid");
+
+    private LogWindow? _logWindow;
 
     public ObservableCollection<string> ServerLogs { get; } = new();
 
@@ -72,18 +77,27 @@ public class ServerManager
 
             var webappDir = ResolveWebAppDirectory();
 
-            Log("- - - - - - - - - - - - - - - - - - - -");
-            Log("Starting WebApp install process...");
-            await RunBunCommandAsync(settings, webappDir, "install");
+            if (webappDir != String.Empty)
+            {
+                Log("- - - - - - - - - - - - - - - - - - - -");
+                Log("Starting WebApp install process...");
+                await RunBunCommandAsync(settings, webappDir, "install");
 
-            Log("- - - - - - - - - - - - - - - - - - - -");
-            Log("Starting WebApp building process...");
-            await RunBunCommandAsync(settings, webappDir, "run", "build");
+                Log("- - - - - - - - - - - - - - - - - - - -");
+                Log("Starting WebApp building process...");
+                await RunBunCommandAsync(settings, webappDir, "run", "build");
 
-            Log("- - - - - - - - - - - - - - - - - - - -");
-            Log("Build complete. Starting WebApp...");
-            _serverProcess = StartBunServer(settings, webappDir);
-            File.WriteAllText(_pidFile, _serverProcess.Id.ToString());
+                Log("- - - - - - - - - - - - - - - - - - - -");
+                Log("Build complete. Starting WebApp...");
+                _serverProcess = StartBunServer(settings, webappDir);
+                File.WriteAllText(_pidFile, _serverProcess.Id.ToString());
+
+                OpenUrl(settings.BaseUrl);
+            } else
+            {
+                ShowLogsWindow();
+                throw new DirectoryNotFoundException("Could not find the webapp directory.");
+            }
         }
         catch (Exception ex)
         {
@@ -93,28 +107,37 @@ public class ServerManager
 
     public void StopServer()
     {
-        try
+        lock (_shutdownLock)
         {
-            if (_serverProcess != null)
+            var process = _serverProcess;
+            _serverProcess = null;
+
+            try
             {
-                if (!_serverProcess.HasExited)
+                if (process != null)
                 {
-                    _serverProcess.Kill(true);
-                    Log("Server process killed.");
+                    try
+                    {
+                        StopProcessTree(process);
+                    }
+                    finally
+                    {
+                        CloseServerJob();
+                        process.Dispose();
+                    }
+                }
+                else
+                {
+                    CloseServerJob();
                 }
 
-                _serverProcess.Dispose();
-                _serverProcess = null;
+                TryDeleteFile(_pidFile);
             }
-
-            if (File.Exists(_pidFile))
+            catch (Exception ex)
             {
-                File.Delete(_pidFile);
+                Debug.WriteLine($"Failed to stop server: {ex.Message}");
+                ShowLogsWindow();
             }
-        }
-        catch (Exception ex)
-        {
-            Debug.WriteLine($"Failed to stop server: {ex.Message}");
         }
     }
 
@@ -134,6 +157,7 @@ public class ServerManager
         }
 
         Log("Node.js (>=20) not found. Installing...");
+        ShowLogsWindow();
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -194,6 +218,7 @@ public class ServerManager
         if (!File.Exists(bunExe))
         {
             Log("Bun not found. Installing...");
+            ShowLogsWindow();
 
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
@@ -243,6 +268,7 @@ public class ServerManager
         }
 
         Log("FFmpeg binaries not found. Downloading...");
+        ShowLogsWindow();
 
         Directory.CreateDirectory(ffmpegDir);
 
@@ -306,29 +332,40 @@ public class ServerManager
     {
         Log("Detecting hardware acceleration type...");
 
-        var dump = "";
+        var hardware = new HardwareDetectionInfo("", "");
 
         try
         {
-            dump = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-                ? await DetectWindowsGpuAsync()
-                : await DetectUnixGpuAsync();
+            hardware = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                ? await DetectWindowsHardwareAsync()
+                : await DetectUnixHardwareAsync();
         }
         catch (Exception ex)
         {
             Log($"Hardware detection failed: {ex.Message}");
         }
 
-        var normalized = dump.ToLowerInvariant();
+        var gpuInfo = hardware.GpuInfo.ToLowerInvariant();
+        var cpuInfo = hardware.CpuInfo.ToLowerInvariant();
 
-        if (normalized.Contains("nvidia"))
+        if (HasNvidiaGpu(gpuInfo))
         {
             Log("Found Nvidia GPU, using nvenc.");
             settings.TranscodeAccel = "nvenc";
         }
-        else if (normalized.Contains("intel"))
+        else if (HasIntelHardware(gpuInfo))
         {
-            Log("Found Intel GPU/CPU, using qsv.");
+            Log("Found Intel GPU, using qsv.");
+            settings.TranscodeAccel = "qsv";
+        }
+        else if (HasAmdGpu(gpuInfo))
+        {
+            Log("Found AMD GPU, using amd.");
+            settings.TranscodeAccel = "amd";
+        }
+        else if (HasIntelHardware(cpuInfo))
+        {
+            Log("Found Intel CPU, using qsv.");
             settings.TranscodeAccel = "qsv";
         }
         else
@@ -404,8 +441,10 @@ public class ServerManager
         if (!process.Start())
         {
             throw new InvalidOperationException($"Failed to start command: {fileName}");
+            ShowLogsWindow();
         }
 
+        AssignProcessToServerJob(process);
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
 
@@ -415,6 +454,7 @@ public class ServerManager
         if (options.ThrowOnError && result.ExitCode != 0)
         {
             throw new InvalidOperationException($"Command failed ({fileName}) with exit code {result.ExitCode}: {result.Error.Trim()}");
+            ShowLogsWindow();
         }
 
         return result;
@@ -432,12 +472,150 @@ public class ServerManager
         if (!process.Start())
         {
             throw new InvalidOperationException($"Failed to start command: {fileName}");
+            ShowLogsWindow();
         }
 
+        AssignProcessToServerJob(process);
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
 
         return process;
+    }
+
+    private async void StopProcessTree(Process process)
+    {
+        try
+        {
+            if (process.HasExited)
+            {
+                return;
+            }
+
+            Log("Requesting graceful shutdown...");
+
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                using var taskKill = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "taskkill",
+                    Arguments = $"/PID {process.Id} /T",
+                    CreateNoWindow = true,
+                    UseShellExecute = false
+                });
+                await taskKill?.WaitForExitAsync();
+            }
+            else
+            {
+                using var killProcess = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "kill",
+                    Arguments = $"-SIGINT {process.Id}",
+                    CreateNoWindow = true,
+                    UseShellExecute = false
+                });
+                await killProcess?.WaitForExitAsync();
+            }
+
+            if (process.WaitForExit(30000))
+            {
+                Log("Server process stopped gracefully.");
+                return;
+            }
+
+            Log("Process did not exit gracefully, forcing hard kill...");
+            process.Kill(true);
+
+            if (process.WaitForExit(5000))
+            {
+                Log("Server process force stopped.");
+                return;
+            }
+
+            Log("Server process did not exit after hard kill request.");
+        }
+        catch (InvalidOperationException)
+        {
+            // The process already exited before we could interact with it
+        }
+        catch (Exception ex)
+        {
+            Log($"Server process stop failed: {ex.Message}");
+        }
+    }
+
+    private void AssignProcessToServerJob(Process process)
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return;
+        }
+
+        try
+        {
+            EnsureServerJob();
+
+            if (_serverJobHandle != IntPtr.Zero && !AssignProcessToJobObject(_serverJobHandle, process.Handle))
+            {
+                Log($"Failed to bind server process cleanup: {new Win32Exception(Marshal.GetLastWin32Error()).Message}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"Failed to prepare server process cleanup: {ex.Message}");
+        }
+    }
+
+    private void EnsureServerJob()
+    {
+        if (_serverJobHandle != IntPtr.Zero)
+        {
+            return;
+        }
+
+        var jobHandle = CreateJobObject(IntPtr.Zero, null);
+        if (jobHandle == IntPtr.Zero)
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+
+        var info = new JobObjectExtendedLimitInformation
+        {
+            BasicLimitInformation = new JobObjectBasicLimitInformation
+            {
+                LimitFlags = JobObjectLimitFlags.KillOnJobClose
+            }
+        };
+
+        var length = Marshal.SizeOf<JobObjectExtendedLimitInformation>();
+        var infoPointer = Marshal.AllocHGlobal(length);
+
+        try
+        {
+            Marshal.StructureToPtr(info, infoPointer, false);
+            if (!SetInformationJobObject(jobHandle, JobObjectInfoClass.ExtendedLimitInformation, infoPointer, (uint)length))
+            {
+                var error = Marshal.GetLastWin32Error();
+                CloseHandle(jobHandle);
+                throw new Win32Exception(error);
+            }
+
+            _serverJobHandle = jobHandle;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(infoPointer);
+        }
+    }
+
+    private void CloseServerJob()
+    {
+        if (_serverJobHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        CloseHandle(_serverJobHandle);
+        _serverJobHandle = IntPtr.Zero;
     }
 
     private Process CreateProcess(string fileName, IReadOnlyList<string> arguments, CommandOptions options)
@@ -499,32 +677,58 @@ public class ServerManager
         }
     }
 
-    private async Task<string> DetectWindowsGpuAsync()
+    private async Task<HardwareDetectionInfo> DetectWindowsHardwareAsync()
     {
-        var registryDump = ReadWindowsGpuNamesFromRegistry();
-        if (!string.IsNullOrWhiteSpace(registryDump))
+        var gpuInfo = ReadWindowsGpuNamesFromRegistry();
+        var cpuInfo = ReadWindowsCpuNameFromRegistry();
+
+        if (string.IsNullOrWhiteSpace(gpuInfo))
         {
-            return registryDump;
+            gpuInfo = await RunPowerShellOutputAsync("Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name");
         }
 
+        if (string.IsNullOrWhiteSpace(cpuInfo))
+        {
+            cpuInfo = await RunPowerShellOutputAsync("Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Name");
+        }
+
+        return new HardwareDetectionInfo(gpuInfo, cpuInfo);
+    }
+
+    private async Task<HardwareDetectionInfo> DetectUnixHardwareAsync()
+    {
+        var gpuResult = await TryRunProcessAsync("lspci", Array.Empty<string>(), new CommandOptions
+        {
+            LogErrors = false,
+            Timeout = HardwareDetectionTimeout
+        });
+
+        var cpuInfo = ReadUnixCpuInfo();
+        if (string.IsNullOrWhiteSpace(cpuInfo) && RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            var cpuResult = await TryRunProcessAsync("sysctl", new[] { "-n", "machdep.cpu.brand_string" }, new CommandOptions
+            {
+                LogErrors = false,
+                Timeout = HardwareDetectionTimeout
+            });
+
+            cpuInfo = cpuResult?.Output ?? "";
+        }
+
+        return new HardwareDetectionInfo(gpuResult?.Output ?? "", cpuInfo);
+    }
+
+    private async Task<string> RunPowerShellOutputAsync(string command)
+    {
         var result = await TryRunProcessAsync("powershell", new[]
         {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"
+            command
         }, new CommandOptions
         {
-            Timeout = HardwareDetectionTimeout
-        });
-
-        return result?.Output ?? "";
-    }
-
-    private async Task<string> DetectUnixGpuAsync()
-    {
-        var result = await TryRunProcessAsync("lspci", Array.Empty<string>(), new CommandOptions
-        {
+            LogErrors = false,
             Timeout = HardwareDetectionTimeout
         });
 
@@ -565,6 +769,56 @@ public class ServerManager
         }
     }
 
+    private string ReadWindowsCpuNameFromRegistry()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return "";
+        }
+
+        try
+        {
+            using var processorKey = Registry.LocalMachine.OpenSubKey(@"HARDWARE\DESCRIPTION\System\CentralProcessor\0");
+            return processorKey?.GetValue("ProcessorNameString") as string ?? "";
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    private static string ReadUnixCpuInfo()
+    {
+        try
+        {
+            return File.Exists("/proc/cpuinfo") ? File.ReadAllText("/proc/cpuinfo") : "";
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    private static bool HasNvidiaGpu(string gpuInfo)
+    {
+        return ContainsAny(gpuInfo, "nvidia", "geforce", "quadro");
+    }
+
+    private static bool HasAmdGpu(string gpuInfo)
+    {
+        return ContainsAny(gpuInfo, "amd", "radeon", "advanced micro devices", "ati technologies", "firepro");
+    }
+
+    private static bool HasIntelHardware(string hardwareInfo)
+    {
+        return ContainsAny(hardwareInfo, "intel", "iris", "uhd graphics");
+    }
+
+    private static bool ContainsAny(string value, params string[] tokens)
+    {
+        return tokens.Any(value.Contains);
+    }
+
     private static bool TryGetNodeMajorVersion(string? output, out int version)
     {
         version = 0;
@@ -595,30 +849,17 @@ public class ServerManager
         };
     }
 
-    private static string ResolveWebAppDirectory()
+    private string ResolveWebAppDirectory()
     {
-        var candidates = new[]
+        var webappPath = Path.Combine(Environment.CurrentDirectory, "webapp");
+        if (File.Exists(Path.Combine(webappPath, "package.json")))
         {
-            Environment.CurrentDirectory,
-            AppContext.BaseDirectory
-        };
-
-        foreach (var candidate in candidates)
-        {
-            var directory = new DirectoryInfo(candidate);
-            while (directory != null)
-            {
-                var webappPath = Path.Combine(directory.FullName, "webapp");
-                if (File.Exists(Path.Combine(webappPath, "package.json")))
-                {
-                    return webappPath;
-                }
-
-                directory = directory.Parent;
-            }
+            return webappPath;
         }
-
-        throw new DirectoryNotFoundException("Could not find the webapp directory.");
+        else
+        {
+            return String.Empty;
+        }
     }
 
     private static void CopyFfmpegBinaries(string extractPath, string ffmpegDir)
@@ -717,7 +958,26 @@ public class ServerManager
 
     private void Log(string message)
     {
-        Avalonia.Threading.Dispatcher.UIThread.Post(() => ServerLogs.Add($"[{DateTime.Now:HH:mm:ss}] {message}"));
+        try
+        {
+            Avalonia.Threading.Dispatcher.UIThread.Post(() => ServerLogs.Add($"[{DateTime.Now:HH:mm:ss}] {message}"));
+        }
+        catch
+        {
+        }
+    }
+
+    private void ShowLogsWindow()
+    {
+        if (_logWindow == null || !_logWindow.IsVisible)
+        {
+            _logWindow = new LogWindow(ServerLogs);
+            _logWindow.Show();
+        }
+        else
+        {
+            _logWindow.Activate();
+        }
     }
 
     private sealed class CommandOptions
@@ -731,4 +991,81 @@ public class ServerManager
     }
 
     private sealed record CommandResult(int ExitCode, string Output, string Error);
+
+    private sealed record HardwareDetectionInfo(string GpuInfo, string CpuInfo);
+
+    [Flags]
+    private enum JobObjectLimitFlags : uint
+    {
+        KillOnJobClose = 0x2000
+    }
+
+    private enum JobObjectInfoClass
+    {
+        ExtendedLimitInformation = 9
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IoCounters
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JobObjectBasicLimitInformation
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public JobObjectLimitFlags LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JobObjectExtendedLimitInformation
+    {
+        public JobObjectBasicLimitInformation BasicLimitInformation;
+        public IoCounters IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateJobObject(IntPtr jobAttributes, string? name);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(IntPtr jobHandle, JobObjectInfoClass infoClass, IntPtr jobObjectInfo, uint jobObjectInfoLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr jobHandle, IntPtr processHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    public static void OpenUrl(string url)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
+        }
+        else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+        {
+            Process.Start("xdg-open", url);
+        }
+        else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            Process.Start("open", url);
+        }
+    }
 }

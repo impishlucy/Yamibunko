@@ -35,3 +35,30 @@ export function resolveEpisodeFile(
 
   return resolved
 }
+
+export function resolveEpisodeMedia(
+  animeId: string,
+  seasonNr: string | number,
+  epNr: string | number
+) {
+  const episode = getEpisode(animeId, seasonNr, epNr)
+
+  if (!episode) {
+    return null
+  }
+
+  const config = getServerConfig()
+  const root = path.resolve(config.mediaDir)
+  const resolved = path.resolve(episode.filePath)
+
+  if (!assertInsideRoot(root, resolved)) {
+    throw new Error(
+      "Resolved media path escaped the configured media directory"
+    )
+  }
+
+  return {
+    file: resolved,
+    episode,
+  }
+}

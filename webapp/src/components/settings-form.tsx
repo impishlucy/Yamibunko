@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { isStrongPassword } from "@/lib/password-policy"
 import type { SafeSettings } from "@/lib/types"
 
 type SettingsFormProps = {
@@ -23,16 +24,6 @@ type AniListConnectionResponse = {
     lastListSyncAt: string | null
   } | null
   callbackUrl: string
-}
-
-function isStrongPassword(password: string) {
-  return (
-    password.length >= 32 &&
-    /[A-Z]/.test(password) &&
-    /[a-z]/.test(password) &&
-    /\d/.test(password) &&
-    /[^A-Za-z0-9]/.test(password)
-  )
 }
 
 export function SettingsForm({ settings }: SettingsFormProps) {

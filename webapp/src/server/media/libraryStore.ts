@@ -2,10 +2,12 @@ import type { AnimeInfo, AnimeSummary, Episode } from "@/lib/types"
 import {
   getAdjacentEpisodes,
   getAnime,
+  getLibraryEntry as getStoredLibraryEntry,
   getStoredEpisode,
   listAnime,
   listEpisodes,
 } from "@/server/db/library"
+import { parsePositiveInt } from "@/server/utils/format"
 
 export function getLibrary(): AnimeSummary[] {
   return listAnime()
@@ -13,6 +15,13 @@ export function getLibrary(): AnimeSummary[] {
 
 export function getAnimeInfo(animeId: string | number): AnimeInfo | null {
   return getAnime(animeId)
+}
+
+export function getLibraryEntry(
+  identifier: string,
+  selectedAnimeId?: string | number
+) {
+  return getStoredLibraryEntry(identifier, selectedAnimeId)
 }
 
 export function getEpisodes(
@@ -28,27 +37,11 @@ export function getEpisode(
   epNr?: string | number,
   username?: string
 ): Episode | null {
-  const seasonNumber =
-    epNr === undefined
-      ? 1
-      : typeof seasonNr === "number"
-        ? seasonNr
-        : Number.parseInt(seasonNr, 10)
+  const seasonNumber = epNr === undefined ? 1 : parsePositiveInt(seasonNr)
   const episodeNumber =
-    epNr === undefined
-      ? typeof seasonNr === "number"
-        ? seasonNr
-        : Number.parseInt(seasonNr, 10)
-      : typeof epNr === "number"
-        ? epNr
-        : Number.parseInt(epNr, 10)
+    epNr === undefined ? parsePositiveInt(seasonNr) : parsePositiveInt(epNr)
 
-  if (
-    !Number.isInteger(seasonNumber) ||
-    !Number.isInteger(episodeNumber) ||
-    seasonNumber < 1 ||
-    episodeNumber < 1
-  ) {
+  if (!seasonNumber || !episodeNumber) {
     return null
   }
 

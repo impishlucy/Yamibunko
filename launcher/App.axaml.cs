@@ -17,10 +17,10 @@ public partial class App : Application
 
     public App()
     {
-        AppDomain.CurrentDomain.ProcessExit += (s, e) =>
-        {
-            ServerManager.StopServer();
-        };
+        AppDomain.CurrentDomain.ProcessExit += (s, e) => ServerManager.StopServer();
+        AppDomain.CurrentDomain.DomainUnload += (s, e) => ServerManager.StopServer();
+        AppDomain.CurrentDomain.UnhandledException += (s, e) => ServerManager.StopServer();
+        Console.CancelKeyPress += (s, e) => ServerManager.StopServer();
     }
 
     public override void OnFrameworkInitializationCompleted()
@@ -28,6 +28,8 @@ public partial class App : Application
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
             desktop.ShutdownMode = Avalonia.Controls.ShutdownMode.OnExplicitShutdown;
+            desktop.ShutdownRequested += (s, e) => ServerManager.StopServer();
+            desktop.Exit += (s, e) => ServerManager.StopServer();
 
             ServerManager.CleanupOrphans();
 

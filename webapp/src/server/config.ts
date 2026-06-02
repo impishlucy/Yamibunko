@@ -6,11 +6,13 @@ import { z } from "zod"
 import type { SafeSettings } from "@/lib/types"
 import { normalizeBaseUrl } from "@/server/http/baseUrl"
 
+export type TranscodeAcceleration = "nvenc" | "qsv" | "amd" | "cpu"
+
 const serverConfigSchema = z.object({
   FFMPEG_DIR: z.string().trim().min(1),
   ANIME_INPUT_DIR: z.string().trim().min(1),
   ANIME_MEDIA_DIR: z.string().trim().min(1),
-  TRANSCODE_ACCEL: z.enum(["nvenc", "qsv", "cpu"]),
+  TRANSCODE_ACCEL: z.enum(["nvenc", "qsv", "amd", "cpu"]),
   ANILIST_CLIENT_ID: z.string().trim().optional(),
   ANILIST_CLIENT_SECRET: z.string().trim().optional(),
   BASE_URL: z.url(),
@@ -22,7 +24,7 @@ export type ServerConfig = {
   inputDir: string
   mediaDir: string
   tempDir: string
-  transcodeAccel: "nvenc" | "qsv" | "cpu"
+  transcodeAccel: TranscodeAcceleration
   anilistClientId?: string
   anilistClientSecret?: string
   baseUrl: string
@@ -70,6 +72,9 @@ function readEnvironment() {
       process.env.ANIME_INPUT_DIR ?? process.env.INPUT_FOLDER_PATH,
     ANIME_MEDIA_DIR:
       process.env.ANIME_MEDIA_DIR ?? process.env.OUTPUT_FOLDER_PATH,
+    TRANSCODE_ACCEL: process.env.TRANSCODE_ACCEL
+      ? process.env.TRANSCODE_ACCEL.trim().toLowerCase()
+      : undefined,
     ANILIST_CLIENT_ID: process.env.ANILIST_CLIENT_ID,
     ANILIST_CLIENT_SECRET: process.env.ANILIST_CLIENT_SECRET,
     BASE_URL: process.env.BASE_URL ?? process.env.APP_BASE_URL,

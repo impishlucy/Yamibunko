@@ -2,7 +2,6 @@ import { existsSync, readFileSync, statSync } from "node:fs"
 import path from "node:path"
 
 import { normalizeBaseUrl } from "@/server/http/baseUrl"
-import { serverLog } from "@/server/logger"
 
 const requiredEnvironmentKeys = [
   "FFMPEG_DIR",
@@ -138,6 +137,14 @@ function applyEnvironmentAliases() {
   }
 }
 
+function normalizeTranscodeAcceleration() {
+  const value = process.env.TRANSCODE_ACCEL
+
+  if (value) {
+    process.env.TRANSCODE_ACCEL = cleanValue(value).toLowerCase()
+  }
+}
+
 function hasAnyRequiredEnvironmentValue() {
   for (const [alias, canonical] of launcherAliases) {
     if (requiredCanonicalKeys.has(canonical) && process.env[alias]) {
@@ -148,19 +155,27 @@ function hasAnyRequiredEnvironmentValue() {
   return false
 }
 
-function getKnownEnvironmentSnapshot() {
-  return Object.fromEntries(
-    loggedEnvironmentKeys.map((key) => [key, process.env[key] ?? null])
-  )
+function formatKnownEnvironmentSnapshot() {
+  return loggedEnvironmentKeys
+    .map((key) => {
+      const value = process.env[key]
+
+      if (!value) {
+        return `${key}=<missing>`
+      }
+
+      return key.includes("SECRET") ? `${key}=<redacted>` : `${key}=${value}`
+    })
+    .join(", ")
 }
 
 function resolveRequiredPath(envVarName: string) {
   const rawPath = process.env[envVarName]
 
   if (!rawPath) {
-    serverLog.error("Startup", "Required path variable is missing.", {
-      envVarName,
-    })
+    console.error(
+      `[Error] [Startup] Required path variable is missing - environment.ts - ${envVarName}`
+    )
     throw new Error(
       `CRITICAL INITIALIZATION FAILURE: Environment variable '${envVarName}' is missing. Ensure the launcher is passing parameters or the local .env file contains this variable.`
     )
@@ -173,10 +188,9 @@ function resolveRequiredPath(envVarName: string) {
 
 function assertExistingDirectory(label: string, directoryPath: string) {
   if (!existsSync(directoryPath) || !statSync(directoryPath).isDirectory()) {
-    serverLog.error("Startup", "Directory validation failed.", {
-      label,
-      directoryPath,
-    })
+    console.error(
+      `[Error] [Startup] Directory validation failed - environment.ts - ${label}: ${directoryPath}`
+    )
     throw new Error(
       `CRITICAL STARTUP ERROR: ${label} path does not exist on disk: ${directoryPath}`
     )
@@ -185,10 +199,9 @@ function assertExistingDirectory(label: string, directoryPath: string) {
 
 function assertExistingFile(label: string, filePath: string) {
   if (!existsSync(filePath) || !statSync(filePath).isFile()) {
-    serverLog.error("Startup", "Executable validation failed.", {
-      label,
-      filePath,
-    })
+    console.error(
+      `[Error] [Startup] Executable validation failed - environment.ts - ${label}: ${filePath}`
+    )
     throw new Error(
       `CRITICAL STARTUP ERROR: ${label} executable could not be found at: ${filePath}`
     )
@@ -197,7 +210,7 @@ function assertExistingFile(label: string, filePath: string) {
 
 function assertValidBaseUrl(value: string | undefined) {
   if (!value) {
-    serverLog.error("Startup", "BASE_URL is missing.")
+    console.error("[Error] [Startup] BASE_URL is missing - environment.ts")
     throw new Error(
       "CRITICAL INITIALIZATION FAILURE: Environment variable 'BASE_URL' is missing. Ensure the launcher is passing parameters or the local .env file contains this variable."
     )
@@ -206,9 +219,9 @@ function assertValidBaseUrl(value: string | undefined) {
   try {
     process.env.BASE_URL = normalizeBaseUrl(cleanValue(value))
   } catch {
-    serverLog.error("Startup", "BASE_URL validation failed.", {
-      value,
-    })
+    console.error(
+      `[Error] [Startup] BASE_URL validation failed - environment.ts - ${value}`
+    )
     throw new Error(
       `CRITICAL STARTUP ERROR: BASE_URL must be a valid http(s) URL, for example http://localhost:3000 or https://domain.ext/some/path. Received: ${value}`
     )
@@ -230,29 +243,28 @@ export function bootstrapEnvironment() {
   const dotEnvPath = path.resolve(process.cwd(), ".env")
   const hasDotEnv = existsSync(dotEnvPath)
 
-  if (
-    !hadRuntimeEnvironment &&
-    !appliedLauncherParameters &&
-    !hasDotEnv
-  ) {
-    serverLog.error("Startup", "no parameters found, can't start", {
-      dotEnvPath,
-    })
+  if (!hadRuntimeEnvironment && !appliedLauncherParameters && !hasDotEnv) {
+    console.error(
+      `[Error] [Startup] no parameters found, can't start - environment.ts - Checked .env: ${dotEnvPath}`
+    )
     throw new Error("no parameters found, can't start")
   }
 
   const loadedDotEnv = loadDotEnv(dotEnvPath)
   applyEnvironmentAliases()
+  normalizeTranscodeAcceleration()
 
-  serverLog.info("Startup", "Loaded startup configuration.", {
-    sources: [
-      ...(hadRuntimeEnvironment ? ["process environment"] : []),
-      ...(appliedLauncherParameters ? ["launcher parameters"] : []),
-      ...(loadedDotEnv ? [".env"] : []),
-    ],
-    dotEnvPath: hasDotEnv ? dotEnvPath : null,
-    values: getKnownEnvironmentSnapshot(),
-  })
+  const sources = [
+    ...(hadRuntimeEnvironment ? ["process environment"] : []),
+    ...(appliedLauncherParameters ? ["launcher parameters"] : []),
+    ...(loadedDotEnv ? [".env"] : []),
+  ].join(", ")
+
+  console.log(
+    `[Info] [Startup] Loaded startup configuration - Sources: ${sources || "none"} - ${formatKnownEnvironmentSnapshot()}${
+      hasDotEnv ? ` - .env: ${dotEnvPath}` : ""
+    }`
+  )
 
   for (const key of pathEnvironmentKeys) {
     if (process.env[key]) {
@@ -262,21 +274,36 @@ export function bootstrapEnvironment() {
 
   for (const key of requiredEnvironmentKeys) {
     if (!process.env[key]) {
-      serverLog.error("Startup", "Required environment variable is missing.", {
-        key,
-      })
+      console.error(
+        `[Error] [Startup] Required environment variable is missing - environment.ts - ${key}`
+      )
       throw new Error(
         `CRITICAL INITIALIZATION FAILURE: Environment variable '${key}' is missing. Ensure the launcher is passing parameters or the local .env file contains this variable.`
       )
     }
   }
 
-  if (!["nvenc", "qsv", "cpu"].includes(process.env.TRANSCODE_ACCEL ?? "")) {
-    serverLog.error("Startup", "TRANSCODE_ACCEL validation failed.", {
-      value: process.env.TRANSCODE_ACCEL,
-    })
+  if (
+    !["nvenc", "qsv", "amd", "cpu"].includes(process.env.TRANSCODE_ACCEL ?? "")
+  ) {
+    console.error(
+      `[Error] [Startup] TRANSCODE_ACCEL validation failed - environment.ts - ${process.env.TRANSCODE_ACCEL}`
+    )
     throw new Error(
-      "CRITICAL STARTUP ERROR: TRANSCODE_ACCEL must be one of nvenc, qsv, or cpu."
+      "CRITICAL STARTUP ERROR: TRANSCODE_ACCEL must be one of nvenc, qsv, amd, or cpu."
+    )
+  }
+
+  if (
+    process.env.TRANSCODE_ACCEL === "amd" &&
+    process.platform !== "win32" &&
+    process.platform !== "linux"
+  ) {
+    console.error(
+      `[Error] [Startup] AMD transcoding is unsupported on this OS - environment.ts - ${process.platform}`
+    )
+    throw new Error(
+      "CRITICAL STARTUP ERROR: AMD transcoding is only supported on Windows through AMF or Linux through VA-API."
     )
   }
 
@@ -296,7 +323,7 @@ export function bootstrapEnvironment() {
   assertExistingFile("FFmpeg", path.join(ffmpegDir, executableName("ffmpeg")))
   assertExistingFile("FFprobe", path.join(ffmpegDir, executableName("ffprobe")))
 
-  serverLog.info("Startup", "Validated startup configuration.")
+  console.log("[Info] [Startup] Validated startup configuration.")
 
   bootstrapped = true
 }

@@ -2,11 +2,8 @@ import { z } from "zod"
 
 import { requireSameOriginRequest } from "@/server/auth/api"
 import { createSession, setSessionCookie } from "@/server/auth/session"
-import {
-  hashPassword,
-  isStrongPassword,
-  verifyPassword,
-} from "@/server/auth/password"
+import { isStrongPassword, maxPasswordLength } from "@/lib/password-policy"
+import { hashPassword, verifyPassword } from "@/server/auth/password"
 import { getUser, setUserPasswordHash } from "@/server/db/users"
 import { isSecureRequest } from "@/server/http/request"
 
@@ -15,7 +12,7 @@ export const dynamic = "force-dynamic"
 
 const loginSchema = z.object({
   username: z.string().trim().min(1).max(64),
-  password: z.string().min(1).max(1024),
+  password: z.string().min(1).max(maxPasswordLength),
 })
 
 export async function POST(request: Request) {

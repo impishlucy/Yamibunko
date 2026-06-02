@@ -5,6 +5,7 @@ import { cookies } from "next/headers"
 import { requireApiUser, requireSameOriginRequest } from "@/server/auth/api"
 import { getAniListAuthorizationUrl } from "@/server/anilist/client"
 import { getRequestOrigin } from "@/server/http/request"
+import { errorMessage } from "@/server/utils/format"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -38,8 +39,7 @@ export async function GET(request: Request) {
 
     return Response.redirect(await getAniListAuthorizationUrl(request, state))
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "AniList OAuth is unavailable"
+    const message = errorMessage(error) || "AniList OAuth is unavailable"
 
     return Response.json({ ok: false, error: message }, { status: 400 })
   }

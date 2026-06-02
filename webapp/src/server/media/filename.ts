@@ -1,5 +1,7 @@
 import path from "node:path"
 
+import { parsePositiveInt } from "@/server/utils/format"
+
 const releaseGroupPattern = /^\[[^\]]+\]\s*/
 const bracketPattern = /\[[^\]]*\]|\([^)]*\)/g
 const hashPattern = /\b[A-F0-9]{8,}\b/gi
@@ -20,13 +22,12 @@ function normalizeTitle(value: string) {
     .trim()
 }
 
-function toPositiveInteger(value: string | undefined) {
-  if (!value) {
-    return null
-  }
+function cleanTitleSegment(value: string) {
+  return normalizeTitle(value).replace(/(?:\s*-\s*)+$/g, "").trim()
+}
 
-  const number = Number.parseInt(value, 10)
-  return Number.isInteger(number) && number > 0 ? number : null
+function toPositiveInteger(value: string | undefined) {
+  return parsePositiveInt(value)
 }
 
 export function parseAnimeFileName(
@@ -35,6 +36,26 @@ export function parseAnimeFileName(
   const baseName = path.basename(filePath, path.extname(filePath))
   const mainName = baseName.split("|")[0] ?? baseName
   const normalized = normalizeTitle(mainName)
+
+  const movieDashEpisode = /^(.+?\bMovie)\s*-\s*(\d{1,4})\s*-\s*(.+)$/i.exec(
+    normalized
+  )
+
+  if (movieDashEpisode) {
+    const episode = toPositiveInteger(movieDashEpisode[2])
+    const titlePrefix = cleanTitleSegment(
+      (movieDashEpisode[1] ?? "").replace(/\bMovie$/i, "")
+    )
+    const titleSuffix = cleanTitleSegment(movieDashEpisode[3] ?? "")
+
+    if (episode && titlePrefix && titleSuffix) {
+      return {
+        title: `${titlePrefix} ${titleSuffix}`,
+        season: 1,
+        episode,
+      }
+    }
+  }
 
   const seasonEpisode = /^(.+?)\s*[-\s]\s*S(\d{1,2})E(\d{1,4})\b/i.exec(
     normalized

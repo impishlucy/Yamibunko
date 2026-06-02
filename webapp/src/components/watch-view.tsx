@@ -81,16 +81,20 @@ export function WatchView({
 
   return (
     <div className="space-y-5">
-      <AnimePlayer
-        animeId={animeId}
-        seasonNumber={payload.episode.seasonNumber}
-        episodeNumber={payload.episode.episodeNumber}
-        playback={payload.playback}
-        previousEpisode={payload.previousEpisode}
-        nextEpisode={payload.nextEpisode}
-        autoPlay={autoPlay}
-        onEpisodeChange={openEpisode}
-      />
+      <div className="mx-auto w-full lg:max-w-[60vw]">
+        <AnimePlayer
+          animeId={animeId}
+          seasonNumber={payload.episode.seasonNumber}
+          episodeNumber={payload.episode.episodeNumber}
+          playback={payload.playback}
+          fileName={payload.episode.fileName}
+          previousEpisode={payload.previousEpisode}
+          nextEpisode={payload.nextEpisode}
+          durationSeconds={payload.episode.durationSeconds}
+          autoPlay={autoPlay}
+          onEpisodeChange={openEpisode}
+        />
+      </div>
 
       <section className="space-y-2">
         <div className="flex flex-wrap items-center gap-2">

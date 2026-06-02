@@ -3,8 +3,8 @@ import { z } from "zod"
 import { requireApiUser, requireSameOriginRequest } from "@/server/auth/api"
 import { saveAniListProgress } from "@/server/anilist/client"
 import { upsertEpisodeProgress } from "@/server/db/library"
-import { serverLog } from "@/server/logger"
 import { getEpisode } from "@/server/media/libraryStore"
+import { errorMessage, parsePositiveInt } from "@/server/utils/format"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -48,20 +48,13 @@ export async function POST(request: Request, context: ProgressContext) {
     )
   }
 
-  const animeIdNumber = Number.parseInt(animeId, 10)
-  const episodeNumber = Number.parseInt(epNr, 10)
+  const animeIdNumber = parsePositiveInt(animeId)
+  const episodeNumber = parsePositiveInt(epNr)
   const seasonNumber =
     parsed.data.season ??
-    Number.parseInt(url.searchParams.get("season") ?? "1", 10)
+    parsePositiveInt(url.searchParams.get("season") ?? "1")
 
-  if (
-    !Number.isInteger(animeIdNumber) ||
-    !Number.isInteger(seasonNumber) ||
-    !Number.isInteger(episodeNumber) ||
-    animeIdNumber < 1 ||
-    seasonNumber < 1 ||
-    episodeNumber < 1
-  ) {
+  if (!animeIdNumber || !seasonNumber || !episodeNumber) {
     return Response.json({ ok: false, error: "NOT_FOUND" }, { status: 404 })
   }
 
@@ -100,7 +93,9 @@ export async function POST(request: Request, context: ProgressContext) {
       animeId: animeIdNumber,
       progress: episodeNumber,
     }).catch((error) => {
-      serverLog.error("Anilist", "Progress sync failed.", { error })
+      console.error(
+        `[Error] [Anilist] Progress sync failed - watch/progress/route.ts - ${errorMessage(error)}`
+      )
     })
   }
 

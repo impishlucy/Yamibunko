@@ -7,11 +7,26 @@ import { Button } from "@/components/ui/button"
 type AniListTrackingState = {
   configured: boolean
   connected: boolean
+  ratingScale: 5 | 10
   entry: {
     id: number
     status: string | null
     progress: number
+    rating: number | null
   } | null
+}
+
+const statusLabels: Record<string, string> = {
+  CURRENT: "Watching",
+  REPEATING: "Rewatching",
+  COMPLETED: "Completed",
+  PLANNING: "Planning",
+  PAUSED: "Paused",
+  DROPPED: "Dropped",
+}
+
+function shouldShowProgress(status: string | null) {
+  return status === "CURRENT" || status === "REPEATING"
 }
 
 export function AniListTracking({ animeId }: { animeId: number }) {
@@ -69,15 +84,75 @@ export function AniListTracking({ animeId }: { animeId: number }) {
     }
   }
 
+  async function rate(rating: number) {
+    setBusy(true)
+
+    try {
+      const response = await fetch("/api/anilist/track", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          animeId,
+          rating,
+        }),
+      })
+
+      if (response.ok) {
+        setState((current) =>
+          current
+            ? {
+                ...current,
+                entry: current.entry
+                  ? {
+                      ...current.entry,
+                      rating,
+                    }
+                  : current.entry,
+              }
+            : current
+        )
+      }
+    } finally {
+      setBusy(false)
+    }
+  }
+
   if (!state?.connected) {
     return null
   }
 
   return state.entry ? (
-    <p className="text-sm text-zinc-400">
-      AniList: {state.entry.status ?? "Tracked"} at episode{" "}
-      {state.entry.progress}
-    </p>
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="rounded-full border border-violet-400/25 bg-violet-500/15 px-3 py-1 text-xs font-medium text-violet-100">
+        AniList: {statusLabels[state.entry.status ?? ""] ?? "Tracked"}
+        {shouldShowProgress(state.entry.status)
+          ? `, episode ${state.entry.progress}`
+          : ""}
+      </span>
+      <select
+        value={state.entry.rating ?? ""}
+        disabled={busy}
+        onChange={(event) => {
+          const rating = Number(event.target.value)
+
+          if (Number.isInteger(rating) && rating > 0) {
+            void rate(rating)
+          }
+        }}
+        className="h-8 rounded-full border border-white/10 bg-zinc-950/80 px-3 text-xs text-zinc-100 outline-none"
+      >
+        <option value="">No rating</option>
+        {Array.from({ length: state.ratingScale }, (_, index) => index + 1).map(
+          (rating) => (
+            <option key={rating} value={rating}>
+              {rating}/{state.ratingScale}
+            </option>
+          )
+        )}
+      </select>
+    </div>
   ) : (
     <Button
       type="button"

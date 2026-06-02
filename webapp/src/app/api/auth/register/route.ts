@@ -2,7 +2,8 @@ import { z } from "zod"
 
 import { requireSameOriginRequest } from "@/server/auth/api"
 import { createSession, setSessionCookie } from "@/server/auth/session"
-import { hashPassword, isStrongPassword } from "@/server/auth/password"
+import { isStrongPassword, maxPasswordLength } from "@/lib/password-policy"
+import { hashPassword } from "@/server/auth/password"
 import { createUser, hasAnyUsers } from "@/server/db/users"
 import { isSecureRequest } from "@/server/http/request"
 
@@ -16,7 +17,7 @@ const registerSchema = z.object({
     .min(3)
     .max(64)
     .regex(/^[a-z0-9._-]+$/i),
-  password: z.string().min(1).max(1024),
+  password: z.string().min(1).max(maxPasswordLength),
 })
 
 export async function POST(request: Request) {

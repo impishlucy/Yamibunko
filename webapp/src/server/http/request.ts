@@ -1,5 +1,6 @@
 import { headers } from "next/headers"
 
+import { allowedDevOrigins } from "@/lib/allowed-dev-origins"
 import { normalizeBaseUrl } from "@/server/http/baseUrl"
 
 function firstForwardedValue(value: string | null) {
@@ -64,7 +65,9 @@ export async function isSecureRequest(request?: Request) {
     return true
   }
 
-  return ["localhost", "127.0.0.1", "::1"].includes(url.hostname)
+  return ["localhost", "127.0.0.1", "::1", "192.168.1.101"].includes(
+    url.hostname
+  )
 }
 
 function sameOrigin(left: string, right: string) {
@@ -81,19 +84,75 @@ function sameOrigin(left: string, right: string) {
   }
 }
 
-export async function isSameOriginRequest(request: Request) {
-  const expectedOrigin = await getRequestOrigin(request)
+function candidateRequestOrigin(request: Request) {
   const origin = firstForwardedValue(request.headers.get("origin"))
 
   if (origin) {
-    return sameOrigin(origin, expectedOrigin)
+    return origin
   }
 
   const referer = firstForwardedValue(request.headers.get("referer"))
 
-  if (referer) {
-    return sameOrigin(referer, expectedOrigin)
+  if (!referer) {
+    return null
   }
 
-  return true
+  try {
+    return new URL(referer).origin
+  } catch {
+    return null
+  }
+}
+
+function allowedDevOriginMatches(candidate: string) {
+  if (process.env.NODE_ENV === "production" || allowedDevOrigins.length === 0) {
+    return false
+  }
+
+  let candidateUrl: URL
+
+  try {
+    candidateUrl = new URL(candidate)
+  } catch {
+    return false
+  }
+
+  return allowedDevOrigins.some((allowedOrigin) => {
+    const value = allowedOrigin.trim()
+
+    if (!value) {
+      return false
+    }
+
+    const hasProtocol = /^[a-z][a-z\d+.-]*:\/\//i.test(value)
+    const normalizedAllowed = hasProtocol ? value : `http://${value}`
+
+    try {
+      const allowedUrl = new URL(normalizedAllowed)
+      const hostnameMatches = allowedUrl.hostname.startsWith("*.")
+        ? candidateUrl.hostname.endsWith(allowedUrl.hostname.slice(1))
+        : candidateUrl.hostname === allowedUrl.hostname
+      const portMatches = allowedUrl.port
+        ? candidateUrl.port === allowedUrl.port
+        : true
+      const protocolMatches = hasProtocol
+        ? candidateUrl.protocol === allowedUrl.protocol
+        : true
+
+      return hostnameMatches && portMatches && protocolMatches
+    } catch {
+      return false
+    }
+  })
+}
+
+export async function isSameOriginRequest(request: Request) {
+  const expectedOrigin = await getRequestOrigin(request)
+  const candidate = candidateRequestOrigin(request)
+
+  if (!candidate) {
+    return true
+  }
+
+  return sameOrigin(candidate, expectedOrigin) || allowedDevOriginMatches(candidate)
 }

@@ -6,19 +6,10 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { isStrongPassword } from "@/lib/password-policy"
 
 type AuthFormProps = {
   mode: "admin-registration" | "login"
-}
-
-function isStrongPassword(password: string) {
-  return (
-    password.length >= 32 &&
-    /[A-Z]/.test(password) &&
-    /[a-z]/.test(password) &&
-    /\d/.test(password) &&
-    /[^A-Za-z0-9]/.test(password)
-  )
 }
 
 export function AuthForm({ mode }: AuthFormProps) {

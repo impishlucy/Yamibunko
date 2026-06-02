@@ -1,5 +1,7 @@
 import type { NextConfig } from "next"
 
+import { allowedDevOrigins } from "./src/lib/allowed-dev-origins"
+
 const securityHeaders = [
   {
     key: "X-Content-Type-Options",
@@ -20,6 +22,7 @@ const securityHeaders = [
 ]
 
 const nextConfig: NextConfig = {
+  allowedDevOrigins,
   images: {
     remotePatterns: [
       {

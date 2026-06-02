@@ -3,12 +3,11 @@ import path from "node:path"
 
 import {
   deleteEpisodeByPath,
-  findAnimeByTitle,
+  getEpisodeByPath,
   upsertAnime,
   upsertEpisode,
 } from "@/server/db/library"
 import { getServerConfig } from "@/server/config"
-import { serverLog } from "@/server/logger"
 import { ffprobe } from "@/server/media/ffmpeg"
 import { parseAnimeFileName, sanitizePathPart } from "@/server/media/filename"
 import {
@@ -21,6 +20,7 @@ import {
   waitForStableFile,
 } from "@/server/media/mediaFiles"
 import { findAnimeMetadata } from "@/server/metadata/anilist"
+import { fileName, parsePositiveInt } from "@/server/utils/format"
 
 type ParsedLibraryPath = {
   animeTitle: string
@@ -35,8 +35,7 @@ function parseSeasonFolder(value: string) {
     return null
   }
 
-  const season = Number.parseInt(match[1] ?? "", 10)
-  return Number.isInteger(season) && season > 0 ? season : null
+  return parsePositiveInt(match[1])
 }
 
 function parseEpisodeNumber(filePath: string) {
@@ -55,8 +54,7 @@ function parseEpisodeNumber(filePath: string) {
     return null
   }
 
-  const episode = Number.parseInt(match[1] ?? "", 10)
-  return Number.isInteger(episode) && episode > 0 ? episode : null
+  return parsePositiveInt(match[1])
 }
 
 function parseLibraryPath(filePath: string): ParsedLibraryPath | null {
@@ -74,8 +72,28 @@ function parseLibraryPath(filePath: string): ParsedLibraryPath | null {
     return null
   }
 
-  const animeTitle = sanitizePathPart(parts[0] ?? "")
-  const season = parseSeasonFolder(parts[1] ?? "") ?? 1
+  const folderName = parts[1] ?? ""
+  const parsedFileName = parseAnimeFileName(filePath)
+  const isMovieFolder = /^movies$/i.test(folderName)
+  const isSpecialFolder = /^specials$/i.test(folderName)
+  const seasonFolder = parseSeasonFolder(folderName)
+
+  if (isSpecialFolder && parts.length !== 4) {
+    return null
+  }
+
+  if (!isSpecialFolder && parts.length !== 3) {
+    return null
+  }
+
+  if (!seasonFolder && !isMovieFolder && !isSpecialFolder) {
+    return null
+  }
+
+  const season = seasonFolder ?? parsedFileName?.season ?? 1
+  const animeTitle = sanitizePathPart(
+    isSpecialFolder ? (parts[2] ?? "") : (parsedFileName?.title ?? "")
+  )
   const episode = parseEpisodeNumber(filePath)
 
   if (!animeTitle || !episode) {
@@ -92,77 +110,71 @@ function parseLibraryPath(filePath: string): ParsedLibraryPath | null {
 export async function syncLibraryFile(filePath: string) {
   const resolvedPath = path.resolve(filePath)
 
-  serverLog.info("Media", "Library file sync started.", {
-    filePath: resolvedPath,
-  })
+  console.log(
+    `[Info] [Media] Library file sync started - ${fileName(resolvedPath)}`
+  )
 
   if (!isMediaFile(resolvedPath)) {
-    serverLog.info("Media", "Skipped non-media library file.", {
-      filePath: resolvedPath,
-    })
+    console.log(
+      `[Info] [Media] Skipped non-media library file - ${fileName(resolvedPath)}`
+    )
     return null
   }
 
   if (!(await pathExists(resolvedPath))) {
-    serverLog.info("Media", "Library file no longer exists, removing DB entry.", {
-      filePath: resolvedPath,
-    })
+    console.log(
+      `[Info] [Media] Library file no longer exists, removing DB entry - ${resolvedPath}`
+    )
     return removeLibraryFile(resolvedPath)
   }
 
   await waitForStableFile(resolvedPath)
 
+  const existingEpisode = getEpisodeByPath(resolvedPath)
+
+  if (existingEpisode) {
+    console.log(
+      `[Info] [Media] Library file already exists in database - Anime id ${existingEpisode.animeId}, Season ${existingEpisode.seasonNumber}, Episode ${existingEpisode.episodeNumber}`
+    )
+    return {
+      animeId: existingEpisode.animeId,
+      seasonNr: existingEpisode.seasonNumber,
+      epNr: existingEpisode.episodeNumber,
+      filePath: resolvedPath,
+    }
+  }
+
   const parsed = parseLibraryPath(resolvedPath)
 
   if (!parsed) {
-    serverLog.warn("Media", "Library file path could not be parsed.", {
-      filePath: resolvedPath,
-    })
+    console.warn(
+      `[Warn] [Media] Library file path could not be parsed - syncLibraryFile.ts - ${resolvedPath}`
+    )
     return null
   }
 
-  serverLog.info("Media", "Recognized library file.", {
-    filePath: resolvedPath,
-    title: parsed.animeTitle,
-    season: parsed.season,
-    episode: parsed.episode,
-  })
+  console.log(
+    `[Info] [Media] Recognized library file - Title: ${parsed.animeTitle}, Season: ${parsed.season}, Episode: ${parsed.episode}`
+  )
 
-  const existingAnime = findAnimeByTitle(parsed.animeTitle)
-  let animeId = existingAnime?.id
+  const metadata = await findAnimeMetadata(parsed.animeTitle, parsed.season)
 
-  if (animeId) {
-    serverLog.info("Media", "Matched library file to existing anime.", {
-      filePath: resolvedPath,
-      title: parsed.animeTitle,
-      anilistId: animeId,
-    })
-  } else {
-    const metadata = await findAnimeMetadata(parsed.animeTitle, parsed.season)
-
-    if (!metadata) {
-      throw new Error(`AniList could not match "${parsed.animeTitle}"`)
-    }
-
-    upsertAnime(metadata)
-    animeId = metadata.id
-    serverLog.info("Media", "Created anime from AniList metadata.", {
-      filePath: resolvedPath,
-      title: parsed.animeTitle,
-      anilistId: animeId,
-    })
+  if (!metadata) {
+    throw new Error(`AniList could not match "${parsed.animeTitle}"`)
   }
+
+  upsertAnime(metadata)
+  const animeId = metadata.id
+  console.log(
+    `[Info] [Media] Created anime from AniList metadata - ${parsed.animeTitle} - id ${animeId}`
+  )
 
   const probe = (await ffprobe(resolvedPath)) as ProbeResult
   const durationSeconds = parseDurationSeconds(probe)
 
-  serverLog.info("Media", "Generating thumbnail for library file.", {
-    filePath: resolvedPath,
-    animeId,
-    season: parsed.season,
-    episode: parsed.episode,
-    durationSeconds,
-  })
+  console.log(
+    `[Info] [Media] Generating thumbnail for library file - ${fileName(resolvedPath)}`
+  )
 
   const thumbnailPath = await generateEpisodeThumbnail(
     resolvedPath,
@@ -178,13 +190,9 @@ export async function syncLibraryFile(filePath: string) {
     durationSeconds,
   })
 
-  serverLog.info("Media", "Library episode added to database.", {
-    animeId,
-    season: parsed.season,
-    episode: parsed.episode,
-    filePath: resolvedPath,
-    thumbnailPath,
-  })
+  console.log(
+    `[Info] [Media] Library episode added to database - Anime id ${animeId}, Season ${parsed.season}, Episode ${parsed.episode}`
+  )
 
   return {
     animeId,
@@ -199,19 +207,16 @@ export async function removeLibraryFile(filePath: string) {
   const episode = deleteEpisodeByPath(resolvedPath)
 
   if (episode) {
-    serverLog.info("Media", "Removed deleted library file from database.", {
-      filePath: resolvedPath,
-      animeId: episode.animeId,
-      season: episode.seasonNumber,
-      episode: episode.episodeNumber,
-    })
+    console.log(
+      `[Info] [Media] Removed deleted library file from database - Anime id ${episode.animeId}, Season ${episode.seasonNumber}, Episode ${episode.episodeNumber}`
+    )
     await rm(thumbnailPathForEpisode(resolvedPath), { force: true }).catch(
       () => undefined
     )
   } else {
-    serverLog.info("Media", "Deleted library file was not present in database.", {
-      filePath: resolvedPath,
-    })
+    console.log(
+      `[Info] [Media] Deleted library file was not present in database - ${fileName(resolvedPath)}`
+    )
   }
 
   return episode

@@ -1,10 +1,10 @@
 import { createReadStream } from "node:fs"
 import { stat } from "node:fs/promises"
-import path from "node:path"
 import { Readable } from "node:stream"
 
 import { requireApiUser } from "@/server/auth/api"
 import { getEpisodeThumbnailPath } from "@/server/db/library"
+import { thumbnailPathForEpisode } from "@/server/media/mediaFiles"
 import { getEpisode } from "@/server/media/libraryStore"
 
 export const runtime = "nodejs"
@@ -21,11 +21,6 @@ const fallbackThumbnail = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
   "base64"
 )
-
-function thumbnailPathForEpisode(filePath: string) {
-  const extension = path.extname(filePath)
-  return `${filePath.slice(0, -extension.length)}.jpg`
-}
 
 function fallbackThumbnailResponse() {
   return new Response(fallbackThumbnail, {

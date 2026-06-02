@@ -2,27 +2,68 @@ import Image from "next/image"
 import { notFound } from "next/navigation"
 
 import { AniListTracking } from "@/components/anilist-tracking"
+import { AnimeVariantSelect } from "@/components/anime-variant-select"
 import { EpisodeCard } from "@/components/episode-card"
 import { Badge } from "@/components/ui/badge"
 import { getCurrentUser } from "@/server/auth/session"
-import { getAnimeInfo, getEpisodes } from "@/server/media/libraryStore"
+import { getEpisodes, getLibraryEntry } from "@/server/media/libraryStore"
 
 type AnimePageProps = {
   params: Promise<{
-    animeId: string
+    slug: string
+  }>
+  searchParams: Promise<{
+    media?: string
   }>
 }
 
-export default async function AnimePage({ params }: AnimePageProps) {
-  const { animeId } = await params
-  const anime = getAnimeInfo(animeId)
+function isSeriesFormat(format?: string) {
+  return !format || format === "TV" || format === "TV_SHORT" || format === "ONA"
+}
 
-  if (!anime) {
-    notFound()
+function selectedSubtitle(input: {
+  format?: string
+  title: string
+  seasonNumber?: number
+}) {
+  if (isSeriesFormat(input.format)) {
+    return `Season ${String(input.seasonNumber ?? 1).padStart(2, "0")}`
   }
 
+  return input.title
+}
+
+function episodeCountBadgeClass(localCount: number, anilistCount: number) {
+  if (anilistCount <= 0 || localCount === anilistCount) {
+    return "bg-violet-500/90 text-white"
+  }
+
+  if (localCount < anilistCount) {
+    return "bg-red-500/90 text-white"
+  }
+
+  return "bg-orange-500/90 text-white"
+}
+
+export default async function AnimePage({
+  params,
+  searchParams,
+}: AnimePageProps) {
+  const { slug } = await params
+  const { media } = await searchParams
+  const libraryEntry = getLibraryEntry(slug, media)
+
+  if (!libraryEntry) {
+    return notFound()
+  }
+
+  const anime = libraryEntry.selected
+  const selectedVariant = libraryEntry.variants.find(
+    (variant) => variant.id === anime.id
+  )
   const user = await getCurrentUser()
-  const episodes = getEpisodes(animeId, user?.username)
+  const episodes = getEpisodes(anime.id, user?.username)
+  const localEpisodeCount = selectedVariant?.episodeCount ?? episodes.length
   const episodesBySeason = new Map<number, typeof episodes>()
 
   for (const episode of episodes) {
@@ -66,20 +107,43 @@ export default async function AnimePage({ params }: AnimePageProps) {
                 </Badge>
               ) : null}
               <Badge
-                variant="outline"
-                className="border-violet-400/25 text-violet-100"
+                className={episodeCountBadgeClass(
+                  localEpisodeCount,
+                  anime.episodeCount
+                )}
               >
-                {anime.episodeCount} episodes
+                {anime.episodeCount > 0
+                  ? `${localEpisodeCount}/${anime.episodeCount} episodes`
+                  : `${localEpisodeCount} episodes`}
               </Badge>
+              {anime.format ? (
+                <Badge
+                  variant="outline"
+                  className="border-white/10 bg-black/20 text-zinc-300"
+                >
+                  {anime.format.replace("_", " ")}
+                </Badge>
+              ) : null}
             </div>
             <h1 className="max-w-3xl text-3xl font-semibold text-zinc-50">
-              {anime.title}
+              {libraryEntry.title}
             </h1>
+            <p className="text-sm font-medium text-violet-200">
+              {selectedSubtitle({
+                format: anime.format,
+                title: anime.title,
+                seasonNumber: selectedVariant?.seasonNumber,
+              })}
+            </p>
             {anime.description ? (
               <p className="max-w-2xl text-sm leading-6 text-zinc-300">
                 {anime.description}
               </p>
             ) : null}
+            <AnimeVariantSelect
+              variants={libraryEntry.variants}
+              selectedId={anime.id}
+            />
             {anime.genres?.length ? (
               <div className="flex flex-wrap gap-2">
                 {anime.genres.map((genre) => (
@@ -102,9 +166,6 @@ export default async function AnimePage({ params }: AnimePageProps) {
         <h2 className="text-lg font-semibold text-zinc-50">Episodes</h2>
         {[...episodesBySeason.entries()].map(([season, seasonEpisodes]) => (
           <div key={season} className="space-y-3">
-            <h3 className="text-sm font-medium text-zinc-400">
-              Season {String(season).padStart(2, "0")}
-            </h3>
             <div className="grid gap-3 xl:grid-cols-2">
               {seasonEpisodes.map((episode) => (
                 <EpisodeCard
