@@ -3,6 +3,7 @@ import { readdir } from "node:fs/promises"
 import path from "node:path"
 
 import { listEpisodeFilePaths } from "@/server/db/library"
+import { runDailyAniListRefresh } from "@/server/anilist/dailyRefresh"
 import { getServerConfigResult } from "@/server/config"
 import { isMediaFile, pathExists } from "@/server/media/mediaFiles"
 import { processInputFile } from "@/server/media/processInputFile"
@@ -25,6 +26,7 @@ type WorkerGlobalState = typeof globalThis & {
 }
 
 const scanIntervalMs = 5 * 60 * 1000
+const dailyAniListRefreshHour = 5
 
 const workerGlobal = globalThis as WorkerGlobalState
 
@@ -48,6 +50,18 @@ async function walkFiles(directory: string): Promise<string[]> {
   return files
 }
 
+function millisecondsUntilNextLocalHour(hour: number) {
+  const now = new Date()
+  const next = new Date(now)
+  next.setHours(hour, 0, 0, 0)
+
+  if (next <= now) {
+    next.setDate(next.getDate() + 1)
+  }
+
+  return next.getTime() - now.getTime()
+}
+
 export function startWorkers() {
   if (workerGlobal.__yamibunkoWorkerRuntime) {
     return workerGlobal.__yamibunkoWorkerRuntime
@@ -67,6 +81,7 @@ export function startWorkers() {
   const activeWork = new Set<Promise<void>>()
   let shuttingDown = false
   let scanning = false
+  let dailyAniListTimer: ReturnType<typeof setTimeout> | undefined
 
   const inputWatcher = chokidar.watch(config.inputDir, {
     ignoreInitial: true,
@@ -134,6 +149,23 @@ export function startWorkers() {
     activeWork.add(work)
     void work.finally(() => {
       activeWork.delete(work)
+    })
+  }
+
+  function runTrackedWork(work: () => Promise<void>) {
+    if (shuttingDown) {
+      return
+    }
+
+    const promise = work().catch((error) => {
+      console.error(
+        `[Error] [Workers] Background task failed - startWorkers.ts - ${errorMessage(error)}`
+      )
+    })
+
+    activeWork.add(promise)
+    void promise.finally(() => {
+      activeWork.delete(promise)
     })
   }
 
@@ -233,6 +265,20 @@ export function startWorkers() {
 
   void scanAllDirectories()
 
+  function scheduleDailyAniListRefresh() {
+    if (shuttingDown) {
+      return
+    }
+
+    dailyAniListTimer = setTimeout(() => {
+      runTrackedWork(runDailyAniListRefresh)
+      scheduleDailyAniListRefresh()
+    }, millisecondsUntilNextLocalHour(dailyAniListRefreshHour))
+    dailyAniListTimer.unref?.()
+  }
+
+  scheduleDailyAniListRefresh()
+
   async function stop() {
     if (shuttingDown) {
       return
@@ -241,6 +287,7 @@ export function startWorkers() {
     shuttingDown = true
     console.log("[Info] [Workers] Stopping background workers.")
     clearInterval(scanTimer)
+    clearTimeout(dailyAniListTimer)
     await Promise.all([inputWatcher.close(), libraryWatcher.close()])
 
     while (activeWork.size > 0) {
