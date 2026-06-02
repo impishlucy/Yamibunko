@@ -69,7 +69,7 @@ export async function isSecureRequest(request?: Request) {
     return true
   }
 
-  return ["localhost", "127.0.0.1", "::1", "192.168.1.101"].includes(
+  return ["localhost", "127.0.0.1", "::1"].includes(
     url.hostname
   )
 }
