@@ -68,7 +68,7 @@ export function startWorkers() {
   let shuttingDown = false
   let scanning = false
 
-  const inputWatcher = chokidar.watch(config.inputDir, {
+  const inputWatcher = chokidar.watch(config.inputDirs, {
     ignoreInitial: true,
     awaitWriteFinish: {
       stabilityThreshold: 3000,
@@ -146,8 +146,17 @@ export function startWorkers() {
     console.log("[Info] [Workers] Scanning input folder.")
 
     try {
-      const files = await walkFiles(config.inputDir)
-      const mediaFiles = files.filter(isMediaFile)
+      const mediaFiles: string[] = []
+
+      for (const inputDir of config.inputDirs) {
+        try {
+          mediaFiles.push(...(await walkFiles(inputDir)).filter(isMediaFile))
+        } catch (error) {
+          console.error(
+            `[Error] [Workers] Input folder scan failed - startWorkers.ts - ${inputDir} - ${errorMessage(error)}`
+          )
+        }
+      }
 
       console.log("[Info] [Workers] Input folder scan completed.")
 
@@ -156,7 +165,7 @@ export function startWorkers() {
       }
     } catch (error) {
       console.error(
-        `[Error] [Workers] Input folder scan failed - startWorkers.ts - ${config.inputDir} - ${errorMessage(error)}`
+        `[Error] [Workers] Input folder scan failed - startWorkers.ts - ${errorMessage(error)}`
       )
     } finally {
       scanning = false
