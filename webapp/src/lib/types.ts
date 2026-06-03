@@ -71,6 +71,20 @@ export type TranscodeStatus = {
 export type PlaybackProfile = "original" | "dataSaver"
 export type PlaybackMode = "direct" | "transcode"
 
+export type MediaStreamInfo = {
+  id: string
+  index: number
+  codec?: string
+  language?: string
+  label: string
+  isDefault: boolean
+}
+
+export type SubtitleStreamInfo = MediaStreamInfo & {
+  isForced: boolean
+  isSupported: boolean
+}
+
 export type WatchPayload = {
   anime: AnimeInfo
   episode: Episode
@@ -82,6 +96,20 @@ export type WatchPayload = {
     dataSaverUrl: string
     castDirectUrl: string
     castTranscodeUrl: string
+    castDataSaverUrl: string
+    liveTranscodeEnabled: boolean
+    subtitleUrl: string
+    castSubtitleUrl: string
+  }
+  media: {
+    audioStreams: MediaStreamInfo[]
+    subtitleStreams: SubtitleStreamInfo[]
+    defaultAudioStreamId: string | null
+    defaultSubtitleStreamId: string | null
+    directAudioStreamId: string | null
+    videoCodec?: string
+    container?: string
+    sourceBitrateMbps?: number
   }
 }
 

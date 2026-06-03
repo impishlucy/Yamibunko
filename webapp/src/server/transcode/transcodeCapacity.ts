@@ -388,7 +388,7 @@ async function getCanFitTranscode(
   const acceleration = result.config.transcodeAccel
 
   if (acceleration === "cpu") {
-    return activeTranscodes.size === 0
+    return kind !== "live" && activeTranscodes.size === 0
   }
 
   const snapshot = await getHardwarePressureSnapshot(acceleration)
@@ -471,7 +471,7 @@ async function getDynamicLiveCapacity() {
   const acceleration = result.config.transcodeAccel
 
   if (acceleration === "cpu") {
-    return activeTranscodes.size === 0 ? 1 : 0
+    return 0
   }
 
   const snapshot = await getHardwarePressureSnapshot(acceleration)
@@ -517,14 +517,18 @@ function createLease(
 
 export async function getLiveTranscodeStatus(): Promise<TranscodeStatus> {
   const available = await getDynamicLiveCapacity()
-  const active = activeTranscodes.size
+  const active = [...activeTranscodes.values()].filter(
+    (transcode) => transcode.kind === "live"
+  ).length
+  const queued = pendingTranscodes.filter(
+    (request) => request.kind === "live"
+  ).length
 
   return {
     max: active + available,
     active,
     available,
-    queued: pendingTranscodes.filter((request) => request.kind === "live")
-      .length,
+    queued,
   }
 }
 
@@ -575,6 +579,14 @@ export function acquireLiveTranscode(
   profile?: PlaybackProfile,
   signal?: AbortSignal
 ) {
+  const result = getServerConfigResult()
+
+  if (result.ok && result.config.transcodeAccel === "cpu") {
+    return Promise.reject(
+      new Error("Live transcoding is disabled when TRANSCODE_ACCEL=cpu")
+    )
+  }
+
   return acquireQueuedTranscode({
     label,
     kind: "live",

@@ -171,7 +171,7 @@ function getAmdHevcEncoderArgs(videoBitrateKbps: number) {
 
 export function getLiveH264Args(
   profile: PlaybackProfile,
-  options: { sourceBitrateKbps?: number } = {}
+  options: { audioStreamIndex?: number; sourceBitrateKbps?: number } = {}
 ) {
   const config = getServerConfig()
   const audioBitrate = profile === "dataSaver" ? "128k" : "192k"
@@ -209,11 +209,15 @@ export function getLiveH264Args(
         )
       : [...getLiveH264FormatArgs(config.transcodeAccel), ...qualityArgs]
 
+  const audioMap = Number.isInteger(options.audioStreamIndex)
+    ? `0:${options.audioStreamIndex}?`
+    : "0:a:0?"
+
   return [
     "-map",
     "0:V:0",
     "-map",
-    "0:a:0?",
+    audioMap,
     "-sn",
     "-dn",
     ...encoderArgs,
@@ -359,7 +363,7 @@ function getLiveDataSaverArgs(
 export function getHevcFileArgs(input: {
   videoBitrateKbps: number
   convertVideo: boolean
-  convertAudioToMp3: boolean
+  audioOutputIndexesToMp3: number[]
 }) {
   const config = getServerConfig()
 
@@ -402,9 +406,16 @@ export function getHevcFileArgs(input: {
             ]
     : ["-c:v", "copy"]
 
-  const audioArgs = input.convertAudioToMp3
-    ? ["-c:a", "libmp3lame", "-b:a", "256k"]
-    : ["-c:a", "copy"]
+  const audioArgs = [
+    "-c:a",
+    "copy",
+    ...input.audioOutputIndexesToMp3.flatMap((outputAudioIndex) => [
+      `-c:a:${outputAudioIndex}`,
+      "libmp3lame",
+      `-b:a:${outputAudioIndex}`,
+      "256k",
+    ]),
+  ]
 
   return [
     "-map",
@@ -413,9 +424,17 @@ export function getHevcFileArgs(input: {
     "0:a?",
     "-map",
     "0:s?",
+    "-map",
+    "0:t?",
+    "-map_metadata",
+    "0",
+    "-map_chapters",
+    "0",
     ...videoArgs,
     ...audioArgs,
     "-c:s",
+    "copy",
+    "-c:t",
     "copy",
     "-dn",
   ]

@@ -1,4 +1,5 @@
 type GoogleCastLoadRequest = {
+  activeTrackIds?: number[]
   autoplay: boolean
   currentTime: number
 }
@@ -12,10 +13,21 @@ type GoogleCastSeekRequest = GoogleCastMediaCommandRequest & {
   resumeState?: string
 }
 
+type GoogleCastTextTrack = {
+  language?: string
+  name: string
+  subtype: string
+  trackContentId: string
+  trackContentType: string
+  trackId: number
+  type: string
+}
+
 type GoogleCastMediaInfo = {
   contentId?: string
   duration?: number
   streamType?: string
+  tracks?: GoogleCastTextTrack[]
 }
 
 type GoogleCastMediaSession = {
@@ -308,6 +320,12 @@ export function createGoogleCastLoadRequest(input: {
   contentType: string
   autoplay: boolean
   currentTime: number
+  textTrack?: {
+    id: number
+    language?: string
+    label: string
+    url: string
+  }
 }) {
   const apis = getCastApis()
 
@@ -322,9 +340,24 @@ export function createGoogleCastLoadRequest(input: {
   mediaInfo.streamType =
     apis.chromeCast.media.StreamType?.BUFFERED ?? "BUFFERED"
 
+  if (input.textTrack) {
+    mediaInfo.tracks = [
+      {
+        language: input.textTrack.language,
+        name: input.textTrack.label,
+        subtype: "SUBTITLES",
+        trackContentId: input.textTrack.url,
+        trackContentType: "text/vtt",
+        trackId: input.textTrack.id,
+        type: "TEXT",
+      },
+    ]
+  }
+
   const request = new apis.chromeCast.media.LoadRequest(mediaInfo)
   request.autoplay = input.autoplay
   request.currentTime = input.currentTime
+  request.activeTrackIds = input.textTrack ? [input.textTrack.id] : []
   return request
 }
 

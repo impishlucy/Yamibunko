@@ -7,12 +7,12 @@ import {
   Maximize2,
   Pause,
   Play,
+  Settings,
   SkipBack,
   SkipForward,
   Square,
 } from "lucide-react"
 
-import { PlaybackStatus, type PlaybackStatusState } from "@/components/playback-status"
 import { Button } from "@/components/ui/button"
 import {
   addGoogleCastMediaStateListener,
@@ -34,17 +34,14 @@ import {
   type GoogleCastMediaState,
   type GoogleCastSessionHandle,
 } from "@/lib/google-cast"
-import type {
-  Episode,
-  PlaybackProfile,
-  WatchPayload,
-} from "@/lib/types"
+import type { Episode, MediaStreamInfo, PlaybackProfile, WatchPayload } from "@/lib/types"
 
 type AnimePlayerProps = {
   animeId: string
   seasonNumber: number
   episodeNumber: number
   playback: WatchPayload["playback"]
+  media: WatchPayload["media"]
   fileName: string
   previousEpisode?: Episode
   nextEpisode?: Episode
@@ -53,6 +50,8 @@ type AnimePlayerProps = {
   autoPlay?: boolean
   onEpisodeChange?: (episode: Episode, autoPlay: boolean) => void
 }
+
+type PlaybackStatusState = "checking" | "direct" | "transcoding" | "blocked"
 
 type SwitchSourceOptions = {
   preservePosition?: boolean
@@ -72,6 +71,36 @@ type LocalPlaybackSnapshot = {
   directPossible: boolean
   position: number
   wasMuted: boolean
+}
+
+type CastTextTrack = {
+  id: number
+  language?: string
+  label: string
+  url: string
+}
+
+type BrowserAudioTrack = {
+  enabled: boolean
+  id?: string
+  kind?: string
+  label?: string
+  language?: string
+}
+
+type BrowserAudioTrackList = {
+  length: number
+  [index: number]: BrowserAudioTrack
+}
+
+type HtmlVideoElementWithAudioTracks = HTMLVideoElement & {
+  audioTracks?: BrowserAudioTrackList
+}
+
+type SubtitleCue = {
+  start: number
+  end: number
+  text: string
 }
 
 const hevcMp4Checks = [
@@ -122,8 +151,12 @@ function isPlayerControlTarget(target: EventTarget | null) {
   )
 }
 
-function getCastDirectContentType(fileName: string) {
+function getCastDirectContentType(fileName: string, usesAudioRemux = false) {
   const extension = fileName.split(".").at(-1)?.toLowerCase() ?? ""
+
+  if (usesAudioRemux) {
+    return extension === "webm" ? "video/webm" : "video/mp4"
+  }
 
   if (extension === "mp4" || extension === "m4v") {
     return "video/mp4"
@@ -174,7 +207,7 @@ function getStableDuration(
   fileDurationSeconds: number | undefined,
   measuredDurationSeconds?: number,
   fallbackDurationSeconds?: number
-): number {
+) {
   if (isUsableDuration(fileDurationSeconds)) {
     return fileDurationSeconds
   }
@@ -201,25 +234,471 @@ function clampTime(seconds: number, durationSeconds: number) {
   return minClamped
 }
 
-function withTranscodeStartTime(sourceUrl: string, startTime: number) {
-  const url = new URL(sourceUrl, window.location.href)
-  const safeStartTime = Number.isFinite(startTime) ? Math.max(startTime, 0) : 0
+function serializeUrl(originalUrl: string, url: URL) {
+  return /^https?:\/\//i.test(originalUrl)
+    ? url.toString()
+    : `${url.pathname}${url.search}${url.hash}`
+}
 
-  if (safeStartTime > 0.25) {
-    url.searchParams.set("start", safeStartTime.toFixed(3))
+function getUrlBase() {
+  return typeof window === "undefined" ? "http://localhost" : window.location.href
+}
+
+function withStreamParams(
+  sourceUrl: string,
+  input: { audioStreamId?: string | null; startTime?: number | null }
+) {
+  const url = new URL(sourceUrl, getUrlBase())
+
+  if (input.audioStreamId) {
+    url.searchParams.set("audio", input.audioStreamId)
+  } else {
+    url.searchParams.delete("audio")
+  }
+
+  const startTime = input.startTime
+
+  if (typeof startTime === "number" && Number.isFinite(startTime) && startTime > 0.25) {
+    url.searchParams.set("start", startTime.toFixed(3))
   } else {
     url.searchParams.delete("start")
   }
 
-  return `${url.pathname}${url.search}${url.hash}`
+  return serializeUrl(sourceUrl, url)
 }
 
+function withSubtitleStream(sourceUrl: string, streamId: string) {
+  const url = new URL(sourceUrl, getUrlBase())
+  url.searchParams.set("stream", streamId)
+  return serializeUrl(sourceUrl, url)
+}
+
+function estimateStreamMbps(input: {
+  quality: PlaybackProfile
+  sourceBitrateMbps?: number
+  status: PlaybackStatusState
+}) {
+  const source = input.sourceBitrateMbps
+
+  if (!source || source <= 0) {
+    return undefined
+  }
+
+  if (input.status === "direct") {
+    return source
+  }
+
+  return input.quality === "dataSaver"
+    ? Math.max(Number((source / 2).toFixed(2)), 0.5)
+    : source
+}
+
+function getBufferedEnd(video: HTMLVideoElement) {
+  const { buffered } = video
+
+  if (!buffered.length) {
+    return 0
+  }
+
+  let end = 0
+
+  for (let index = 0; index < buffered.length; index += 1) {
+    end = Math.max(end, buffered.end(index))
+  }
+
+  return end
+}
+
+function parseWebVttTimestamp(value: string) {
+  const parts = value.trim().replace(",", ".").split(":")
+
+  if (parts.length < 2 || parts.length > 3) {
+    return null
+  }
+
+  const seconds = Number(parts.at(-1))
+  const minutes = Number(parts.at(-2))
+  const hours = parts.length === 3 ? Number(parts[0]) : 0
+
+  if (
+    !Number.isFinite(hours) ||
+    !Number.isFinite(minutes) ||
+    !Number.isFinite(seconds)
+  ) {
+    return null
+  }
+
+  return hours * 3600 + minutes * 60 + seconds
+}
+
+function stripSubtitleFormatting(value: string) {
+  return value
+    .replace(/\{\\[^}]*}/g, "")
+    .replace(/<[^>]*>/g, "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/[ \t]+/g, " ")
+    .trim()
+}
+
+function parseWebVtt(input: string) {
+  const cues: SubtitleCue[] = []
+  const blocks = input
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split(/\n{2,}/)
+
+  for (const block of blocks) {
+    const lines = block
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+
+    if (!lines.length) {
+      continue
+    }
+
+    const firstLine = lines[0].toUpperCase()
+
+    if (
+      firstLine.startsWith("WEBVTT") ||
+      firstLine.startsWith("NOTE") ||
+      firstLine.startsWith("STYLE") ||
+      firstLine.startsWith("REGION")
+    ) {
+      continue
+    }
+
+    const timingLineIndex = lines.findIndex((line) => line.includes("-->"))
+
+    if (timingLineIndex === -1) {
+      continue
+    }
+
+    const timingLine = lines[timingLineIndex]
+    const [rawStart, rawEndWithSettings] = timingLine.split(/\s+-->\s+/)
+    const rawEnd = rawEndWithSettings?.split(/\s+/)[0]
+    const start = rawStart ? parseWebVttTimestamp(rawStart) : null
+    const end = rawEnd ? parseWebVttTimestamp(rawEnd) : null
+
+    if (start === null || end === null || end <= start) {
+      continue
+    }
+
+    const text = lines
+      .slice(timingLineIndex + 1)
+      .map(stripSubtitleFormatting)
+      .filter(Boolean)
+      .join("\n")
+
+    if (text) {
+      cues.push({ start, end, text })
+    }
+  }
+
+  return cues.sort((a, b) => a.start - b.start)
+}
+
+function getActiveSubtitleTexts(cues: SubtitleCue[], seconds: number) {
+  if (!Number.isFinite(seconds) || !cues.length) {
+    return []
+  }
+
+  let low = 0
+  let high = cues.length - 1
+  let firstPossibleIndex = cues.length
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2)
+
+    if (cues[mid].end >= seconds) {
+      firstPossibleIndex = mid
+      high = mid - 1
+    } else {
+      low = mid + 1
+    }
+  }
+
+  if (firstPossibleIndex === cues.length) {
+    return []
+  }
+
+  const texts: string[] = []
+
+  for (let index = firstPossibleIndex; index < cues.length; index += 1) {
+    const cue = cues[index]
+
+    if (cue.start > seconds) {
+      break
+    }
+
+    if (seconds >= cue.start && seconds <= cue.end) {
+      texts.push(cue.text)
+    }
+  }
+
+  return texts
+}
+
+function subtitleTextKey(texts: string[]) {
+  return texts.join("\u001f")
+}
+
+function normalizeTrackLanguage(value: string | undefined) {
+  const language = value?.trim().toLowerCase()
+
+  if (!language) {
+    return undefined
+  }
+
+  if (language === "eng" || language.startsWith("en")) {
+    return "en"
+  }
+
+  if (language === "jpn" || language.startsWith("ja")) {
+    return "ja"
+  }
+
+  return language.slice(0, 2)
+}
+
+function applyDirectAudioTrack(
+  video: HTMLVideoElement,
+  selectedAudioStream: MediaStreamInfo | undefined,
+  audioStreams: MediaStreamInfo[]
+) {
+  const tracks = (video as HtmlVideoElementWithAudioTracks).audioTracks
+
+  if (!tracks?.length || !selectedAudioStream) {
+    return false
+  }
+
+  const selectedOrdinal = audioStreams.findIndex(
+    (stream) => stream.id === selectedAudioStream.id
+  )
+  const selectedLanguage = normalizeTrackLanguage(selectedAudioStream.language)
+  let selectedTrackIndex = -1
+
+  if (selectedLanguage) {
+    for (let index = 0; index < tracks.length; index += 1) {
+      if (normalizeTrackLanguage(tracks[index]?.language) === selectedLanguage) {
+        selectedTrackIndex = index
+        break
+      }
+    }
+  }
+
+  if (selectedTrackIndex === -1 && selectedOrdinal >= 0 && selectedOrdinal < tracks.length) {
+    selectedTrackIndex = selectedOrdinal
+  }
+
+  if (selectedTrackIndex === -1) {
+    return false
+  }
+
+  for (let index = 0; index < tracks.length; index += 1) {
+    const track = tracks[index]
+
+    if (track) {
+      track.enabled = index === selectedTrackIndex
+    }
+  }
+
+  return true
+}
+
+
+function subtitleLanguageLabel(languageCode: string | undefined) {
+  if (!languageCode) {
+    return "Default"
+  }
+
+  const names: Record<string, string> = {
+    en: "English",
+    ja: "Japanese",
+    de: "German",
+    fr: "French",
+    es: "Spanish",
+    it: "Italian",
+    ko: "Korean",
+    zh: "Chinese",
+    pt: "Portuguese",
+    ru: "Russian",
+  }
+
+  return names[languageCode] ?? languageCode.toUpperCase()
+}
+
+function subtitlePreferenceScore(stream: WatchPayload["media"]["subtitleStreams"][number]) {
+  const text = `${stream.label} ${stream.codec ?? ""}`
+    .toLowerCase()
+    .replace(/[._-]+/g, " ")
+    .replace(/\s+/g, " ")
+
+  let score = 0
+
+  if (stream.isDefault) {
+    score += 6
+  }
+
+  if (stream.isForced) {
+    score -= 35
+  }
+
+  if (/\bfull\b/.test(text) || /full subs?/.test(text)) {
+    score += 80
+  }
+
+  if (/without\s+honou?rifics?/.test(text) || /no\s+honou?rifics?/.test(text)) {
+    score += 70
+  } else if (/with\s+honou?rifics?/.test(text)) {
+    score -= 25
+  }
+
+  if (/signs?/.test(text) || /songs?/.test(text) || /karaoke/.test(text)) {
+    score -= 75
+  }
+
+  if (/dialogue/.test(text)) {
+    score += 15
+  }
+
+  return score
+}
+
+function chooseBestSubtitleStream(
+  streams: WatchPayload["media"]["subtitleStreams"],
+  language?: string
+) {
+  const candidates = streams.filter((stream) =>
+    language ? stream.language === language : !stream.language
+  )
+
+  return candidates
+    .slice()
+    .sort((left, right) => {
+      const scoreDiff = subtitlePreferenceScore(right) - subtitlePreferenceScore(left)
+
+      if (scoreDiff !== 0) {
+        return scoreDiff
+      }
+
+      return left.index - right.index
+    })[0]
+}
+
+function getSubtitleLanguageOptions(
+  streams: WatchPayload["media"]["subtitleStreams"]
+) {
+  const groupedStreams = new Map<string, WatchPayload["media"]["subtitleStreams"]>()
+
+  for (const stream of streams) {
+    const key = stream.language ?? "default"
+    const existing = groupedStreams.get(key) ?? []
+    existing.push(stream)
+    groupedStreams.set(key, existing)
+  }
+
+  return Array.from(groupedStreams.entries())
+    .map(([languageKey, languageStreams]) => {
+      const language = languageKey === "default" ? undefined : languageKey
+      const stream = chooseBestSubtitleStream(languageStreams, language) ?? languageStreams[0]
+
+      return {
+        id: stream.id,
+        label: subtitleLanguageLabel(language),
+        language,
+        stream,
+      }
+    })
+    .sort((left, right) => {
+      if (left.language === "en") {
+        return -1
+      }
+
+      if (right.language === "en") {
+        return 1
+      }
+
+      if (!left.language) {
+        return 1
+      }
+
+      if (!right.language) {
+        return -1
+      }
+
+      return left.label.localeCompare(right.label)
+    })
+}
+
+function selectSubtitleForAudio(
+  audioStream: MediaStreamInfo | undefined,
+  subtitleStreams: WatchPayload["media"]["subtitleStreams"]
+) {
+  if (audioStream?.language === "en") {
+    return null
+  }
+
+  const supportedSubtitles = subtitleStreams.filter((stream) => stream.isSupported)
+
+  if (!supportedSubtitles.length) {
+    return null
+  }
+
+  return (
+    chooseBestSubtitleStream(supportedSubtitles, "en") ??
+    chooseBestSubtitleStream(supportedSubtitles) ??
+    supportedSubtitles
+      .slice()
+      .sort((left, right) => {
+        const scoreDiff = subtitlePreferenceScore(right) - subtitlePreferenceScore(left)
+
+        if (scoreDiff !== 0) {
+          return scoreDiff
+        }
+
+        return left.index - right.index
+      })[0]
+  )
+}
+
+function shouldUseDirectAudioRemux(
+  audioStreamId: string | null,
+  directAudioStreamId: string | null
+) {
+  return Boolean(
+    audioStreamId && directAudioStreamId && audioStreamId !== directAudioStreamId
+  )
+}
+
+function statusLabel(status: PlaybackStatusState) {
+  if (status === "direct") {
+    return "Direct"
+  }
+
+  if (status === "transcoding") {
+    return "Transcode"
+  }
+
+  if (status === "blocked") {
+    return "Blocked"
+  }
+
+  return "Checking"
+}
 
 export function AnimePlayer({
   animeId,
   seasonNumber,
   episodeNumber,
   playback,
+  media,
   fileName,
   previousEpisode,
   nextEpisode,
@@ -231,29 +710,36 @@ export function AnimePlayer({
   const playerRef = useRef<HTMLDivElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
   const playbackKeyRef = useRef(`${animeId}:${seasonNumber}:${episodeNumber}`)
+  const castSelectionKeyRef = useRef("")
   const lastProgressSaveRef = useRef(0)
   const completedProgressRef = useRef(false)
   const directFallbackAttemptedRef = useRef(false)
   const currentTimeRef = useRef(0)
+  const subtitleCuesRef = useRef<SubtitleCue[]>([])
+  const activeSubtitleKeyRef = useRef("")
   const pendingSeekRef = useRef<number | null>(null)
   const sourceUrlRef = useRef<string | null>(null)
   const statusRef = useRef<PlaybackStatusState>("checking")
-  const activeTranscodeStartRef = useRef(0)
+  const activeSourceStartRef = useRef(0)
   const shouldAutoPlaySourceRef = useRef(autoPlay)
   const isCastingRef = useRef(false)
   const isCastLoadingRef = useRef(false)
   const isPlayingRef = useRef(false)
   const castContentIdRef = useRef<string | null>(null)
-  const castErrorFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
-    null
-  )
+  const castErrorFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const castFinishedHandledRef = useRef(false)
   const castMediaCleanupRef = useRef<(() => void) | null>(null)
-  const castProgressTimerRef = useRef<ReturnType<typeof setInterval> | null>(
-    null
-  )
+  const castProgressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const castStartPromiseRef = useRef<Promise<boolean> | null>(null)
   const localPlaybackBeforeCastRef = useRef<LocalPlaybackSnapshot | null>(null)
+  const controlsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const hardwareWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const seekPreviewFrameTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const subtitleAnimationFrameRef = useRef<number | null>(null)
+  const streamStatsSampleRef = useRef<{
+    bufferedEnd: number
+    sampledAt: number
+  } | null>(null)
   const startGoogleCastingRef = useRef<
     (
       video: HTMLVideoElement,
@@ -269,14 +755,13 @@ export function AnimePlayer({
     ) => void
   >(() => undefined)
   const handleCastEndedRef = useRef<() => void>(() => undefined)
-  const controlsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const hardwareWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
-    null
-  )
-  const seekPreviewFrameTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
-    null
-  )
   const [quality, setQuality] = useState<PlaybackProfile>("original")
+  const [selectedAudioStreamId, setSelectedAudioStreamId] = useState<string | null>(
+    media.defaultAudioStreamId
+  )
+  const [selectedSubtitleStreamId, setSelectedSubtitleStreamId] = useState<
+    string | null
+  >(media.defaultSubtitleStreamId)
   const [sourceUrl, setSourceUrl] = useState<string | null>(null)
   const [status, setStatus] = useState<PlaybackStatusState>("checking")
   const [directPossible, setDirectPossible] = useState(false)
@@ -285,26 +770,58 @@ export function AnimePlayer({
   const [showHardwareWait, setShowHardwareWait] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
   const [seekPreview, setSeekPreview] = useState<number | null>(null)
-  const [seekPreviewFrame, setSeekPreviewFrame] =
-    useState<SeekPreviewFrame | null>(null)
+  const [seekPreviewFrame, setSeekPreviewFrame] = useState<SeekPreviewFrame | null>(null)
   const [duration, setDuration] = useState(getStableDuration(durationSeconds))
   const [controlsVisible, setControlsVisible] = useState(true)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const [canCast, setCanCast] = useState(false)
   const [isCasting, setIsCasting] = useState(false)
   const [isCastStarting, setIsCastStarting] = useState(false)
   const [castErrorFlash, setCastErrorFlash] = useState(false)
+  const [subtitleCues, setSubtitleCues] = useState<SubtitleCue[]>([])
+  const [activeSubtitleTexts, setActiveSubtitleTexts] = useState<string[]>([])
+  const [measuredStreamMbps, setMeasuredStreamMbps] = useState<number | null>(null)
 
-  const labels = useMemo(
-    () => ({
-      original: "Original",
-      dataSaver: "Data Saver",
-    }),
-    []
-  )
   const playbackKey = `${animeId}:${seasonNumber}:${episodeNumber}`
+  const liveTranscodeEnabled = playback.liveTranscodeEnabled !== false
+  const selectedAudioStream = useMemo(
+    () => media.audioStreams.find((stream) => stream.id === selectedAudioStreamId),
+    [media.audioStreams, selectedAudioStreamId]
+  )
+  const directAudioRemuxActive = shouldUseDirectAudioRemux(
+    selectedAudioStreamId,
+    media.directAudioStreamId
+  )
+  const supportedSubtitleStreams = useMemo(
+    () => media.subtitleStreams.filter((stream) => stream.isSupported),
+    [media.subtitleStreams]
+  )
+  const subtitleLanguageOptions = useMemo(
+    () => getSubtitleLanguageOptions(supportedSubtitleStreams),
+    [supportedSubtitleStreams]
+  )
+  const selectedSubtitleStream = useMemo(
+    () =>
+      supportedSubtitleStreams.find(
+        (stream) => stream.id === selectedSubtitleStreamId
+      ) ?? null,
+    [selectedSubtitleStreamId, supportedSubtitleStreams]
+  )
+  const subtitleTrackUrl = selectedSubtitleStream
+    ? withSubtitleStream(playback.subtitleUrl, selectedSubtitleStream.id)
+    : null
+  const streamMbps = estimateStreamMbps({
+    quality,
+    sourceBitrateMbps: media.sourceBitrateMbps,
+    status,
+  })
+  const displayMethod = statusLabel(status)
+  const castSelectionKey = `${playbackKey}:${quality}:${selectedAudioStreamId ?? ""}:${selectedSubtitleStreamId ?? ""}`
 
   useEffect(() => {
     sourceUrlRef.current = sourceUrl
+    streamStatsSampleRef.current = null
+    setMeasuredStreamMbps(null)
   }, [sourceUrl])
 
   useEffect(() => {
@@ -318,6 +835,65 @@ export function AnimePlayer({
   useEffect(() => {
     statusRef.current = status
   }, [status])
+
+  useEffect(() => {
+    if (!liveTranscodeEnabled && quality !== "original") {
+      setQuality("original")
+    }
+  }, [liveTranscodeEnabled, quality])
+
+  useEffect(() => {
+    const video = videoRef.current
+
+    if (!video || status !== "direct") {
+      return
+    }
+
+    applyDirectAudioTrack(video, selectedAudioStream, media.audioStreams)
+  }, [media.audioStreams, selectedAudioStream, sourceUrl, status])
+
+  useEffect(() => {
+    const defaultSubtitle = supportedSubtitleStreams.find(
+      (stream) => stream.id === media.defaultSubtitleStreamId
+    )
+    const bestDefaultSubtitle = defaultSubtitle
+      ? subtitleLanguageOptions.find(
+          (option) => option.language === defaultSubtitle.language
+        )?.stream ?? defaultSubtitle
+      : null
+
+    setSelectedAudioStreamId(media.defaultAudioStreamId)
+    setSelectedSubtitleStreamId(bestDefaultSubtitle?.id ?? null)
+  }, [
+    media.defaultAudioStreamId,
+    media.defaultSubtitleStreamId,
+    playbackKey,
+    subtitleLanguageOptions,
+    supportedSubtitleStreams,
+  ])
+
+  useEffect(() => {
+    if (!selectedSubtitleStreamId) {
+      return
+    }
+
+    const selectedStream = supportedSubtitleStreams.find(
+      (stream) => stream.id === selectedSubtitleStreamId
+    )
+
+    if (!selectedStream) {
+      setSelectedSubtitleStreamId(null)
+      return
+    }
+
+    const bestLanguageOption = subtitleLanguageOptions.find(
+      (option) => option.language === selectedStream.language
+    )
+
+    if (bestLanguageOption && bestLanguageOption.id !== selectedSubtitleStreamId) {
+      setSelectedSubtitleStreamId(bestLanguageOption.id)
+    }
+  }, [selectedSubtitleStreamId, subtitleLanguageOptions, supportedSubtitleStreams])
 
   useEffect(() => {
     let cancelled = false
@@ -373,6 +949,13 @@ export function AnimePlayer({
     }
   }, [])
 
+  const clearSubtitleAnimationFrame = useCallback(() => {
+    if (subtitleAnimationFrameRef.current !== null) {
+      window.cancelAnimationFrame(subtitleAnimationFrameRef.current)
+      subtitleAnimationFrameRef.current = null
+    }
+  }, [])
+
   const clearCastErrorFlashTimer = useCallback(() => {
     if (castErrorFlashTimerRef.current) {
       clearTimeout(castErrorFlashTimerRef.current)
@@ -390,17 +973,20 @@ export function AnimePlayer({
     }
   }, [])
 
-  const beginMediaWait = useCallback((forceTranscodeWait = false) => {
-    clearHardwareWaitTimer()
-    setIsWaitingForMedia(true)
-    setShowHardwareWait(false)
+  const beginMediaWait = useCallback(
+    (forceTranscodeWait = false) => {
+      clearHardwareWaitTimer()
+      setIsWaitingForMedia(true)
+      setShowHardwareWait(false)
 
-    if (forceTranscodeWait || status === "transcoding") {
-      hardwareWaitTimerRef.current = setTimeout(() => {
-        setShowHardwareWait(true)
-      }, 5000)
-    }
-  }, [clearHardwareWaitTimer, status])
+      if (forceTranscodeWait || statusRef.current === "transcoding") {
+        hardwareWaitTimerRef.current = setTimeout(() => {
+          setShowHardwareWait(true)
+        }, 5000)
+      }
+    },
+    [clearHardwareWaitTimer]
+  )
 
   const endMediaWait = useCallback(() => {
     clearHardwareWaitTimer()
@@ -413,19 +999,20 @@ export function AnimePlayer({
       clearControlsTimer()
       setControlsVisible(true)
 
-      if (!keepVisible && isPlaying && !isCasting) {
+      if (!keepVisible && isPlayingRef.current && !isCastingRef.current) {
         controlsTimerRef.current = setTimeout(() => {
           setControlsVisible(false)
+          setSettingsOpen(false)
         }, 2500)
       }
     },
-    [clearControlsTimer, isCasting, isPlaying]
+    [clearControlsTimer]
   )
 
   const saveProgress = useCallback(
     async (
       watchedSeconds: number,
-      durationSeconds: number | undefined,
+      knownDurationSeconds: number | undefined,
       completed: boolean
     ) => {
       lastProgressSaveRef.current = Date.now()
@@ -440,7 +1027,7 @@ export function AnimePlayer({
           body: JSON.stringify({
             season: seasonNumber,
             watchedSeconds,
-            durationSeconds,
+            durationSeconds: knownDurationSeconds,
             completed,
           }),
         }
@@ -449,10 +1036,7 @@ export function AnimePlayer({
     [animeId, episodeNumber, seasonNumber]
   )
 
-  function updateWatchedProgress(
-    watchedSeconds: number,
-    measuredDuration?: number
-  ) {
+  function updateWatchedProgress(watchedSeconds: number, measuredDuration?: number) {
     const effectiveDuration = getStableDuration(
       durationSeconds,
       measuredDuration,
@@ -461,6 +1045,7 @@ export function AnimePlayer({
 
     currentTimeRef.current = watchedSeconds
     setCurrentTime(watchedSeconds)
+    syncSubtitleOverlay(watchedSeconds)
 
     if (effectiveDuration) {
       setDuration(effectiveDuration)
@@ -483,22 +1068,16 @@ export function AnimePlayer({
 
   function completePlayback(endedTime: number, knownDuration?: number) {
     const finalTime =
-      knownDuration && Number.isFinite(knownDuration)
-        ? knownDuration
-        : endedTime
+      knownDuration && Number.isFinite(knownDuration) ? knownDuration : endedTime
     const completedEnough =
-      knownDuration && knownDuration > 0
-        ? endedTime / knownDuration >= 0.9
-        : endedTime >= 60
+      knownDuration && knownDuration > 0 ? endedTime / knownDuration >= 0.9 : endedTime >= 60
 
     setIsPlaying(false)
     completedProgressRef.current = Boolean(completedEnough)
     showControls(true)
     void saveProgress(
       completedEnough ? finalTime : endedTime,
-      knownDuration && Number.isFinite(knownDuration)
-        ? knownDuration
-        : undefined,
+      knownDuration && Number.isFinite(knownDuration) ? knownDuration : undefined,
       Boolean(completedEnough)
     )
 
@@ -514,6 +1093,7 @@ export function AnimePlayer({
       clearCastErrorFlashTimer()
       clearCastMediaSync()
       clearSeekPreviewFrameTimer()
+      clearSubtitleAnimationFrame()
     },
     [
       clearControlsTimer,
@@ -521,18 +1101,21 @@ export function AnimePlayer({
       clearCastErrorFlashTimer,
       clearCastMediaSync,
       clearSeekPreviewFrameTimer,
+      clearSubtitleAnimationFrame,
     ]
   )
 
   function getPlaybackPosition() {
-    const video = videoRef.current
+    return getPlaybackClockPosition(videoRef.current)
+  }
 
+  function getPlaybackClockPosition(video: HTMLVideoElement | null) {
     if (
       video &&
       Number.isFinite(video.currentTime) &&
-      statusRef.current === "transcoding"
+      activeSourceStartRef.current > 0
     ) {
-      return Math.max(activeTranscodeStartRef.current + video.currentTime, 0)
+      return Math.max(activeSourceStartRef.current + video.currentTime, 0)
     }
 
     const seconds =
@@ -543,6 +1126,18 @@ export function AnimePlayer({
     return Math.max(seconds, 0)
   }
 
+  function syncSubtitleOverlay(seconds = getPlaybackPosition()) {
+    const texts = getActiveSubtitleTexts(subtitleCuesRef.current, seconds)
+    const key = subtitleTextKey(texts)
+
+    if (key === activeSubtitleKeyRef.current) {
+      return
+    }
+
+    activeSubtitleKeyRef.current = key
+    setActiveSubtitleTexts(texts)
+  }
+
   function applyPendingSeek(video: HTMLVideoElement) {
     const pendingSeek = pendingSeekRef.current
 
@@ -550,13 +1145,8 @@ export function AnimePlayer({
       return
     }
 
-    const knownDuration = getStableDuration(
-      durationSeconds,
-      video.duration,
-      duration
-    )
-    const target =
-      knownDuration > 0 ? Math.min(pendingSeek, knownDuration) : pendingSeek
+    const knownDuration = getStableDuration(durationSeconds, video.duration, duration)
+    const target = knownDuration > 0 ? Math.min(pendingSeek, knownDuration) : pendingSeek
 
     if (Number.isFinite(target) && target > 0) {
       video.currentTime = target
@@ -567,6 +1157,23 @@ export function AnimePlayer({
     pendingSeekRef.current = null
   }
 
+  function getDirectUrl(startTime?: number) {
+    return withStreamParams(playback.directUrl, {
+      audioStreamId: selectedAudioStreamId,
+      startTime: directAudioRemuxActive ? startTime : null,
+    })
+  }
+
+  function getTranscodeUrl(profile: PlaybackProfile, startTime?: number) {
+    return withStreamParams(
+      profile === "dataSaver" ? playback.dataSaverUrl : playback.originalTranscodeUrl,
+      {
+        audioStreamId: selectedAudioStreamId,
+        startTime,
+      }
+    )
+  }
+
   function switchSource(
     nextSourceUrl: string,
     nextStatus: PlaybackStatusState,
@@ -574,37 +1181,46 @@ export function AnimePlayer({
   ) {
     const video = videoRef.current
     const previousPosition = options.preservePosition ? getPlaybackPosition() : 0
-    const transcodeStartTime =
-      nextStatus === "transcoding"
-        ? options.transcodeStartTime ?? previousPosition
-        : 0
-    const sourceToLoad =
-      nextStatus === "transcoding"
-        ? withTranscodeStartTime(nextSourceUrl, transcodeStartTime)
-        : nextSourceUrl
+    const sourceUsesOffset = nextStatus === "transcoding" || directAudioRemuxActive
+    const sourceStartTime = sourceUsesOffset
+      ? options.transcodeStartTime ?? previousPosition
+      : 0
+    const sourceToLoad = sourceUsesOffset
+      ? withStreamParams(nextSourceUrl, {
+          audioStreamId: selectedAudioStreamId,
+          startTime: sourceStartTime,
+        })
+      : withStreamParams(nextSourceUrl, {
+          audioStreamId: selectedAudioStreamId,
+          startTime: null,
+        })
 
-    activeTranscodeStartRef.current = transcodeStartTime
+    activeSourceStartRef.current = sourceStartTime
 
     if (options.preservePosition) {
       currentTimeRef.current = previousPosition
       setCurrentTime(previousPosition)
-      pendingSeekRef.current =
-        nextStatus === "transcoding" ? null : previousPosition
+      pendingSeekRef.current = sourceUsesOffset ? null : previousPosition
     } else {
       pendingSeekRef.current = null
 
-      if (nextStatus === "transcoding" && transcodeStartTime > 0) {
-        currentTimeRef.current = transcodeStartTime
-        setCurrentTime(transcodeStartTime)
+      if (sourceUsesOffset && sourceStartTime > 0) {
+        currentTimeRef.current = sourceStartTime
+        setCurrentTime(sourceStartTime)
       }
     }
 
-    video?.pause()
-    setIsPlaying(false)
+    const sourceChanged = sourceUrlRef.current !== sourceToLoad
+
+    if (sourceChanged) {
+      video?.pause()
+      setIsPlaying(false)
+    }
+
     setStatus(nextStatus)
     statusRef.current = nextStatus
 
-    if (sourceUrlRef.current !== sourceToLoad) {
+    if (sourceChanged) {
       sourceUrlRef.current = sourceToLoad
       if (video) {
         video.src = sourceToLoad
@@ -624,22 +1240,44 @@ export function AnimePlayer({
 
   switchSourceRef.current = switchSource
 
+  const blockLiveTranscodePlayback = useCallback(() => {
+    const video = videoRef.current
+
+    video?.pause()
+    video?.removeAttribute("src")
+    video?.load()
+    sourceUrlRef.current = null
+    activeSourceStartRef.current = 0
+    pendingSeekRef.current = null
+    setSourceUrl(null)
+    setStatus("blocked")
+    statusRef.current = "blocked"
+    setIsPlaying(false)
+    endMediaWait()
+    showControls(true)
+  }, [endMediaWait, showControls])
+
   useEffect(() => {
     let cancelled = false
 
     async function selectSource() {
       const previousSourceUrl = sourceUrlRef.current
       const episodeChanged = playbackKeyRef.current !== playbackKey
+
       if (episodeChanged) {
         playbackKeyRef.current = playbackKey
         currentTimeRef.current = 0
+        activeSourceStartRef.current = 0
+        activeSubtitleKeyRef.current = ""
         pendingSeekRef.current = null
         shouldAutoPlaySourceRef.current = autoPlay || isPlayingRef.current
         setCurrentTime(0)
         setSeekPreview(null)
         setSeekPreviewFrame(null)
+        setActiveSubtitleTexts([])
         setDuration(getStableDuration(durationSeconds))
         setControlsVisible(!isPlayingRef.current)
+        setSettingsOpen(false)
         endMediaWait()
         lastProgressSaveRef.current = 0
         completedProgressRef.current = false
@@ -661,14 +1299,14 @@ export function AnimePlayer({
       }
 
       const video = videoRef.current
-      const canDirect = video ? supportsDirectPlayback(video, fileName) : false
-      setDirectPossible(canDirect)
+      const canUseDirect = video ? supportsDirectPlayback(video, fileName) : false
+      setDirectPossible(canUseDirect)
       setStatus("checking")
       endMediaWait()
 
-      if (quality === "original" && canDirect) {
+      if (quality === "original" && canUseDirect) {
         directFallbackAttemptedRef.current = false
-        switchSourceRef.current(playback.directUrl, "direct", {
+        switchSourceRef.current(getDirectUrl(), "direct", {
           preservePosition: Boolean(previousSourceUrl) && !episodeChanged,
         })
         return
@@ -678,15 +1316,14 @@ export function AnimePlayer({
         return
       }
 
-      switchSourceRef.current(
-        quality === "dataSaver"
-          ? playback.dataSaverUrl
-          : playback.originalTranscodeUrl,
-        "transcoding",
-        {
-          preservePosition: Boolean(previousSourceUrl) && !episodeChanged,
-        }
-      )
+      if (!liveTranscodeEnabled) {
+        blockLiveTranscodePlayback()
+        return
+      }
+
+      switchSourceRef.current(getTranscodeUrl(quality), "transcoding", {
+        preservePosition: Boolean(previousSourceUrl) && !episodeChanged,
+      })
     }
 
     void selectSource()
@@ -695,15 +1332,18 @@ export function AnimePlayer({
       cancelled = true
     }
   }, [
+    autoPlay,
+    blockLiveTranscodePlayback,
     durationSeconds,
     endMediaWait,
     fileName,
-    autoPlay,
-    quality,
+    liveTranscodeEnabled,
     playbackKey,
     playback.dataSaverUrl,
     playback.directUrl,
     playback.originalTranscodeUrl,
+    quality,
+    selectedAudioStreamId,
   ])
 
   useEffect(() => {
@@ -717,26 +1357,95 @@ export function AnimePlayer({
       const timer = window.setTimeout(() => {
         shouldAutoPlaySourceRef.current = false
         beginMediaWait()
-        void video.play().catch(() => undefined)
+        void video.play().catch(() => {
+          setIsPlaying(false)
+          endMediaWait()
+        })
       }, 0)
 
       return () => window.clearTimeout(timer)
     }
   }, [beginMediaWait, sourceUrl])
 
+  useEffect(() => {
+    let cancelled = false
+
+    subtitleCuesRef.current = []
+    activeSubtitleKeyRef.current = ""
+    setSubtitleCues([])
+    setActiveSubtitleTexts([])
+
+    if (!selectedSubtitleStream || !subtitleTrackUrl) {
+      return
+    }
+
+    void fetch(subtitleTrackUrl, { cache: "no-store" })
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error(`Subtitle request failed with status ${response.status}`)
+        }
+
+        return response.text()
+      })
+      .then((text) => {
+        if (!cancelled) {
+          const cues = parseWebVtt(text)
+          subtitleCuesRef.current = cues
+          setSubtitleCues(cues)
+          syncSubtitleOverlay()
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          subtitleCuesRef.current = []
+          activeSubtitleKeyRef.current = ""
+          setSubtitleCues([])
+          setActiveSubtitleTexts([])
+          console.error(error)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [selectedSubtitleStream, subtitleTrackUrl])
+
+  useEffect(() => {
+    subtitleCuesRef.current = subtitleCues
+    activeSubtitleKeyRef.current = ""
+    syncSubtitleOverlay()
+  }, [subtitleCues])
+
+  useEffect(() => {
+    clearSubtitleAnimationFrame()
+
+    if (!subtitleCues.length || isCasting) {
+      activeSubtitleKeyRef.current = ""
+      setActiveSubtitleTexts([])
+      return
+    }
+
+    const tick = () => {
+      syncSubtitleOverlay()
+      subtitleAnimationFrameRef.current = window.requestAnimationFrame(tick)
+    }
+
+    tick()
+
+    return clearSubtitleAnimationFrame
+  }, [clearSubtitleAnimationFrame, isCasting, sourceUrl, subtitleCues])
+
   function tryDirectPlay() {
     setQuality("original")
     directFallbackAttemptedRef.current = false
-    switchSource(playback.directUrl, "direct", { preservePosition: true })
+    switchSource(getDirectUrl(), "direct", { preservePosition: true })
   }
 
   function restoreLocalSource(options: { preservePosition?: boolean } = {}) {
     const previousLocalPlayback = localPlaybackBeforeCastRef.current
 
     if (previousLocalPlayback?.sourceUrl) {
-      const position = options.preservePosition
-        ? previousLocalPlayback.position
-        : 0
+      const position = options.preservePosition ? previousLocalPlayback.position : 0
       const video = videoRef.current
 
       localPlaybackBeforeCastRef.current = null
@@ -755,37 +1464,42 @@ export function AnimePlayer({
     }
 
     const video = videoRef.current
-    const canDirect = video ? supportsDirectPlayback(video, fileName) : false
+    const canUseDirect = video ? supportsDirectPlayback(video, fileName) : false
 
     if (video) {
       video.muted = false
     }
 
-    setDirectPossible(canDirect)
+    setDirectPossible(canUseDirect)
 
-    if (quality === "original" && canDirect) {
+    if (quality === "original" && canUseDirect) {
       directFallbackAttemptedRef.current = false
-      switchSource(playback.directUrl, "direct", {
+      switchSource(getDirectUrl(), "direct", {
         preservePosition: options.preservePosition,
       })
       return
     }
 
-    switchSource(
-      quality === "dataSaver"
-        ? playback.dataSaverUrl
-        : playback.originalTranscodeUrl,
-      "transcoding",
-      {
-        preservePosition: options.preservePosition,
-      }
-    )
+    if (!liveTranscodeEnabled) {
+      blockLiveTranscodePlayback()
+      return
+    }
+
+    switchSource(getTranscodeUrl(quality), "transcoding", {
+      preservePosition: options.preservePosition,
+    })
   }
 
   function fallbackDirectToTranscode() {
     directFallbackAttemptedRef.current = true
     setDirectPossible(false)
-    switchSource(playback.originalTranscodeUrl, "transcoding", {
+
+    if (!liveTranscodeEnabled) {
+      blockLiveTranscodePlayback()
+      return
+    }
+
+    switchSource(getTranscodeUrl("original"), "transcoding", {
       preservePosition: true,
       waitForMedia: isPlaying || autoPlay,
     })
@@ -847,18 +1561,19 @@ export function AnimePlayer({
 
     const target = clampTime(seconds, duration)
 
-    if (statusRef.current === "transcoding") {
+    if (statusRef.current === "transcoding" || directAudioRemuxActive) {
       const wasPlaying = !video.paused || isPlayingRef.current
-      const baseTranscodeUrl =
-        quality === "dataSaver"
-          ? playback.dataSaverUrl
-          : playback.originalTranscodeUrl
+      const nextStatus = statusRef.current === "transcoding" ? "transcoding" : "direct"
+      const nextSourceUrl =
+        nextStatus === "transcoding" ? getTranscodeUrl(quality) : getDirectUrl(target)
 
-      activeTranscodeStartRef.current = target
+      activeSourceStartRef.current = target
       currentTimeRef.current = target
       setCurrentTime(target)
+      syncSubtitleOverlay(target)
+      setIsPlaying(false)
       shouldAutoPlaySourceRef.current = wasPlaying
-      switchSource(baseTranscodeUrl, "transcoding", {
+      switchSource(nextSourceUrl, nextStatus, {
         transcodeStartTime: target,
         waitForMedia: wasPlaying,
       })
@@ -866,9 +1581,11 @@ export function AnimePlayer({
       return
     }
 
+    activeSourceStartRef.current = 0
     video.currentTime = target
     currentTimeRef.current = video.currentTime
     setCurrentTime(video.currentTime)
+    syncSubtitleOverlay(video.currentTime)
     showControls()
   }
 
@@ -901,10 +1618,7 @@ export function AnimePlayer({
     }, 140)
   }
 
-  function getSeekTimeFromPointer(
-    input: HTMLInputElement,
-    clientX: number
-  ) {
+  function getSeekTimeFromPointer(input: HTMLInputElement, clientX: number) {
     if (!duration) {
       return 0
     }
@@ -918,10 +1632,7 @@ export function AnimePlayer({
     return ratio * duration
   }
 
-  function updateSeekHoverPreview(
-    input: HTMLInputElement,
-    clientX: number
-  ) {
+  function updateSeekHoverPreview(input: HTMLInputElement, clientX: number) {
     const hoverTime = getSeekTimeFromPointer(input, clientX)
     scheduleSeekPreviewFrame(hoverTime)
   }
@@ -1026,19 +1737,42 @@ export function AnimePlayer({
     }
   }
 
+  function getSelectedCastTextTrack() {
+    if (!selectedSubtitleStream) {
+      return undefined
+    }
+
+    const trackUrl = getCastReceiverUrl(
+      withSubtitleStream(playback.castSubtitleUrl, selectedSubtitleStream.id)
+    )
+
+    return {
+      id: selectedSubtitleStream.index + 1,
+      language: selectedSubtitleStream.language,
+      label: subtitleLanguageLabel(selectedSubtitleStream.language),
+      url: trackUrl,
+    }
+  }
+
   async function loadGoogleCastMedia(input: {
     session: GoogleCastSessionHandle
     url: string
     contentType: string
     shouldResume: boolean
     startTime: number
+    textTrack?: CastTextTrack
     timeoutMs?: number | null
   }) {
+    if (input.textTrack) {
+      assertCastReceiverUrlReachable(input.textTrack.url)
+    }
+
     const request = createGoogleCastLoadRequest({
       url: input.url,
       contentType: input.contentType,
       autoplay: input.shouldResume,
       currentTime: input.startTime,
+      textTrack: input.textTrack,
     })
 
     if (!request) {
@@ -1100,10 +1834,7 @@ export function AnimePlayer({
     }
   }
 
-  function attachCastMediaSync(
-    session: GoogleCastSessionHandle,
-    contentId: string
-  ) {
+  function attachCastMediaSync(session: GoogleCastSessionHandle, contentId: string) {
     clearCastMediaSync()
     castContentIdRef.current = contentId
     castFinishedHandledRef.current = false
@@ -1146,6 +1877,7 @@ export function AnimePlayer({
   ) {
     isCastLoadingRef.current = false
     isCastingRef.current = true
+    castSelectionKeyRef.current = castSelectionKey
     setIsCasting(true)
     setStatus(nextStatus)
     endMediaWait()
@@ -1190,18 +1922,25 @@ export function AnimePlayer({
 
     const startTime = startTimeOverride ?? getPlaybackPosition()
     const session = getGoogleCastSession() ?? (await requestGoogleCastSession())
-    const directFirst = quality === "original"
-    const directCastUrl = getCastReceiverUrl(playback.castDirectUrl)
-    const transcodeCastUrl = getCastReceiverUrl(playback.castTranscodeUrl)
     const canLocalDirect = supportsDirectPlayback(video, fileName)
+    const directFirst = quality === "original" && canLocalDirect
+    const directCastUrl = getCastReceiverUrl(
+      withStreamParams(playback.castDirectUrl, {
+        audioStreamId: selectedAudioStreamId,
+      })
+    )
+    const castTranscodeBaseUrl =
+      quality === "dataSaver" ? playback.castDataSaverUrl : playback.castTranscodeUrl
+    const transcodeCastUrl = getCastReceiverUrl(
+      withStreamParams(castTranscodeBaseUrl, {
+        audioStreamId: selectedAudioStreamId,
+      })
+    )
+    const textTrack = getSelectedCastTextTrack()
     const localFallbackStatus =
-      quality === "original" && canLocalDirect ? "direct" : "transcoding"
+      directFirst || !liveTranscodeEnabled ? "direct" : "transcoding"
     const localFallbackSource =
-      localFallbackStatus === "direct"
-        ? playback.directUrl
-        : quality === "dataSaver"
-          ? playback.dataSaverUrl
-          : playback.originalTranscodeUrl
+      localFallbackStatus === "direct" ? getDirectUrl() : getTranscodeUrl(quality)
 
     localPlaybackBeforeCastRef.current = {
       sourceUrl: sourceUrlRef.current ?? localFallbackSource,
@@ -1224,9 +1963,10 @@ export function AnimePlayer({
         const result = await loadGoogleCastMedia({
           session,
           url: directCastUrl,
-          contentType: getCastDirectContentType(fileName),
+          contentType: getCastDirectContentType(fileName, directAudioRemuxActive),
           shouldResume,
           startTime,
+          textTrack,
           timeoutMs: 60_000,
         })
         if (result === "loaded") {
@@ -1236,7 +1976,9 @@ export function AnimePlayer({
 
         if (result === "failed") {
           const fallbackError = new Error(
-            "Direct cast failed on the receiver. Switching to transcoded stream."
+            liveTranscodeEnabled
+              ? "Direct cast failed on the receiver. Switching to transcoded stream."
+              : "Direct cast failed on the receiver, and live transcoding is disabled."
           )
           reportCastError(fallbackError)
           console.error(fallbackError)
@@ -1245,6 +1987,17 @@ export function AnimePlayer({
         reportCastError(error)
         console.error(error)
       }
+    }
+
+    if (!liveTranscodeEnabled) {
+      isCastLoadingRef.current = false
+      endMediaWait()
+      safeEndGoogleCastSession(session, true)
+      restoreLocalSource({ preservePosition: true })
+      flashCastError(
+        new Error("Live transcoding is disabled when TRANSCODE_ACCEL=cpu.")
+      )
+      return true
     }
 
     setStatus("transcoding")
@@ -1257,6 +2010,7 @@ export function AnimePlayer({
         contentType: "video/mp4",
         shouldResume,
         startTime,
+        textTrack,
         timeoutMs: null,
       })
 
@@ -1290,6 +2044,26 @@ export function AnimePlayer({
 
   startGoogleCastingRef.current = startGoogleCasting
 
+  useEffect(() => {
+    if (!isCasting) {
+      castSelectionKeyRef.current = castSelectionKey
+      return
+    }
+
+    if (castSelectionKeyRef.current === castSelectionKey) {
+      return
+    }
+
+    const video = videoRef.current
+
+    if (!video) {
+      return
+    }
+
+    castSelectionKeyRef.current = castSelectionKey
+    void startGoogleCastingRef.current(video, isPlayingRef.current, getPlaybackPosition())
+  }, [castSelectionKey, isCasting])
+
   async function startCasting() {
     const video = videoRef.current
 
@@ -1314,7 +2088,6 @@ export function AnimePlayer({
 
     showControls(true)
     const shouldResume = !video.paused || isPlayingRef.current
-
     const startPromise = startGoogleCasting(video, shouldResume)
     castStartPromiseRef.current = startPromise
     setIsCastStarting(true)
@@ -1372,13 +2145,47 @@ export function AnimePlayer({
     handleCastEnded()
   }
 
+  function handleProgress(event: React.SyntheticEvent<HTMLVideoElement>) {
+    const estimatedMbps = streamMbps
+
+    if (!estimatedMbps || estimatedMbps <= 0) {
+      streamStatsSampleRef.current = null
+      setMeasuredStreamMbps(null)
+      return
+    }
+
+    const bufferedEnd = getBufferedEnd(event.currentTarget)
+    const sampledAt = performance.now()
+    const previousSample = streamStatsSampleRef.current
+
+    streamStatsSampleRef.current = { bufferedEnd, sampledAt }
+
+    if (!previousSample) {
+      return
+    }
+
+    const elapsedSeconds = (sampledAt - previousSample.sampledAt) / 1000
+    const bufferedSeconds = bufferedEnd - previousSample.bufferedEnd
+
+    if (elapsedSeconds < 0.75 || bufferedSeconds <= 0) {
+      return
+    }
+
+    const nextMeasuredMbps = Number(
+      ((bufferedSeconds / elapsedSeconds) * estimatedMbps).toFixed(2)
+    )
+
+    if (Number.isFinite(nextMeasuredMbps) && nextMeasuredMbps > 0) {
+      setMeasuredStreamMbps(nextMeasuredMbps)
+    }
+  }
+
   function handleTimeUpdate(event: React.SyntheticEvent<HTMLVideoElement>) {
     const video = event.currentTarget
-    const transcodeOffset =
-      statusRef.current === "transcoding" ? activeTranscodeStartRef.current : 0
-    const watchedSeconds = transcodeOffset + video.currentTime
+    const sourceOffset = activeSourceStartRef.current
+    const watchedSeconds = sourceOffset + video.currentTime
     const measuredDuration = Number.isFinite(video.duration)
-      ? video.duration + transcodeOffset
+      ? video.duration + sourceOffset
       : undefined
 
     updateWatchedProgress(watchedSeconds, measuredDuration)
@@ -1416,13 +2223,90 @@ export function AnimePlayer({
     completePlayback(endedTime, knownDuration)
   }
 
+  function changeQuality(nextQuality: PlaybackProfile) {
+    if (!liveTranscodeEnabled) {
+      setQuality("original")
+      showControls(true)
+      return
+    }
+
+    const video = videoRef.current
+    const wasPlaying = Boolean(video && !video.paused) || isPlayingRef.current
+
+    shouldAutoPlaySourceRef.current = wasPlaying
+    setIsPlaying(false)
+    setQuality(nextQuality)
+    showControls(true)
+  }
+
+  function changeAudio(nextAudioStreamId: string | null) {
+    const nextAudioStream = media.audioStreams.find(
+      (stream) => stream.id === nextAudioStreamId
+    )
+    const nextSubtitleStream = selectSubtitleForAudio(
+      nextAudioStream,
+      media.subtitleStreams
+    )
+    const video = videoRef.current
+    const wasPlaying = Boolean(video && !video.paused) || isPlayingRef.current
+    const nextDirectAudioRemuxActive = shouldUseDirectAudioRemux(
+      nextAudioStreamId,
+      media.directAudioStreamId
+    )
+    const sourceWillReload =
+      statusRef.current === "transcoding" ||
+      (statusRef.current === "direct" &&
+        (directAudioRemuxActive || nextDirectAudioRemuxActive))
+
+    shouldAutoPlaySourceRef.current = wasPlaying
+
+    if (sourceWillReload) {
+      setIsPlaying(false)
+      if (wasPlaying) {
+        beginMediaWait(statusRef.current === "transcoding")
+      }
+    }
+
+    setSelectedAudioStreamId(nextAudioStreamId)
+    setSelectedSubtitleStreamId(nextSubtitleStream?.id ?? null)
+
+    if (video && statusRef.current === "direct" && !sourceWillReload) {
+      const switchedTrack = applyDirectAudioTrack(
+        video,
+        nextAudioStream,
+        media.audioStreams
+      )
+
+      if (!switchedTrack && nextDirectAudioRemuxActive) {
+        setIsPlaying(false)
+      }
+    }
+
+    showControls(true)
+  }
+
+  function changeSubtitle(nextSubtitleStreamId: string | null) {
+    setSelectedSubtitleStreamId(nextSubtitleStreamId)
+    showControls(true)
+  }
+
   const displayedCurrentTime = seekPreview ?? currentTime
   const canSkipIntro = duration > 90 && currentTime < 90
   const canSkipOutro = duration > 180 && duration - currentTime <= 120
-  const controlsAreVisible = controlsVisible || !isPlaying || isCasting
+  const controlsAreVisible = controlsVisible || !isPlaying || isCasting || settingsOpen
   const centerToggleVisible =
     !isWaitingForMedia && !isCasting && (!isPlaying || controlsAreVisible)
-
+  const settingsSelectClass =
+    "h-8 w-full rounded-md border border-white/10 bg-zinc-950 px-2 text-xs text-zinc-100 outline-none focus:border-violet-400"
+  const selectedSubtitleLabel = selectedSubtitleStream
+    ? subtitleLanguageLabel(selectedSubtitleStream.language)
+    : "Off"
+  const selectedAudioLabel = selectedAudioStream?.label ?? "Default"
+  const streamMbpsLabel = measuredStreamMbps
+    ? `${measuredStreamMbps.toFixed(2)} Mb/s current`
+    : streamMbps
+      ? `${streamMbps.toFixed(2)} Mb/s estimated`
+      : "unknown"
   return (
     <div className="space-y-3">
       <div
@@ -1442,12 +2326,13 @@ export function AnimePlayer({
         onMouseLeave={() => {
           if (isPlaying && !isCasting) {
             setControlsVisible(false)
+            setSettingsOpen(false)
           }
         }}
       >
         <video
           ref={videoRef}
-          className={`aspect-video w-full bg-black transition-opacity ${
+          className={`yamibunko-player-video aspect-video w-full bg-black transition-opacity ${
             isCasting ? "opacity-0" : "opacity-100"
           }`}
           playsInline
@@ -1465,7 +2350,14 @@ export function AnimePlayer({
               setDuration(nextDuration)
             }
           }}
-          onLoadedMetadata={(event) => applyPendingSeek(event.currentTarget)}
+          onLoadedMetadata={(event) => {
+            applyPendingSeek(event.currentTarget)
+            applyDirectAudioTrack(
+              event.currentTarget,
+              selectedAudioStream,
+              media.audioStreams
+            )
+          }}
           onEnded={handleEnded}
           onError={() => {
             if (isCastingRef.current || isCastLoadingRef.current) {
@@ -1511,6 +2403,7 @@ export function AnimePlayer({
           }}
           onWaiting={() => beginMediaWait()}
           onTimeUpdate={handleTimeUpdate}
+          onProgress={handleProgress}
         />
 
         {isCasting ? (
@@ -1518,10 +2411,11 @@ export function AnimePlayer({
             Casting
           </div>
         ) : null}
+
         {isWaitingForMedia ? (
           <div className="pointer-events-none absolute inset-0 grid place-items-center">
             <div className="flex flex-col items-center gap-3">
-              <Loader2 className="size-12 animate-spin text-white/70" />
+              <Loader2 className="size-12 animate-spin text-white/80" />
               {showHardwareWait ? (
                 <div className="rounded-lg border border-orange-400/40 bg-orange-500/15 px-3 py-2 text-sm font-medium text-orange-100">
                   Waiting for available Hardware Slot
@@ -1533,10 +2427,8 @@ export function AnimePlayer({
 
         <button
           type="button"
-          className={`absolute top-1/2 left-1/2 grid size-20 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full bg-black/45 text-white/60 transition-opacity duration-150 hover:bg-black/60 hover:text-white/80 ${
-            centerToggleVisible
-              ? "opacity-100"
-              : "pointer-events-none opacity-0"
+          className={`absolute top-1/2 left-1/2 grid size-20 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full bg-black/45 text-white/70 transition-opacity duration-150 hover:bg-black/60 hover:text-white ${
+            centerToggleVisible ? "opacity-100" : "pointer-events-none opacity-0"
           }`}
           disabled={!sourceUrl}
           onClick={(event) => {
@@ -1545,109 +2437,92 @@ export function AnimePlayer({
           }}
           title={isPlaying ? "Pause" : "Play"}
         >
-          {isPlaying ? (
-            <Pause className="size-10" />
-          ) : (
-            <Play className="ml-1 size-10" />
-          )}
+          {isPlaying ? <Pause className="size-10" /> : <Play className="ml-1 size-10" />}
         </button>
 
+        {canSkipIntro ? (
+          <Button
+            type="button"
+            variant="secondary"
+            className="absolute right-4 bottom-20 rounded-lg bg-zinc-950/90"
+            onClick={() => void seekTo(90)}
+          >
+            Skip intro
+          </Button>
+        ) : null}
+        {canSkipOutro ? (
+          <Button
+            type="button"
+            variant="secondary"
+            className="absolute right-4 bottom-20 rounded-lg bg-zinc-950/90"
+            onClick={() => void seekTo(duration)}
+          >
+            Skip outro
+          </Button>
+        ) : null}
+
+        {activeSubtitleTexts.length ? (
+          <div className="pointer-events-none absolute inset-x-4 bottom-[5.25rem] z-10 flex justify-center px-4 text-center text-lg font-semibold leading-snug text-white drop-shadow-[0_2px_5px_rgba(0,0,0,0.95)] sm:text-xl">
+            <div className="max-w-[90%] whitespace-pre-line">
+              {activeSubtitleTexts.join("\n")}
+            </div>
+          </div>
+        ) : null}
+
         <div
-          className={`absolute inset-0 transition-opacity duration-300 ${
+          className={`absolute inset-x-0 bottom-0 bg-zinc-950/40 p-3 backdrop-blur-md transition-opacity duration-300 ${
             controlsAreVisible ? "opacity-100" : "pointer-events-none opacity-0"
           }`}
         >
-          <div className="absolute inset-x-0 top-0 flex items-start justify-between gap-3 bg-gradient-to-b from-black/80 via-black/35 to-transparent p-3">
-            <div className="flex flex-wrap items-center gap-2">
-              {(["original", "dataSaver"] as const).map((item) => (
-                <Button
-                  key={item}
-                  type="button"
-                  size="sm"
-                  variant={quality === item ? "default" : "secondary"}
-                  onClick={() => {
-                    setQuality(item)
-                    showControls(true)
-                  }}
-                  className="rounded-lg bg-zinc-950/80"
-                >
-                  {labels[item]}
-                </Button>
-              ))}
-              <PlaybackStatus state={status} />
-              {status === "blocked" && directPossible ? (
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="secondary"
-                  className="rounded-lg bg-zinc-950/80"
-                  onClick={tryDirectPlay}
-                >
-                  Try Direct Play
-                </Button>
-              ) : null}
-            </div>
-
-            {isCasting ? (
-              <Button
-                type="button"
-                variant="secondary"
-                size="icon"
-                className={`bg-zinc-950/80 ${
-                  castErrorFlash
-                    ? "border-red-500/70 text-red-400 ring-2 ring-red-500/40"
-                    : ""
-                }`}
-                title="Stop casting"
-                onClick={stopCasting}
-              >
-                <Square className="size-4" />
-              </Button>
-            ) : (
-              <Button
-                type="button"
-                variant="secondary"
-                size="icon"
-                className={`bg-zinc-950/80 ${
-                  castErrorFlash
-                    ? "border-red-500/70 text-red-400 ring-2 ring-red-500/40"
-                    : ""
-                }`}
-                title={canCast ? "Cast" : getGoogleCastUnavailableReason()}
-                disabled={(!sourceUrl && !isCasting) || isCastStarting}
-                onClick={startCasting}
-              >
-                <Cast className="size-4" />
-              </Button>
-            )}
-          </div>
-
-          {canSkipIntro ? (
+          <div className="flex items-center gap-2">
+            <Button
+              type="button"
+              size="icon"
+              onClick={togglePlay}
+              disabled={!sourceUrl && !isCasting}
+              title={isPlaying ? "Pause" : "Play"}
+            >
+              {isPlaying ? <Pause className="size-4" /> : <Play className="size-4" />}
+            </Button>
             <Button
               type="button"
               variant="secondary"
-              className="absolute right-4 bottom-24 rounded-lg bg-zinc-950/90"
-              onClick={() => void seekTo(90)}
+              size="icon"
+              className="bg-zinc-950/70"
+              onClick={() => {
+                if (previousEpisode && onEpisodeChange) {
+                  onEpisodeChange(previousEpisode, isPlayingRef.current)
+                }
+              }}
+              disabled={!previousEpisode}
+              title="Previous episode"
             >
-              Skip intro
+              <SkipBack className="size-4" />
             </Button>
-          ) : null}
-          {canSkipOutro ? (
             <Button
               type="button"
               variant="secondary"
-              className="absolute right-4 bottom-24 rounded-lg bg-zinc-950/90"
-              onClick={() => void seekTo(duration)}
+              size="icon"
+              className="bg-zinc-950/70"
+              onClick={() => {
+                if (nextEpisode && onEpisodeChange) {
+                  onEpisodeChange(nextEpisode, isPlayingRef.current)
+                }
+              }}
+              disabled={!nextEpisode}
+              title="Next episode"
             >
-              Skip outro
+              <SkipForward className="size-4" />
             </Button>
-          ) : null}
 
-          <div className="absolute inset-x-0 bottom-0 space-y-3 bg-gradient-to-t from-black/85 via-black/45 to-transparent p-3">
-            <div className="relative">
+            <span className="shrink-0 text-xs text-zinc-200 tabular-nums">
+              {formatTime(displayedCurrentTime)} / {formatTime(duration)}
+            </span>
+
+            <div className="relative min-w-0 flex-1">
               {seekPreviewFrame ? (
                 <div
-                  className="pointer-events-none absolute bottom-5 z-10 w-40 -translate-x-1/2 overflow-hidden rounded-md border border-white/15 bg-zinc-950 shadow-xl"
+                  className="pointer-events-none absolute bottom-7 z-10 w-40 -translate-x-1/2 overflow-hidden rounded-md border border-white/15 bg-zinc-950 shadow-xl"
                   style={{ left: `${seekPreviewFrame.leftPercent}%` }}
                 >
                   {getSeekPreviewFrameUrl(seekPreviewFrame.time) ? (
@@ -1671,10 +2546,7 @@ export function AnimePlayer({
                 value={duration ? Math.min(displayedCurrentTime, duration) : 0}
                 onChange={(event) => updateSeekDragPreview(event.target.value)}
                 onPointerMove={(event) =>
-                  updateSeekHoverPreview(
-                    event.currentTarget,
-                    event.clientX
-                  )
+                  updateSeekHoverPreview(event.currentTarget, event.clientX)
                 }
                 onPointerLeave={() => {
                   if (seekPreview === null) {
@@ -1690,68 +2562,153 @@ export function AnimePlayer({
               />
             </div>
 
-            <div className="grid gap-3 sm:grid-cols-[auto_1fr_auto] sm:items-center">
-              <div className="flex items-center gap-2">
-                <Button
-                  type="button"
-                  variant="secondary"
-                  size="icon"
-                  className="bg-zinc-950/80"
-                  onClick={() => {
-                    if (previousEpisode && onEpisodeChange) {
-                      onEpisodeChange(previousEpisode, isPlayingRef.current)
-                    }
-                  }}
-                  disabled={!previousEpisode}
-                  title="Previous episode"
-                >
-                  <SkipBack className="size-4" />
-                </Button>
-                <Button
-                  type="button"
-                  size="icon"
-                  onClick={togglePlay}
-                  disabled={!sourceUrl && !isCasting}
-                  title={isPlaying ? "Pause" : "Play"}
-                >
-                  {isPlaying ? (
-                    <Pause className="size-4" />
-                  ) : (
-                    <Play className="size-4" />
-                  )}
-                </Button>
-                <Button
-                  type="button"
-                  variant="secondary"
-                  size="icon"
-                  className="bg-zinc-950/80"
-                  onClick={() => {
-                    if (nextEpisode && onEpisodeChange) {
-                      onEpisodeChange(nextEpisode, isPlayingRef.current)
-                    }
-                  }}
-                  disabled={!nextEpisode}
-                  title="Next episode"
-                >
-                  <SkipForward className="size-4" />
-                </Button>
-              </div>
 
-              <span className="text-xs text-zinc-300 tabular-nums sm:text-center">
-                {formatTime(displayedCurrentTime)} / {formatTime(duration)}
-              </span>
-
+            <div className="relative">
               <Button
                 type="button"
                 variant="secondary"
                 size="icon"
-                className="bg-zinc-950/80"
-                onClick={requestFullscreen}
-                title="Fullscreen"
+                className="bg-zinc-950/70"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  setSettingsOpen((open) => !open)
+                  showControls(true)
+                }}
+                title="Settings"
               >
-                <Maximize2 className="size-4" />
+                <Settings className="size-4" />
               </Button>
+
+              {settingsOpen ? (
+                <div className="absolute right-0 bottom-12 z-20 max-h-[min(70vh,23rem)] w-72 space-y-3 overflow-y-auto rounded-xl border border-white/10 bg-zinc-950/95 p-3 text-xs shadow-2xl">
+                  {liveTranscodeEnabled ? (
+                    <>
+                      <label className="grid gap-1 text-zinc-300">
+                        <span>Quality</span>
+                        <select
+                          className={settingsSelectClass}
+                          value={quality}
+                          onChange={(event) =>
+                            changeQuality(event.target.value as PlaybackProfile)
+                          }
+                        >
+                          <option value="original">Default</option>
+                          <option value="dataSaver">Data Saver</option>
+                        </select>
+                      </label>
+
+                      <div className="grid gap-1 text-zinc-300">
+                        <span>Display Method</span>
+                        <div className="rounded-md border border-white/10 bg-zinc-950 px-2 py-1.5 text-zinc-100">
+                          {displayMethod}
+                        </div>
+                      </div>
+                    </>
+                  ) : null}
+
+                  <label className="grid gap-1 text-zinc-300">
+                    <span>Audio Language</span>
+                    <select
+                      className={settingsSelectClass}
+                      value={selectedAudioStreamId ?? ""}
+                      onChange={(event) => changeAudio(event.target.value || null)}
+                    >
+                      {media.audioStreams.length ? null : (
+                        <option value="">Default</option>
+                      )}
+                      {media.audioStreams.map((stream) => (
+                        <option key={stream.id} value={stream.id}>
+                          {stream.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="grid gap-1 text-zinc-300">
+                    <span>Subtitle Language</span>
+                    <select
+                      className={settingsSelectClass}
+                      value={selectedSubtitleStreamId ?? ""}
+                      onChange={(event) => changeSubtitle(event.target.value || null)}
+                    >
+                      <option value="">Off</option>
+                      {subtitleLanguageOptions.map((option) => (
+                        <option key={option.id} value={option.id}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <div className="group/stats relative grid gap-1 text-zinc-300">
+                    <span>Stats for Nerds</span>
+                    <div className="rounded-md border border-white/10 bg-zinc-950 px-2 py-1.5 text-zinc-100">
+                      Hover for stream info
+                    </div>
+                    <div className="pointer-events-none absolute right-0 bottom-full mb-2 hidden w-64 rounded-lg border border-white/10 bg-black/95 p-3 text-[11px] leading-relaxed text-zinc-200 shadow-xl group-hover/stats:block">
+                      <div>Video: {media.videoCodec ?? "unknown"}</div>
+                      <div>Container: {media.container ?? "unknown"}</div>
+                      <div>Audio: {selectedAudioLabel}{selectedAudioStream?.codec ? ` (${selectedAudioStream.codec})` : ""}</div>
+                      <div>Subtitles: {selectedSubtitleLabel}</div>
+                      <div>
+                        Stream: {streamMbpsLabel}
+                      </div>
+                    </div>
+                  </div>
+
+                  {status === "blocked" && directPossible ? (
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      className="w-full rounded-lg bg-zinc-900"
+                      onClick={tryDirectPlay}
+                    >
+                      Try Direct Play
+                    </Button>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
+
+            {isCasting ? (
+              <Button
+                type="button"
+                variant="secondary"
+                size="icon"
+                className={`bg-zinc-950/70 ${
+                  castErrorFlash ? "border-red-500/70 text-red-400 ring-2 ring-red-500/40" : ""
+                }`}
+                title="Stop casting"
+                onClick={stopCasting}
+              >
+                <Square className="size-4" />
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                variant="secondary"
+                size="icon"
+                className={`bg-zinc-950/70 ${
+                  castErrorFlash ? "border-red-500/70 text-red-400 ring-2 ring-red-500/40" : ""
+                }`}
+                title={canCast ? "Cast" : getGoogleCastUnavailableReason()}
+                disabled={(!sourceUrl && !isCasting) || isCastStarting}
+                onClick={startCasting}
+              >
+                <Cast className="size-4" />
+              </Button>
+            )}
+
+            <Button
+              type="button"
+              variant="secondary"
+              size="icon"
+              className="bg-zinc-950/70"
+              onClick={requestFullscreen}
+              title="Fullscreen"
+            >
+              <Maximize2 className="size-4" />
+            </Button>
           </div>
         </div>
       </div>

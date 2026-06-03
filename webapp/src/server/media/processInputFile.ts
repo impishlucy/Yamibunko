@@ -43,9 +43,11 @@ import {
   acquireAudioTranscode,
   acquireVideoTranscode,
 } from "@/server/transcode/transcodeCapacity"
+import { getAudioOutputIndexesToMp3 } from "@/server/media/streamMetadata"
 import { errorMessage, fileName } from "@/server/utils/format"
 
-const maxHevcBytesPerMinute = 20 * 1024 * 1024
+const hardwareMaxHevcBytesPerMinute = 20 * 1024 * 1024
+const cpuMaxHevcBytesPerMinute = 30 * 1024 * 1024
 const targetBytesPerMinute = 17 * 1024 * 1024
 const targetAudioKbps = 256
 
@@ -64,15 +66,10 @@ function hasHevcVideo(probe: ProbeResult) {
   )
 }
 
-function needsMp3Audio(probe: ProbeResult) {
-  return (probe.streams ?? []).some((stream) => {
-    const codec = (stream.codec_name ?? "").toLowerCase()
-
-    return (
-      stream.codec_type === "audio" &&
-      (codec === "flac" || codec === "wav" || codec.startsWith("pcm_"))
-    )
-  })
+function getMaxHevcBytesPerMinute() {
+  return getServerConfig().transcodeAccel === "cpu"
+    ? cpuMaxHevcBytesPerMinute
+    : hardwareMaxHevcBytesPerMinute
 }
 
 function calculateVideoBitrateKbps() {
@@ -207,7 +204,7 @@ async function transcodeFile(
   outputPath: string,
   options: {
     convertVideo: boolean
-    convertAudioToMp3: boolean
+    audioOutputIndexesToMp3: number[]
     videoBitrateKbps: number
   }
 ) {
@@ -311,10 +308,12 @@ export async function processInputFile(
       inputStat.size,
       durationSeconds
     )
+    const maxHevcBytesPerMinute = getMaxHevcBytesPerMinute()
     const inputHasHevcVideo = hasHevcVideo(probe)
     const convertVideo =
       !inputHasHevcVideo || inputBytesPerMinute > maxHevcBytesPerMinute
-    const convertAudioToMp3 = needsMp3Audio(probe)
+    const audioOutputIndexesToMp3 = getAudioOutputIndexesToMp3(probe)
+    const convertAudioToMp3 = audioOutputIndexesToMp3.length > 0
     const needsFfmpegProcessing = convertVideo || convertAudioToMp3
     const videoBitrateKbps = calculateVideoBitrateKbps()
     const mediaTitle = metadataTitle(metadata)
@@ -393,12 +392,12 @@ export async function processInputFile(
         })
 
         console.log(
-          `[Info] [Media] Starting media transcode - ${fileName(filePath)} - Accel: ${getServerConfig().transcodeAccel}, HW decode: ${convertVideo ? getHardwareInputLabel() : "not needed"}, HEVC: ${convertVideo ? `yes (${inputHasHevcVideo ? "over 20 MB/min" : "source is not HEVC"})` : "copy"}, MP3 audio: ${convertAudioToMp3 ? "yes" : "copy"}, Target: 17 MB/min, Bitrate: ${videoBitrateKbps}k`
+          `[Info] [Media] Starting media transcode - ${fileName(filePath)} - Accel: ${getServerConfig().transcodeAccel}, HW decode: ${convertVideo ? getHardwareInputLabel() : "not needed"}, HEVC: ${convertVideo ? `yes (${inputHasHevcVideo ? `over ${formatMegabytesPerMinute(maxHevcBytesPerMinute)} MB/min` : "source is not HEVC"})` : "copy"}, MP3 audio tracks: ${audioOutputIndexesToMp3.length ? audioOutputIndexesToMp3.join(", ") : "none"}, Target: ${formatMegabytesPerMinute(targetBytesPerMinute)} MB/min, Bitrate: ${videoBitrateKbps}k`
         )
 
         await transcodeFile(filePath, tempPath, {
           convertVideo,
-          convertAudioToMp3,
+          audioOutputIndexesToMp3,
           videoBitrateKbps,
         })
       } finally {

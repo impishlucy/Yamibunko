@@ -5,9 +5,21 @@ import path from "node:path"
 import { runFfmpeg } from "@/server/media/ffmpeg"
 
 export type ProbeStream = {
+  index?: number
   codec_type?: string
   codec_name?: string
   duration?: string
+  bit_rate?: string
+  channels?: number
+  disposition?: {
+    default?: number
+    forced?: number
+    hearing_impaired?: number
+  }
+  tags?: {
+    language?: string
+    title?: string
+  }
 }
 
 export type ProbeResult = {
@@ -15,6 +27,7 @@ export type ProbeResult = {
   format?: {
     duration?: string
     size?: string
+    format_name?: string
   }
 }
 

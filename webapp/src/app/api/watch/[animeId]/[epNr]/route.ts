@@ -1,4 +1,5 @@
 import { requireApiUser } from "@/server/auth/api"
+import { getServerConfig } from "@/server/config"
 import {
   getAnimeInfo,
   getEpisode,
@@ -7,7 +8,11 @@ import {
 import { joinBaseUrl } from "@/server/http/baseUrl"
 import { getPublicBaseUrl } from "@/server/http/request"
 import { createCastStreamToken } from "@/server/media/castTokens"
-import { parsePositiveInt } from "@/server/utils/format"
+import { ffprobe } from "@/server/media/ffmpeg"
+import type { ProbeResult } from "@/server/media/mediaFiles"
+import { resolveEpisodeMedia } from "@/server/media/resolveMediaId"
+import { getMediaStreamMetadata } from "@/server/media/streamMetadata"
+import { errorMessage, parsePositiveInt } from "@/server/utils/format"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -47,6 +52,32 @@ export async function GET(request: Request, context: WatchContext) {
     return Response.json({ error: "Episode not found" }, { status: 404 })
   }
 
+  const media = resolveEpisodeMedia(animeId, seasonNumber, episodeNumber)
+
+  if (!media) {
+    return Response.json({ error: "Episode not found" }, { status: 404 })
+  }
+
+  let streamMetadata
+
+  try {
+    streamMetadata = getMediaStreamMetadata(
+      (await ffprobe(media.file)) as ProbeResult
+    )
+  } catch (error) {
+    console.error(
+      `[Error] [Watch] Unable to inspect media streams - route.ts - Anime ${animeId}, Season ${seasonNumber}, Episode ${episodeNumber} - ${errorMessage(error)}`
+    )
+    streamMetadata = {
+      audioStreams: [],
+      subtitleStreams: [],
+      defaultAudioStreamId: null,
+      defaultSubtitleStreamId: null,
+      directAudioStreamId: null,
+    }
+  }
+
+  const liveTranscodeEnabled = getServerConfig().transcodeAccel !== "cpu"
   const neighbors = getEpisodeNeighbors({
     animeId: anime.id,
     seasonNr: seasonNumber,
@@ -54,8 +85,11 @@ export async function GET(request: Request, context: WatchContext) {
     username: auth.user.username,
   })
   const base = `/api/watch/${encodeURIComponent(animeId)}/${episodeNumber}/stream`
+  const subtitleBase = `/api/watch/${encodeURIComponent(animeId)}/${episodeNumber}/subtitles`
   const commonQuery = `season=${seasonNumber}`
-  const castBase = joinBaseUrl(await getPublicBaseUrl(), base)
+  const publicBaseUrl = await getPublicBaseUrl()
+  const castBase = joinBaseUrl(publicBaseUrl, base)
+  const castSubtitleBase = joinBaseUrl(publicBaseUrl, subtitleBase)
   const castToken = createCastStreamToken({
     username: auth.user.username,
     animeId,
@@ -74,6 +108,11 @@ export async function GET(request: Request, context: WatchContext) {
       dataSaverUrl: `${base}?${commonQuery}&mode=transcode&profile=dataSaver`,
       castDirectUrl: `${castBase}?${commonQuery}&mode=direct&profile=original&${castTokenQuery}`,
       castTranscodeUrl: `${castBase}?${commonQuery}&mode=transcode&profile=original&${castTokenQuery}`,
+      castDataSaverUrl: `${castBase}?${commonQuery}&mode=transcode&profile=dataSaver&${castTokenQuery}`,
+      liveTranscodeEnabled,
+      subtitleUrl: `${subtitleBase}?${commonQuery}`,
+      castSubtitleUrl: `${castSubtitleBase}?${commonQuery}&${castTokenQuery}`,
     },
+    media: streamMetadata,
   })
 }

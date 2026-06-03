@@ -8,10 +8,13 @@ import type { PlaybackMode, PlaybackProfile } from "@/lib/types"
 import { requireApiUser } from "@/server/auth/api"
 import { getServerConfig } from "@/server/config"
 import {
+  ffprobe,
   getLiveH264Args,
   getLiveTranscodeInputArgs,
 } from "@/server/media/ffmpeg"
 import { validateCastStreamToken } from "@/server/media/castTokens"
+import type { ProbeResult } from "@/server/media/mediaFiles"
+import { getMediaStreamMetadata } from "@/server/media/streamMetadata"
 import { resolveEpisodeMedia } from "@/server/media/resolveMediaId"
 import { acquireLiveTranscode } from "@/server/transcode/transcodeCapacity"
 import { errorMessage, fileName, parsePositiveInt } from "@/server/utils/format"
@@ -62,6 +65,20 @@ function getMode(value: string | null): PlaybackMode {
 
 function getProfile(value: string | null): PlaybackProfile {
   return value === "dataSaver" ? "dataSaver" : "original"
+}
+
+function liveTranscodingEnabled() {
+  return getServerConfig().transcodeAccel !== "cpu"
+}
+
+function parseOptionalStreamIndex(value: string | null) {
+  if (!value) {
+    return undefined
+  }
+
+  const index = Number(value)
+
+  return Number.isInteger(index) && index >= 0 ? index : undefined
 }
 
 function parseStartSeconds(value: string | null) {
@@ -199,7 +216,7 @@ async function resolveStreamUser(input: {
 
 function logStreamStartOnce(input: {
   username: string
-  type: "direct" | "transcode"
+  type: "direct" | "direct-remux" | "transcode"
   animeId: string
   seasonNumber: number
   episodeNumber: number
@@ -340,6 +357,232 @@ async function handleDirect(request: Request, file: string, size: number) {
   )
 }
 
+
+function getDirectRemuxTarget(file: string) {
+  const extension = path.extname(file).toLowerCase()
+
+  if (extension === ".webm") {
+    return {
+      contentType: "video/webm",
+      args: ["-f", "webm"],
+    }
+  }
+
+  return {
+    contentType: "video/mp4",
+    args: [
+      "-movflags",
+      "frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
+      "-frag_duration",
+      "1000000",
+      "-f",
+      "mp4",
+    ],
+  }
+}
+
+function shouldUseDirectAudioRemux(input: {
+  requestedAudioStreamIndex?: number
+  defaultDirectAudioStreamIndex?: number
+}) {
+  return (
+    typeof input.requestedAudioStreamIndex === "number" &&
+    typeof input.defaultDirectAudioStreamIndex === "number" &&
+    input.requestedAudioStreamIndex !== input.defaultDirectAudioStreamIndex
+  )
+}
+
+async function handleDirectAudioRemux(input: {
+  request: Request
+  file: string
+  animeId: string
+  seasonNumber: number
+  episodeNumber: number
+  username: string
+  profile: PlaybackProfile
+  startSeconds: number
+  audioStreamIndex: number
+}) {
+  const config = getServerConfig()
+  const target = getDirectRemuxTarget(input.file)
+
+  logStreamStartOnce({
+    username: input.username,
+    type: "direct-remux",
+    animeId: input.animeId,
+    seasonNumber: input.seasonNumber,
+    episodeNumber: input.episodeNumber,
+    profile: input.profile,
+    file: input.file,
+  })
+
+  const child = spawn(
+    config.ffmpegPath,
+    [
+      "-hide_banner",
+      "-nostdin",
+      "-loglevel",
+      "error",
+      "-fflags",
+      "+genpts",
+      "-ignore_unknown",
+      ...(input.startSeconds > 0 ? ["-ss", input.startSeconds.toFixed(3)] : []),
+      "-i",
+      input.file,
+      "-map",
+      "0:V:0",
+      "-map",
+      `0:${input.audioStreamIndex}`,
+      "-sn",
+      "-dn",
+      "-c:v",
+      "copy",
+      "-c:a",
+      "copy",
+      "-map_chapters",
+      "-1",
+      "-avoid_negative_ts",
+      "make_zero",
+      "-max_muxing_queue_size",
+      "2048",
+      ...target.args,
+      "pipe:1",
+    ],
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    }
+  )
+
+  if (!child.stdout) {
+    child.kill("SIGKILL")
+    console.error(
+      `[Error] [Stream] Unable to start direct audio remuxer - stream/route.ts - ${input.file}`
+    )
+    return jsonError("Unable to start direct audio stream.", 500)
+  }
+
+  let stderr = ""
+  let settled = false
+  let clientClosed = false
+  let shutdownTimer: ReturnType<typeof setTimeout> | null = null
+
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderr = appendStderr(stderr, chunk)
+  })
+
+  const stopChild = () => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      return
+    }
+
+    child.kill("SIGTERM")
+
+    if (!shutdownTimer) {
+      shutdownTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGKILL")
+        }
+      }, ffmpegShutdownGraceMs)
+      shutdownTimer.unref?.()
+    }
+  }
+
+  const onAbort = () => {
+    clientClosed = true
+    settled = true
+    stopChild()
+  }
+
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      input.request.signal.addEventListener("abort", onAbort, { once: true })
+
+      child.stdout?.on("data", (chunk: Buffer) => {
+        if (settled) {
+          return
+        }
+
+        try {
+          controller.enqueue(new Uint8Array(chunk))
+        } catch {
+          clientClosed = true
+          settled = true
+          stopChild()
+        }
+      })
+
+      child.once("error", (error) => {
+        console.error(
+          `[Error] [Stream] Direct audio remuxer process failed - stream/route.ts - ${input.file} - ${errorMessage(error)}`
+        )
+
+        if (!settled) {
+          settled = true
+          controller.error(error)
+        }
+      })
+
+      child.once("close", (code, signal) => {
+        input.request.signal.removeEventListener("abort", onAbort)
+
+        if (shutdownTimer) {
+          clearTimeout(shutdownTimer)
+          shutdownTimer = null
+        }
+
+        if (code && code !== 0 && !clientClosed) {
+          const details = compactStderr(stderr)
+
+          console.error(
+            `[Error] [Stream] Direct audio remuxer exited with an error - stream/route.ts - ${input.file} - code ${code}${signal ? `, signal ${signal}` : ""}${details ? ` - ${details}` : ""}`
+          )
+        }
+
+        if (!settled) {
+          settled = true
+          controller.close()
+        }
+      })
+    },
+    cancel() {
+      clientClosed = true
+      settled = true
+      stopChild()
+    },
+  })
+
+  return new Response(body, {
+    headers: {
+      ...streamCorsHeaders(),
+      "cache-control": "no-store",
+      "content-type": target.contentType,
+    },
+  })
+}
+
+function resolveAudioSelection(input: {
+  metadata: ReturnType<typeof getMediaStreamMetadata>
+  requestedAudioStreamIndex?: number
+}) {
+  const audioStreams = input.metadata.audioStreams
+  const requestedAudioStream = audioStreams.find(
+    (stream) => stream.index === input.requestedAudioStreamIndex
+  )
+  const fallbackAudioStream = audioStreams.find(
+    (stream) => stream.id === input.metadata.defaultAudioStreamId
+  )
+  const directAudioStream = audioStreams.find(
+    (stream) => stream.id === input.metadata.directAudioStreamId
+  )
+
+  return {
+    requestedAudioStreamIndex:
+      requestedAudioStream?.index ?? fallbackAudioStream?.index ?? undefined,
+    defaultDirectAudioStreamIndex: directAudioStream?.index,
+  }
+}
+
 async function handleTranscode(
   request: Request,
   file: string,
@@ -349,7 +592,8 @@ async function handleTranscode(
   username: string,
   profile: PlaybackProfile,
   startSeconds: number,
-  sourceBitrateKbps?: number
+  sourceBitrateKbps?: number,
+  audioStreamIndex?: number
 ) {
   let waitLogged = false
   const waitLogTimer = setTimeout(() => {
@@ -411,7 +655,10 @@ async function handleTranscode(
       ...(startSeconds > 0 ? ["-ss", startSeconds.toFixed(3)] : []),
       "-i",
       file,
-      ...getLiveH264Args(profile, { sourceBitrateKbps }),
+      ...getLiveH264Args(profile, {
+        audioStreamIndex,
+        sourceBitrateKbps,
+      }),
       "-map_chapters",
       "-1",
       "-max_muxing_queue_size",
@@ -620,6 +867,9 @@ export async function GET(request: Request, context: StreamContext) {
   const mode = getMode(url.searchParams.get("mode"))
   const profile = getProfile(url.searchParams.get("profile"))
   const startSeconds = parseStartSeconds(url.searchParams.get("start"))
+  const requestedAudioStreamIndex = parseOptionalStreamIndex(
+    url.searchParams.get("audio")
+  )
 
   if (!seasonNumber) {
     return jsonError("Episode not found.", 404)
@@ -653,7 +903,55 @@ export async function GET(request: Request, context: StreamContext) {
     return jsonError("Media file not found.", 404)
   }
 
+  if (mode === "transcode" && !liveTranscodingEnabled()) {
+    return jsonError(
+      "Live transcoding is disabled when TRANSCODE_ACCEL=cpu.",
+      403
+    )
+  }
+
+  let audioSelection: ReturnType<typeof resolveAudioSelection> = {
+    requestedAudioStreamIndex,
+    defaultDirectAudioStreamIndex: undefined,
+  }
+
+  try {
+    const metadata = getMediaStreamMetadata(
+      (await ffprobe(resolved.file)) as ProbeResult
+    )
+    audioSelection = resolveAudioSelection({
+      metadata,
+      requestedAudioStreamIndex,
+    })
+  } catch (error) {
+    console.warn(
+      `[Warn] [Stream] Unable to inspect audio streams, using first audio stream - stream/route.ts - ${resolved.file} - ${errorMessage(error)}`
+    )
+  }
+
   if (mode === "direct") {
+    const selectedDirectAudioStreamIndex = audioSelection.requestedAudioStreamIndex
+
+    if (
+      shouldUseDirectAudioRemux({
+        requestedAudioStreamIndex: selectedDirectAudioStreamIndex,
+        defaultDirectAudioStreamIndex: audioSelection.defaultDirectAudioStreamIndex,
+      }) &&
+      typeof selectedDirectAudioStreamIndex === "number"
+    ) {
+      return await handleDirectAudioRemux({
+        request,
+        file: resolved.file,
+        animeId,
+        seasonNumber,
+        episodeNumber,
+        username: streamUser.username,
+        profile,
+        startSeconds,
+        audioStreamIndex: selectedDirectAudioStreamIndex,
+      })
+    }
+
     logStreamStartOnce({
       username: streamUser.username,
       type: "direct",
@@ -676,6 +974,7 @@ export async function GET(request: Request, context: StreamContext) {
     streamUser.username,
     profile,
     startSeconds,
-    calculateSourceBitrateKbps(resolved)
+    calculateSourceBitrateKbps(resolved),
+    audioSelection.requestedAudioStreamIndex
   )
 }
