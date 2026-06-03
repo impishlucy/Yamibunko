@@ -6,8 +6,13 @@ import {
 import { getServerConfig } from "@/server/config"
 import {
   getAniListConnection,
+  getCachedAniListMediaListEntry,
   getSafeAniListConnection,
   markAniListConnectionSynced,
+  updateAniListConnectionScoreFormat,
+  upsertAniListMediaListEntries,
+  type AniListConnection,
+  type CachedAniListMediaListEntry,
 } from "@/server/db/anilistConnections"
 import { markEpisodesCompleteThrough } from "@/server/db/library"
 import { joinBaseUrl } from "@/server/http/baseUrl"
@@ -37,6 +42,8 @@ type AniListListEntry = {
   status: string | null
   progress: number | null
   score: number | null
+  createdAt?: number | string | null
+  updatedAt?: number | string | null
 }
 
 type AniListListCollection = {
@@ -157,14 +164,31 @@ export async function exchangeAniListAuthorizationCode(
   }
 }
 
-export async function getAniListViewer(accessToken: string) {
-  const userService = getAniListClient(accessToken).user as {
-    getUserInfo: (userId?: number) => Promise<{ User?: AniListViewer | null }>
+function decodeAniListUserIdFromToken(accessToken: string) {
+  const [, payload] = accessToken.split(".")
+
+  if (!payload) {
+    throw new Error("AniList access token did not include a readable user id")
   }
+
+  const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as {
+    sub?: string | number
+  }
+  const userId = Number(decoded.sub)
+
+  if (!Number.isInteger(userId) || userId <= 0) {
+    throw new Error("AniList access token user id was invalid")
+  }
+
+  return userId
+}
+
+export async function getAniListViewer(accessToken: string) {
+  const userId = decodeAniListUserIdFromToken(accessToken)
   const result = await queueAniListOperation(() =>
-    userService.getUserInfo()
+    getAniListClient(accessToken).user.getUserInfo(userId)
   )
-  const viewer = result.User ?? null
+  const viewer = result.User as AniListViewer | null
 
   if (!viewer) {
     console.error(
@@ -246,8 +270,46 @@ function flattenListEntries(collection: AniListListCollection) {
   return (
     collection.MediaListCollection?.lists
       ?.flatMap((list) => list?.entries ?? [])
-      .filter((entry): entry is AniListListEntry => Boolean(entry)) ?? []
+      .filter((entry): entry is AniListListEntry => Boolean(entry?.id)) ?? []
   )
+}
+
+function toIsoDate(value: number | string | null | undefined) {
+  if (!value) {
+    return null
+  }
+
+  if (typeof value === "number") {
+    return new Date(value * 1000).toISOString()
+  }
+
+  return value
+}
+
+function normalizeListEntry(entry: AniListListEntry) {
+  if (!entry.id || !entry.mediaId) {
+    return null
+  }
+
+  return {
+    id: entry.id,
+    mediaId: entry.mediaId,
+    status: entry.status,
+    progress: entry.progress,
+    score: entry.score,
+    createdAt: toIsoDate(entry.createdAt),
+    updatedAt: toIsoDate(entry.updatedAt),
+  }
+}
+
+function cachedToListEntry(entry: CachedAniListMediaListEntry): AniListListEntry {
+  return {
+    id: entry.listEntryId,
+    mediaId: entry.mediaId,
+    status: entry.status,
+    progress: entry.progress,
+    score: entry.score,
+  }
 }
 
 async function readUserInfo(input: {
@@ -275,33 +337,38 @@ async function readUserAnimeList(input: {
   return flattenListEntries(result as AniListListCollection)
 }
 
-async function readMediaListEntry(input: {
-  username: string
-  animeId: number
-  accessToken: string
-}) {
-  const connection = getAniListConnection(input.username)
-
-  if (!connection) {
-    return null
-  }
-
-  const userInfo = await readUserInfo({
-    accessToken: input.accessToken,
-    aniListUserId: connection.aniListUserId,
-  })
-  const scoreFormat = userInfo?.mediaListOptions?.scoreFormat ?? null
-  const entries = await readUserAnimeList({
-    accessToken: input.accessToken,
-    aniListUserId: connection.aniListUserId,
+async function getCachedOrSyncedEntry(connection: AniListConnection, animeId: number) {
+  const cached = getCachedAniListMediaListEntry({
+    username: connection.username,
+    mediaId: animeId,
   })
 
-  return {
-    entry:
-      entries.find((entry) => entry.mediaId === input.animeId) ?? null,
-    scoreFormat,
-    ratingScale: getRatingScale(scoreFormat),
+  if (cached) {
+    return cachedToListEntry(cached)
   }
+
+  await syncAniListLibraryProgress(connection.username)
+
+  const refreshed = getCachedAniListMediaListEntry({
+    username: connection.username,
+    mediaId: animeId,
+  })
+
+  return refreshed ? cachedToListEntry(refreshed) : null
+}
+
+function cacheSavedEntry(connection: AniListConnection, entry: AniListListEntry | null) {
+  const normalized = entry ? normalizeListEntry(entry) : null
+
+  if (!normalized) {
+    return
+  }
+
+  upsertAniListMediaListEntries({
+    username: connection.username,
+    aniListUserId: connection.aniListUserId,
+    entries: [normalized],
+  })
 }
 
 export async function getAniListTrackingState(
@@ -328,9 +395,9 @@ export async function getAniListTrackingState(
     }
   }
 
-  const accessToken = getAniListAccessTokenForUser(username)
+  const connection = getAniListConnection(username)
 
-  if (!accessToken) {
+  if (!connection) {
     return {
       configured: isAniListConfigured(),
       connected: false,
@@ -339,12 +406,8 @@ export async function getAniListTrackingState(
     }
   }
 
-  const listState = await readMediaListEntry({
-    username,
-    animeId,
-    accessToken,
-  })
-  const entry = listState?.entry ?? null
+  const entry = await getCachedOrSyncedEntry(connection, animeId)
+  const currentConnection = getAniListConnection(username) ?? connection
 
   if (entry?.progress) {
     markEpisodesCompleteThrough({
@@ -368,11 +431,11 @@ export async function getAniListTrackingState(
           status: entry.status,
           progress: entry.progress ?? 0,
           score: entry.score ?? null,
-          rating: scoreToRating(entry.score, listState?.scoreFormat ?? null),
+          rating: scoreToRating(entry.score, currentConnection.scoreFormat),
         }
       : null,
-    scoreFormat: listState?.scoreFormat ?? null,
-    ratingScale: listState?.ratingScale ?? 10,
+    scoreFormat: currentConnection.scoreFormat,
+    ratingScale: getRatingScale(currentConnection.scoreFormat),
   }
 }
 
@@ -381,29 +444,28 @@ export async function saveAniListProgress(input: {
   animeId: number
   progress: number
 }) {
+  const connection = getAniListConnection(input.username)
   const accessToken = getAniListAccessTokenForUser(input.username)
 
-  if (!accessToken) {
+  if (!connection || !accessToken) {
     return null
   }
 
-  const current = await readMediaListEntry({
-    username: input.username,
-    animeId: input.animeId,
-    accessToken,
-  })
-  const status = watchingStatuses.has(current?.entry?.status ?? "")
-    ? (toMediaListStatus(current?.entry?.status) ?? mediaListStatus.Current)
+  const current = await getCachedOrSyncedEntry(connection, input.animeId)
+  const status = watchingStatuses.has(current?.status ?? "")
+    ? (toMediaListStatus(current?.status) ?? mediaListStatus.Current)
     : mediaListStatus.Current
   const saved = await queueAniListOperation(() =>
     getAniListClient(accessToken).mediaList.saveEntry({
       mediaId: input.animeId,
       status,
       progress: Math.max(input.progress, 0),
-      score: current?.entry?.score ?? undefined,
+      score: current?.score ?? undefined,
     })
   )
+  const savedEntry = (saved.SaveMediaListEntry ?? null) as AniListListEntry | null
 
+  cacheSavedEntry(connection, savedEntry)
   markEpisodesCompleteThrough({
     username: input.username,
     animeId: input.animeId,
@@ -414,7 +476,7 @@ export async function saveAniListProgress(input: {
     `[Info] [Anilist] Saved progress - Anime id ${input.animeId}, Episode ${input.progress}`
   )
 
-  return saved.SaveMediaListEntry ?? null
+  return savedEntry
 }
 
 export async function saveAniListRating(input: {
@@ -422,20 +484,18 @@ export async function saveAniListRating(input: {
   animeId: number
   rating: number
 }) {
+  const connection = getAniListConnection(input.username)
   const accessToken = getAniListAccessTokenForUser(input.username)
 
-  if (!accessToken) {
+  if (!connection || !accessToken) {
     return null
   }
 
-  const current = await readMediaListEntry({
-    username: input.username,
-    animeId: input.animeId,
-    accessToken,
-  })
-  const status = toMediaListStatus(current?.entry?.status) ?? mediaListStatus.Current
-  const progress = current?.entry?.progress ?? 0
-  const score = ratingToScore(input.rating, current?.scoreFormat ?? null)
+  const current = await getCachedOrSyncedEntry(connection, input.animeId)
+  const currentConnection = getAniListConnection(input.username) ?? connection
+  const status = toMediaListStatus(current?.status) ?? mediaListStatus.Current
+  const progress = current?.progress ?? 0
+  const score = ratingToScore(input.rating, currentConnection.scoreFormat)
   const saved = await queueAniListOperation(() =>
     getAniListClient(accessToken).mediaList.saveEntry({
       mediaId: input.animeId,
@@ -444,12 +504,15 @@ export async function saveAniListRating(input: {
       score,
     })
   )
+  const savedEntry = (saved.SaveMediaListEntry ?? null) as AniListListEntry | null
+
+  cacheSavedEntry(connection, savedEntry)
 
   console.log(
-    `[Info] [Anilist] Saved rating - Anime id ${input.animeId}, Rating ${input.rating}/${current?.ratingScale ?? 10}`
+    `[Info] [Anilist] Saved rating - Anime id ${input.animeId}, Rating ${input.rating}/${getRatingScale(currentConnection.scoreFormat)}`
   )
 
-  return saved.SaveMediaListEntry ?? null
+  return savedEntry
 }
 
 export async function syncAniListLibraryProgress(username: string) {
@@ -463,14 +526,36 @@ export async function syncAniListLibraryProgress(username: string) {
     return { synced: false, reason: "not-connected" as const }
   }
 
+  const userInfo = await readUserInfo({
+    accessToken: connection.accessToken,
+    aniListUserId: connection.aniListUserId,
+  })
+  const scoreFormat = userInfo?.mediaListOptions?.scoreFormat ?? null
+
+  updateAniListConnectionScoreFormat({
+    username,
+    scoreFormat,
+  })
+
   const entries = await readUserAnimeList({
     accessToken: connection.accessToken,
     aniListUserId: connection.aniListUserId,
   })
+  const normalizedEntries = entries
+    .map(normalizeListEntry)
+    .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
+
+  upsertAniListMediaListEntries({
+    username,
+    aniListUserId: connection.aniListUserId,
+    entries: normalizedEntries,
+    replace: true,
+  })
+
   let matchedEntries = 0
 
-  for (const entry of entries) {
-    if (!entry.mediaId || !entry.progress) {
+  for (const entry of normalizedEntries) {
+    if (!entry.progress) {
       continue
     }
 

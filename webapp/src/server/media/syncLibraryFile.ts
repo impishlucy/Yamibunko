@@ -157,7 +157,7 @@ export async function syncLibraryFile(filePath: string) {
     `[Info] [Media] Recognized library file - Title: ${parsed.animeTitle}, Season: ${parsed.season}, Episode: ${parsed.episode}`
   )
 
-  const metadata = await findAnimeMetadata(parsed.animeTitle, parsed.season)
+  const metadata = await findAnimeMetadata(parsed.animeTitle, parsed.season, parsed.episode)
 
   if (!metadata) {
     throw new Error(`AniList could not match "${parsed.animeTitle}"`)

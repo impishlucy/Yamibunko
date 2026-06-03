@@ -18,6 +18,8 @@ type YamibunkoDatabase = DatabaseSync & {
 
 let database: YamibunkoDatabase | undefined
 
+const currentSchemaVersion = 7
+
 function getDatabasePath() {
   return path.join(
     /*turbopackIgnore: true*/ process.cwd(),
@@ -40,12 +42,46 @@ function assertNoLegacyMigrationTable(db: YamibunkoDatabase) {
   }
 }
 
+function tableColumnExists(
+  db: YamibunkoDatabase,
+  tableName: string,
+  columnName: string
+) {
+  return db
+    .query<{ name: string }>(`PRAGMA table_info(${tableName})`)
+    .all()
+    .some((column) => column.name === columnName)
+}
+
+function ensureColumn(
+  db: YamibunkoDatabase,
+  tableName: string,
+  columnName: string,
+  definition: string
+) {
+  if (tableColumnExists(db, tableName, columnName)) {
+    return
+  }
+
+  db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${definition}`)
+}
+
+function getUserVersion(db: YamibunkoDatabase) {
+  return db.query<{ user_version: number }>("PRAGMA user_version").get()
+    ?.user_version ?? 0
+}
+
+function setUserVersion(db: YamibunkoDatabase, version: number) {
+  db.exec(`PRAGMA user_version = ${version}`)
+}
+
 function initializeSchema(db: YamibunkoDatabase) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       username TEXT PRIMARY KEY COLLATE NOCASE,
       password_hash TEXT,
       is_admin INTEGER NOT NULL DEFAULT 0,
+      anilist_refresh_pressed_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -77,6 +113,9 @@ function initializeSchema(db: YamibunkoDatabase) {
       cover_image TEXT,
       banner_image TEXT,
       average_score INTEGER,
+      anilist_raw_json TEXT,
+      anilist_synced_at TEXT,
+      streaming_episodes_synced_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -123,10 +162,24 @@ function initializeSchema(db: YamibunkoDatabase) {
       FOREIGN KEY (tag_id) REFERENCES media_tags(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS anime_streaming_episodes (
+      anime_id INTEGER NOT NULL,
+      episode_number INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      thumbnail TEXT,
+      url TEXT,
+      site TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (anime_id, episode_number),
+      FOREIGN KEY (anime_id) REFERENCES anime(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS episodes (
       anime_id INTEGER NOT NULL,
       season_nr INTEGER NOT NULL,
       ep_nr INTEGER NOT NULL,
+      title TEXT,
       file_path TEXT NOT NULL UNIQUE,
       thumbnail_path TEXT,
       duration_seconds REAL,
@@ -176,10 +229,32 @@ function initializeSchema(db: YamibunkoDatabase) {
       anilist_username TEXT NOT NULL,
       access_token_ciphertext TEXT NOT NULL,
       token_type TEXT NOT NULL DEFAULT 'Bearer',
+      score_format TEXT,
       connected_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       last_list_sync_at TEXT,
       FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS anilist_media_list_entries (
+      username TEXT NOT NULL COLLATE NOCASE,
+      anilist_user_id INTEGER NOT NULL,
+      media_id INTEGER NOT NULL,
+      list_entry_id INTEGER NOT NULL,
+      status TEXT,
+      progress INTEGER,
+      score REAL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      synced_at TEXT NOT NULL,
+      PRIMARY KEY (username, media_id),
+      FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS app_state (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
     );
 
     CREATE INDEX IF NOT EXISTS anime_library_slug_idx ON anime(library_slug);
@@ -187,6 +262,8 @@ function initializeSchema(db: YamibunkoDatabase) {
       ON anime_relations(related_anime_id);
     CREATE INDEX IF NOT EXISTS anime_genres_genre_idx ON anime_genres(genre);
     CREATE INDEX IF NOT EXISTS anime_tags_tag_id_idx ON anime_tags(tag_id);
+    CREATE INDEX IF NOT EXISTS anime_streaming_episodes_anime_id_idx
+      ON anime_streaming_episodes(anime_id);
     CREATE INDEX IF NOT EXISTS episodes_anime_id_idx ON episodes(anime_id);
     CREATE INDEX IF NOT EXISTS episodes_file_path_idx ON episodes(file_path);
     CREATE INDEX IF NOT EXISTS episode_progress_username_idx
@@ -195,7 +272,327 @@ function initializeSchema(db: YamibunkoDatabase) {
     CREATE INDEX IF NOT EXISTS jobs_created_at_idx ON jobs(created_at);
     CREATE INDEX IF NOT EXISTS anilist_connections_user_id_idx
       ON anilist_connections(anilist_user_id);
+    CREATE INDEX IF NOT EXISTS anilist_media_list_entries_user_idx
+      ON anilist_media_list_entries(username, anilist_user_id);
   `)
+}
+
+function runSchemaMigrations(db: YamibunkoDatabase) {
+  const version = getUserVersion(db)
+
+  if (version < 2) {
+    ensureColumn(db, "anime", "anilist_raw_json", "anilist_raw_json TEXT")
+    ensureColumn(db, "anime", "anilist_synced_at", "anilist_synced_at TEXT")
+    ensureColumn(
+      db,
+      "anime",
+      "streaming_episodes_synced_at",
+      "streaming_episodes_synced_at TEXT"
+    )
+    ensureColumn(db, "episodes", "title", "title TEXT")
+    ensureColumn(db, "anilist_connections", "score_format", "score_format TEXT")
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS anime_streaming_episodes (
+        anime_id INTEGER NOT NULL,
+        episode_number INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        thumbnail TEXT,
+        url TEXT,
+        site TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (anime_id, episode_number),
+        FOREIGN KEY (anime_id) REFERENCES anime(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS anilist_media_list_entries (
+        username TEXT NOT NULL COLLATE NOCASE,
+        anilist_user_id INTEGER NOT NULL,
+        media_id INTEGER NOT NULL,
+        list_entry_id INTEGER NOT NULL,
+        status TEXT,
+        progress INTEGER,
+        score REAL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        synced_at TEXT NOT NULL,
+        PRIMARY KEY (username, media_id),
+        FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS anime_streaming_episodes_anime_id_idx
+        ON anime_streaming_episodes(anime_id);
+      CREATE INDEX IF NOT EXISTS anilist_media_list_entries_user_idx
+        ON anilist_media_list_entries(username, anilist_user_id);
+    `)
+  }
+
+  if (version < 3) {
+    const now = nowIso()
+    const existingLibraryAnime = db
+      .query<{ count: number }>(
+        `
+        SELECT COUNT(DISTINCT a.id) AS count
+        FROM anime a
+        WHERE a.library_slug IS NOT NULL
+          AND (
+            EXISTS (SELECT 1 FROM episodes e WHERE e.anime_id = a.id)
+            OR EXISTS (
+              SELECT 1
+              FROM library_entries le
+              WHERE le.primary_anime_id = a.id
+            )
+          )
+      `
+      )
+      .get()?.count ?? 0
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS app_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `)
+
+    if (existingLibraryAnime > 0) {
+      db.query(
+        `
+        UPDATE anime
+        SET anilist_raw_json = NULL,
+            anilist_synced_at = NULL,
+            streaming_episodes_synced_at = NULL,
+            updated_at = ?
+        WHERE library_slug IS NOT NULL
+          AND (
+            EXISTS (SELECT 1 FROM episodes e WHERE e.anime_id = anime.id)
+            OR EXISTS (
+              SELECT 1
+              FROM library_entries le
+              WHERE le.primary_anime_id = anime.id
+            )
+          )
+      `
+      ).run(now)
+
+      db.exec(`
+        DELETE FROM anime_streaming_episodes
+        WHERE anime_id IN (
+          SELECT DISTINCT a.id
+          FROM anime a
+          WHERE a.library_slug IS NOT NULL
+            AND (
+              EXISTS (SELECT 1 FROM episodes e WHERE e.anime_id = a.id)
+              OR EXISTS (
+                SELECT 1
+                FROM library_entries le
+                WHERE le.primary_anime_id = a.id
+              )
+            )
+        );
+      `)
+
+      db.query(
+        `
+        UPDATE episodes
+        SET title = 'Episode ' || ep_nr,
+            updated_at = ?
+        WHERE anime_id IN (
+          SELECT DISTINCT a.id
+          FROM anime a
+          WHERE a.library_slug IS NOT NULL
+        )
+      `
+      ).run(now)
+    }
+  }
+
+  if (version < 4) {
+    const now = nowIso()
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS app_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `)
+
+    const existingLibraryAnime = db
+      .query<{ count: number }>(
+        `
+        SELECT COUNT(DISTINCT a.id) AS count
+        FROM anime a
+        WHERE EXISTS (SELECT 1 FROM episodes e WHERE e.anime_id = a.id)
+          OR EXISTS (
+            SELECT 1
+            FROM library_entries le
+            WHERE le.primary_anime_id = a.id
+          )
+      `
+      )
+      .get()?.count ?? 0
+
+    if (existingLibraryAnime > 0) {
+      db.query(
+        `
+        UPDATE episodes
+        SET title = 'Episode ' || ep_nr,
+            updated_at = ?
+        WHERE anime_id IN (
+          SELECT a.id
+          FROM anime a
+          LEFT JOIN anime_streaming_episodes se ON se.anime_id = a.id
+          LEFT JOIN episodes e ON e.anime_id = a.id
+          GROUP BY a.id
+          HAVING COUNT(DISTINCT se.episode_number) = 0
+            OR COUNT(DISTINCT se.episode_number) != COALESCE(NULLIF(a.episodes, 0), COUNT(DISTINCT e.ep_nr))
+        )
+      `
+      ).run(now)
+    }
+  }
+
+  if (version < 5) {
+    const now = nowIso()
+
+    const existingLibraryAnime = db
+      .query<{ count: number }>(
+        `
+        SELECT COUNT(DISTINCT a.id) AS count
+        FROM anime a
+        WHERE EXISTS (SELECT 1 FROM episodes e WHERE e.anime_id = a.id)
+          OR EXISTS (
+            SELECT 1
+            FROM library_entries le
+            WHERE le.primary_anime_id = a.id
+          )
+      `
+      )
+      .get()?.count ?? 0
+
+    if (existingLibraryAnime > 0) {
+      db.query(
+        `
+        UPDATE anime
+        SET anilist_raw_json = NULL,
+            anilist_synced_at = NULL,
+            streaming_episodes_synced_at = NULL,
+            updated_at = ?
+        WHERE EXISTS (SELECT 1 FROM episodes e WHERE e.anime_id = anime.id)
+          OR EXISTS (
+            SELECT 1
+            FROM library_entries le
+            WHERE le.primary_anime_id = anime.id
+          )
+      `
+      ).run(now)
+
+      db.exec(`
+        DELETE FROM anime_streaming_episodes
+        WHERE anime_id IN (
+          SELECT DISTINCT a.id
+          FROM anime a
+          WHERE EXISTS (SELECT 1 FROM episodes e WHERE e.anime_id = a.id)
+            OR EXISTS (
+              SELECT 1
+              FROM library_entries le
+              WHERE le.primary_anime_id = a.id
+            )
+        );
+      `)
+
+      db.query(
+        `
+        UPDATE episodes
+        SET title = 'Episode ' || ep_nr,
+            updated_at = ?
+        WHERE anime_id IN (
+          SELECT DISTINCT a.id
+          FROM anime a
+          WHERE EXISTS (SELECT 1 FROM episodes e WHERE e.anime_id = a.id)
+        )
+      `
+      ).run(now)
+    }
+  }
+
+  if (version < 6) {
+    ensureColumn(
+      db,
+      "users",
+      "anilist_refresh_pressed_at",
+      "anilist_refresh_pressed_at TEXT"
+    )
+  }
+
+
+  if (version < 7) {
+    const now = nowIso()
+
+    const existingLibraryAnime = db
+      .query<{ count: number }>(
+        `
+        SELECT COUNT(DISTINCT a.id) AS count
+        FROM anime a
+        WHERE EXISTS (SELECT 1 FROM episodes e WHERE e.anime_id = a.id)
+          OR EXISTS (
+            SELECT 1
+            FROM library_entries le
+            WHERE le.primary_anime_id = a.id
+          )
+      `
+      )
+      .get()?.count ?? 0
+
+    if (existingLibraryAnime > 0) {
+      db.query(
+        `
+        UPDATE anime
+        SET anilist_raw_json = NULL,
+            anilist_synced_at = NULL,
+            streaming_episodes_synced_at = NULL,
+            updated_at = ?
+        WHERE EXISTS (SELECT 1 FROM episodes e WHERE e.anime_id = anime.id)
+          OR EXISTS (
+            SELECT 1
+            FROM library_entries le
+            WHERE le.primary_anime_id = anime.id
+          )
+      `
+      ).run(now)
+
+      db.exec(`
+        DELETE FROM anime_streaming_episodes
+        WHERE anime_id IN (
+          SELECT DISTINCT a.id
+          FROM anime a
+          WHERE EXISTS (SELECT 1 FROM episodes e WHERE e.anime_id = a.id)
+            OR EXISTS (
+              SELECT 1
+              FROM library_entries le
+              WHERE le.primary_anime_id = a.id
+            )
+        );
+      `)
+
+      db.query(
+        `
+        UPDATE episodes
+        SET title = 'Episode ' || ep_nr,
+            updated_at = ?
+        WHERE anime_id IN (
+          SELECT DISTINCT a.id
+          FROM anime a
+          WHERE EXISTS (SELECT 1 FROM episodes e WHERE e.anime_id = a.id)
+        )
+      `
+      ).run(now)
+    }
+  }
+
+  setUserVersion(db, currentSchemaVersion)
 }
 
 export function getDb() {
@@ -219,6 +616,7 @@ export function getDb() {
 
   assertNoLegacyMigrationTable(database)
   initializeSchema(database)
+  runSchemaMigrations(database)
   return database
 }
 

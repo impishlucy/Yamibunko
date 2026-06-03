@@ -1,8 +1,5 @@
 import { requireApiUser, requireSameOriginRequest } from "@/server/auth/api"
-import {
-  getAniListRedirectUri,
-  isAniListConfigured,
-} from "@/server/anilist/client"
+import { isAniListConfigured } from "@/server/anilist/client"
 import { getAniListRateLimitState } from "@/server/anilist/transport"
 import {
   deleteAniListConnection,
@@ -12,7 +9,7 @@ import {
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
-export async function GET(request: Request) {
+export async function GET() {
   const auth = await requireApiUser()
 
   if (!auth.ok) {
@@ -25,7 +22,6 @@ export async function GET(request: Request) {
   return Response.json({
     configured,
     connected: configured && Boolean(connection),
-    callbackUrl: await getAniListRedirectUri(request),
     rateLimit: getAniListRateLimitState(),
     user:
       configured && connection
@@ -58,7 +54,6 @@ export async function DELETE(request: Request) {
     ok: true,
     configured: isAniListConfigured(),
     connected: false,
-    callbackUrl: await getAniListRedirectUri(request),
     rateLimit: getAniListRateLimitState(),
     user: null,
   })

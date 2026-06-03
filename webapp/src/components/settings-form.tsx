@@ -23,7 +23,63 @@ type AniListConnectionResponse = {
     connectedAt: string
     lastListSyncAt: string | null
   } | null
-  callbackUrl: string
+}
+
+type AniListOAuthStatus =
+  | "connected"
+  | "failed"
+  | "invalid-state"
+  | "denied"
+  | "login-required"
+
+function getAniListOAuthMessage(status: AniListOAuthStatus | null) {
+  if (!status) {
+    return null
+  }
+
+  if (status === "connected") {
+    return { kind: "success" as const, text: "AniList connected." }
+  }
+
+  if (status === "invalid-state") {
+    return {
+      kind: "error" as const,
+      text: "AniList connection failed because the OAuth state expired or did not match.",
+    }
+  }
+
+  if (status === "denied") {
+    return { kind: "error" as const, text: "AniList authorization was denied." }
+  }
+
+  if (status === "login-required") {
+    return { kind: "error" as const, text: "Log in before connecting AniList." }
+  }
+
+  return {
+    kind: "error" as const,
+    text: "AniList connection failed. Check the OAuth app settings and server logs.",
+  }
+}
+
+function getInitialAniListOAuthStatus(): AniListOAuthStatus | null {
+  if (typeof window === "undefined") {
+    return null
+  }
+
+  const status = new URLSearchParams(window.location.search).get("anilist")
+
+  if (
+    status === "connected" ||
+    status === "failed" ||
+    status === "invalid-state" ||
+    status === "denied" ||
+    status === "login-required"
+  ) {
+    return status
+  }
+
+  return null
 }
 
 export function SettingsForm({ settings }: SettingsFormProps) {
@@ -32,7 +88,11 @@ export function SettingsForm({ settings }: SettingsFormProps) {
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [aniList, setAniList] = useState<AniListConnectionResponse | null>(null)
+  const [aniListOAuthStatus] = useState<AniListOAuthStatus | null>(
+    getInitialAniListOAuthStatus
+  )
   const aniListAvailable = aniList?.configured ?? false
+  const aniListOAuthMessage = getAniListOAuthMessage(aniListOAuthStatus)
 
   const canSavePassword = useMemo(() => isStrongPassword(password), [password])
 
@@ -180,9 +240,16 @@ export function SettingsForm({ settings }: SettingsFormProps) {
               <p className="text-sm text-zinc-400">
                 OAuth app id and secret are not configured.
               </p>
-            ) : aniList.callbackUrl ? (
-              <p className="text-xs text-zinc-500">
-                Callback: {aniList.callbackUrl}
+            ) : null}
+            {aniListOAuthMessage ? (
+              <p
+                className={`text-sm ${
+                  aniListOAuthMessage.kind === "success"
+                    ? "text-emerald-300"
+                    : "text-red-300"
+                }`}
+              >
+                {aniListOAuthMessage.text}
               </p>
             ) : null}
           </div>

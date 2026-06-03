@@ -2,6 +2,7 @@ import chokidar, { type FSWatcher } from "chokidar"
 import { readdir } from "node:fs/promises"
 import path from "node:path"
 
+import { runFullAniListRefresh } from "@/server/anilist/sync"
 import { listEpisodeFilePaths } from "@/server/db/library"
 import { getServerConfigResult } from "@/server/config"
 import { isMediaFile, pathExists } from "@/server/media/mediaFiles"
@@ -25,6 +26,18 @@ type WorkerGlobalState = typeof globalThis & {
 }
 
 const scanIntervalMs = 5 * 60 * 1000
+
+function msUntilNextDailyAniListSync() {
+  const now = new Date()
+  const next = new Date(now)
+  next.setHours(5, 0, 0, 0)
+
+  if (next <= now) {
+    next.setDate(next.getDate() + 1)
+  }
+
+  return next.getTime() - now.getTime()
+}
 
 const workerGlobal = globalThis as WorkerGlobalState
 
@@ -67,6 +80,8 @@ export function startWorkers() {
   const activeWork = new Set<Promise<void>>()
   let shuttingDown = false
   let scanning = false
+  let dailyAniListTimer: NodeJS.Timeout | undefined
+  let dailyAniListSyncRunning = false
 
   const inputWatcher = chokidar.watch(config.inputDir, {
     ignoreInitial: true,
@@ -202,6 +217,37 @@ export function startWorkers() {
     await scanLibraryDirectory()
   }
 
+  async function runDailyAniListSync() {
+    if (shuttingDown || dailyAniListSyncRunning) {
+      return
+    }
+
+    dailyAniListSyncRunning = true
+    console.log("[Info] [Workers] Starting daily AniList sync.")
+
+    try {
+      await runFullAniListRefresh()
+      console.log("[Info] [Workers] Daily AniList sync completed.")
+    } catch (error) {
+      console.error(
+        `[Error] [Workers] Daily AniList sync failed - startWorkers.ts - ${errorMessage(error)}`
+      )
+    } finally {
+      dailyAniListSyncRunning = false
+    }
+  }
+
+  function scheduleDailyAniListSync() {
+    if (shuttingDown) {
+      return
+    }
+
+    dailyAniListTimer = setTimeout(() => {
+      void runDailyAniListSync().finally(scheduleDailyAniListSync)
+    }, msUntilNextDailyAniListSync())
+    dailyAniListTimer.unref?.()
+  }
+
   inputWatcher.on("add", (filePath) => {
     enqueue("input", filePath)
   })
@@ -231,7 +277,14 @@ export function startWorkers() {
   }, scanIntervalMs)
   scanTimer.unref?.()
 
+  const startupAniListSync = runDailyAniListSync()
+  activeWork.add(startupAniListSync)
+  void startupAniListSync.finally(() => {
+    activeWork.delete(startupAniListSync)
+  })
+
   void scanAllDirectories()
+  scheduleDailyAniListSync()
 
   async function stop() {
     if (shuttingDown) {
@@ -241,6 +294,9 @@ export function startWorkers() {
     shuttingDown = true
     console.log("[Info] [Workers] Stopping background workers.")
     clearInterval(scanTimer)
+    if (dailyAniListTimer) {
+      clearTimeout(dailyAniListTimer)
+    }
     await Promise.all([inputWatcher.close(), libraryWatcher.close()])
 
     while (activeWork.size > 0) {

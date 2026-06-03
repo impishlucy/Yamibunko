@@ -49,6 +49,7 @@ export type Episode = {
   animeId: number
   seasonNumber: number
   episodeNumber: number
+  title?: string
   fileName: string
   filePath: string
   thumbnail?: string

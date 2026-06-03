@@ -1,3 +1,4 @@
+import { SettingsAbout } from "@/components/settings-about"
 import { SettingsForm } from "@/components/settings-form"
 import { UserManagement } from "@/components/user-management"
 import { getSafeServerSettings } from "@/server/config"
@@ -16,7 +17,8 @@ export default async function SettingsPage() {
         <h1 className="text-2xl font-semibold text-zinc-50">Settings</h1>
       </div>
       <SettingsForm settings={settings} />
-      <UserManagement />
+      {user?.isAdmin ? <UserManagement /> : null}
+      <SettingsAbout isAdmin={settings.account.isAdmin} />
     </div>
   )
 }

@@ -4,6 +4,7 @@ type UserRow = {
   username: string
   password_hash: string | null
   is_admin: number
+  anilist_refresh_pressed_at: string | null
   created_at: string
   updated_at: string
 }
@@ -12,15 +13,19 @@ export type StoredUser = {
   username: string
   passwordHash: string | null
   isAdmin: boolean
+  aniListRefreshPressedAt: string | null
   createdAt: string
   updatedAt: string
 }
+
+export const aniListRefreshCooldownMs = 5 * 60 * 1000
 
 function toUser(row: UserRow): StoredUser {
   return {
     username: row.username,
     passwordHash: row.password_hash,
     isAdmin: row.is_admin === 1,
+    aniListRefreshPressedAt: row.anilist_refresh_pressed_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
@@ -37,7 +42,7 @@ export function hasAnyUsers() {
 export function getUser(username: string) {
   const row = getDb()
     .query<UserRow>(
-      "SELECT username, password_hash, is_admin, created_at, updated_at FROM users WHERE username = ?"
+      "SELECT username, password_hash, is_admin, anilist_refresh_pressed_at, created_at, updated_at FROM users WHERE username = ?"
     )
     .get(username.trim())
 
@@ -47,7 +52,7 @@ export function getUser(username: string) {
 export function listUsers() {
   return getDb()
     .query<UserRow>(
-      "SELECT username, password_hash, is_admin, created_at, updated_at FROM users ORDER BY is_admin DESC, username ASC"
+      "SELECT username, password_hash, is_admin, anilist_refresh_pressed_at, created_at, updated_at FROM users ORDER BY is_admin DESC, username ASC"
     )
     .all()
     .map(toUser)
@@ -91,4 +96,49 @@ export function setUserPasswordHash(username: string, passwordHash: string) {
 
 export function deleteUser(username: string) {
   getDb().query("DELETE FROM users WHERE username = ?").run(username.trim())
+}
+
+
+export function getUserAniListRefreshState(username: string) {
+  const row = getDb()
+    .query<{ anilist_refresh_pressed_at: string | null }>(
+      "SELECT anilist_refresh_pressed_at FROM users WHERE username = ?"
+    )
+    .get(username.trim())
+
+  if (!row) {
+    return null
+  }
+
+  const lastPressedAt = row.anilist_refresh_pressed_at
+  const lastPressedMs = lastPressedAt ? Date.parse(lastPressedAt) : Number.NaN
+  const remainingMs = Number.isFinite(lastPressedMs)
+    ? Math.max(lastPressedMs + aniListRefreshCooldownMs - Date.now(), 0)
+    : 0
+
+  return {
+    lastPressedAt,
+    canPress: remainingMs <= 0,
+    cooldownSeconds: Math.ceil(remainingMs / 1000),
+  }
+}
+
+export function markUserAniListRefreshPressed(username: string) {
+  const now = nowIso()
+  const allowedBefore = new Date(Date.now() - aniListRefreshCooldownMs).toISOString()
+  const result = getDb()
+    .query(
+      `
+      UPDATE users
+      SET anilist_refresh_pressed_at = ?, updated_at = ?
+      WHERE username = ?
+        AND (
+          anilist_refresh_pressed_at IS NULL
+          OR anilist_refresh_pressed_at <= ?
+        )
+    `
+    )
+    .run(now, now, username.trim(), allowedBefore)
+
+  return result.changes > 0
 }

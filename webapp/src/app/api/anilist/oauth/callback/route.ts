@@ -68,6 +68,7 @@ export async function GET(request: Request) {
       aniListUsername: viewer.name,
       accessToken: token.accessToken,
       tokenType: token.tokenType,
+      scoreFormat: viewer.mediaListOptions?.scoreFormat ?? null,
     })
 
     await syncAniListLibraryProgress(user.username).catch((syncError) => {

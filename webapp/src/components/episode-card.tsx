@@ -64,7 +64,7 @@ export function EpisodeCard({ episode }: { episode: Episode }) {
                 {String(episode.episodeNumber).padStart(2, "0")}
               </Badge>
               <h3 className="truncate text-sm font-medium text-zinc-100">
-                {episode.fileName}
+                {episode.title ?? episode.fileName}
               </h3>
             </div>
             <p className="mt-3 inline-flex items-center gap-1 text-xs text-zinc-500">

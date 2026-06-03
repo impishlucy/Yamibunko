@@ -281,7 +281,7 @@ export async function processInputFile(
       message: "Fetching AniList metadata.",
     })
 
-    const metadata = await findAnimeMetadata(parsed.title, parsed.season)
+    const metadata = await findAnimeMetadata(parsed.title, parsed.season, parsed.episode)
 
     if (!metadata) {
       throw new Error(`AniList could not match "${parsed.title}"`)

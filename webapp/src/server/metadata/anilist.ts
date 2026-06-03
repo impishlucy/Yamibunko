@@ -1,9 +1,20 @@
+import { AniListOperations } from "@api-wrappers/anilist-wrapper"
+
 import { slugifyAnimeTitle } from "@/lib/slug"
 import {
   getAniListClient,
   queueAniListOperation,
 } from "@/server/anilist/transport"
-import type { AnimeMetadataInput } from "@/server/db/library"
+import {
+  findCachedAnimeMetadataForFile,
+  getAnimeMetadataById,
+  getMaxCachedStreamingEpisodeNumber,
+  listAnimeIdsForAniListRefresh,
+  upsertAnime,
+  type AnimeMetadataInput,
+  type AnimeStreamingEpisodeInput,
+} from "@/server/db/library"
+import { errorMessage } from "@/server/utils/format"
 
 type AniListMediaNode = {
   id: number
@@ -21,6 +32,8 @@ type AniListMediaNode = {
   duration?: number | null
   coverImage?: {
     extraLarge?: string | null
+    large?: string | null
+    medium?: string | null
   } | null
   bannerImage?: string | null
   genres?: Array<string | null> | null
@@ -33,6 +46,12 @@ type AniListMediaNode = {
     rank?: number | null
     isAdult?: boolean | null
   } | null> | null
+  streamingEpisodes?: Array<{
+    title?: string | null
+    thumbnail?: string | null
+    url?: string | null
+    site?: string | null
+  } | null> | null
   relations?: {
     edges?: Array<{
       relationType?: string | null
@@ -40,6 +59,16 @@ type AniListMediaNode = {
     } | null> | null
   } | null
 }
+
+
+const AnimeWithStreamingEpisodesDocument = `
+  query YamibunkoAnimeWithStreamingEpisodes($id: Int!) {
+    Media(id: $id, type: ANIME) {
+      ...AnimeFragment
+    }
+  }
+  ${AniListOperations.AnimeFragmentDoc}
+`
 
 const seriesFormats = new Set(["TV", "TV_SHORT", "ONA"])
 const sideStoryFormats = new Set(["MOVIE", "SPECIAL", "OVA"])
@@ -69,7 +98,22 @@ function titleForMetadata(metadata: AnimeMetadataInput) {
   return title
 }
 
-function toMetadata(media: AniListMediaNode): AnimeMetadataInput {
+function toStreamingEpisodes(
+  episodes: AniListMediaNode["streamingEpisodes"]
+): AnimeStreamingEpisodeInput[] {
+  return (episodes ?? [])
+    .filter((episode): episode is NonNullable<typeof episode> => Boolean(episode))
+    .map((episode) => ({
+      title: episode.title ?? null,
+      thumbnail: episode.thumbnail ?? null,
+      url: episode.url ?? null,
+      site: episode.site ?? null,
+    }))
+}
+
+function toMetadata(media: AniListMediaNode, fullPayload = false): AnimeMetadataInput {
+  const syncedAt = fullPayload ? new Date().toISOString() : null
+
   return {
     id: media.id,
     format: media.format ?? null,
@@ -84,15 +128,18 @@ function toMetadata(media: AniListMediaNode): AnimeMetadataInput {
     seasonYear: media.seasonYear ?? null,
     episodes: media.episodes ?? null,
     duration: media.duration ?? null,
-    coverImage: media.coverImage?.extraLarge ?? null,
+    coverImage:
+      media.coverImage?.extraLarge ??
+      media.coverImage?.large ??
+      media.coverImage?.medium ??
+      null,
     bannerImage: media.bannerImage ?? null,
-    genres: (media.genres ?? []).filter((item): item is string =>
-      Boolean(item)
-    ),
+    genres: (media.genres ?? []).filter((item): item is string => Boolean(item)),
     averageScore: media.averageScore ?? null,
     tags: (media.tags ?? []).filter((item): item is NonNullable<typeof item> =>
       Boolean(item)
     ),
+    streamingEpisodes: toStreamingEpisodes(media.streamingEpisodes),
     relations: (media.relations?.edges ?? [])
       .filter(
         (
@@ -104,8 +151,10 @@ function toMetadata(media: AniListMediaNode): AnimeMetadataInput {
       )
       .map((edge) => ({
         relationType: edge.relationType,
-        media: toMetadata(edge.node),
+        media: toMetadata(edge.node, false),
       })),
+    rawMedia: fullPayload ? media : undefined,
+    anilistSyncedAt: syncedAt,
   }
 }
 
@@ -167,7 +216,10 @@ function pickRootCandidate(metadata: AnimeMetadataInput) {
 
 async function fetchAnimeMetadataById(id: number) {
   const animeResult = await queueAniListOperation(() =>
-    getAniListClient().anime.getAnimeById(id)
+    getAniListClient().graphql.request<{ Media: AniListMediaNode | null }, { id: number }>(
+      AnimeWithStreamingEpisodesDocument,
+      { id }
+    )
   )
   const media = animeResult.Media as AniListMediaNode | null
 
@@ -175,20 +227,7 @@ async function fetchAnimeMetadataById(id: number) {
     return null
   }
 
-  const relationsResult = await queueAniListOperation(() =>
-    getAniListClient().anime.getRelations(id)
-  )
-  const relationEdges =
-    (relationsResult.Media?.relations?.edges ?? []) as NonNullable<
-      AniListMediaNode["relations"]
-    >["edges"]
-
-  return toMetadata({
-    ...media,
-    relations: {
-      edges: relationEdges ?? [],
-    },
-  })
+  return toMetadata(media, true)
 }
 
 async function resolveLibraryRoot(
@@ -301,7 +340,47 @@ function scoreMediaCandidate(media: AniListMediaNode, search: string) {
   return bestOverlap >= 0.5 ? 2 : 3
 }
 
-export async function findAnimeMetadata(title: string, season?: number) {
+function needsFullCachedRefresh(metadata: AnimeMetadataInput, episode?: number) {
+  if (!metadata.rawMedia) {
+    return true
+  }
+
+  if (!episode || episode <= 0) {
+    return false
+  }
+
+  const maxCachedEpisode = getMaxCachedStreamingEpisodeNumber(metadata.id)
+
+  return maxCachedEpisode <= 0 || episode > maxCachedEpisode
+}
+
+export async function findAnimeMetadata(
+  title: string,
+  season?: number,
+  episode?: number
+) {
+  const cached = findCachedAnimeMetadataForFile(title, season)
+
+  if (cached) {
+    if (needsFullCachedRefresh(cached, episode)) {
+      const refreshed = await fetchAnimeMetadataById(cached.id).catch((error) => {
+        console.warn(
+          `[Warn] [Anilist] Cached metadata refresh failed - ${cached.id} - ${errorMessage(error)}`
+        )
+        return null
+      })
+
+      if (refreshed) {
+        return attachLibraryInfo(refreshed)
+      }
+    }
+
+    console.log(
+      `[Info] [Anilist] Resolved anime metadata from local cache - ${title} - id ${cached.id}`
+    )
+    return cached
+  }
+
   for (const candidate of getSearchCandidates(title, season)) {
     console.log(`[Info] [Anilist] Searching anime metadata - ${candidate}`)
 
@@ -323,7 +402,7 @@ export async function findAnimeMetadata(title: string, season?: number) {
     if (media) {
       const metadata =
         (await fetchAnimeMetadataById(media.id).catch(() => null)) ??
-        toMetadata(media)
+        toMetadata(media, false)
 
       console.log(
         `[Info] [Anilist] Found match ${
@@ -343,7 +422,41 @@ export async function findAnimeMetadata(title: string, season?: number) {
 }
 
 export async function findAnimeMetadataById(id: number) {
+  const cached = getAnimeMetadataById(id)
+
+  if (cached && !needsFullCachedRefresh(cached)) {
+    return cached
+  }
+
   const metadata = await fetchAnimeMetadataById(id)
 
   return metadata ? attachLibraryInfo(metadata) : null
+}
+
+export async function refreshCachedAniListMetadata() {
+  const animeIds = listAnimeIdsForAniListRefresh()
+  let refreshed = 0
+
+  for (const animeId of animeIds) {
+    try {
+      const metadata = await fetchAnimeMetadataById(animeId)
+
+      if (!metadata) {
+        continue
+      }
+
+      upsertAnime(await attachLibraryInfo(metadata))
+      refreshed += 1
+    } catch (error) {
+      console.warn(
+        `[Warn] [Anilist] Cached metadata sync failed - ${animeId} - ${errorMessage(error)}`
+      )
+    }
+  }
+
+  console.log(
+    `[Info] [Anilist] Cached metadata sync completed - Refreshed: ${refreshed}/${animeIds.length}`
+  )
+
+  return { refreshed, total: animeIds.length }
 }

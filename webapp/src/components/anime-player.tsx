@@ -821,7 +821,12 @@ export function AnimePlayer({
   useEffect(() => {
     sourceUrlRef.current = sourceUrl
     streamStatsSampleRef.current = null
-    setMeasuredStreamMbps(null)
+
+    const timer = window.setTimeout(() => {
+      setMeasuredStreamMbps(null)
+    }, 0)
+
+    return () => window.clearTimeout(timer)
   }, [sourceUrl])
 
   useEffect(() => {
@@ -837,9 +842,15 @@ export function AnimePlayer({
   }, [status])
 
   useEffect(() => {
-    if (!liveTranscodeEnabled && quality !== "original") {
-      setQuality("original")
+    if (liveTranscodeEnabled || quality === "original") {
+      return
     }
+
+    const timer = window.setTimeout(() => {
+      setQuality("original")
+    }, 0)
+
+    return () => window.clearTimeout(timer)
   }, [liveTranscodeEnabled, quality])
 
   useEffect(() => {
@@ -861,9 +872,12 @@ export function AnimePlayer({
           (option) => option.language === defaultSubtitle.language
         )?.stream ?? defaultSubtitle
       : null
+    const timer = window.setTimeout(() => {
+      setSelectedAudioStreamId(media.defaultAudioStreamId)
+      setSelectedSubtitleStreamId(bestDefaultSubtitle?.id ?? null)
+    }, 0)
 
-    setSelectedAudioStreamId(media.defaultAudioStreamId)
-    setSelectedSubtitleStreamId(bestDefaultSubtitle?.id ?? null)
+    return () => window.clearTimeout(timer)
   }, [
     media.defaultAudioStreamId,
     media.defaultSubtitleStreamId,
@@ -880,19 +894,26 @@ export function AnimePlayer({
     const selectedStream = supportedSubtitleStreams.find(
       (stream) => stream.id === selectedSubtitleStreamId
     )
+    const bestLanguageOption = selectedStream
+      ? subtitleLanguageOptions.find(
+          (option) => option.language === selectedStream.language
+        )
+      : null
+    const nextSubtitleStreamId = selectedStream
+      ? bestLanguageOption && bestLanguageOption.id !== selectedSubtitleStreamId
+        ? bestLanguageOption.id
+        : selectedSubtitleStreamId
+      : null
 
-    if (!selectedStream) {
-      setSelectedSubtitleStreamId(null)
+    if (nextSubtitleStreamId === selectedSubtitleStreamId) {
       return
     }
 
-    const bestLanguageOption = subtitleLanguageOptions.find(
-      (option) => option.language === selectedStream.language
-    )
+    const timer = window.setTimeout(() => {
+      setSelectedSubtitleStreamId(nextSubtitleStreamId)
+    }, 0)
 
-    if (bestLanguageOption && bestLanguageOption.id !== selectedSubtitleStreamId) {
-      setSelectedSubtitleStreamId(bestLanguageOption.id)
-    }
+    return () => window.clearTimeout(timer)
   }, [selectedSubtitleStreamId, subtitleLanguageOptions, supportedSubtitleStreams])
 
   useEffect(() => {
@@ -1105,11 +1126,7 @@ export function AnimePlayer({
     ]
   )
 
-  function getPlaybackPosition() {
-    return getPlaybackClockPosition(videoRef.current)
-  }
-
-  function getPlaybackClockPosition(video: HTMLVideoElement | null) {
+  const getPlaybackClockPosition = useCallback((video: HTMLVideoElement | null) => {
     if (
       video &&
       Number.isFinite(video.currentTime) &&
@@ -1124,19 +1141,26 @@ export function AnimePlayer({
         : currentTimeRef.current
 
     return Math.max(seconds, 0)
-  }
+  }, [])
 
-  function syncSubtitleOverlay(seconds = getPlaybackPosition()) {
-    const texts = getActiveSubtitleTexts(subtitleCuesRef.current, seconds)
-    const key = subtitleTextKey(texts)
+  const getPlaybackPosition = useCallback(() => {
+    return getPlaybackClockPosition(videoRef.current)
+  }, [getPlaybackClockPosition])
 
-    if (key === activeSubtitleKeyRef.current) {
-      return
-    }
+  const syncSubtitleOverlay = useCallback(
+    (seconds = getPlaybackPosition()) => {
+      const texts = getActiveSubtitleTexts(subtitleCuesRef.current, seconds)
+      const key = subtitleTextKey(texts)
 
-    activeSubtitleKeyRef.current = key
-    setActiveSubtitleTexts(texts)
-  }
+      if (key === activeSubtitleKeyRef.current) {
+        return
+      }
+
+      activeSubtitleKeyRef.current = key
+      setActiveSubtitleTexts(texts)
+    },
+    [getPlaybackPosition]
+  )
 
   function applyPendingSeek(video: HTMLVideoElement) {
     const pendingSeek = pendingSeekRef.current
@@ -1157,22 +1181,28 @@ export function AnimePlayer({
     pendingSeekRef.current = null
   }
 
-  function getDirectUrl(startTime?: number) {
-    return withStreamParams(playback.directUrl, {
-      audioStreamId: selectedAudioStreamId,
-      startTime: directAudioRemuxActive ? startTime : null,
-    })
-  }
-
-  function getTranscodeUrl(profile: PlaybackProfile, startTime?: number) {
-    return withStreamParams(
-      profile === "dataSaver" ? playback.dataSaverUrl : playback.originalTranscodeUrl,
-      {
+  const getDirectUrl = useCallback(
+    (startTime?: number) =>
+      withStreamParams(playback.directUrl, {
         audioStreamId: selectedAudioStreamId,
-        startTime,
-      }
-    )
-  }
+        startTime: directAudioRemuxActive ? startTime : null,
+      }),
+    [directAudioRemuxActive, playback.directUrl, selectedAudioStreamId]
+  )
+
+  const getTranscodeUrl = useCallback(
+    (profile: PlaybackProfile, startTime?: number) =>
+      withStreamParams(
+        profile === "dataSaver"
+          ? playback.dataSaverUrl
+          : playback.originalTranscodeUrl,
+        {
+          audioStreamId: selectedAudioStreamId,
+          startTime,
+        }
+      ),
+    [playback.dataSaverUrl, playback.originalTranscodeUrl, selectedAudioStreamId]
+  )
 
   function switchSource(
     nextSourceUrl: string,
@@ -1337,13 +1367,11 @@ export function AnimePlayer({
     durationSeconds,
     endMediaWait,
     fileName,
+    getDirectUrl,
+    getTranscodeUrl,
     liveTranscodeEnabled,
     playbackKey,
-    playback.dataSaverUrl,
-    playback.directUrl,
-    playback.originalTranscodeUrl,
     quality,
-    selectedAudioStreamId,
   ])
 
   useEffect(() => {
@@ -1365,18 +1393,26 @@ export function AnimePlayer({
 
       return () => window.clearTimeout(timer)
     }
-  }, [beginMediaWait, sourceUrl])
+  }, [beginMediaWait, endMediaWait, sourceUrl])
 
   useEffect(() => {
     let cancelled = false
 
     subtitleCuesRef.current = []
     activeSubtitleKeyRef.current = ""
-    setSubtitleCues([])
-    setActiveSubtitleTexts([])
+
+    const resetTimer = window.setTimeout(() => {
+      if (!cancelled) {
+        setSubtitleCues([])
+        setActiveSubtitleTexts([])
+      }
+    }, 0)
 
     if (!selectedSubtitleStream || !subtitleTrackUrl) {
-      return
+      return () => {
+        cancelled = true
+        window.clearTimeout(resetTimer)
+      }
     }
 
     void fetch(subtitleTrackUrl, { cache: "no-store" })
@@ -1407,22 +1443,31 @@ export function AnimePlayer({
 
     return () => {
       cancelled = true
+      window.clearTimeout(resetTimer)
     }
-  }, [selectedSubtitleStream, subtitleTrackUrl])
+  }, [selectedSubtitleStream, subtitleTrackUrl, syncSubtitleOverlay])
 
   useEffect(() => {
     subtitleCuesRef.current = subtitleCues
     activeSubtitleKeyRef.current = ""
-    syncSubtitleOverlay()
-  }, [subtitleCues])
+
+    const frame = window.requestAnimationFrame(() => {
+      syncSubtitleOverlay()
+    })
+
+    return () => window.cancelAnimationFrame(frame)
+  }, [subtitleCues, syncSubtitleOverlay])
 
   useEffect(() => {
     clearSubtitleAnimationFrame()
 
     if (!subtitleCues.length || isCasting) {
       activeSubtitleKeyRef.current = ""
-      setActiveSubtitleTexts([])
-      return
+      const timer = window.setTimeout(() => {
+        setActiveSubtitleTexts([])
+      }, 0)
+
+      return () => window.clearTimeout(timer)
     }
 
     const tick = () => {
@@ -1430,10 +1475,16 @@ export function AnimePlayer({
       subtitleAnimationFrameRef.current = window.requestAnimationFrame(tick)
     }
 
-    tick()
+    subtitleAnimationFrameRef.current = window.requestAnimationFrame(tick)
 
     return clearSubtitleAnimationFrame
-  }, [clearSubtitleAnimationFrame, isCasting, sourceUrl, subtitleCues])
+  }, [
+    clearSubtitleAnimationFrame,
+    isCasting,
+    sourceUrl,
+    subtitleCues,
+    syncSubtitleOverlay,
+  ])
 
   function tryDirectPlay() {
     setQuality("original")
@@ -2062,7 +2113,7 @@ export function AnimePlayer({
 
     castSelectionKeyRef.current = castSelectionKey
     void startGoogleCastingRef.current(video, isPlayingRef.current, getPlaybackPosition())
-  }, [castSelectionKey, isCasting])
+  }, [castSelectionKey, getPlaybackPosition, isCasting])
 
   async function startCasting() {
     const video = videoRef.current

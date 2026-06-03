@@ -22,6 +22,9 @@ type AnimeRow = {
   cover_image: string | null
   banner_image: string | null
   average_score: number | null
+  anilist_raw_json: string | null
+  anilist_synced_at: string | null
+  streaming_episodes_synced_at: string | null
 }
 
 type AnimeListRow = AnimeRow & {
@@ -47,6 +50,7 @@ type EpisodeRow = {
   anime_id: number
   season_nr: number
   ep_nr: number
+  title: string | null
   file_path: string
   thumbnail_path: string | null
   duration_seconds: number | null
@@ -63,6 +67,22 @@ type AnimeTagRow = {
   rank: number | null
   isAdult: number | null
 }
+
+type StreamingEpisodeRow = {
+  anime_id: number
+  episode_number: number
+  title: string
+  thumbnail: string | null
+  url: string | null
+  site: string | null
+}
+
+type CachedAnimeCandidateRow = AnimeRow & {
+  library_title: string | null
+  primary_anime_id: number | null
+}
+
+const seriesFormats = new Set(["TV", "TV_SHORT", "ONA"])
 
 function animeTitle(metadata: Pick<AnimeMetadataInput, "id" | "title">) {
   const title =
@@ -142,6 +162,14 @@ function ensureLibraryEntry(input: {
   return input.slug
 }
 
+export type AnimeStreamingEpisodeInput = {
+  episodeNumber?: number | null
+  title?: string | null
+  thumbnail?: string | null
+  url?: string | null
+  site?: string | null
+}
+
 export type AnimeMetadataInput = {
   id: number
   format?: string | null
@@ -178,6 +206,9 @@ export type AnimeMetadataInput = {
     rank?: number | null
     isAdult?: boolean | null
   }>
+  streamingEpisodes?: AnimeStreamingEpisodeInput[]
+  rawMedia?: unknown
+  anilistSyncedAt?: string | null
 }
 
 function listSeasonsForAnimeId(animeId: number) {
@@ -223,6 +254,26 @@ function listTagsForAnimeId(animeId: number) {
       category: row.category,
       rank: row.rank,
       isAdult: row.isAdult === 1,
+    }))
+}
+
+function listStreamingEpisodesForAnimeId(animeId: number) {
+  return getDb()
+    .query<StreamingEpisodeRow>(
+      `
+      SELECT anime_id, episode_number, title, thumbnail, url, site
+      FROM anime_streaming_episodes
+      WHERE anime_id = ?
+      ORDER BY episode_number ASC
+    `
+    )
+    .all(animeId)
+    .map((row) => ({
+      episodeNumber: row.episode_number,
+      title: row.title,
+      thumbnail: row.thumbnail,
+      url: row.url,
+      site: row.site,
     }))
 }
 
@@ -314,6 +365,269 @@ function replaceAnimeTags(
   }
 }
 
+function inferStreamingEpisodeNumber(episode: AnimeStreamingEpisodeInput) {
+  if (episode.episodeNumber && episode.episodeNumber > 0) {
+    return episode.episodeNumber
+  }
+
+  const candidates = [episode.title, episode.url]
+    .filter((value): value is string => Boolean(value))
+    .join(" ")
+  const patterns = [
+    /(?:episode|ep)[\s._/-]*0*(\d{1,4})(?:\b|[^a-z0-9])/i,
+    /(?:^|[^a-z0-9])e[\s._/-]*0*(\d{1,4})(?:\b|[^a-z0-9])/i,
+    /(?:^|[\/._-])0*(\d{1,4})(?:[\/._-]|$)/i,
+  ]
+
+  for (const pattern of patterns) {
+    const match = pattern.exec(candidates)
+
+    if (!match) {
+      continue
+    }
+
+    const parsed = parsePositiveInt(match[1])
+
+    if (parsed) {
+      return parsed
+    }
+  }
+
+  return null
+}
+
+function cleanStreamingEpisodeTitle(value: string | null | undefined) {
+  if (!value) {
+    return null
+  }
+
+  const cleaned = value
+    .replace(/<[^>]*>/g, "")
+    .replace(/^\s*(?:episode|ep)\s*\d{1,4}\s*[-–—:]\s*/i, "")
+    .replace(/^\s*S\d{1,2}\s*E\d{1,4}\s*[-–—:]\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim()
+
+  return cleaned || null
+}
+
+function fallbackEpisodeTitle(episodeNumber: number) {
+  return `Episode ${episodeNumber}`
+}
+
+function canUseCachedStreamingEpisodeTitles(animeId: number) {
+  const row = getDb()
+    .query<{
+      local_episode_count: number
+      local_titled_count: number
+      cached_title_count: number
+      anilist_episode_count: number | null
+    }>(
+      `
+      SELECT
+        COUNT(DISTINCT e.ep_nr) AS local_episode_count,
+        COUNT(DISTINCT se_local.episode_number) AS local_titled_count,
+        (
+          SELECT COUNT(DISTINCT se_all.episode_number)
+          FROM anime_streaming_episodes se_all
+          WHERE se_all.anime_id = a.id
+        ) AS cached_title_count,
+        a.episodes AS anilist_episode_count
+      FROM anime a
+      LEFT JOIN episodes e ON e.anime_id = a.id
+      LEFT JOIN anime_streaming_episodes se_local
+        ON se_local.anime_id = e.anime_id
+       AND se_local.episode_number = e.ep_nr
+      WHERE a.id = ?
+      GROUP BY a.id
+    `
+    )
+    .get(animeId)
+
+  if (!row || row.local_episode_count <= 0 || row.cached_title_count <= 0) {
+    return false
+  }
+
+  if (row.local_titled_count !== row.local_episode_count) {
+    return false
+  }
+
+  if (row.anilist_episode_count && row.anilist_episode_count > 0) {
+    return row.cached_title_count === row.anilist_episode_count
+  }
+
+  return true
+}
+
+function setFallbackEpisodeTitles(animeId: number, now = nowIso()) {
+  getDb()
+    .query(
+      `
+      UPDATE episodes
+      SET title = 'Episode ' || ep_nr,
+          updated_at = ?
+      WHERE anime_id = ?
+    `
+    )
+    .run(now, animeId)
+}
+
+function replaceAnimeStreamingEpisodes(
+  animeId: number,
+  streamingEpisodes: AnimeStreamingEpisodeInput[]
+) {
+  const now = nowIso()
+  const candidates = streamingEpisodes
+    .map((episode, index) => ({
+      index,
+      episode,
+      episodeNumber: inferStreamingEpisodeNumber(episode),
+      title: cleanStreamingEpisodeTitle(episode.title),
+    }))
+    .filter((item) => item.title)
+  const hasInferredEpisodeNumbers = candidates.some((item) => item.episodeNumber)
+  const normalizedEpisodesByNumber = new Map<
+    number,
+    {
+      episodeNumber: number
+      title: string
+      thumbnail: string | null
+      url: string | null
+      site: string | null
+    }
+  >()
+
+  for (const candidate of candidates) {
+    const episodeNumber =
+      candidate.episodeNumber ??
+      (hasInferredEpisodeNumbers ? null : candidate.index + 1)
+
+    if (!episodeNumber || !candidate.title) {
+      continue
+    }
+
+    if (normalizedEpisodesByNumber.has(episodeNumber)) {
+      continue
+    }
+
+    normalizedEpisodesByNumber.set(episodeNumber, {
+      episodeNumber,
+      title: candidate.title,
+      thumbnail: candidate.episode.thumbnail ?? null,
+      url: candidate.episode.url ?? null,
+      site: candidate.episode.site ?? null,
+    })
+  }
+
+  const normalizedEpisodes = [...normalizedEpisodesByNumber.values()].sort(
+    (left, right) => left.episodeNumber - right.episodeNumber
+  )
+
+  getDb()
+    .query("DELETE FROM anime_streaming_episodes WHERE anime_id = ?")
+    .run(animeId)
+
+  if (normalizedEpisodes.length === 0) {
+    setFallbackEpisodeTitles(animeId, now)
+    getDb()
+      .query(
+        "UPDATE anime SET streaming_episodes_synced_at = ?, updated_at = ? WHERE id = ?"
+      )
+      .run(now, now, animeId)
+    return
+  }
+
+  const insert = getDb().query(
+    `
+    INSERT INTO anime_streaming_episodes (
+      anime_id,
+      episode_number,
+      title,
+      thumbnail,
+      url,
+      site,
+      created_at,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(anime_id, episode_number) DO UPDATE SET
+      title = excluded.title,
+      thumbnail = excluded.thumbnail,
+      url = excluded.url,
+      site = excluded.site,
+      updated_at = excluded.updated_at
+  `
+  )
+
+  for (const episode of normalizedEpisodes) {
+    insert.run(
+      animeId,
+      episode.episodeNumber,
+      episode.title,
+      episode.thumbnail,
+      episode.url,
+      episode.site,
+      now,
+      now
+    )
+  }
+
+  syncEpisodeTitlesFromCachedStreaming(animeId, now)
+
+  getDb()
+    .query(
+      "UPDATE anime SET streaming_episodes_synced_at = ?, updated_at = ? WHERE id = ?"
+    )
+    .run(now, now, animeId)
+}
+
+function syncEpisodeTitlesFromCachedStreaming(animeId: number, now = nowIso()) {
+  if (!canUseCachedStreamingEpisodeTitles(animeId)) {
+    setFallbackEpisodeTitles(animeId, now)
+    return
+  }
+
+  getDb()
+    .query(
+      `
+      UPDATE episodes
+      SET title = COALESCE((
+        SELECT title
+        FROM anime_streaming_episodes
+        WHERE anime_streaming_episodes.anime_id = episodes.anime_id
+          AND anime_streaming_episodes.episode_number = episodes.ep_nr
+      ), 'Episode ' || ep_nr),
+          updated_at = ?
+      WHERE anime_id = ?
+    `
+    )
+    .run(now, animeId)
+}
+
+function safeJsonStringify(value: unknown) {
+  if (value === undefined || value === null) {
+    return null
+  }
+
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return null
+  }
+}
+
+function safeJsonParse(value: string | null) {
+  if (!value) {
+    return undefined
+  }
+
+  try {
+    return JSON.parse(value) as unknown
+  } catch {
+    return undefined
+  }
+}
+
 function toEpisode(row: EpisodeRow): Episode {
   const durationSeconds =
     row.duration_seconds ?? row.watched_duration_seconds ?? undefined
@@ -329,6 +643,9 @@ function toEpisode(row: EpisodeRow): Episode {
     animeId: row.anime_id,
     seasonNumber: row.season_nr,
     episodeNumber: row.ep_nr,
+    title: canUseCachedStreamingEpisodeTitles(row.anime_id)
+      ? row.title ?? fallbackEpisodeTitle(row.ep_nr)
+      : fallbackEpisodeTitle(row.ep_nr),
     fileName: baseFileName(row.file_path),
     filePath: row.file_path,
     thumbnail: `/api/anime/${row.anime_id}/episodes/${row.ep_nr}/thumbnail?season=${row.season_nr}`,
@@ -348,6 +665,8 @@ function toEpisode(row: EpisodeRow): Episode {
 function upsertAnimeBase(metadata: AnimeMetadataInput) {
   const now = nowIso()
   const titleUserPreferred = animeTitle(metadata)
+  const rawMedia = safeJsonStringify(metadata.rawMedia)
+  const syncedAt = rawMedia ? (metadata.anilistSyncedAt ?? now) : null
 
   getDb()
     .query(
@@ -369,10 +688,12 @@ function upsertAnimeBase(metadata: AnimeMetadataInput) {
         cover_image,
         banner_image,
         average_score,
+        anilist_raw_json,
+        anilist_synced_at,
         created_at,
         updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         library_slug = COALESCE(excluded.library_slug, anime.library_slug),
         format = excluded.format,
@@ -389,6 +710,8 @@ function upsertAnimeBase(metadata: AnimeMetadataInput) {
         cover_image = excluded.cover_image,
         banner_image = excluded.banner_image,
         average_score = excluded.average_score,
+        anilist_raw_json = COALESCE(excluded.anilist_raw_json, anime.anilist_raw_json),
+        anilist_synced_at = COALESCE(excluded.anilist_synced_at, anime.anilist_synced_at),
         updated_at = excluded.updated_at
     `
     )
@@ -409,6 +732,8 @@ function upsertAnimeBase(metadata: AnimeMetadataInput) {
       metadata.coverImage ?? null,
       metadata.bannerImage ?? null,
       metadata.averageScore ?? null,
+      rawMedia,
+      syncedAt,
       now,
       now
     )
@@ -429,6 +754,20 @@ function replaceAnimeRelations(
   }
 }
 
+function normalizeRelatedMetadata(
+  media: AnimeMetadataInput,
+  library: NonNullable<AnimeMetadataInput["library"]>,
+  relationKind: string
+): AnimeMetadataInput {
+  return {
+    ...media,
+    library: {
+      ...library,
+      relationKind: media.id === library.primaryAnimeId ? "self" : relationKind,
+    },
+  }
+}
+
 export function upsertAnime(metadata: AnimeMetadataInput) {
   const library = requireLibrary(metadata)
   const relations = metadata.relations ?? []
@@ -444,54 +783,59 @@ export function upsertAnime(metadata: AnimeMetadataInput) {
     )
   }
 
-  upsertAnimeBase({
-    ...rootMetadata,
-    library: {
-      ...library,
-      relationKind:
-        rootMetadata.id === metadata.id ? library.relationKind : "self",
-    },
-  })
-
   const librarySlug = ensureLibraryEntry(library)
   const normalizedLibrary = {
     ...library,
     slug: librarySlug,
   }
 
+  upsertAnimeBase(
+    normalizeRelatedMetadata(rootMetadata, normalizedLibrary, "self")
+  )
+
   for (const relation of relations) {
     upsertAnimeBase(
-      relation.media.id === normalizedLibrary.primaryAnimeId
-        ? {
-            ...relation.media,
-            library: {
-              ...normalizedLibrary,
-              relationKind: "self",
-            },
-          }
-        : relation.media
+      normalizeRelatedMetadata(
+        relation.media,
+        normalizedLibrary,
+        relation.relationType
+      )
     )
   }
 
-  upsertAnimeBase({
-    ...metadata,
-    library: normalizedLibrary,
-  })
-
+  upsertAnimeBase(normalizeRelatedMetadata(metadata, normalizedLibrary, library.relationKind))
   replaceAnimeGenres(metadata.id, metadata.genres ?? [])
   replaceAnimeTags(metadata.id, metadata.tags ?? [])
   replaceAnimeRelations(metadata.id, metadata.relations ?? [])
+  replaceAnimeStreamingEpisodes(metadata.id, metadata.streamingEpisodes ?? [])
 }
+
+export function getMaxCachedStreamingEpisodeNumber(animeId: number) {
+  return (
+    getDb()
+      .query<{ max_episode: number | null }>(
+        `
+        SELECT MAX(episode_number) AS max_episode
+        FROM anime_streaming_episodes
+        WHERE anime_id = ?
+      `
+      )
+      .get(animeId)?.max_episode ?? 0
+  )
+}
+
 
 export function upsertEpisode(input: {
   animeId: number
   seasonNr: number
   epNr: number
   filePath: string
+  title?: string | null
   thumbnailPath?: string | null
   durationSeconds?: number | null
 }) {
   const now = nowIso()
+  const title = input.title ?? fallbackEpisodeTitle(input.epNr)
 
   getDb()
     .query(
@@ -500,14 +844,16 @@ export function upsertEpisode(input: {
         anime_id,
         season_nr,
         ep_nr,
+        title,
         file_path,
         thumbnail_path,
         duration_seconds,
         created_at,
         updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(anime_id, season_nr, ep_nr) DO UPDATE SET
+        title = excluded.title,
         file_path = excluded.file_path,
         thumbnail_path = excluded.thumbnail_path,
         duration_seconds = excluded.duration_seconds,
@@ -518,12 +864,15 @@ export function upsertEpisode(input: {
       input.animeId,
       input.seasonNr,
       input.epNr,
+      title,
       input.filePath,
       input.thumbnailPath ?? null,
       input.durationSeconds ?? null,
       now,
       now
     )
+
+  syncEpisodeTitlesFromCachedStreaming(input.animeId, now)
 }
 
 export function listAnime(): AnimeSummary[] {
@@ -550,6 +899,9 @@ export function listAnime(): AnimeSummary[] {
         root.cover_image,
         root.banner_image,
         root.average_score,
+        root.anilist_raw_json,
+        root.anilist_synced_at,
+        root.streaming_episodes_synced_at,
         COUNT(e.ep_nr) AS local_episode_count,
         COUNT(DISTINCT a.id) AS media_count
       FROM library_entries le
@@ -616,6 +968,30 @@ function listAnimeVariants(librarySlug: string) {
     )
     .all(librarySlug)
     .map(toAnimeVariant)
+}
+
+function listCachedAnimeVariants(librarySlug: string) {
+  return getDb()
+    .query<AnimeRow>(
+      `
+      SELECT *
+      FROM anime
+      WHERE library_slug = ?
+      ORDER BY
+        CASE format
+          WHEN 'TV' THEN 0
+          WHEN 'TV_SHORT' THEN 1
+          WHEN 'ONA' THEN 2
+          WHEN 'MOVIE' THEN 3
+          WHEN 'SPECIAL' THEN 4
+          WHEN 'OVA' THEN 5
+          ELSE 6
+        END,
+        COALESCE(season_year, 9999),
+        title_user_preferred
+    `
+    )
+    .all(librarySlug)
 }
 
 export function getLibraryEntry(
@@ -696,6 +1072,7 @@ export function listEpisodes(animeId: string | number, username?: string) {
           e.anime_id,
           e.season_nr,
           e.ep_nr,
+          e.title,
           e.file_path,
           e.thumbnail_path,
           e.duration_seconds,
@@ -719,7 +1096,7 @@ export function listEpisodes(animeId: string | number, username?: string) {
   return getDb()
     .query<EpisodeRow>(
       `
-      SELECT anime_id, season_nr, ep_nr, file_path, thumbnail_path, duration_seconds
+      SELECT anime_id, season_nr, ep_nr, title, file_path, thumbnail_path, duration_seconds
       FROM episodes
       WHERE anime_id = ?
       ORDER BY season_nr ASC, ep_nr ASC
@@ -752,6 +1129,7 @@ export function getStoredEpisode(
             e.anime_id,
             e.season_nr,
             e.ep_nr,
+            e.title,
             e.file_path,
             e.thumbnail_path,
             e.duration_seconds,
@@ -771,7 +1149,7 @@ export function getStoredEpisode(
     : getDb()
         .query<EpisodeRow>(
           `
-          SELECT anime_id, season_nr, ep_nr, file_path, thumbnail_path, duration_seconds
+          SELECT anime_id, season_nr, ep_nr, title, file_path, thumbnail_path, duration_seconds
           FROM episodes
           WHERE anime_id = ? AND season_nr = ? AND ep_nr = ?
         `
@@ -785,7 +1163,7 @@ export function getEpisodeByPath(filePath: string) {
   const row = getDb()
     .query<EpisodeRow>(
       `
-      SELECT anime_id, season_nr, ep_nr, file_path, thumbnail_path, duration_seconds
+      SELECT anime_id, season_nr, ep_nr, title, file_path, thumbnail_path, duration_seconds
       FROM episodes
       WHERE file_path = ?
     `
@@ -984,4 +1362,247 @@ export function markEpisodesCompleteThrough(input: {
     .run(now, input.username, input.animeId, Math.max(input.progress, 0))
 
   return completedEpisodes.length
+}
+
+function normalizeComparableTitle(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\b(season|part|cour)\s+\d+\b/g, " ")
+    .replace(/\bs\d+\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function titleTokens(value: string) {
+  return normalizeComparableTitle(value)
+    .split(" ")
+    .filter((token) => token.length > 2)
+}
+
+function tokenOverlap(search: string, title: string) {
+  const searchTokens = titleTokens(search)
+
+  if (searchTokens.length === 0) {
+    return 0
+  }
+
+  const candidateTokens = new Set(titleTokens(title))
+  const matches = searchTokens.filter((token) => candidateTokens.has(token))
+
+  return matches.length / searchTokens.length
+}
+
+function scoreTitleCandidate(search: string, titles: Array<string | null | undefined>) {
+  const normalizedSearch = normalizeComparableTitle(search)
+  const normalizedTitles = titles
+    .filter((title): title is string => Boolean(title))
+    .map(normalizeComparableTitle)
+    .filter(Boolean)
+
+  if (normalizedTitles.length === 0 || !normalizedSearch) {
+    return 4
+  }
+
+  if (normalizedTitles.some((title) => title === normalizedSearch)) {
+    return 0
+  }
+
+  if (normalizedTitles.some((title) => title.includes(normalizedSearch))) {
+    return 1
+  }
+
+  const bestOverlap = Math.max(
+    ...normalizedTitles.map((title) => tokenOverlap(normalizedSearch, title)),
+    0
+  )
+
+  return bestOverlap >= 0.7 ? 2 : 4
+}
+
+function rowTitles(row: Pick<AnimeRow, "title_user_preferred" | "title_english" | "title_romaji" | "title_native">) {
+  return [
+    row.title_user_preferred,
+    row.title_english,
+    row.title_romaji,
+    row.title_native,
+  ]
+}
+
+function toMetadataFromRow(
+  row: AnimeRow,
+  visited = new Set<number>()
+): AnimeMetadataInput {
+  const library = row.library_slug
+    ? getDb()
+        .query<LibraryEntryRow>(
+          "SELECT slug, title, primary_anime_id FROM library_entries WHERE slug = ?"
+        )
+        .get(row.library_slug)
+    : null
+
+  const nextVisited = new Set(visited)
+  nextVisited.add(row.id)
+  const relations = visited.has(row.id)
+    ? []
+    : getDb()
+        .query<{ relation_type: string; related_anime_id: number }>(
+          `
+          SELECT relation_type, related_anime_id
+          FROM anime_relations
+          WHERE anime_id = ?
+        `
+        )
+        .all(row.id)
+        .map((relation) => {
+          if (nextVisited.has(relation.related_anime_id)) {
+            return null
+          }
+
+          const relatedRow = getDb()
+            .query<AnimeRow>("SELECT * FROM anime WHERE id = ?")
+            .get(relation.related_anime_id)
+          const related = relatedRow
+            ? toMetadataFromRow(relatedRow, nextVisited)
+            : null
+
+          return related
+            ? {
+                relationType: relation.relation_type,
+                media: related,
+              }
+            : null
+        })
+        .filter(
+          (relation): relation is { relationType: string; media: AnimeMetadataInput } =>
+            Boolean(relation)
+        )
+
+  return {
+    id: row.id,
+    format: row.format,
+    library: library
+      ? {
+          slug: library.slug,
+          title: library.title,
+          primaryAnimeId: library.primary_anime_id,
+          relationKind: row.relation_kind ?? "related",
+        }
+      : undefined,
+    relations,
+    title: {
+      romaji: row.title_romaji,
+      english: row.title_english,
+      native: row.title_native,
+      userPreferred: row.title_user_preferred,
+    },
+    status: row.status,
+    description: row.description,
+    seasonYear: row.season_year,
+    episodes: row.episodes,
+    duration: row.duration,
+    coverImage: row.cover_image,
+    bannerImage: row.banner_image,
+    genres: listGenresForAnimeId(row.id),
+    averageScore: row.average_score,
+    tags: listTagsForAnimeId(row.id),
+    streamingEpisodes: listStreamingEpisodesForAnimeId(row.id),
+    rawMedia: safeJsonParse(row.anilist_raw_json),
+    anilistSyncedAt: row.anilist_synced_at,
+  }
+}
+
+export function getAnimeMetadataById(animeId: number) {
+  const row = getDb()
+    .query<AnimeRow>("SELECT * FROM anime WHERE id = ?")
+    .get(animeId)
+
+  return row ? toMetadataFromRow(row) : null
+}
+
+function listCachedAnimeCandidates() {
+  return getDb()
+    .query<CachedAnimeCandidateRow>(
+      `
+      SELECT
+        a.*,
+        le.title AS library_title,
+        le.primary_anime_id
+      FROM anime a
+      LEFT JOIN library_entries le ON le.slug = a.library_slug
+      WHERE a.library_slug IS NOT NULL
+    `
+    )
+    .all()
+}
+
+function findLibraryRootMatch(title: string) {
+  const candidates = listCachedAnimeCandidates()
+    .filter((row) => row.primary_anime_id === row.id)
+    .map((row) => ({
+      row,
+      score: scoreTitleCandidate(title, [...rowTitles(row), row.library_title]),
+    }))
+    .sort((left, right) => left.score - right.score)
+
+  return candidates.find((candidate) => candidate.score <= 2)?.row ?? null
+}
+
+function findSeasonVariant(librarySlug: string, season?: number) {
+  if (!season || season <= 1) {
+    return null
+  }
+
+  const seriesVariants = listCachedAnimeVariants(librarySlug).filter((row) =>
+    seriesFormats.has(row.format ?? "")
+  )
+
+  return seriesVariants[season - 1] ?? null
+}
+
+export function findCachedAnimeMetadataForFile(title: string, season?: number) {
+  const root = findLibraryRootMatch(title)
+
+  if (root?.library_slug) {
+    const seasonVariant = findSeasonVariant(root.library_slug, season)
+
+    if (seasonVariant) {
+      return toMetadataFromRow(seasonVariant)
+    }
+
+    if (season && season > 1) {
+      return null
+    }
+
+    return toMetadataFromRow(root)
+  }
+
+  const directMatch = listCachedAnimeCandidates()
+    .map((row) => ({
+      row,
+      score: scoreTitleCandidate(title, rowTitles(row)),
+    }))
+    .sort((left, right) => left.score - right.score)
+    .find((candidate) => candidate.score <= 1)?.row
+
+  return directMatch ? toMetadataFromRow(directMatch) : null
+}
+
+export function listAnimeIdsForAniListRefresh() {
+  return getDb()
+    .query<{ id: number }>(
+      `
+      SELECT DISTINCT a.id
+      FROM anime a
+      WHERE EXISTS (SELECT 1 FROM episodes e WHERE e.anime_id = a.id)
+        OR EXISTS (
+          SELECT 1
+          FROM library_entries le
+          WHERE le.primary_anime_id = a.id
+        )
+      ORDER BY a.id ASC
+    `
+    )
+    .all()
+    .map((row) => row.id)
 }
