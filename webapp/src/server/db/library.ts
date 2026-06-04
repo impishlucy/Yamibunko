@@ -783,15 +783,15 @@ export function upsertAnime(metadata: AnimeMetadataInput) {
     )
   }
 
+  upsertAnimeBase(
+    normalizeRelatedMetadata(rootMetadata, library, "self")
+  )
+
   const librarySlug = ensureLibraryEntry(library)
   const normalizedLibrary = {
     ...library,
     slug: librarySlug,
   }
-
-  upsertAnimeBase(
-    normalizeRelatedMetadata(rootMetadata, normalizedLibrary, "self")
-  )
 
   for (const relation of relations) {
     upsertAnimeBase(
