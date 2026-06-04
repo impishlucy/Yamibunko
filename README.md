@@ -19,6 +19,24 @@ Yamibunko does not include, download, or provide access to copyrighted media. Yo
 
 </div>
 
+## Features
+
+Yamibunko is built around a local anime library workflow:
+
+* Self-made browser player designed for anime watching, with responsive controls, volume control, skip intro/outro buttons, stream info hints, and mobile-friendly layouts.
+* Direct-File play possible and live transcoding when the browser or device needs a compatible stream.
+* Data Saver mode for when bandwidth is low.
+* Bandwidth-aware streaming, uses a server limit and helps avoid overloading the host connection.
+* VIP priority streaming so selected users can get better access when the server is under load.
+* Google Cast support that respects stream limits, bandwidth rules, audio, subtitles, and playback mode.
+* Import conversion for smaller, more consistent files, including HEVC conversion and audio cleanup when needed.
+* Per-series library grouping, no more searching the library, its all grouped together.
+* AniList integration for metadata, tracking, watching progress and watching status.
+* One active stream per user, with confirmation when switching playback to another episode or device.
+* Desktop launcher that prepares the runtime, starts the webapp, and keeps setup easier for normal installs.
+* Responsive layouts for all pages, on desktop, tablets, and phones.
+
+
 ## Install
 
 ### Normal Install
@@ -69,23 +87,6 @@ bun run start
 ```
 
 Supported `TRANSCODE_ACCEL` values in env are `nvenc`, `qsv`, and `cpu`.
-
-## Features
-
-Yamibunko is built around a local anime library workflow:
-
-* Self-made browser player designed for anime watching, with responsive controls, volume control, skip intro/outro buttons, stream info hints, and mobile-friendly layouts.
-* Direct-File play possible and live transcoding when the browser or device needs a compatible stream.
-* Data Saver mode for when bandwidth is low.
-* Bandwidth-aware streaming, uses a server limit and helps avoid overloading the host connection.
-* VIP priority streaming so selected users can get better access when the server is under load.
-* Google Cast support that respects stream limits, bandwidth rules, audio, subtitles, and playback mode.
-* Import conversion for smaller, more consistent files, including HEVC conversion and audio cleanup when needed.
-* Per-series library grouping, no more searching the library, its all grouped together.
-* AniList integration for metadata, tracking, watching progress and watching status.
-* One active stream per user, with confirmation when switching playback to another episode or device.
-* Desktop launcher that prepares the runtime, starts the webapp, and keeps setup easier for normal installs.
-* Responsive layouts for all pages, on desktop, tablets, and phones.
 
 ## Contributing
 
