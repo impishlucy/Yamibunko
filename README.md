@@ -4,8 +4,6 @@ Yamibunko is a local anime library server with a desktop launcher and a web UI. 
 
 Yamibunko does not include, download, or provide access to copyrighted media. You bring your own local files.
 
-[Download releases](https://github.com/impishlucy/Yamibunko/releases)
-
 ## Install
 
 ### Normal Install
