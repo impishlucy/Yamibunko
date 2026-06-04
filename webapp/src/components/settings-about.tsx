@@ -2,6 +2,7 @@ import { Heart, Info } from "lucide-react"
 import { SiGithub } from "@icons-pack/react-simple-icons"
 
 import { Card, CardContent } from "@/components/ui/card"
+import { HoverHint } from "@/components/ui/hover-hint"
 
 type SettingsAboutProps = {
   isAdmin: boolean
@@ -10,7 +11,7 @@ type SettingsAboutProps = {
 export function SettingsAbout({ isAdmin }: SettingsAboutProps) {
   return (
     <Card className="rounded-lg border-white/10 bg-zinc-900/75">
-      <CardContent className="space-y-4 pt-6 text-sm text-zinc-300">
+      <CardContent className="space-y-4 text-sm text-zinc-300">
         <p className="flex flex-wrap items-center gap-1.5">
           <span>Made with</span>
           <Heart className="size-4 fill-pink-400 text-pink-400" />
@@ -62,13 +63,17 @@ export function SettingsAbout({ isAdmin }: SettingsAboutProps) {
                 should be reported to your admin.
               </span>
             </p>
-            <p
-              className="inline-flex items-center gap-1.5 text-xs text-zinc-500"
-              title="Anime xyz is missing ep 12 -> Inform Admin / UI or Player is behaving weird -> Report to Github"
+            <HoverHint
+              label="Anime xyz is missing ep 12 -> Inform Admin / UI or Player is behaving weird -> Report to Github"
+              className="max-w-full"
+              align="start"
+              contentClassName="whitespace-normal"
             >
-              <Info className="size-3.5" />
-              Hover for a quick reporting guide.
-            </p>
+              <p className="inline-flex items-center gap-1.5 text-xs text-zinc-500">
+                <Info className="size-3.5" />
+                Hover or tap for a quick reporting guide.
+              </p>
+            </HoverHint>
           </div>
         )}
 

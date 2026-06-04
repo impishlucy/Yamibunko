@@ -18,7 +18,7 @@ type YamibunkoDatabase = DatabaseSync & {
 
 let database: YamibunkoDatabase | undefined
 
-const currentSchemaVersion = 7
+const currentSchemaVersion = 8
 
 function getDatabasePath() {
   return path.join(
@@ -81,6 +81,7 @@ function initializeSchema(db: YamibunkoDatabase) {
       username TEXT PRIMARY KEY COLLATE NOCASE,
       password_hash TEXT,
       is_admin INTEGER NOT NULL DEFAULT 0,
+      is_vip INTEGER NOT NULL DEFAULT 0,
       anilist_refresh_pressed_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -590,6 +591,19 @@ function runSchemaMigrations(db: YamibunkoDatabase) {
       `
       ).run(now)
     }
+  }
+
+  if (version < 8) {
+    ensureColumn(db, "users", "is_vip", "is_vip INTEGER NOT NULL DEFAULT 0")
+    db.query(
+      `
+      UPDATE users
+      SET is_vip = 1,
+          updated_at = ?
+      WHERE is_admin = 1
+        AND is_vip = 0
+    `
+    ).run(nowIso())
   }
 
   setUserVersion(db, currentSchemaVersion)

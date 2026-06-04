@@ -5,7 +5,16 @@ import path from "node:path"
 import { Readable } from "node:stream"
 
 import type { PlaybackMode, PlaybackProfile } from "@/lib/types"
+import { markAniListWatchingStarted } from "@/server/anilist/client"
 import { requireApiUser } from "@/server/auth/api"
+import { guardApiRequest } from "@/server/security/abuseGuard"
+import {
+  acquireStreamUpload,
+  estimateUploadKbps,
+  getActiveStreamConflict,
+  type StreamUploadLease,
+} from "@/server/bandwidth/streamBandwidth"
+import { getUser } from "@/server/db/users"
 import { getServerConfig } from "@/server/config"
 import {
   ffprobe,
@@ -41,6 +50,8 @@ const transcodeStartupTimeoutMs = 15_000
 const transcodeStartupByteThreshold = 64 * 1024
 const ffmpegShutdownGraceMs = 2_000
 const loggedStreamStarts = new Map<string, number>()
+const aniListWatchingStartTtlMs = 15 * 60 * 1000
+const aniListWatchingStartMarks = new Map<string, number>()
 
 function streamCorsHeaders() {
   return {
@@ -197,7 +208,9 @@ async function resolveStreamUser(input: {
     if (castAuth) {
       return {
         ok: true as const,
-        username: `${castAuth.username} (cast)`,
+        username: castAuth.username,
+        displayUsername: `${castAuth.username} (cast)`,
+        isVip: getUser(castAuth.username)?.isVip ?? false,
       }
     }
   }
@@ -211,6 +224,8 @@ async function resolveStreamUser(input: {
   return {
     ok: true as const,
     username: auth.user.username,
+    displayUsername: auth.user.username,
+    isVip: auth.user.isVip,
   }
 }
 
@@ -241,6 +256,33 @@ function logStreamStartOnce(input: {
   console.log(
     `[Info] [Stream] Starting ${input.type} stream for user ${input.username} - ${fileName(input.file)}`
   )
+}
+
+
+function markAniListWatchingStartedOnce(input: {
+  username: string
+  animeId: number
+}) {
+  const now = Date.now()
+  const key = `${input.username}:${input.animeId}`
+  const lastMarkedAt = aniListWatchingStartMarks.get(key)
+
+  if (lastMarkedAt && now - lastMarkedAt < aniListWatchingStartTtlMs) {
+    return
+  }
+
+  for (const [cachedKey, markedAt] of aniListWatchingStartMarks) {
+    if (now - markedAt >= aniListWatchingStartTtlMs) {
+      aniListWatchingStartMarks.delete(cachedKey)
+    }
+  }
+
+  aniListWatchingStartMarks.set(key, now)
+  void markAniListWatchingStarted(input).catch((error) => {
+    console.error(
+      `[Error] [Anilist] Unable to mark anime as watching - stream/route.ts - Anime ${input.animeId} - ${errorMessage(error)}`
+    )
+  })
 }
 
 function appendStderr(current: string, chunk: Buffer) {
@@ -278,6 +320,29 @@ function calculateSourceBitrateKbps(input: {
   )
 }
 
+function parseClientId(value: string | null) {
+  if (!value) {
+    return null
+  }
+
+  const trimmed = value.trim()
+
+  return /^[a-z0-9._:-]{8,128}$/i.test(trimmed) ? trimmed : null
+}
+
+function releaseStreamUploadOnce(lease: StreamUploadLease) {
+  let released = false
+
+  return () => {
+    if (released) {
+      return
+    }
+
+    released = true
+    lease.release()
+  }
+}
+
 function getDirectContentType(file: string) {
   const extension = path.extname(file).toLowerCase()
 
@@ -304,13 +369,21 @@ function getDirectContentType(file: string) {
   return "application/octet-stream"
 }
 
-async function handleDirect(request: Request, file: string, size: number) {
+async function handleDirect(input: {
+  request: Request
+  file: string
+  size: number
+  uploadLease: StreamUploadLease
+}) {
+  const { request, file, size, uploadLease } = input
+  const releaseUpload = releaseStreamUploadOnce(uploadLease)
   const range = parseByteRange(request.headers.get("range"), size)
 
   if (range === "invalid") {
     console.warn(
       `[Warn] [Stream] Invalid byte range requested - stream/route.ts - ${file} - ${request.headers.get("range")}`
     )
+    releaseUpload()
     return new Response(null, {
       status: 416,
       headers: {
@@ -327,15 +400,35 @@ async function handleDirect(request: Request, file: string, size: number) {
     "content-type": getDirectContentType(file),
   })
 
+  function bindFileStream(fileStream: ReturnType<typeof createReadStream>) {
+    fileStream.on("data", (chunk: Buffer) => {
+      uploadLease.observeUploadBytes(chunk.byteLength)
+    })
+
+    const abort = () => {
+      fileStream.destroy()
+      releaseUpload()
+    }
+
+    uploadLease.setForceClose(abort)
+    fileStream.once("close", releaseUpload)
+    fileStream.once("error", releaseUpload)
+    request.signal.addEventListener("abort", abort, { once: true })
+    fileStream.once("close", () => {
+      request.signal.removeEventListener("abort", abort)
+    })
+    return fileStream
+  }
+
   if (range) {
     const contentLength = range.end - range.start + 1
     headers.set("content-range", `bytes ${range.start}-${range.end}/${size}`)
     headers.set("content-length", String(contentLength))
 
-    const fileStream = createReadStream(file, {
+    const fileStream = bindFileStream(createReadStream(file, {
       start: range.start,
       end: range.end,
-    })
+    }))
 
     return new Response(
       Readable.toWeb(fileStream) as ReadableStream<Uint8Array>,
@@ -347,7 +440,7 @@ async function handleDirect(request: Request, file: string, size: number) {
   }
 
   headers.set("content-length", String(size))
-  const fileStream = createReadStream(file)
+  const fileStream = bindFileStream(createReadStream(file))
 
   return new Response(
     Readable.toWeb(fileStream) as ReadableStream<Uint8Array>,
@@ -356,7 +449,6 @@ async function handleDirect(request: Request, file: string, size: number) {
     }
   )
 }
-
 
 function getDirectRemuxTarget(file: string) {
   const extension = path.extname(file).toLowerCase()
@@ -402,6 +494,7 @@ async function handleDirectAudioRemux(input: {
   profile: PlaybackProfile
   startSeconds: number
   audioStreamIndex: number
+  uploadLease: StreamUploadLease
 }) {
   const config = getServerConfig()
   const target = getDirectRemuxTarget(input.file)
@@ -456,6 +549,7 @@ async function handleDirectAudioRemux(input: {
 
   if (!child.stdout) {
     child.kill("SIGKILL")
+    input.uploadLease.release()
     console.error(
       `[Error] [Stream] Unable to start direct audio remuxer - stream/route.ts - ${input.file}`
     )
@@ -466,6 +560,7 @@ async function handleDirectAudioRemux(input: {
   let settled = false
   let clientClosed = false
   let shutdownTimer: ReturnType<typeof setTimeout> | null = null
+  const releaseUpload = releaseStreamUploadOnce(input.uploadLease)
 
   child.stderr?.on("data", (chunk: Buffer) => {
     stderr = appendStderr(stderr, chunk)
@@ -492,7 +587,10 @@ async function handleDirectAudioRemux(input: {
     clientClosed = true
     settled = true
     stopChild()
+    releaseUpload()
   }
+
+  input.uploadLease.setForceClose(onAbort)
 
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -504,11 +602,13 @@ async function handleDirectAudioRemux(input: {
         }
 
         try {
+          input.uploadLease.observeUploadBytes(chunk.byteLength)
           controller.enqueue(new Uint8Array(chunk))
         } catch {
           clientClosed = true
           settled = true
           stopChild()
+          releaseUpload()
         }
       })
 
@@ -521,6 +621,8 @@ async function handleDirectAudioRemux(input: {
           settled = true
           controller.error(error)
         }
+
+        releaseUpload()
       })
 
       child.once("close", (code, signal) => {
@@ -543,12 +645,15 @@ async function handleDirectAudioRemux(input: {
           settled = true
           controller.close()
         }
+
+        releaseUpload()
       })
     },
     cancel() {
       clientClosed = true
       settled = true
       stopChild()
+      releaseUpload()
     },
   })
 
@@ -583,6 +688,10 @@ function resolveAudioSelection(input: {
   }
 }
 
+function inputReleaseUpload(uploadLease?: StreamUploadLease) {
+  uploadLease?.release()
+}
+
 async function handleTranscode(
   request: Request,
   file: string,
@@ -590,10 +699,12 @@ async function handleTranscode(
   seasonNumber: number,
   episodeNumber: number,
   username: string,
+  isVip: boolean,
   profile: PlaybackProfile,
   startSeconds: number,
   sourceBitrateKbps?: number,
-  audioStreamIndex?: number
+  audioStreamIndex?: number,
+  uploadLease?: StreamUploadLease
 ) {
   let waitLogged = false
   const waitLogTimer = setTimeout(() => {
@@ -607,7 +718,8 @@ async function handleTranscode(
   const lease = await acquireLiveTranscode(
     `${animeId}:${seasonNumber}:${episodeNumber}:${profile}`,
     profile,
-    request.signal
+    request.signal,
+    { isVip }
   ).catch((error) => {
     console.warn(
       `[Warn] [Stream] Live transcode request cancelled - stream/route.ts - Anime ${animeId}, Season ${seasonNumber}, Episode ${episodeNumber} - ${errorMessage(error)}`
@@ -617,6 +729,7 @@ async function handleTranscode(
   clearTimeout(waitLogTimer)
 
   if (!lease) {
+    inputReleaseUpload(uploadLease)
     return jsonError("Transcode request was cancelled.", 499)
   }
 
@@ -689,6 +802,7 @@ async function handleTranscode(
 
   if (!child.stdout) {
     lease.release()
+    inputReleaseUpload(uploadLease)
     console.error(
       `[Error] [Stream] Unable to start live transcoder - stream/route.ts - ${file}`
     )
@@ -702,6 +816,7 @@ async function handleTranscode(
   })
 
   let released = false
+  const releaseUpload = uploadLease ? releaseStreamUploadOnce(uploadLease) : null
   let settled = false
   let clientClosed = false
   let startupTimer: ReturnType<typeof setTimeout> | null = null
@@ -740,6 +855,7 @@ async function handleTranscode(
     clearStartupTimer()
     request.signal.removeEventListener("abort", onAbort)
     lease.release()
+    releaseUpload?.()
   }
 
   const onAbort = () => {
@@ -748,6 +864,8 @@ async function handleTranscode(
     stopChild()
     release()
   }
+
+  uploadLease?.setForceClose(onAbort)
 
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -780,6 +898,7 @@ async function handleTranscode(
 
         try {
           bytesSent += chunk.byteLength
+          uploadLease?.observeUploadBytes(chunk.byteLength)
           if (bytesSent >= transcodeStartupByteThreshold) {
             clearStartupTimer()
           }
@@ -855,10 +974,17 @@ async function handleTranscode(
 }
 
 export async function GET(request: Request, context: StreamContext) {
+  const abuseError = await guardApiRequest(request)
+
+  if (abuseError) {
+    return abuseError
+  }
+
   const { animeId, epNr } = await context.params
+  const animeIdNumber = parsePositiveInt(animeId)
   const episodeNumber = parsePositiveInt(epNr)
 
-  if (!episodeNumber) {
+  if (!animeIdNumber || !episodeNumber) {
     return jsonError("Episode not found.", 404)
   }
 
@@ -867,9 +993,14 @@ export async function GET(request: Request, context: StreamContext) {
   const mode = getMode(url.searchParams.get("mode"))
   const profile = getProfile(url.searchParams.get("profile"))
   const startSeconds = parseStartSeconds(url.searchParams.get("start"))
+  const clientId = parseClientId(url.searchParams.get("clientId"))
   const requestedAudioStreamIndex = parseOptionalStreamIndex(
     url.searchParams.get("audio")
   )
+
+  if (!clientId) {
+    return jsonError("Missing stream client id.", 400)
+  }
 
   if (!seasonNumber) {
     return jsonError("Episode not found.", 404)
@@ -886,6 +1017,15 @@ export async function GET(request: Request, context: StreamContext) {
 
   if (!streamUser.ok) {
     return streamUser.response
+  }
+
+  const activeStreamConflict = getActiveStreamConflict({
+    username: streamUser.username,
+    clientId,
+  })
+
+  if (activeStreamConflict) {
+    return jsonError("Only one active stream is allowed at a time.", 403)
   }
 
   let resolved: Awaited<ReturnType<typeof resolveReadableFile>>
@@ -929,14 +1069,60 @@ export async function GET(request: Request, context: StreamContext) {
     )
   }
 
-  if (mode === "direct") {
-    const selectedDirectAudioStreamIndex = audioSelection.requestedAudioStreamIndex
+  const sourceBitrateKbps = calculateSourceBitrateKbps(resolved)
+  const selectedDirectAudioStreamIndex = audioSelection.requestedAudioStreamIndex
+  const directAudioRemuxRequested =
+    mode === "direct" &&
+    shouldUseDirectAudioRemux({
+      requestedAudioStreamIndex: selectedDirectAudioStreamIndex,
+      defaultDirectAudioStreamIndex: audioSelection.defaultDirectAudioStreamIndex,
+    }) &&
+    typeof selectedDirectAudioStreamIndex === "number"
+  const requestedUploadKbps = estimateUploadKbps({
+    sourceBitrateKbps,
+    profile,
+    mode,
+  })
+  const dataSaverUploadKbps = estimateUploadKbps({
+    sourceBitrateKbps,
+    profile: "dataSaver",
+    mode: "transcode",
+  })
+  let uploadLease: StreamUploadLease
 
+  try {
+    uploadLease = await acquireStreamUpload({
+      clientId,
+      username: streamUser.username,
+      isVip: streamUser.isVip,
+      mode,
+      profile,
+      estimatedUploadKbps: requestedUploadKbps,
+      dataSaverUploadKbps,
+      canTranscodeDataSaver: liveTranscodingEnabled(),
+      animeId,
+      seasonNumber,
+      episodeNumber,
+      signal: request.signal,
+    })
+  } catch (error) {
+    console.warn(
+      `[Warn] [Stream] Waiting stream upload reservation cancelled - stream/route.ts - Anime ${animeId}, Season ${seasonNumber}, Episode ${episodeNumber} - ${errorMessage(error)}`
+    )
+    return jsonError("Stream upload reservation was cancelled.", 499)
+  }
+
+  markAniListWatchingStartedOnce({
+    username: streamUser.username,
+    animeId: animeIdNumber,
+  })
+
+  const effectiveMode = uploadLease.effectiveMode
+  const effectiveProfile = uploadLease.effectiveProfile
+
+  if (effectiveMode === "direct") {
     if (
-      shouldUseDirectAudioRemux({
-        requestedAudioStreamIndex: selectedDirectAudioStreamIndex,
-        defaultDirectAudioStreamIndex: audioSelection.defaultDirectAudioStreamIndex,
-      }) &&
+      directAudioRemuxRequested &&
       typeof selectedDirectAudioStreamIndex === "number"
     ) {
       return await handleDirectAudioRemux({
@@ -945,24 +1131,30 @@ export async function GET(request: Request, context: StreamContext) {
         animeId,
         seasonNumber,
         episodeNumber,
-        username: streamUser.username,
-        profile,
+        username: streamUser.displayUsername,
+        profile: effectiveProfile,
         startSeconds,
         audioStreamIndex: selectedDirectAudioStreamIndex,
+        uploadLease,
       })
     }
 
     logStreamStartOnce({
-      username: streamUser.username,
+      username: streamUser.displayUsername,
       type: "direct",
       animeId,
       seasonNumber,
       episodeNumber,
-      profile,
+      profile: effectiveProfile,
       file: resolved.file,
     })
 
-    return handleDirect(request, resolved.file, resolved.size)
+    return handleDirect({
+      request,
+      file: resolved.file,
+      size: resolved.size,
+      uploadLease,
+    })
   }
 
   return await handleTranscode(
@@ -971,10 +1163,12 @@ export async function GET(request: Request, context: StreamContext) {
     animeId,
     seasonNumber,
     episodeNumber,
-    streamUser.username,
-    profile,
+    streamUser.displayUsername,
+    streamUser.isVip,
+    effectiveProfile,
     startSeconds,
-    calculateSourceBitrateKbps(resolved),
-    audioSelection.requestedAudioStreamIndex
+    sourceBitrateKbps,
+    audioSelection.requestedAudioStreamIndex,
+    uploadLease
   )
 }

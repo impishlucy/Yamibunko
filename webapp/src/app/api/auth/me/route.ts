@@ -19,6 +19,7 @@ export async function GET() {
       username: user.username,
       name: user.name,
       isAdmin: user.isAdmin,
+      isVip: user.isVip,
       hasPassword: user.hasPassword,
     },
   })

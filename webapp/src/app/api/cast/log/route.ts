@@ -1,6 +1,7 @@
 import { z } from "zod"
 
 import { requireApiUser, requireSameOriginRequest } from "@/server/auth/api"
+import { sanitizeLogText } from "@/server/security/input"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -29,7 +30,7 @@ export async function POST(request: Request) {
   }
 
   console.error(
-    `[Error] [Cast] ${auth.user.username} Cast error: ${parsed.data.error}`
+    `[Error] [Cast] ${auth.user.username} Cast error: ${sanitizeLogText(parsed.data.error)}`
   )
 
   return Response.json({ ok: true })

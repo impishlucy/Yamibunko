@@ -109,6 +109,8 @@ export type WatchPayload = {
     defaultSubtitleStreamId: string | null
     directAudioStreamId: string | null
     videoCodec?: string
+    videoWidth?: number
+    videoHeight?: number
     container?: string
     sourceBitrateMbps?: number
   }

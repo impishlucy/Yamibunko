@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   Cast,
+  Info,
   Loader2,
   Maximize2,
   Pause,
@@ -14,6 +15,8 @@ import {
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
+import { HoverHint } from "@/components/ui/hover-hint"
+import { getPreferredPlayerAspectRatio } from "@/lib/player-aspect-ratio"
 import {
   addGoogleCastMediaStateListener,
   addGoogleCastSessionStateListener,
@@ -34,7 +37,12 @@ import {
   type GoogleCastMediaState,
   type GoogleCastSessionHandle,
 } from "@/lib/google-cast"
-import type { Episode, MediaStreamInfo, PlaybackProfile, WatchPayload } from "@/lib/types"
+import type {
+  Episode,
+  MediaStreamInfo,
+  PlaybackProfile,
+  WatchPayload,
+} from "@/lib/types"
 
 type AnimePlayerProps = {
   animeId: string
@@ -48,6 +56,7 @@ type AnimePlayerProps = {
   durationSeconds?: number
   thumbnailUrl?: string
   autoPlay?: boolean
+  clientStreamId?: string
   onEpisodeChange?: (episode: Episode, autoPlay: boolean) => void
 }
 
@@ -57,11 +66,23 @@ type SwitchSourceOptions = {
   preservePosition?: boolean
   waitForMedia?: boolean
   transcodeStartTime?: number
+  forceReload?: boolean
 }
 
 type SeekPreviewFrame = {
   time: number
   leftPercent: number
+}
+
+type StreamPriorityAction = {
+  type:
+    | "forceDataSaver"
+    | "restoreOriginal"
+    | "waitingForBandwidth"
+    | "bandwidthRecheckStarted"
+    | "bandwidthRecheckFinished"
+  message: string
+  createdAt: string
 }
 
 type LocalPlaybackSnapshot = {
@@ -71,6 +92,26 @@ type LocalPlaybackSnapshot = {
   directPossible: boolean
   position: number
   wasMuted: boolean
+}
+
+type BandwidthRecheckSnapshot = {
+  wasCasting: boolean
+  wasPlaying: boolean
+  position: number
+  sourceUrl: string | null
+  status: PlaybackStatusState
+}
+
+type PriorityInfo = {
+  type:
+    | "forceDataSaver"
+    | "restoreOriginal"
+    | "waitingForBandwidth"
+    | "protectedDataSaver"
+    | "bandwidthRecheckStarted"
+    | "bandwidthRecheckFinished"
+  message: string
+  createdAt: string
 }
 
 type CastTextTrack = {
@@ -109,6 +150,10 @@ const hevcMp4Checks = [
   'video/mp4; codecs="hvc1"',
   'video/mp4; codecs="hev1"',
 ]
+
+function createClientStreamId() {
+  return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`
+}
 
 function canPlayAny(video: HTMLVideoElement, checks: string[]) {
   return checks.some((codec) => {
@@ -241,12 +286,18 @@ function serializeUrl(originalUrl: string, url: URL) {
 }
 
 function getUrlBase() {
-  return typeof window === "undefined" ? "http://localhost" : window.location.href
+  return typeof window === "undefined"
+    ? "http://localhost"
+    : window.location.href
 }
 
 function withStreamParams(
   sourceUrl: string,
-  input: { audioStreamId?: string | null; startTime?: number | null }
+  input: {
+    audioStreamId?: string | null
+    startTime?: number | null
+    clientId?: string | null
+  }
 ) {
   const url = new URL(sourceUrl, getUrlBase())
 
@@ -256,9 +307,17 @@ function withStreamParams(
     url.searchParams.delete("audio")
   }
 
+  if (input.clientId) {
+    url.searchParams.set("clientId", input.clientId)
+  }
+
   const startTime = input.startTime
 
-  if (typeof startTime === "number" && Number.isFinite(startTime) && startTime > 0.25) {
+  if (
+    typeof startTime === "number" &&
+    Number.isFinite(startTime) &&
+    startTime > 0.25
+  ) {
     url.searchParams.set("start", startTime.toFixed(3))
   } else {
     url.searchParams.delete("start")
@@ -273,24 +332,28 @@ function withSubtitleStream(sourceUrl: string, streamId: string) {
   return serializeUrl(sourceUrl, url)
 }
 
+
 function estimateStreamMbps(input: {
   quality: PlaybackProfile
   sourceBitrateMbps?: number
   status: PlaybackStatusState
 }) {
   const source = input.sourceBitrateMbps
+  const overheadFactor = 1.06
 
   if (!source || source <= 0) {
     return undefined
   }
 
   if (input.status === "direct") {
-    return source
+    return Number((source * overheadFactor).toFixed(2))
   }
 
-  return input.quality === "dataSaver"
-    ? Math.max(Number((source / 2).toFixed(2)), 0.5)
-    : source
+  if (input.quality === "dataSaver") {
+    return Number((Math.max(source / 2, 0.628) * overheadFactor).toFixed(2))
+  }
+
+  return Number(((Math.min(Math.max(source, 1.5), 50) + 0.192) * overheadFactor).toFixed(2))
 }
 
 function getBufferedEnd(video: HTMLVideoElement) {
@@ -693,6 +756,33 @@ function statusLabel(status: PlaybackStatusState) {
   return "Checking"
 }
 
+
+function formatClientError(error: unknown) {
+  if (error instanceof Error) {
+    return `${error.name}: ${error.message}`
+  }
+
+  try {
+    return JSON.stringify(error)
+  } catch {
+    return String(error)
+  }
+}
+
+function reportCastError(error: unknown) {
+  const formattedError = formatClientError(error)
+
+  void fetch("/api/cast/log", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      error: formattedError,
+    }),
+  }).catch(() => undefined)
+}
+
 export function AnimePlayer({
   animeId,
   seasonNumber,
@@ -705,13 +795,17 @@ export function AnimePlayer({
   durationSeconds,
   thumbnailUrl,
   autoPlay = false,
+  clientStreamId,
   onEpisodeChange,
 }: AnimePlayerProps) {
   const playerRef = useRef<HTMLDivElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
+  const settingsPanelRef = useRef<HTMLDivElement>(null)
+  const settingsButtonRef = useRef<HTMLDivElement>(null)
   const playbackKeyRef = useRef(`${animeId}:${seasonNumber}:${episodeNumber}`)
+  const clientStreamIdRef = useRef(clientStreamId ?? createClientStreamId())
   const castSelectionKeyRef = useRef("")
-  const lastProgressSaveRef = useRef(0)
+  const lastProgressSavePositionRef = useRef(0)
   const completedProgressRef = useRef(false)
   const directFallbackAttemptedRef = useRef(false)
   const currentTimeRef = useRef(0)
@@ -722,6 +816,7 @@ export function AnimePlayer({
   const statusRef = useRef<PlaybackStatusState>("checking")
   const activeSourceStartRef = useRef(0)
   const shouldAutoPlaySourceRef = useRef(autoPlay)
+  const sourceSwitchPauseSuppressionUntilRef = useRef(0)
   const isCastingRef = useRef(false)
   const isCastLoadingRef = useRef(false)
   const isPlayingRef = useRef(false)
@@ -734,6 +829,12 @@ export function AnimePlayer({
   const localPlaybackBeforeCastRef = useRef<LocalPlaybackSnapshot | null>(null)
   const controlsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const hardwareWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const priorityInfoTimerRef = useRef<number | null>(null)
+  const pendingPrioritySwitchRef = useRef(false)
+  const bandwidthRecheckHoldRef = useRef(false)
+  const bandwidthRecheckSnapshotRef = useRef<BandwidthRecheckSnapshot | null>(null)
+  const handledPriorityActionsRef = useRef<Set<string>>(new Set())
+  const forcedDowngradeHistoryRef = useRef<Array<{ playbackKey: string; downgradedAt: number }>>([])
   const seekPreviewFrameTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const subtitleAnimationFrameRef = useRef<number | null>(null)
   const streamStatsSampleRef = useRef<{
@@ -756,6 +857,10 @@ export function AnimePlayer({
   >(() => undefined)
   const handleCastEndedRef = useRef<() => void>(() => undefined)
   const [quality, setQuality] = useState<PlaybackProfile>("original")
+  const [detectedPlayerAspectRatio, setDetectedPlayerAspectRatio] = useState<{
+    playbackKey: string
+    aspectRatio: string
+  } | null>(null)
   const [selectedAudioStreamId, setSelectedAudioStreamId] = useState<string | null>(
     media.defaultAudioStreamId
   )
@@ -768,19 +873,21 @@ export function AnimePlayer({
   const [isPlaying, setIsPlaying] = useState(false)
   const [isWaitingForMedia, setIsWaitingForMedia] = useState(false)
   const [showHardwareWait, setShowHardwareWait] = useState(false)
+  const [priorityInfo, setPriorityInfo] = useState<PriorityInfo | null>(null)
+  const [dataSaverProtectionKey, setDataSaverProtectionKey] = useState<string | null>(null)
   const [currentTime, setCurrentTime] = useState(0)
   const [seekPreview, setSeekPreview] = useState<number | null>(null)
   const [seekPreviewFrame, setSeekPreviewFrame] = useState<SeekPreviewFrame | null>(null)
   const [duration, setDuration] = useState(getStableDuration(durationSeconds))
   const [controlsVisible, setControlsVisible] = useState(true)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [isPortraitViewport, setIsPortraitViewport] = useState(false)
   const [canCast, setCanCast] = useState(false)
   const [isCasting, setIsCasting] = useState(false)
   const [isCastStarting, setIsCastStarting] = useState(false)
   const [castErrorFlash, setCastErrorFlash] = useState(false)
   const [subtitleCues, setSubtitleCues] = useState<SubtitleCue[]>([])
   const [activeSubtitleTexts, setActiveSubtitleTexts] = useState<string[]>([])
-  const [measuredStreamMbps, setMeasuredStreamMbps] = useState<number | null>(null)
 
   const playbackKey = `${animeId}:${seasonNumber}:${episodeNumber}`
   const liveTranscodeEnabled = playback.liveTranscodeEnabled !== false
@@ -823,7 +930,6 @@ export function AnimePlayer({
     streamStatsSampleRef.current = null
 
     const timer = window.setTimeout(() => {
-      setMeasuredStreamMbps(null)
     }, 0)
 
     return () => window.clearTimeout(timer)
@@ -963,6 +1069,13 @@ export function AnimePlayer({
     }
   }, [])
 
+  const clearPriorityInfoTimer = useCallback(() => {
+    if (priorityInfoTimerRef.current) {
+      window.clearTimeout(priorityInfoTimerRef.current)
+      priorityInfoTimerRef.current = null
+    }
+  }, [])
+
   const clearSeekPreviewFrameTimer = useCallback(() => {
     if (seekPreviewFrameTimerRef.current) {
       clearTimeout(seekPreviewFrameTimerRef.current)
@@ -983,6 +1096,19 @@ export function AnimePlayer({
       castErrorFlashTimerRef.current = null
     }
   }, [])
+
+  const flashCastError = useCallback(
+    (error: unknown) => {
+      reportCastError(error)
+      clearCastErrorFlashTimer()
+      setCastErrorFlash(true)
+      castErrorFlashTimerRef.current = setTimeout(() => {
+        setCastErrorFlash(false)
+        castErrorFlashTimerRef.current = null
+      }, 1800)
+    },
+    [clearCastErrorFlashTimer]
+  )
 
   const clearCastMediaSync = useCallback(() => {
     castMediaCleanupRef.current?.()
@@ -1030,13 +1156,58 @@ export function AnimePlayer({
     [clearControlsTimer]
   )
 
+  useEffect(() => {
+    const mediaQuery = window.matchMedia("(orientation: portrait)")
+
+    function syncPortraitViewport() {
+      setIsPortraitViewport(mediaQuery.matches)
+    }
+
+    syncPortraitViewport()
+    mediaQuery.addEventListener("change", syncPortraitViewport)
+
+    return () => {
+      mediaQuery.removeEventListener("change", syncPortraitViewport)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!settingsOpen) {
+      return
+    }
+
+    function handleDocumentPointerDown(event: PointerEvent) {
+      const target = event.target
+
+      if (!(target instanceof Node)) {
+        return
+      }
+
+      if (settingsPanelRef.current?.contains(target)) {
+        return
+      }
+
+      if (settingsButtonRef.current?.contains(target)) {
+        return
+      }
+
+      setSettingsOpen(false)
+    }
+
+    document.addEventListener("pointerdown", handleDocumentPointerDown)
+
+    return () => {
+      document.removeEventListener("pointerdown", handleDocumentPointerDown)
+    }
+  }, [settingsOpen])
+
   const saveProgress = useCallback(
     async (
       watchedSeconds: number,
       knownDurationSeconds: number | undefined,
       completed: boolean
     ) => {
-      lastProgressSaveRef.current = Date.now()
+      lastProgressSavePositionRef.current = watchedSeconds
 
       await fetch(
         `/api/watch/${encodeURIComponent(animeId)}/${episodeNumber}/progress?season=${seasonNumber}`,
@@ -1082,7 +1253,7 @@ export function AnimePlayer({
       return
     }
 
-    if (Date.now() - lastProgressSaveRef.current > 15_000) {
+    if (Math.abs(watchedSeconds - lastProgressSavePositionRef.current) >= 15) {
       void saveProgress(watchedSeconds, effectiveDuration, false)
     }
   }
@@ -1111,6 +1282,7 @@ export function AnimePlayer({
     () => () => {
       clearControlsTimer()
       clearHardwareWaitTimer()
+      clearPriorityInfoTimer()
       clearCastErrorFlashTimer()
       clearCastMediaSync()
       clearSeekPreviewFrameTimer()
@@ -1119,6 +1291,7 @@ export function AnimePlayer({
     [
       clearControlsTimer,
       clearHardwareWaitTimer,
+      clearPriorityInfoTimer,
       clearCastErrorFlashTimer,
       clearCastMediaSync,
       clearSeekPreviewFrameTimer,
@@ -1186,6 +1359,7 @@ export function AnimePlayer({
       withStreamParams(playback.directUrl, {
         audioStreamId: selectedAudioStreamId,
         startTime: directAudioRemuxActive ? startTime : null,
+        clientId: clientStreamIdRef.current,
       }),
     [directAudioRemuxActive, playback.directUrl, selectedAudioStreamId]
   )
@@ -1199,6 +1373,7 @@ export function AnimePlayer({
         {
           audioStreamId: selectedAudioStreamId,
           startTime,
+          clientId: clientStreamIdRef.current,
         }
       ),
     [playback.dataSaverUrl, playback.originalTranscodeUrl, selectedAudioStreamId]
@@ -1219,17 +1394,24 @@ export function AnimePlayer({
       ? withStreamParams(nextSourceUrl, {
           audioStreamId: selectedAudioStreamId,
           startTime: sourceStartTime,
+          clientId: clientStreamIdRef.current,
         })
       : withStreamParams(nextSourceUrl, {
           audioStreamId: selectedAudioStreamId,
           startTime: null,
+          clientId: clientStreamIdRef.current,
         })
+    const shouldResume =
+      Boolean(video && !video.paused) ||
+      isPlayingRef.current ||
+      shouldAutoPlaySourceRef.current
 
     activeSourceStartRef.current = sourceStartTime
 
     if (options.preservePosition) {
       currentTimeRef.current = previousPosition
       setCurrentTime(previousPosition)
+      syncSubtitleOverlay(previousPosition)
       pendingSeekRef.current = sourceUsesOffset ? null : previousPosition
     } else {
       pendingSeekRef.current = null
@@ -1237,14 +1419,17 @@ export function AnimePlayer({
       if (sourceUsesOffset && sourceStartTime > 0) {
         currentTimeRef.current = sourceStartTime
         setCurrentTime(sourceStartTime)
+        syncSubtitleOverlay(sourceStartTime)
       }
     }
 
-    const sourceChanged = sourceUrlRef.current !== sourceToLoad
+    const sourceChanged = sourceUrlRef.current !== sourceToLoad || options.forceReload === true
 
-    if (sourceChanged) {
-      video?.pause()
-      setIsPlaying(false)
+    if (sourceChanged && shouldResume) {
+      shouldAutoPlaySourceRef.current = true
+      sourceSwitchPauseSuppressionUntilRef.current = Date.now() + 5000
+    } else if (sourceChanged) {
+      sourceSwitchPauseSuppressionUntilRef.current = 0
     }
 
     setStatus(nextStatus)
@@ -1259,7 +1444,7 @@ export function AnimePlayer({
       setSourceUrl(sourceToLoad)
     }
 
-    if (options.waitForMedia) {
+    if (options.waitForMedia || (sourceChanged && shouldResume)) {
       beginMediaWait(nextStatus === "transcoding")
     } else {
       endMediaWait()
@@ -1268,7 +1453,9 @@ export function AnimePlayer({
     showControls(true)
   }
 
-  switchSourceRef.current = switchSource
+  useEffect(() => {
+    switchSourceRef.current = switchSource
+  })
 
   const blockLiveTranscodePlayback = useCallback(() => {
     const video = videoRef.current
@@ -1296,6 +1483,10 @@ export function AnimePlayer({
 
       if (episodeChanged) {
         playbackKeyRef.current = playbackKey
+        forcedDowngradeHistoryRef.current = []
+        setDataSaverProtectionKey(null)
+        setPriorityInfo(null)
+        clearPriorityInfoTimer()
         currentTimeRef.current = 0
         activeSourceStartRef.current = 0
         activeSubtitleKeyRef.current = ""
@@ -1309,7 +1500,7 @@ export function AnimePlayer({
         setControlsVisible(!isPlayingRef.current)
         setSettingsOpen(false)
         endMediaWait()
-        lastProgressSaveRef.current = 0
+        lastProgressSavePositionRef.current = 0
         completedProgressRef.current = false
         directFallbackAttemptedRef.current = false
       }
@@ -1330,6 +1521,9 @@ export function AnimePlayer({
 
       const video = videoRef.current
       const canUseDirect = video ? supportsDirectPlayback(video, fileName) : false
+      const waitForPrioritySwitch = pendingPrioritySwitchRef.current
+      pendingPrioritySwitchRef.current = false
+
       setDirectPossible(canUseDirect)
       setStatus("checking")
       endMediaWait()
@@ -1338,6 +1532,7 @@ export function AnimePlayer({
         directFallbackAttemptedRef.current = false
         switchSourceRef.current(getDirectUrl(), "direct", {
           preservePosition: Boolean(previousSourceUrl) && !episodeChanged,
+          waitForMedia: waitForPrioritySwitch,
         })
         return
       }
@@ -1353,6 +1548,7 @@ export function AnimePlayer({
 
       switchSourceRef.current(getTranscodeUrl(quality), "transcoding", {
         preservePosition: Boolean(previousSourceUrl) && !episodeChanged,
+        waitForMedia: waitForPrioritySwitch,
       })
     }
 
@@ -1366,6 +1562,7 @@ export function AnimePlayer({
     blockLiveTranscodePlayback,
     durationSeconds,
     endMediaWait,
+    clearPriorityInfoTimer,
     fileName,
     getDirectUrl,
     getTranscodeUrl,
@@ -1486,7 +1683,412 @@ export function AnimePlayer({
     syncSubtitleOverlay,
   ])
 
+  const showPriorityInfoMessage = useCallback(
+    (info: PriorityInfo, options: { autoClearMs?: number | null } = {}) => {
+      clearPriorityInfoTimer()
+      setPriorityInfo(info)
+
+      if (options.autoClearMs) {
+        priorityInfoTimerRef.current = window.setTimeout(() => {
+          setPriorityInfo(null)
+          priorityInfoTimerRef.current = null
+        }, options.autoClearMs)
+      }
+
+      showControls(true)
+    },
+    [clearPriorityInfoTimer, showControls]
+  )
+
+  const registerForcedDowngrade = useCallback(() => {
+    const now = Date.now()
+    const recentDowngrades = forcedDowngradeHistoryRef.current.filter(
+      (entry) =>
+        entry.playbackKey === playbackKey && now - entry.downgradedAt < 5 * 60_000
+    )
+
+    recentDowngrades.push({ playbackKey, downgradedAt: now })
+    forcedDowngradeHistoryRef.current = recentDowngrades
+
+    return recentDowngrades.length >= 2
+  }, [playbackKey])
+
+  const switchQualityFromPriority = useCallback(
+    (nextQuality: PlaybackProfile) => {
+      if (!liveTranscodeEnabled) {
+        return
+      }
+
+      const video = videoRef.current
+      const wasPlaying =
+        Boolean(video && !video.paused) || isPlayingRef.current || isCastingRef.current
+
+      shouldAutoPlaySourceRef.current = wasPlaying
+      pendingPrioritySwitchRef.current = true
+      if (wasPlaying) {
+        beginMediaWait(nextQuality !== "original" || statusRef.current === "transcoding")
+      }
+      setQuality(nextQuality)
+      showControls(true)
+    },
+    [beginMediaWait, liveTranscodeEnabled, showControls]
+  )
+
+  const markDataSaverProtectionOnServer = useCallback(() => {
+    void fetch("/api/stream/priority/events", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        clientId: clientStreamIdRef.current,
+        protected: true,
+      }),
+    }).catch(() => undefined)
+  }, [])
+
+  const handleBandwidthRecheckStarted = useCallback(
+    (action: StreamPriorityAction) => {
+      const video = videoRef.current
+      const wasCasting = isCastingRef.current || isCastLoadingRef.current
+      const wasPlaying = wasCasting
+        ? isPlayingRef.current
+        : Boolean(video && !video.paused) || isPlayingRef.current
+      const position = getPlaybackPosition()
+
+      bandwidthRecheckHoldRef.current = true
+      bandwidthRecheckSnapshotRef.current = {
+        wasCasting,
+        wasPlaying,
+        position,
+        sourceUrl: sourceUrlRef.current,
+        status: statusRef.current,
+      }
+      shouldAutoPlaySourceRef.current = false
+
+      if (wasCasting) {
+        const session = getGoogleCastSession()
+
+        if (session && wasPlaying) {
+          void pauseGoogleCastMedia(session).catch((error) => {
+            flashCastError(error)
+            console.error(error)
+          })
+        }
+      } else {
+        video?.pause()
+      }
+
+      isPlayingRef.current = false
+      setIsPlaying(false)
+      currentTimeRef.current = position
+      setCurrentTime(position)
+      syncSubtitleOverlay(position)
+      beginMediaWait(statusRef.current === "transcoding" || wasCasting)
+      showPriorityInfoMessage({
+        type: action.type,
+        message: action.message,
+        createdAt: action.createdAt,
+      })
+    },
+    [
+      beginMediaWait,
+      flashCastError,
+      getPlaybackPosition,
+      showPriorityInfoMessage,
+      syncSubtitleOverlay,
+    ]
+  )
+
+  const handleBandwidthRecheckFinished = useCallback(
+    (action: StreamPriorityAction) => {
+      const snapshot = bandwidthRecheckSnapshotRef.current
+
+      bandwidthRecheckHoldRef.current = false
+      bandwidthRecheckSnapshotRef.current = null
+      showPriorityInfoMessage(
+        {
+          type: action.type,
+          message: action.message,
+          createdAt: action.createdAt,
+        },
+        { autoClearMs: 15_000 }
+      )
+
+      if (!snapshot) {
+        endMediaWait()
+        return
+      }
+
+      currentTimeRef.current = snapshot.position
+      setCurrentTime(snapshot.position)
+      syncSubtitleOverlay(snapshot.position)
+      shouldAutoPlaySourceRef.current = snapshot.wasPlaying
+
+      if (snapshot.wasCasting) {
+        const video = videoRef.current
+
+        if (!video) {
+          endMediaWait()
+          return
+        }
+
+        beginMediaWait(true)
+        void startGoogleCastingRef.current(
+          video,
+          snapshot.wasPlaying,
+          snapshot.position
+        ).catch(
+          (error) => {
+            flashCastError(error)
+            console.error(error)
+            endMediaWait()
+          }
+        )
+        return
+      }
+
+      if (!snapshot.sourceUrl || snapshot.status === "blocked") {
+        endMediaWait()
+        return
+      }
+
+      if (snapshot.wasPlaying) {
+        beginMediaWait(snapshot.status === "transcoding")
+      }
+
+      switchSourceRef.current(snapshot.sourceUrl, snapshot.status, {
+        preservePosition: true,
+        transcodeStartTime: snapshot.position,
+        waitForMedia: snapshot.wasPlaying,
+        forceReload: true,
+      })
+    },
+    [
+      beginMediaWait,
+      endMediaWait,
+      flashCastError,
+      showPriorityInfoMessage,
+      syncSubtitleOverlay,
+    ]
+  )
+
+  const handlePriorityAction = useCallback(
+    (action: StreamPriorityAction) => {
+      const actionKey = `${action.type}:${action.createdAt}:${action.message}`
+      const handledActions = handledPriorityActionsRef.current
+
+      if (handledActions.has(actionKey)) {
+        return
+      }
+
+      handledActions.add(actionKey)
+
+      if (handledActions.size > 50) {
+        const firstKey = handledActions.values().next().value
+
+        if (firstKey) {
+          handledActions.delete(firstKey)
+        }
+      }
+
+      if (action.type === "bandwidthRecheckStarted") {
+        handleBandwidthRecheckStarted(action)
+        return
+      }
+
+      if (action.type === "bandwidthRecheckFinished") {
+        handleBandwidthRecheckFinished(action)
+        return
+      }
+
+      if (action.type === "forceDataSaver") {
+        const protectionAlreadyActive = dataSaverProtectionKey === playbackKey
+        const protectionEnabled = protectionAlreadyActive || registerForcedDowngrade()
+        const message =
+          protectionEnabled && !protectionAlreadyActive
+            ? `${action.message} Data Saver will stay enabled for the rest of this episode because your stream was downgraded twice within 5 minutes.`
+            : action.message
+
+        if (protectionEnabled && !protectionAlreadyActive) {
+          setDataSaverProtectionKey(playbackKey)
+          markDataSaverProtectionOnServer()
+        }
+
+        showPriorityInfoMessage({
+          type: protectionEnabled ? "protectedDataSaver" : action.type,
+          message,
+          createdAt: action.createdAt,
+        })
+
+        if (quality !== "dataSaver") {
+          switchQualityFromPriority("dataSaver")
+        }
+
+        return
+      }
+
+      if (action.type === "restoreOriginal") {
+        if (dataSaverProtectionKey === playbackKey) {
+          markDataSaverProtectionOnServer()
+          return
+        }
+
+        showPriorityInfoMessage(
+          {
+            type: action.type,
+            message: action.message,
+            createdAt: action.createdAt,
+          },
+          { autoClearMs: 15_000 }
+        )
+
+        if (quality === "dataSaver") {
+          switchQualityFromPriority("original")
+        }
+
+        return
+      }
+
+      showPriorityInfoMessage(
+        {
+          type: action.type,
+          message: action.message,
+          createdAt: action.createdAt,
+        },
+        { autoClearMs: 12_000 }
+      )
+    },
+    [
+      dataSaverProtectionKey,
+      handleBandwidthRecheckFinished,
+      handleBandwidthRecheckStarted,
+      markDataSaverProtectionOnServer,
+      playbackKey,
+      quality,
+      registerForcedDowngrade,
+      showPriorityInfoMessage,
+      switchQualityFromPriority,
+    ]
+  )
+
+  useEffect(() => {
+    let cancelled = false
+    let events: EventSource | null = null
+    let staleConnectionTimer: number | null = null
+    let reconnectTimer: number | null = null
+    let lastEventAt = Date.now()
+    const clientId = clientStreamIdRef.current
+    const protectionActive =
+      dataSaverProtectionKey === playbackKey && quality === "dataSaver"
+    const priorityEventsUrl = new URL(
+      "/api/stream/priority/events",
+      window.location.origin
+    )
+    priorityEventsUrl.searchParams.set("clientId", clientId)
+    priorityEventsUrl.searchParams.set("protected", protectionActive ? "1" : "0")
+    const priorityEventsPath = `${priorityEventsUrl.pathname}${priorityEventsUrl.search}`
+
+    function markAlive() {
+      lastEventAt = Date.now()
+    }
+
+    function onPriorityEvent(event: Event) {
+      if (cancelled) {
+        return
+      }
+
+      markAlive()
+
+      try {
+        handlePriorityAction(JSON.parse((event as MessageEvent<string>).data))
+      } catch {
+        return
+      }
+    }
+
+    function closeEvents() {
+      if (!events) {
+        return
+      }
+
+      events.removeEventListener("priority", onPriorityEvent)
+      events.removeEventListener("ready", markAlive)
+      events.removeEventListener("heartbeat", markAlive)
+      events.onerror = null
+      events.close()
+      events = null
+    }
+
+    function connectEvents() {
+      if (cancelled) {
+        return
+      }
+
+      closeEvents()
+      markAlive()
+      events = new EventSource(priorityEventsPath)
+      events.addEventListener("priority", onPriorityEvent)
+      events.addEventListener("ready", markAlive)
+      events.addEventListener("heartbeat", markAlive)
+      events.onerror = () => {
+        if (!cancelled && events?.readyState === EventSource.CLOSED) {
+          scheduleReconnect()
+        }
+      }
+    }
+
+    function scheduleReconnect() {
+      if (cancelled || reconnectTimer) {
+        return
+      }
+
+      closeEvents()
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null
+        connectEvents()
+      }, 1_000)
+    }
+
+    connectEvents()
+    staleConnectionTimer = window.setInterval(() => {
+      if (Date.now() - lastEventAt <= 75_000) {
+        return
+      }
+
+      scheduleReconnect()
+    }, 15_000)
+
+    return () => {
+      cancelled = true
+      closeEvents()
+
+      if (staleConnectionTimer) {
+        window.clearInterval(staleConnectionTimer)
+      }
+
+      if (reconnectTimer) {
+        window.clearTimeout(reconnectTimer)
+      }
+    }
+  }, [
+    dataSaverProtectionKey,
+    handlePriorityAction,
+    playbackKey,
+    quality,
+  ])
+
   function tryDirectPlay() {
+    if (dataSaverProtectionKey === playbackKey) {
+      showPriorityInfoMessage({
+        type: "protectedDataSaver",
+        message:
+          "Data Saver protection is active for the rest of this episode because your stream was downgraded twice within 5 minutes.",
+        createdAt: new Date().toISOString(),
+      })
+      return
+    }
+
     setQuality("original")
     directFallbackAttemptedRef.current = false
     switchSource(getDirectUrl(), "direct", { preservePosition: true })
@@ -1622,8 +2224,10 @@ export function AnimePlayer({
       currentTimeRef.current = target
       setCurrentTime(target)
       syncSubtitleOverlay(target)
-      setIsPlaying(false)
       shouldAutoPlaySourceRef.current = wasPlaying
+      if (wasPlaying) {
+        beginMediaWait(nextStatus === "transcoding")
+      }
       switchSource(nextSourceUrl, nextStatus, {
         transcodeStartTime: target,
         waitForMedia: wasPlaying,
@@ -1728,42 +2332,6 @@ export function AnimePlayer({
     }
 
     void target.requestFullscreen().catch(() => undefined)
-  }
-
-  function formatClientError(error: unknown) {
-    if (error instanceof Error) {
-      return `${error.name}: ${error.message}`
-    }
-
-    try {
-      return JSON.stringify(error)
-    } catch {
-      return String(error)
-    }
-  }
-
-  function reportCastError(error: unknown) {
-    const formattedError = formatClientError(error)
-
-    void fetch("/api/cast/log", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        error: formattedError,
-      }),
-    }).catch(() => undefined)
-  }
-
-  function flashCastError(error: unknown) {
-    reportCastError(error)
-    clearCastErrorFlashTimer()
-    setCastErrorFlash(true)
-    castErrorFlashTimerRef.current = setTimeout(() => {
-      setCastErrorFlash(false)
-      castErrorFlashTimerRef.current = null
-    }, 1800)
   }
 
   function getCastReceiverUrl(castUrl: string) {
@@ -1973,11 +2541,13 @@ export function AnimePlayer({
 
     const startTime = startTimeOverride ?? getPlaybackPosition()
     const session = getGoogleCastSession() ?? (await requestGoogleCastSession())
+    const alreadyCasting = isCastingRef.current || isCastLoadingRef.current
     const canLocalDirect = supportsDirectPlayback(video, fileName)
     const directFirst = quality === "original" && canLocalDirect
     const directCastUrl = getCastReceiverUrl(
       withStreamParams(playback.castDirectUrl, {
         audioStreamId: selectedAudioStreamId,
+        clientId: clientStreamIdRef.current,
       })
     )
     const castTranscodeBaseUrl =
@@ -1985,6 +2555,7 @@ export function AnimePlayer({
     const transcodeCastUrl = getCastReceiverUrl(
       withStreamParams(castTranscodeBaseUrl, {
         audioStreamId: selectedAudioStreamId,
+        clientId: clientStreamIdRef.current,
       })
     )
     const textTrack = getSelectedCastTextTrack()
@@ -1993,18 +2564,21 @@ export function AnimePlayer({
     const localFallbackSource =
       localFallbackStatus === "direct" ? getDirectUrl() : getTranscodeUrl(quality)
 
-    localPlaybackBeforeCastRef.current = {
-      sourceUrl: sourceUrlRef.current ?? localFallbackSource,
-      status: localFallbackStatus,
-      quality,
-      directPossible: canLocalDirect,
-      position: startTime,
-      wasMuted: video.muted,
+    if (!alreadyCasting) {
+      localPlaybackBeforeCastRef.current = {
+        sourceUrl: sourceUrlRef.current ?? localFallbackSource,
+        status: localFallbackStatus,
+        quality,
+        directPossible: canLocalDirect,
+        position: startTime,
+        wasMuted: video.muted,
+      }
+      video.muted = true
+      video.pause()
+      setIsPlaying(false)
     }
+
     isCastLoadingRef.current = true
-    video.muted = true
-    video.pause()
-    setIsPlaying(false)
     beginMediaWait(false)
     showControls(true)
 
@@ -2093,7 +2667,9 @@ export function AnimePlayer({
     return true
   }
 
-  startGoogleCastingRef.current = startGoogleCasting
+  useEffect(() => {
+    startGoogleCastingRef.current = startGoogleCasting
+  })
 
   useEffect(() => {
     if (!isCasting) {
@@ -2183,7 +2759,9 @@ export function AnimePlayer({
     showControls(true)
   }
 
-  handleCastEndedRef.current = handleCastEnded
+  useEffect(() => {
+    handleCastEndedRef.current = handleCastEnded
+  })
 
   function stopCasting() {
     const video = videoRef.current
@@ -2201,7 +2779,6 @@ export function AnimePlayer({
 
     if (!estimatedMbps || estimatedMbps <= 0) {
       streamStatsSampleRef.current = null
-      setMeasuredStreamMbps(null)
       return
     }
 
@@ -2221,14 +2798,6 @@ export function AnimePlayer({
     if (elapsedSeconds < 0.75 || bufferedSeconds <= 0) {
       return
     }
-
-    const nextMeasuredMbps = Number(
-      ((bufferedSeconds / elapsedSeconds) * estimatedMbps).toFixed(2)
-    )
-
-    if (Number.isFinite(nextMeasuredMbps) && nextMeasuredMbps > 0) {
-      setMeasuredStreamMbps(nextMeasuredMbps)
-    }
   }
 
   function handleTimeUpdate(event: React.SyntheticEvent<HTMLVideoElement>) {
@@ -2244,6 +2813,14 @@ export function AnimePlayer({
 
   function handlePause() {
     const video = videoRef.current
+
+    if (
+      shouldAutoPlaySourceRef.current &&
+      Date.now() < sourceSwitchPauseSuppressionUntilRef.current
+    ) {
+      return
+    }
+
     setIsPlaying(false)
     showControls(true)
 
@@ -2281,11 +2858,25 @@ export function AnimePlayer({
       return
     }
 
+    if (dataSaverProtectionKey === playbackKey && nextQuality !== "dataSaver") {
+      setQuality("dataSaver")
+      showPriorityInfoMessage({
+        type: "protectedDataSaver",
+        message:
+          "Data Saver protection is active for the rest of this episode because your stream was downgraded twice within 5 minutes.",
+        createdAt: new Date().toISOString(),
+      })
+      showControls(true)
+      return
+    }
+
     const video = videoRef.current
     const wasPlaying = Boolean(video && !video.paused) || isPlayingRef.current
 
     shouldAutoPlaySourceRef.current = wasPlaying
-    setIsPlaying(false)
+    if (wasPlaying) {
+      beginMediaWait(nextQuality !== "original" || statusRef.current === "transcoding")
+    }
     setQuality(nextQuality)
     showControls(true)
   }
@@ -2311,11 +2902,8 @@ export function AnimePlayer({
 
     shouldAutoPlaySourceRef.current = wasPlaying
 
-    if (sourceWillReload) {
-      setIsPlaying(false)
-      if (wasPlaying) {
-        beginMediaWait(statusRef.current === "transcoding")
-      }
+    if (sourceWillReload && wasPlaying) {
+      beginMediaWait(statusRef.current === "transcoding")
     }
 
     setSelectedAudioStreamId(nextAudioStreamId)
@@ -2328,8 +2916,8 @@ export function AnimePlayer({
         media.audioStreams
       )
 
-      if (!switchedTrack && nextDirectAudioRemuxActive) {
-        setIsPlaying(false)
+      if (!switchedTrack && nextDirectAudioRemuxActive && wasPlaying) {
+        beginMediaWait(false)
       }
     }
 
@@ -2342,29 +2930,31 @@ export function AnimePlayer({
   }
 
   const displayedCurrentTime = seekPreview ?? currentTime
+  const currentPlaybackKey = `${animeId}:${seasonNumber}:${episodeNumber}`
+  const playerAspectRatio =
+    detectedPlayerAspectRatio?.playbackKey === currentPlaybackKey
+      ? detectedPlayerAspectRatio.aspectRatio
+      : getPreferredPlayerAspectRatio(media.videoWidth, media.videoHeight)
   const canSkipIntro = duration > 90 && currentTime < 90
-  const canSkipOutro = duration > 180 && duration - currentTime <= 120
+  const canSkipOutro = duration > 0 && currentTime >= duration * 0.8 && currentTime < duration - 1
   const controlsAreVisible = controlsVisible || !isPlaying || isCasting || settingsOpen
   const centerToggleVisible =
     !isWaitingForMedia && !isCasting && (!isPlaying || controlsAreVisible)
+  const settingsPanelClass = `fixed left-1/2 z-[100] w-[min(24rem,calc(100vw-1.5rem))] -translate-x-1/2 space-y-3 overflow-y-auto overscroll-contain rounded-xl border border-white/10 bg-zinc-950/95 p-3 text-xs shadow-2xl backdrop-blur lg:p-4 lg:text-sm ${
+    isPortraitViewport
+      ? "top-[20dvh] max-h-[calc(80dvh-1rem)]"
+      : "top-1/2 max-h-[calc(100dvh-2rem)] -translate-y-1/2"
+  }`
   const settingsSelectClass =
-    "h-8 w-full rounded-md border border-white/10 bg-zinc-950 px-2 text-xs text-zinc-100 outline-none focus:border-violet-400"
-  const selectedSubtitleLabel = selectedSubtitleStream
-    ? subtitleLanguageLabel(selectedSubtitleStream.language)
-    : "Off"
-  const selectedAudioLabel = selectedAudioStream?.label ?? "Default"
-  const streamMbpsLabel = measuredStreamMbps
-    ? `${measuredStreamMbps.toFixed(2)} Mb/s current`
-    : streamMbps
-      ? `${streamMbps.toFixed(2)} Mb/s estimated`
-      : "unknown"
+    "h-8 w-full rounded-md lg:h-10 border border-white/10 bg-zinc-950 px-2 text-xs text-zinc-100 outline-none focus:border-violet-400"
   return (
-    <div className="space-y-3">
+    <div className="space-y-3 lg:space-y-4">
       <div
         ref={playerRef}
-        className={`group/player relative overflow-hidden rounded-lg border border-white/10 bg-black shadow-[0_28px_90px_rgba(0,0,0,0.45)] ${
+        className={`group/player relative overflow-hidden rounded-xl border border-white/10 bg-black shadow-[0_28px_90px_rgba(0,0,0,0.45)] ${
           controlsAreVisible ? "" : "cursor-none"
         }`}
+        style={{ aspectRatio: playerAspectRatio }}
         onClick={(event) => {
           if (isPlayerControlTarget(event.target)) {
             return
@@ -2383,7 +2973,7 @@ export function AnimePlayer({
       >
         <video
           ref={videoRef}
-          className={`yamibunko-player-video aspect-video w-full bg-black transition-opacity ${
+          className={`yamibunko-player-video block h-full w-full bg-black object-cover transition-opacity ${
             isCasting ? "opacity-0" : "opacity-100"
           }`}
           playsInline
@@ -2402,16 +2992,26 @@ export function AnimePlayer({
             }
           }}
           onLoadedMetadata={(event) => {
-            applyPendingSeek(event.currentTarget)
-            applyDirectAudioTrack(
-              event.currentTarget,
-              selectedAudioStream,
-              media.audioStreams
+            const video = event.currentTarget
+            const nextAspectRatio = getPreferredPlayerAspectRatio(
+              video.videoWidth,
+              video.videoHeight
             )
+
+            setDetectedPlayerAspectRatio({
+              playbackKey: currentPlaybackKey,
+              aspectRatio: nextAspectRatio,
+            })
+            applyPendingSeek(video)
+            applyDirectAudioTrack(video, selectedAudioStream, media.audioStreams)
           }}
           onEnded={handleEnded}
           onError={() => {
-            if (isCastingRef.current || isCastLoadingRef.current) {
+            if (
+              isCastingRef.current ||
+              isCastLoadingRef.current ||
+              bandwidthRecheckHoldRef.current
+            ) {
               return
             }
 
@@ -2444,10 +3044,12 @@ export function AnimePlayer({
           }}
           onPause={handlePause}
           onPlay={() => {
+            sourceSwitchPauseSuppressionUntilRef.current = 0
             setIsPlaying(true)
             showControls()
           }}
           onPlaying={() => {
+            sourceSwitchPauseSuppressionUntilRef.current = 0
             setIsPlaying(true)
             endMediaWait()
             showControls()
@@ -2476,97 +3078,219 @@ export function AnimePlayer({
           </div>
         ) : null}
 
-        <button
-          type="button"
-          className={`absolute top-1/2 left-1/2 grid size-20 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full bg-black/45 text-white/70 transition-opacity duration-150 hover:bg-black/60 hover:text-white ${
+        {priorityInfo ? (
+          <HoverHint
+            label={priorityInfo.message}
+            side="bottom"
+            align="end"
+            clickVisibleMs={null}
+            className="absolute top-4 right-4 z-20"
+            contentClassName="w-72 whitespace-normal border-violet-300/30 bg-violet-950/95 text-violet-50"
+          >
+            <button
+              type="button"
+              className="grid size-9 place-items-center rounded-full border border-violet-300/35 bg-violet-950/80 text-violet-100 shadow-2xl backdrop-blur transition hover:bg-violet-900/90 hover:text-white"
+              onClick={(event) => event.stopPropagation()}
+              aria-label="Playback priority info"
+            >
+              <Info className="size-4 lg:size-5" />
+            </button>
+          </HoverHint>
+        ) : null}
+
+        <HoverHint
+          label={isPlaying ? "Pause" : "Play"}
+          className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 transition-opacity duration-150 ${
             centerToggleVisible ? "opacity-100" : "pointer-events-none opacity-0"
           }`}
-          disabled={!sourceUrl}
-          onClick={(event) => {
-            event.stopPropagation()
-            void togglePlay()
-          }}
-          title={isPlaying ? "Pause" : "Play"}
         >
-          {isPlaying ? <Pause className="size-10" /> : <Play className="ml-1 size-10" />}
-        </button>
+          <button
+            type="button"
+            className="grid size-20 place-items-center lg:size-24 rounded-full bg-black/45 text-white/70 hover:bg-black/60 hover:text-white"
+            disabled={!sourceUrl}
+            onClick={(event) => {
+              event.stopPropagation()
+              void togglePlay()
+            }}
+            aria-label={isPlaying ? "Pause" : "Play"}
+          >
+            {isPlaying ? (
+              <Pause className="size-10 lg:size-12" />
+            ) : (
+              <Play className="ml-1 size-10 lg:size-12" />
+            )}
+          </button>
+        </HoverHint>
 
-        {canSkipIntro ? (
+        {controlsAreVisible && canSkipIntro ? (
           <Button
             type="button"
             variant="secondary"
-            className="absolute right-4 bottom-20 rounded-lg bg-zinc-950/90"
-            onClick={() => void seekTo(90)}
+            className="absolute right-4 bottom-20 z-20 rounded-lg bg-zinc-950/60"
+            onClick={(event) => {
+              event.stopPropagation()
+              void seekTo(Math.min(currentTime + 90, duration))
+            }}
           >
             Skip intro
           </Button>
         ) : null}
-        {canSkipOutro ? (
+        {controlsAreVisible && !canSkipIntro && canSkipOutro ? (
           <Button
             type="button"
             variant="secondary"
-            className="absolute right-4 bottom-20 rounded-lg bg-zinc-950/90"
-            onClick={() => void seekTo(duration)}
+            className="absolute right-4 bottom-20 z-20 rounded-lg bg-zinc-950/60"
+            onClick={(event) => {
+              event.stopPropagation()
+              void seekTo(duration)
+            }}
           >
             Skip outro
           </Button>
         ) : null}
 
         {activeSubtitleTexts.length ? (
-          <div className="pointer-events-none absolute inset-x-4 bottom-[5.25rem] z-10 flex justify-center px-4 text-center text-lg font-semibold leading-snug text-white drop-shadow-[0_2px_5px_rgba(0,0,0,0.95)] sm:text-xl">
+          <div className="pointer-events-none absolute inset-x-4 bottom-[5.25rem] z-10 flex justify-center px-4 text-center text-lg lg:bottom-24 font-semibold leading-snug text-white drop-shadow-[0_2px_5px_rgba(0,0,0,0.95)] sm:text-xl">
             <div className="max-w-[90%] whitespace-pre-line">
               {activeSubtitleTexts.join("\n")}
             </div>
           </div>
         ) : null}
 
+
+        {settingsOpen ? (
+          <div
+            ref={settingsPanelRef}
+            className={settingsPanelClass}
+            onClick={(event) => event.stopPropagation()}
+          >
+            {liveTranscodeEnabled ? (
+              <>
+                <label className="grid gap-1 text-zinc-300">
+                  <span>Quality</span>
+                  <select
+                    className={settingsSelectClass}
+                    value={quality}
+                    onChange={(event) =>
+                      changeQuality(event.target.value as PlaybackProfile)
+                    }
+                  >
+                    <option value="original">Default</option>
+                    <option value="dataSaver">Data Saver</option>
+                  </select>
+                </label>
+
+                <div className="grid gap-1 text-zinc-300">
+                  <span>Display Method</span>
+                  <div className="rounded-md border border-white/10 bg-zinc-950 px-2 py-1.5 text-zinc-100 lg:px-3 lg:py-2">
+                    {displayMethod}
+                  </div>
+                </div>
+              </>
+            ) : null}
+
+            <label className="grid gap-1 text-zinc-300">
+              <span>Audio Language</span>
+              <select
+                className={settingsSelectClass}
+                value={selectedAudioStreamId ?? ""}
+                onChange={(event) => changeAudio(event.target.value || null)}
+              >
+                {media.audioStreams.length ? null : <option value="">Default</option>}
+                {media.audioStreams.map((stream) => (
+                  <option key={stream.id} value={stream.id}>
+                    {stream.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="grid gap-1 text-zinc-300">
+              <span>Subtitle Language</span>
+              <select
+                className={settingsSelectClass}
+                value={selectedSubtitleStreamId ?? ""}
+                onChange={(event) => changeSubtitle(event.target.value || null)}
+              >
+                <option value="">Off</option>
+                {subtitleLanguageOptions.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            {status === "blocked" && directPossible ? (
+              <Button
+                type="button"
+                variant="secondary"
+                className="w-full rounded-lg bg-zinc-900"
+                onClick={tryDirectPlay}
+              >
+                Try Direct Play
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
+
         <div
-          className={`absolute inset-x-0 bottom-0 bg-zinc-950/40 p-3 backdrop-blur-md transition-opacity duration-300 ${
+          className={`absolute inset-x-0 bottom-0 bg-zinc-950/40 p-3 backdrop-blur-md lg:p-4 transition-opacity duration-300 ${
             controlsAreVisible ? "opacity-100" : "pointer-events-none opacity-0"
           }`}
         >
-          <div className="flex items-center gap-2">
-            <Button
-              type="button"
-              size="icon"
-              onClick={togglePlay}
-              disabled={!sourceUrl && !isCasting}
-              title={isPlaying ? "Pause" : "Play"}
-            >
-              {isPlaying ? <Pause className="size-4" /> : <Play className="size-4" />}
-            </Button>
-            <Button
-              type="button"
-              variant="secondary"
-              size="icon"
-              className="bg-zinc-950/70"
-              onClick={() => {
-                if (previousEpisode && onEpisodeChange) {
-                  onEpisodeChange(previousEpisode, isPlayingRef.current)
-                }
-              }}
-              disabled={!previousEpisode}
-              title="Previous episode"
-            >
-              <SkipBack className="size-4" />
-            </Button>
-            <Button
-              type="button"
-              variant="secondary"
-              size="icon"
-              className="bg-zinc-950/70"
-              onClick={() => {
-                if (nextEpisode && onEpisodeChange) {
-                  onEpisodeChange(nextEpisode, isPlayingRef.current)
-                }
-              }}
-              disabled={!nextEpisode}
-              title="Next episode"
-            >
-              <SkipForward className="size-4" />
-            </Button>
+          <div className="flex items-center gap-2 lg:gap-3">
+            <HoverHint label={isPlaying ? "Pause" : "Play"}>
+              <Button
+                type="button"
+                size="icon"
+                onClick={togglePlay}
+                disabled={!sourceUrl && !isCasting}
+                aria-label={isPlaying ? "Pause" : "Play"}
+              >
+                {isPlaying ? (
+                  <Pause className="size-4 lg:size-5" />
+                ) : (
+                  <Play className="size-4 lg:size-5" />
+                )}
+              </Button>
+            </HoverHint>
+            <HoverHint label="Previous episode">
+              <Button
+                type="button"
+                variant="secondary"
+                size="icon"
+                className="bg-zinc-950/70"
+                onClick={() => {
+                  if (previousEpisode && onEpisodeChange) {
+                    onEpisodeChange(previousEpisode, isPlayingRef.current)
+                  }
+                }}
+                disabled={!previousEpisode}
+                aria-label="Previous episode"
+              >
+                <SkipBack className="size-4 lg:size-5" />
+              </Button>
+            </HoverHint>
+            <HoverHint label="Next episode">
+              <Button
+                type="button"
+                variant="secondary"
+                size="icon"
+                className="bg-zinc-950/70"
+                onClick={() => {
+                  if (nextEpisode && onEpisodeChange) {
+                    onEpisodeChange(nextEpisode, isPlayingRef.current)
+                  }
+                }}
+                disabled={!nextEpisode}
+                aria-label="Next episode"
+              >
+                <SkipForward className="size-4 lg:size-5" />
+              </Button>
+            </HoverHint>
 
-            <span className="shrink-0 text-xs text-zinc-200 tabular-nums">
+            <span className="shrink-0 text-xs text-zinc-200 tabular-nums lg:text-base">
               {formatTime(displayedCurrentTime)} / {formatTime(duration)}
             </span>
 
@@ -2609,157 +3333,80 @@ export function AnimePlayer({
                 onKeyUp={(event) => commitSeekInput(event.currentTarget.value)}
                 onBlur={(event) => commitSeekInput(event.currentTarget.value)}
                 disabled={!duration}
-                className="h-2 w-full accent-red-600"
+                className="h-2 w-full accent-red-600 lg:h-3"
               />
             </div>
 
 
-            <div className="relative">
+            <div ref={settingsButtonRef} className="relative">
+              <HoverHint label="Settings">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="icon"
+                  className="bg-zinc-950/70"
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    setSettingsOpen((open) => !open)
+                    showControls(true)
+                  }}
+                  aria-label="Settings"
+                >
+                  <Settings className="size-4 lg:size-5" />
+                </Button>
+              </HoverHint>
+
+            </div>
+
+            {isCasting ? (
+              <HoverHint label="Stop casting">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="icon"
+                  className={`bg-zinc-950/70 ${
+                    castErrorFlash
+                      ? "border-red-500/70 text-red-400 ring-2 ring-red-500/40"
+                      : ""
+                  }`}
+                  aria-label="Stop casting"
+                  onClick={stopCasting}
+                >
+                  <Square className="size-4 lg:size-5" />
+                </Button>
+              </HoverHint>
+            ) : (
+              <HoverHint label={canCast ? "Cast" : getGoogleCastUnavailableReason()}>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="icon"
+                  className={`bg-zinc-950/70 ${
+                    castErrorFlash
+                      ? "border-red-500/70 text-red-400 ring-2 ring-red-500/40"
+                      : ""
+                  }`}
+                  aria-label={canCast ? "Cast" : getGoogleCastUnavailableReason()}
+                  disabled={(!sourceUrl && !isCasting) || isCastStarting}
+                  onClick={startCasting}
+                >
+                  <Cast className="size-4 lg:size-5" />
+                </Button>
+              </HoverHint>
+            )}
+
+            <HoverHint label="Fullscreen">
               <Button
                 type="button"
                 variant="secondary"
                 size="icon"
                 className="bg-zinc-950/70"
-                onClick={(event) => {
-                  event.stopPropagation()
-                  setSettingsOpen((open) => !open)
-                  showControls(true)
-                }}
-                title="Settings"
+                onClick={requestFullscreen}
+                aria-label="Fullscreen"
               >
-                <Settings className="size-4" />
+                <Maximize2 className="size-4 lg:size-5" />
               </Button>
-
-              {settingsOpen ? (
-                <div className="absolute right-0 bottom-12 z-20 max-h-[min(70vh,23rem)] w-72 space-y-3 overflow-y-auto rounded-xl border border-white/10 bg-zinc-950/95 p-3 text-xs shadow-2xl">
-                  {liveTranscodeEnabled ? (
-                    <>
-                      <label className="grid gap-1 text-zinc-300">
-                        <span>Quality</span>
-                        <select
-                          className={settingsSelectClass}
-                          value={quality}
-                          onChange={(event) =>
-                            changeQuality(event.target.value as PlaybackProfile)
-                          }
-                        >
-                          <option value="original">Default</option>
-                          <option value="dataSaver">Data Saver</option>
-                        </select>
-                      </label>
-
-                      <div className="grid gap-1 text-zinc-300">
-                        <span>Display Method</span>
-                        <div className="rounded-md border border-white/10 bg-zinc-950 px-2 py-1.5 text-zinc-100">
-                          {displayMethod}
-                        </div>
-                      </div>
-                    </>
-                  ) : null}
-
-                  <label className="grid gap-1 text-zinc-300">
-                    <span>Audio Language</span>
-                    <select
-                      className={settingsSelectClass}
-                      value={selectedAudioStreamId ?? ""}
-                      onChange={(event) => changeAudio(event.target.value || null)}
-                    >
-                      {media.audioStreams.length ? null : (
-                        <option value="">Default</option>
-                      )}
-                      {media.audioStreams.map((stream) => (
-                        <option key={stream.id} value={stream.id}>
-                          {stream.label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-
-                  <label className="grid gap-1 text-zinc-300">
-                    <span>Subtitle Language</span>
-                    <select
-                      className={settingsSelectClass}
-                      value={selectedSubtitleStreamId ?? ""}
-                      onChange={(event) => changeSubtitle(event.target.value || null)}
-                    >
-                      <option value="">Off</option>
-                      {subtitleLanguageOptions.map((option) => (
-                        <option key={option.id} value={option.id}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-
-                  <div className="group/stats relative grid gap-1 text-zinc-300">
-                    <span>Stats for Nerds</span>
-                    <div className="rounded-md border border-white/10 bg-zinc-950 px-2 py-1.5 text-zinc-100">
-                      Hover for stream info
-                    </div>
-                    <div className="pointer-events-none absolute right-0 bottom-full mb-2 hidden w-64 rounded-lg border border-white/10 bg-black/95 p-3 text-[11px] leading-relaxed text-zinc-200 shadow-xl group-hover/stats:block">
-                      <div>Video: {media.videoCodec ?? "unknown"}</div>
-                      <div>Container: {media.container ?? "unknown"}</div>
-                      <div>Audio: {selectedAudioLabel}{selectedAudioStream?.codec ? ` (${selectedAudioStream.codec})` : ""}</div>
-                      <div>Subtitles: {selectedSubtitleLabel}</div>
-                      <div>
-                        Stream: {streamMbpsLabel}
-                      </div>
-                    </div>
-                  </div>
-
-                  {status === "blocked" && directPossible ? (
-                    <Button
-                      type="button"
-                      variant="secondary"
-                      className="w-full rounded-lg bg-zinc-900"
-                      onClick={tryDirectPlay}
-                    >
-                      Try Direct Play
-                    </Button>
-                  ) : null}
-                </div>
-              ) : null}
-            </div>
-
-            {isCasting ? (
-              <Button
-                type="button"
-                variant="secondary"
-                size="icon"
-                className={`bg-zinc-950/70 ${
-                  castErrorFlash ? "border-red-500/70 text-red-400 ring-2 ring-red-500/40" : ""
-                }`}
-                title="Stop casting"
-                onClick={stopCasting}
-              >
-                <Square className="size-4" />
-              </Button>
-            ) : (
-              <Button
-                type="button"
-                variant="secondary"
-                size="icon"
-                className={`bg-zinc-950/70 ${
-                  castErrorFlash ? "border-red-500/70 text-red-400 ring-2 ring-red-500/40" : ""
-                }`}
-                title={canCast ? "Cast" : getGoogleCastUnavailableReason()}
-                disabled={(!sourceUrl && !isCasting) || isCastStarting}
-                onClick={startCasting}
-              >
-                <Cast className="size-4" />
-              </Button>
-            )}
-
-            <Button
-              type="button"
-              variant="secondary"
-              size="icon"
-              className="bg-zinc-950/70"
-              onClick={requestFullscreen}
-              title="Fullscreen"
-            >
-              <Maximize2 className="size-4" />
-            </Button>
+            </HoverHint>
           </div>
         </div>
       </div>

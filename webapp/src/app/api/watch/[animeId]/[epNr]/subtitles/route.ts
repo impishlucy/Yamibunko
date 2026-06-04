@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process"
 
 import { requireApiUser } from "@/server/auth/api"
+import { guardApiRequest } from "@/server/security/abuseGuard"
 import { getServerConfig } from "@/server/config"
 import { validateCastStreamToken } from "@/server/media/castTokens"
 import { ffprobe } from "@/server/media/ffmpeg"
@@ -220,6 +221,12 @@ function extractSubtitleWebVtt(input: {
 }
 
 export async function GET(request: Request, context: SubtitleContext) {
+  const abuseError = await guardApiRequest(request)
+
+  if (abuseError) {
+    return abuseError
+  }
+
   const { animeId, epNr } = await context.params
   const episodeNumber = parsePositiveInt(epNr)
   const url = new URL(request.url)

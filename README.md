@@ -15,10 +15,11 @@ Yamibunko does not include, download, or provide access to copyrighted media. Yo
 3. Extract the ZIP completely.
 4. Start the launcher from the extracted folder.
 5. Fill in the setup fields:
-   - Base URL, usually `http://localhost:3000` or the website url of the app.
-   - Input folder for new files
-   - Library folder for processed files
-   - AniList API client ID and secret if you want AniList login, tracking, or metadata features
+
+   * Base URL, usually `http://localhost:3000` or the website url of the app.
+   * Input folder for new files
+   * Library folder for processed files
+   * AniList API client ID and secret if you want AniList login, tracking, or metadata features
 6. Save the setup and wait for the launcher to start the web UI.
 
 The launcher prepares the local runtime, starts the webapp, and downloads whats needed.
@@ -41,10 +42,10 @@ Use the same base URL in the launcher or `.env` file. If you host Yamibunko behi
 
 The webapp can run without the launcher, but you must provide the runtime yourself:
 
-- Node.js 20 or newer, with Node.js 24 recommended for development
-- Bun
-- FFmpeg and FFprobe with HEVC support
-- A configured `.env` file
+* Node.js 20 or newer, with Node.js 24 recommended for development
+* Bun
+* FFmpeg and FFprobe with HEVC support
+* A configured `.env` file
 
 From the `webapp` directory:
 
@@ -58,21 +59,20 @@ Supported `TRANSCODE_ACCEL` values in env are `nvenc`, `qsv`, and `cpu`.
 
 ## Features
 
-Yamibunko is built around a local media workflow:
+Yamibunko is built around a local anime library workflow:
 
-- Watches an input folder for new episode files.
-- Checks file format, codec, size, duration, and audio tracks.
-- Converts episodes to HEVC when needed.
-- Targets consistent file sizes based on episode length.
-- Can remove unwanted audio tracks.
-- Converts FLAC or WAV audio when needed.
-- Sorts processed files into an organized library.
-- Fetches AniList metadata for library entries.
-- Generates episode thumbnails.
-- Provides a web UI for browsing and playback with accounts.
-- Supports direct play when the client can handle the file.
-- Falls back to controlled live transcoding when needed.
-- Uses transcode slots so the GPU or CPU is not overloaded.
+* Self-made browser player designed for anime watching, with responsive controls, volume control, skip intro/outro buttons, stream info hints, and mobile-friendly layouts.
+* Direct-File play possible and live transcoding when the browser or device needs a compatible stream.
+* Data Saver mode for when bandwidth is low.
+* Bandwidth-aware streaming, uses a server limit and helps avoid overloading the host connection.
+* VIP priority streaming so selected users can get better access when the server is under load.
+* Google Cast support that respects stream limits, bandwidth rules, audio, subtitles, and playback mode.
+* Import conversion for smaller, more consistent files, including HEVC conversion and audio cleanup when needed.
+* Per-series library grouping, no more searching the library, its all grouped together.
+* AniList integration for metadata, tracking, watching progress and watching status.
+* One active stream per user, with confirmation when switching playback to another episode or device.
+* Desktop launcher that prepares the runtime, starts the webapp, and keeps setup easier for normal installs.
+* Responsive layouts for all pages, on desktop, tablets, and phones.
 
 ## Contributing
 
@@ -116,13 +116,13 @@ Use a .NET SDK that supports the launcher target framework in `launcher/Launcher
 
 Yamibunko uses and is inspired by these projects:
 
-- [Next.js](https://nextjs.org/) for the webapp.
-- [Avalonia UI](https://avaloniaui.net/) for the desktop launcher.
-- [Bun](https://bun.sh/) for webapp package management and scripts.
-- [BtbN FFmpeg Builds](https://github.com/BtbN/FFmpeg-Builds) for FFmpeg builds used by the launcher.
-- [Vidstack](https://www.vidstack.io/) for media player UI tooling.
-- [`@api-wrappers/anilist-wrapper`](https://github.com/Api-Wrappers/anilist-wrapper) for AniList API access.
-- [`chokidar`](https://github.com/paulmillr/chokidar) for file watching.
+* [Next.js](https://nextjs.org/) for the webapp.
+* [Avalonia UI](https://avaloniaui.net/) for the desktop launcher.
+* [Bun](https://bun.sh/) for webapp package management and scripts.
+* [BtbN FFmpeg Builds](https://github.com/BtbN/FFmpeg-Builds) for FFmpeg builds used by the launcher.
+* [Vidstack](https://www.vidstack.io/) for media player UI tooling.
+* [`@api-wrappers/anilist-wrapper`](https://github.com/Api-Wrappers/anilist-wrapper) for AniList API access.
+* [`chokidar`](https://github.com/paulmillr/chokidar) for file watching.
 
 ## License
 

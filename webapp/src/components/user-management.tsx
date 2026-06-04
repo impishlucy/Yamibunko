@@ -1,9 +1,18 @@
 "use client"
 
 import { useEffect, useRef, useState } from "react"
-import { ChevronDown, Trash2, User, UserCog, UserStar } from "lucide-react"
+import {
+  ChevronDown,
+  Star,
+  StarOff,
+  Trash2,
+  User,
+  UserCog,
+  UserStar,
+} from "lucide-react"
 
 import { Button } from "@/components/ui/button"
+import { HoverHint } from "@/components/ui/hover-hint"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -14,6 +23,7 @@ const MAX_VISIBLE_USERNAME_LENGTH = 15
 type UserListItem = {
   username: string
   isAdmin: boolean
+  isVip: boolean
   hasPassword: boolean
   createdAt: string
 }
@@ -22,6 +32,7 @@ type MeResponse = {
   user: {
     username: string
     isAdmin: boolean
+    isVip: boolean
   } | null
 }
 
@@ -40,24 +51,44 @@ function getCompactUsername(username: string) {
 function UserStatusIcon({ user }: { user: UserListItem }) {
   if (user.isAdmin) {
     return (
-      <UserStar
-        className="size-4 shrink-0 text-amber-300"
-        aria-label="Admin"
-      />
+      <HoverHint label="Admin">
+        <span aria-label="Admin" role="img">
+          <UserStar
+            className="size-4 shrink-0 text-amber-300"
+            aria-hidden="true"
+          />
+        </span>
+      </HoverHint>
     )
   }
 
   if (!user.hasPassword) {
     return (
-      <UserCog
-        className="size-4 shrink-0 text-orange-300"
-        aria-label="Password pending"
-      />
+      <HoverHint label="User">
+        <span aria-label="User" role="img">
+          <UserCog
+            className="size-4 shrink-0 text-orange-300"
+            aria-hidden="true"
+          />
+        </span>
+      </HoverHint>
     )
   }
 
   return (
-    <User className="size-4 shrink-0 text-violet-300" aria-label="User" />
+    <HoverHint label="User">
+      <span aria-label="User" role="img">
+        <User className="size-4 shrink-0 text-violet-300" aria-hidden="true" />
+      </span>
+    </HoverHint>
+  )
+}
+
+function UserVipIcon({ user }: { user: UserListItem }) {
+  return user.isVip ? (
+    <Star className="size-4" aria-hidden="true" />
+  ) : (
+    <StarOff className="size-4" aria-hidden="true" />
   )
 }
 
@@ -181,6 +212,29 @@ export function UserManagement() {
     setUsers(payload.users)
   }
 
+  async function toggleVip(user: UserListItem) {
+    setError(null)
+
+    const response = await fetch("/api/auth/users", {
+      method: "PATCH",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        username: user.username,
+        isVip: !user.isVip,
+      }),
+    })
+
+    if (!response.ok) {
+      setError("Unable to update VIP status")
+      return
+    }
+
+    const payload = (await response.json()) as { users: UserListItem[] }
+    setUsers(payload.users)
+  }
+
   if (!me?.isAdmin) {
     return null
   }
@@ -235,28 +289,48 @@ export function UserManagement() {
             {usersOpen ? (
               <div
                 role="listbox"
-                className="absolute left-0 top-11 z-50 max-h-[188px] w-full overflow-y-auto rounded-lg border border-white/10 bg-zinc-950/95 p-1 shadow-2xl shadow-black/40"
+                className="mt-2 max-h-52 w-full overflow-y-auto rounded-lg border border-white/10 bg-zinc-950/95 p-1 shadow-2xl shadow-black/40 sm:absolute sm:left-0 sm:top-11 sm:mt-0 sm:max-h-[188px]"
               >
                 {users.map((user) => (
                   <div
                     key={user.username}
                     className="flex h-9 items-center gap-2 rounded-md px-2 text-sm text-zinc-100 hover:bg-white/5"
-                    title={user.username}
                   >
-                    <span className="min-w-0 flex-1 truncate">
-                      {getCompactUsername(user.username)}
-                    </span>
+                    <HoverHint
+                      label={user.username}
+                      className="min-w-0 flex-1 overflow-hidden"
+                      align="start"
+                    >
+                      <span className="block truncate">
+                        {getCompactUsername(user.username)}
+                      </span>
+                    </HoverHint>
                     <UserStatusIcon user={user} />
-                    {!user.isAdmin ? (
+                    <HoverHint label={user.isVip ? "Remove VIP" : "Make VIP"}>
                       <button
                         type="button"
-                        onClick={() => deleteUser(user)}
-                        className="rounded-md p-1 text-red-300 transition hover:bg-red-400/10 hover:text-red-200"
-                        aria-label={`Delete ${user.username}`}
-                        title={`Delete ${user.username}`}
+                        onClick={() => toggleVip(user)}
+                        className={`rounded-md p-1 transition ${
+                          user.isVip
+                            ? "text-amber-300 hover:bg-amber-400/10 hover:text-amber-200"
+                            : "text-violet-300 hover:bg-violet-400/10 hover:text-violet-200"
+                        }`}
+                        aria-label={user.isVip ? "Remove VIP" : "Make VIP"}
                       >
-                        <Trash2 className="size-4" />
+                        <UserVipIcon user={user} />
                       </button>
+                    </HoverHint>
+                    {!user.isAdmin ? (
+                      <HoverHint label="Delete">
+                        <button
+                          type="button"
+                          onClick={() => deleteUser(user)}
+                          className="rounded-md p-1 text-red-300 transition hover:bg-red-400/10 hover:text-red-200"
+                          aria-label="Delete"
+                        >
+                          <Trash2 className="size-4" />
+                        </button>
+                      </HoverHint>
                     ) : null}
                   </div>
                 ))}

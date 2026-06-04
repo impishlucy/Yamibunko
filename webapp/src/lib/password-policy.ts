@@ -2,7 +2,7 @@ export const maxPasswordLength = 1024
 
 export function isStrongPassword(password: string) {
   return (
-    password.length >= 32 &&
+    password.length >= 12 &&
     password.length <= maxPasswordLength &&
     /[A-Z]/.test(password) &&
     /[a-z]/.test(password) &&

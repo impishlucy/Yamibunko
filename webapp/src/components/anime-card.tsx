@@ -21,7 +21,7 @@ export function AnimeCard({ anime, priority = false }: AnimeCardProps) {
               alt=""
               fill
               priority={priority}
-              sizes="(min-width: 1536px) 11vw, (min-width: 1280px) 12.5vw, (min-width: 1024px) 14vw, (min-width: 640px) 20vw, 33vw"
+              sizes="(min-width: 1536px) 14vw, (min-width: 1280px) 16vw, (min-width: 1024px) 20vw, (min-width: 640px) 20vw, 50vw"
               className="h-full w-full object-cover transition duration-300 group-hover:scale-105"
             />
           ) : (

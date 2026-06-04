@@ -8,6 +8,8 @@ export type ProbeStream = {
   index?: number
   codec_type?: string
   codec_name?: string
+  width?: number
+  height?: number
   duration?: string
   bit_rate?: string
   channels?: number

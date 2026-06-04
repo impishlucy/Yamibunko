@@ -62,3 +62,12 @@ export function validateCastStreamToken(input: {
     username: value.username,
   }
 }
+
+
+export function deleteCastStreamTokensForUser(username: string) {
+  for (const [token, value] of tokens) {
+    if (value.username === username) {
+      tokens.delete(token)
+    }
+  }
+}

@@ -19,6 +19,7 @@ export type CurrentUser = {
   username: string
   name: string
   isAdmin: boolean
+  isVip: boolean
   hasPassword: boolean
 }
 
@@ -80,6 +81,7 @@ export async function getCurrentUser(): Promise<CurrentUser | null> {
     username: user.username,
     name: user.username,
     isAdmin: user.isAdmin,
+    isVip: user.isVip,
     hasPassword: Boolean(user.passwordHash),
   }
 }

@@ -1,31 +1,40 @@
 import { z } from "zod"
 
+import { usernameSchema } from "@/server/security/input"
+
 import {
   requireAdminApiUser,
   requireSameOriginRequest,
 } from "@/server/auth/api"
-import { createUser, deleteUser, getUser, listUsers } from "@/server/db/users"
+import {
+  createUser,
+  deleteUser,
+  getUser,
+  listUsers,
+  setUserVip,
+} from "@/server/db/users"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
 const createUserSchema = z.object({
-  username: z
-    .string()
-    .trim()
-    .min(3)
-    .max(64)
-    .regex(/^[a-z0-9._-]+$/i),
+  username: usernameSchema,
+})
+
+const updateUserSchema = z.object({
+  username: usernameSchema,
+  isVip: z.boolean(),
 })
 
 const deleteUserSchema = z.object({
-  username: z.string().trim().min(1).max(64),
+  username: usernameSchema,
 })
 
 function serializeUsers() {
   return listUsers().map((user) => ({
     username: user.username,
     isAdmin: user.isAdmin,
+    isVip: user.isVip,
     hasPassword: Boolean(user.passwordHash),
     createdAt: user.createdAt,
     updatedAt: user.updatedAt,
@@ -71,6 +80,7 @@ export async function POST(request: Request) {
     createUser({
       username: parsed.data.username,
       isAdmin: false,
+      isVip: false,
       passwordHash: null,
     })
   } catch {
@@ -79,6 +89,46 @@ export async function POST(request: Request) {
       { status: 409 }
     )
   }
+
+  return Response.json({
+    ok: true,
+    users: serializeUsers(),
+  })
+}
+
+export async function PATCH(request: Request) {
+  const originError = await requireSameOriginRequest(request)
+
+  if (originError) {
+    return originError
+  }
+
+  const auth = await requireAdminApiUser()
+
+  if (!auth.ok) {
+    return auth.response
+  }
+
+  const body = await request.json().catch(() => null)
+  const parsed = updateUserSchema.safeParse(body)
+
+  if (!parsed.success) {
+    return Response.json(
+      { ok: false, error: "INVALID_USER_PAYLOAD" },
+      { status: 400 }
+    )
+  }
+
+  const target = getUser(parsed.data.username)
+
+  if (!target) {
+    return Response.json(
+      { ok: false, error: "USER_NOT_FOUND" },
+      { status: 404 }
+    )
+  }
+
+  setUserVip(target.username, parsed.data.isVip)
 
   return Response.json({
     ok: true,

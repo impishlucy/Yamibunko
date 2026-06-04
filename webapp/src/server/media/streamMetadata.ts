@@ -289,6 +289,8 @@ export function getMediaStreamMetadata(probe: ProbeResult): WatchPayload["media"
     defaultSubtitleStreamId: defaultSubtitleStream?.id ?? null,
     directAudioStreamId: audioStreams[0]?.id ?? null,
     videoCodec: firstVideoStream?.codec_name ?? undefined,
+    videoWidth: firstVideoStream?.width,
+    videoHeight: firstVideoStream?.height,
     container: probe.format?.format_name
       ?.split(",")
       .map((item) => item.trim())

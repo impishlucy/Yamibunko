@@ -42,6 +42,7 @@ type AniListListEntry = {
   status: string | null
   progress: number | null
   score: number | null
+  repeat: number | null
   createdAt?: number | string | null
   updatedAt?: number | string | null
 }
@@ -57,6 +58,8 @@ type AniListListCollection = {
 type MediaListStatusInput = NonNullable<SaveMediaListEntryInput["status"]>
 
 const mediaListStatus = AniListOperations.MediaListStatus
+const completedStatus = "COMPLETED" as MediaListStatusInput
+const rewatchingStatus = mediaListStatus.Repeating as MediaListStatusInput
 const watchingStatuses = new Set<string>([
   mediaListStatus.Current,
   mediaListStatus.Repeating,
@@ -309,6 +312,7 @@ function cachedToListEntry(entry: CachedAniListMediaListEntry): AniListListEntry
     status: entry.status,
     progress: entry.progress,
     score: entry.score,
+    repeat: null,
   }
 }
 
@@ -335,6 +339,20 @@ async function readUserAnimeList(input: {
   )
 
   return flattenListEntries(result as AniListListCollection)
+}
+
+
+async function readMediaListEntryByAnimeId(input: {
+  accessToken: string
+  aniListUserId: number
+  animeId: number
+}) {
+  const entries = await readUserAnimeList({
+    accessToken: input.accessToken,
+    aniListUserId: input.aniListUserId,
+  })
+
+  return entries.find((entry) => entry.mediaId === input.animeId) ?? null
 }
 
 async function getCachedOrSyncedEntry(connection: AniListConnection, animeId: number) {
@@ -443,6 +461,7 @@ export async function saveAniListProgress(input: {
   username: string
   animeId: number
   progress: number
+  completed?: boolean
 }) {
   const connection = getAniListConnection(input.username)
   const accessToken = getAniListAccessTokenForUser(input.username)
@@ -452,28 +471,99 @@ export async function saveAniListProgress(input: {
   }
 
   const current = await getCachedOrSyncedEntry(connection, input.animeId)
-  const status = watchingStatuses.has(current?.status ?? "")
-    ? (toMediaListStatus(current?.status) ?? mediaListStatus.Current)
-    : mediaListStatus.Current
+  const currentStatus = toMediaListStatus(current?.status)
+  const progress = Math.max(input.progress, current?.progress ?? 0, 0)
+  const status = input.completed
+    ? completedStatus
+    : watchingStatuses.has(current?.status ?? "")
+      ? (currentStatus ?? mediaListStatus.Current)
+      : mediaListStatus.Current
+  const saveInput: SaveMediaListEntryInput = {
+    mediaId: input.animeId,
+    status,
+    progress,
+    score: current?.score ?? undefined,
+  }
+
   const saved = await queueAniListOperation(() =>
-    getAniListClient(accessToken).mediaList.saveEntry({
-      mediaId: input.animeId,
-      status,
-      progress: Math.max(input.progress, 0),
-      score: current?.score ?? undefined,
-    })
+    getAniListClient(accessToken).mediaList.saveEntry(saveInput)
   )
-  const savedEntry = (saved.SaveMediaListEntry ?? null) as AniListListEntry | null
+  const rawSavedEntry = (saved.SaveMediaListEntry ?? null) as AniListListEntry | null
+  const savedEntry = rawSavedEntry ?? null
 
   cacheSavedEntry(connection, savedEntry)
   markEpisodesCompleteThrough({
     username: input.username,
     animeId: input.animeId,
-    progress: input.progress,
+    progress,
   })
 
   console.log(
-    `[Info] [Anilist] Saved progress - Anime id ${input.animeId}, Episode ${input.progress}`
+    `[Info] [Anilist] Saved progress - Anime id ${input.animeId}, Episode ${progress}, Status: ${status}`
+  )
+
+  return savedEntry
+}
+
+export async function markAniListWatchingStarted(input: {
+  username: string
+  animeId: number
+}) {
+  const connection = getAniListConnection(input.username)
+  const accessToken = getAniListAccessTokenForUser(input.username)
+
+  if (!connection || !accessToken) {
+    return null
+  }
+
+  const exactEntry = await readMediaListEntryByAnimeId({
+    accessToken,
+    aniListUserId: connection.aniListUserId,
+    animeId: input.animeId,
+  })
+  const current = exactEntry ?? (await getCachedOrSyncedEntry(connection, input.animeId))
+  const currentStatus = toMediaListStatus(current?.status)
+
+  if (watchingStatuses.has(current?.status ?? "")) {
+    cacheSavedEntry(connection, current)
+    return current
+  }
+
+  const isCompletedRewatch = currentStatus === completedStatus
+  const progress = isCompletedRewatch ? 0 : Math.max(current?.progress ?? 0, 0)
+  const repeat = isCompletedRewatch
+    ? Math.max(current?.repeat ?? 0, 0) + 1
+    : current?.repeat ?? undefined
+  const status = isCompletedRewatch ? rewatchingStatus : mediaListStatus.Current
+  const saveInput: SaveMediaListEntryInput = {
+    mediaId: input.animeId,
+    status,
+    progress,
+    score: current?.score ?? undefined,
+  }
+
+  if (typeof repeat === "number") {
+    saveInput.repeat = repeat
+  }
+
+  const saved = await queueAniListOperation(() =>
+    getAniListClient(accessToken).mediaList.saveEntry(saveInput)
+  )
+  const rawSavedEntry = (saved.SaveMediaListEntry ?? null) as AniListListEntry | null
+  const savedEntry = rawSavedEntry ?? null
+
+  cacheSavedEntry(connection, savedEntry)
+
+  if (progress > 0) {
+    markEpisodesCompleteThrough({
+      username: input.username,
+      animeId: input.animeId,
+      progress,
+    })
+  }
+
+  console.log(
+    `[Info] [Anilist] Marked anime as ${isCompletedRewatch ? "rewatching" : "watching"} - Anime id ${input.animeId}`
   )
 
   return savedEntry
@@ -496,15 +586,18 @@ export async function saveAniListRating(input: {
   const status = toMediaListStatus(current?.status) ?? mediaListStatus.Current
   const progress = current?.progress ?? 0
   const score = ratingToScore(input.rating, currentConnection.scoreFormat)
+  const saveInput: SaveMediaListEntryInput = {
+    mediaId: input.animeId,
+    status,
+    progress,
+    score,
+  }
+
   const saved = await queueAniListOperation(() =>
-    getAniListClient(accessToken).mediaList.saveEntry({
-      mediaId: input.animeId,
-      status,
-      progress,
-      score,
-    })
+    getAniListClient(accessToken).mediaList.saveEntry(saveInput)
   )
-  const savedEntry = (saved.SaveMediaListEntry ?? null) as AniListListEntry | null
+  const rawSavedEntry = (saved.SaveMediaListEntry ?? null) as AniListListEntry | null
+  const savedEntry = rawSavedEntry ?? null
 
   cacheSavedEntry(connection, savedEntry)
 

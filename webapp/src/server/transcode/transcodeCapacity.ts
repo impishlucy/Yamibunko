@@ -533,10 +533,11 @@ export async function getLiveTranscodeStatus(): Promise<TranscodeStatus> {
 }
 
 function acquireQueuedTranscode(input: {
-  label: string,
+  label: string
   kind: TranscodeKind
   profile?: PlaybackProfile
   signal?: AbortSignal
+  isVip?: boolean
 }) {
   const id = randomUUID()
 
@@ -546,7 +547,7 @@ function acquireQueuedTranscode(input: {
       label: input.label,
       kind: input.kind,
       profile: input.profile,
-      priority: getTranscodePriority(input.kind),
+      priority: getTranscodePriority(input.kind) - (input.isVip ? 1 : 0),
       sequence: pendingSequence++,
       signal: input.signal,
       resolve,
@@ -577,7 +578,8 @@ function acquireQueuedTranscode(input: {
 export function acquireLiveTranscode(
   label: string,
   profile?: PlaybackProfile,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  options?: { isVip?: boolean }
 ) {
   const result = getServerConfigResult()
 
@@ -592,6 +594,7 @@ export function acquireLiveTranscode(
     kind: "live",
     profile,
     signal,
+    isVip: options?.isVip,
   })
 }
 

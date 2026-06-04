@@ -79,3 +79,8 @@ export function touchSession(tokenHash: string) {
 export function deleteSessionByTokenHash(tokenHash: string) {
   getDb().query("DELETE FROM sessions WHERE token_hash = ?").run(tokenHash)
 }
+
+
+export function deleteSessionsByUsername(username: string) {
+  getDb().query("DELETE FROM sessions WHERE username = ?").run(username)
+}

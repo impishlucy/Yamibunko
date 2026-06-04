@@ -12,9 +12,9 @@ export default async function SettingsPage() {
   })
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-5 pb-16 sm:pb-0 lg:space-y-7">
       <div>
-        <h1 className="text-2xl font-semibold text-zinc-50">Settings</h1>
+        <h1 className="text-2xl font-semibold text-zinc-50 lg:text-3xl">Settings</h1>
       </div>
       <SettingsForm settings={settings} />
       {user?.isAdmin ? <UserManagement /> : null}

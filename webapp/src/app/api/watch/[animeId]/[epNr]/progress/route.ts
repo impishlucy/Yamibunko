@@ -3,7 +3,7 @@ import { z } from "zod"
 import { requireApiUser, requireSameOriginRequest } from "@/server/auth/api"
 import { saveAniListProgress } from "@/server/anilist/client"
 import { upsertEpisodeProgress } from "@/server/db/library"
-import { getEpisode } from "@/server/media/libraryStore"
+import { getEpisode, getEpisodeNeighbors } from "@/server/media/libraryStore"
 import { errorMessage, parsePositiveInt } from "@/server/utils/format"
 
 export const runtime = "nodejs"
@@ -88,10 +88,18 @@ export async function POST(request: Request, context: ProgressContext) {
   })
 
   if (completed) {
+    const neighbors = getEpisodeNeighbors({
+      animeId: animeIdNumber,
+      seasonNr: seasonNumber,
+      epNr: episodeNumber,
+      username: auth.user.username,
+    })
+
     await saveAniListProgress({
       username: auth.user.username,
       animeId: animeIdNumber,
       progress: episodeNumber,
+      completed: !neighbors.nextEpisode,
     }).catch((error) => {
       console.error(
         `[Error] [Anilist] Progress sync failed - watch/progress/route.ts - ${errorMessage(error)}`

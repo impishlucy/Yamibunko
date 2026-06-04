@@ -1,5 +1,3 @@
-import { AniListOperations } from "@api-wrappers/anilist-wrapper"
-
 import { slugifyAnimeTitle } from "@/lib/slug"
 import {
   getAniListClient,
@@ -64,11 +62,57 @@ type AniListMediaNode = {
 const AnimeWithStreamingEpisodesDocument = `
   query YamibunkoAnimeWithStreamingEpisodes($id: Int!) {
     Media(id: $id, type: ANIME) {
-      ...AnimeFragment
+      ...YamibunkoAnimeMedia
+      streamingEpisodes {
+        title
+        thumbnail
+        url
+        site
+      }
+      relations {
+        edges {
+          relationType
+          node {
+            ...YamibunkoAnimeMedia
+          }
+        }
+      }
     }
   }
-  ${AniListOperations.AnimeFragmentDoc}
+
+  fragment YamibunkoAnimeMedia on Media {
+    id
+    format
+    title {
+      romaji
+      english
+      native
+      userPreferred
+    }
+    status
+    description
+    seasonYear
+    episodes
+    duration
+    coverImage {
+      extraLarge
+      large
+      medium
+    }
+    bannerImage
+    genres
+    averageScore
+    tags {
+      id
+      name
+      description
+      category
+      rank
+      isAdult
+    }
+  }
 `
+
 
 const seriesFormats = new Set(["TV", "TV_SHORT", "ONA"])
 const sideStoryFormats = new Set(["MOVIE", "SPECIAL", "OVA"])
@@ -216,12 +260,12 @@ function pickRootCandidate(metadata: AnimeMetadataInput) {
 
 async function fetchAnimeMetadataById(id: number) {
   const animeResult = await queueAniListOperation(() =>
-    getAniListClient().graphql.request<{ Media: AniListMediaNode | null }, { id: number }>(
-      AnimeWithStreamingEpisodesDocument,
-      { id }
-    )
+    getAniListClient().graphql.request<
+      { Media: AniListMediaNode | null },
+      { id: number }
+    >(AnimeWithStreamingEpisodesDocument, { id })
   )
-  const media = animeResult.Media as AniListMediaNode | null
+  const media = animeResult.Media
 
   if (!media) {
     return null

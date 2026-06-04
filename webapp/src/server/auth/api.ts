@@ -1,6 +1,11 @@
 import type { CurrentUser } from "@/server/auth/session"
 import { getCurrentUser } from "@/server/auth/session"
 import { isSameOriginRequest } from "@/server/http/request"
+import {
+  guardApiRequest,
+  guardRequest,
+  recordBadOrigin,
+} from "@/server/security/abuseGuard"
 
 export function unauthorized() {
   return Response.json({ ok: false, error: "UNAUTHORIZED" }, { status: 401 })
@@ -11,14 +16,22 @@ export function forbidden() {
 }
 
 export async function requireSameOriginRequest(request: Request) {
+  const blocked = await guardRequest(request, { kind: "api", count: false })
+
+  if (blocked) {
+    return blocked
+  }
+
   if (await isSameOriginRequest(request)) {
     return null
   }
 
+  await recordBadOrigin(request)
+
   return Response.json({ ok: false, error: "BAD_ORIGIN" }, { status: 403 })
 }
 
-export async function requireApiUser(): Promise<
+export async function requireApiUser(request?: Request): Promise<
   | {
       ok: true
       user: CurrentUser
@@ -28,6 +41,12 @@ export async function requireApiUser(): Promise<
       response: Response
     }
 > {
+  const blocked = await guardApiRequest(request)
+
+  if (blocked) {
+    return { ok: false, response: blocked }
+  }
+
   const user = await getCurrentUser()
 
   if (!user) {
@@ -37,8 +56,8 @@ export async function requireApiUser(): Promise<
   return { ok: true, user }
 }
 
-export async function requireAdminApiUser() {
-  const result = await requireApiUser()
+export async function requireAdminApiUser(request?: Request) {
+  const result = await requireApiUser(request)
 
   if (!result.ok) {
     return result

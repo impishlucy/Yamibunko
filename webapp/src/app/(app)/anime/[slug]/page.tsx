@@ -3,6 +3,7 @@ import { notFound } from "next/navigation"
 
 import { AniListTracking } from "@/components/anilist-tracking"
 import { AnimeVariantSelect } from "@/components/anime-variant-select"
+import { MobileDescription } from "@/components/mobile-description"
 import { EpisodeCard } from "@/components/episode-card"
 import { Badge } from "@/components/ui/badge"
 import { getCurrentUser } from "@/server/auth/session"
@@ -73,7 +74,7 @@ export default async function AnimePage({
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 lg:space-y-8">
       <section className="relative overflow-hidden rounded-lg border border-white/10 bg-zinc-900">
         {anime.bannerImage ? (
           <Image
@@ -86,7 +87,7 @@ export default async function AnimePage({
           />
         ) : null}
         <div className="absolute inset-0 bg-gradient-to-r from-zinc-950 via-zinc-950/80 to-zinc-950/30" />
-        <div className="relative grid gap-5 p-5 sm:grid-cols-[160px_1fr] sm:p-6">
+        <div className="relative grid grid-cols-[96px_1fr] gap-3 p-4 sm:grid-cols-[160px_1fr] sm:gap-5 sm:p-6 lg:grid-cols-[200px_1fr] lg:gap-7 lg:p-8">
           <div className="aspect-[3/4] overflow-hidden rounded-lg border border-white/10 bg-zinc-800 shadow-2xl">
             {anime.coverImage ? (
               <Image
@@ -125,7 +126,7 @@ export default async function AnimePage({
                 </Badge>
               ) : null}
             </div>
-            <h1 className="max-w-3xl text-3xl font-semibold text-zinc-50">
+            <h1 className="max-w-3xl text-2xl font-semibold text-zinc-50 sm:text-3xl lg:text-4xl">
               {libraryEntry.title}
             </h1>
             <p className="text-sm font-medium text-violet-200">
@@ -136,9 +137,12 @@ export default async function AnimePage({
               })}
             </p>
             {anime.description ? (
-              <p className="max-w-2xl text-sm leading-6 text-zinc-300">
-                {anime.description}
-              </p>
+              <>
+                <MobileDescription text={anime.description} />
+                <p className="hidden max-w-2xl text-sm leading-6 text-zinc-300 sm:block lg:max-w-3xl lg:text-base lg:leading-7">
+                  {anime.description}
+                </p>
+              </>
             ) : null}
             <AnimeVariantSelect
               variants={libraryEntry.variants}
@@ -163,10 +167,10 @@ export default async function AnimePage({
       </section>
 
       <section className="space-y-3">
-        <h2 className="text-lg font-semibold text-zinc-50">Episodes</h2>
+        <h2 className="text-lg font-semibold text-zinc-50 lg:text-xl">Episodes</h2>
         {[...episodesBySeason.entries()].map(([season, seasonEpisodes]) => (
           <div key={season} className="space-y-3">
-            <div className="grid gap-3 xl:grid-cols-2">
+            <div className="grid gap-3">
               {seasonEpisodes.map((episode) => (
                 <EpisodeCard
                   key={`${episode.animeId}-${episode.seasonNumber}-${episode.episodeNumber}`}

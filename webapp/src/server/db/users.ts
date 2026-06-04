@@ -4,6 +4,7 @@ type UserRow = {
   username: string
   password_hash: string | null
   is_admin: number
+  is_vip: number
   anilist_refresh_pressed_at: string | null
   created_at: string
   updated_at: string
@@ -13,6 +14,7 @@ export type StoredUser = {
   username: string
   passwordHash: string | null
   isAdmin: boolean
+  isVip: boolean
   aniListRefreshPressedAt: string | null
   createdAt: string
   updatedAt: string
@@ -25,6 +27,7 @@ function toUser(row: UserRow): StoredUser {
     username: row.username,
     passwordHash: row.password_hash,
     isAdmin: row.is_admin === 1,
+    isVip: row.is_vip === 1,
     aniListRefreshPressedAt: row.anilist_refresh_pressed_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -42,7 +45,7 @@ export function hasAnyUsers() {
 export function getUser(username: string) {
   const row = getDb()
     .query<UserRow>(
-      "SELECT username, password_hash, is_admin, anilist_refresh_pressed_at, created_at, updated_at FROM users WHERE username = ?"
+      "SELECT username, password_hash, is_admin, is_vip, anilist_refresh_pressed_at, created_at, updated_at FROM users WHERE username = ?"
     )
     .get(username.trim())
 
@@ -52,7 +55,7 @@ export function getUser(username: string) {
 export function listUsers() {
   return getDb()
     .query<UserRow>(
-      "SELECT username, password_hash, is_admin, anilist_refresh_pressed_at, created_at, updated_at FROM users ORDER BY is_admin DESC, username ASC"
+      "SELECT username, password_hash, is_admin, is_vip, anilist_refresh_pressed_at, created_at, updated_at FROM users ORDER BY is_admin DESC, is_vip DESC, username ASC"
     )
     .all()
     .map(toUser)
@@ -62,17 +65,20 @@ export function createUser(input: {
   username: string
   passwordHash?: string | null
   isAdmin: boolean
+  isVip?: boolean
 }) {
   const now = nowIso()
+  const isVip = input.isVip ?? input.isAdmin
 
   getDb()
     .query(
-      "INSERT INTO users (username, password_hash, is_admin, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+      "INSERT INTO users (username, password_hash, is_admin, is_vip, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
     )
     .run(
       input.username.trim(),
       input.passwordHash ?? null,
       input.isAdmin ? 1 : 0,
+      isVip ? 1 : 0,
       now,
       now
     )
@@ -98,6 +104,11 @@ export function deleteUser(username: string) {
   getDb().query("DELETE FROM users WHERE username = ?").run(username.trim())
 }
 
+export function setUserVip(username: string, isVip: boolean) {
+  getDb()
+    .query("UPDATE users SET is_vip = ?, updated_at = ? WHERE username = ?")
+    .run(isVip ? 1 : 0, nowIso(), username.trim())
+}
 
 export function getUserAniListRefreshState(username: string) {
   const row = getDb()
