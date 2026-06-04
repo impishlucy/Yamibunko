@@ -64,7 +64,22 @@ function debugWorkers(message: string) {
   console.log(`[Debug] [Workers] ${message}`)
 }
 
-async function walkFiles(directory: string): Promise<string[]> {
+const failedImportsFolderName = "_Failed Imports"
+
+function isInsideNamedDirectory(root: string, targetPath: string, directoryName: string) {
+  const relative = path.relative(path.resolve(root), path.resolve(targetPath))
+
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+    return false
+  }
+
+  return relative.split(path.sep).includes(directoryName)
+}
+
+async function walkFiles(
+  directory: string,
+  options: { ignoredDirectoryNames?: Set<string> } = {}
+): Promise<string[]> {
   const entries = await readdir(directory, { withFileTypes: true })
   const files: string[] = []
 
@@ -72,7 +87,11 @@ async function walkFiles(directory: string): Promise<string[]> {
     const entryPath = path.join(directory, entry.name)
 
     if (entry.isDirectory()) {
-      files.push(...(await walkFiles(entryPath)))
+      if (options.ignoredDirectoryNames?.has(entry.name)) {
+        continue
+      }
+
+      files.push(...(await walkFiles(entryPath, options)))
       continue
     }
 
@@ -112,6 +131,8 @@ export function startWorkers() {
 
   const inputWatcher = chokidar.watch(config.inputDir, {
     ignoreInitial: true,
+    ignored: (watchPath) =>
+      isInsideNamedDirectory(config.inputDir, watchPath.toString(), failedImportsFolderName),
     awaitWriteFinish: {
       stabilityThreshold: 3000,
       pollInterval: 1000,
@@ -219,6 +240,11 @@ export function startWorkers() {
     const resolvedPath = path.resolve(filePath)
     debugWorkers(`Enqueue requested - Kind ${kind}, Path ${resolvedPath}`)
 
+    if (kind === "input" && isInsideNamedDirectory(config.inputDir, resolvedPath, failedImportsFolderName)) {
+      debugWorkers(`Ignoring failed-import quarantine path - ${resolvedPath}`)
+      return
+    }
+
     if (!isMediaFile(resolvedPath)) {
       debugWorkers(`Ignoring non-media file - Kind ${kind}, Path ${resolvedPath}`)
       return
@@ -245,7 +271,9 @@ export function startWorkers() {
     console.log("[Info] [Workers] Scanning input folder.")
 
     try {
-      const files = await walkFiles(config.inputDir)
+      const files = await walkFiles(config.inputDir, {
+        ignoredDirectoryNames: new Set([failedImportsFolderName]),
+      })
       const mediaFiles = files.filter(isMediaFile)
 
       debugWorkers(

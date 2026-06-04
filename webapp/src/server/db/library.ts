@@ -415,48 +415,19 @@ function fallbackEpisodeTitle(episodeNumber: number) {
   return `Episode ${episodeNumber}`
 }
 
-function canUseCachedStreamingEpisodeTitles(animeId: number) {
-  const row = getDb()
-    .query<{
-      local_episode_count: number
-      local_titled_count: number
-      cached_title_count: number
-      anilist_episode_count: number | null
-    }>(
+export function getCachedStreamingEpisodeTitle(animeId: number, episodeNumber: number) {
+  return (
+    getDb()
+      .query<{ title: string }>(
+        `
+        SELECT title
+        FROM anime_streaming_episodes
+        WHERE anime_id = ?
+          AND episode_number = ?
       `
-      SELECT
-        COUNT(DISTINCT e.ep_nr) AS local_episode_count,
-        COUNT(DISTINCT se_local.episode_number) AS local_titled_count,
-        (
-          SELECT COUNT(DISTINCT se_all.episode_number)
-          FROM anime_streaming_episodes se_all
-          WHERE se_all.anime_id = a.id
-        ) AS cached_title_count,
-        a.episodes AS anilist_episode_count
-      FROM anime a
-      LEFT JOIN episodes e ON e.anime_id = a.id
-      LEFT JOIN anime_streaming_episodes se_local
-        ON se_local.anime_id = e.anime_id
-       AND se_local.episode_number = e.ep_nr
-      WHERE a.id = ?
-      GROUP BY a.id
-    `
-    )
-    .get(animeId)
-
-  if (!row || row.local_episode_count <= 0 || row.cached_title_count <= 0) {
-    return false
-  }
-
-  if (row.local_titled_count !== row.local_episode_count) {
-    return false
-  }
-
-  if (row.anilist_episode_count && row.anilist_episode_count > 0) {
-    return row.cached_title_count === row.anilist_episode_count
-  }
-
-  return true
+      )
+      .get(animeId, episodeNumber)?.title ?? null
+  )
 }
 
 function setFallbackEpisodeTitles(animeId: number, now = nowIso()) {
@@ -582,11 +553,6 @@ function replaceAnimeStreamingEpisodes(
 }
 
 function syncEpisodeTitlesFromCachedStreaming(animeId: number, now = nowIso()) {
-  if (!canUseCachedStreamingEpisodeTitles(animeId)) {
-    setFallbackEpisodeTitles(animeId, now)
-    return
-  }
-
   getDb()
     .query(
       `
@@ -596,7 +562,7 @@ function syncEpisodeTitlesFromCachedStreaming(animeId: number, now = nowIso()) {
         FROM anime_streaming_episodes
         WHERE anime_streaming_episodes.anime_id = episodes.anime_id
           AND anime_streaming_episodes.episode_number = episodes.ep_nr
-      ), 'Episode ' || ep_nr),
+      ), title, 'Episode ' || ep_nr),
           updated_at = ?
       WHERE anime_id = ?
     `
@@ -643,9 +609,7 @@ function toEpisode(row: EpisodeRow): Episode {
     animeId: row.anime_id,
     seasonNumber: row.season_nr,
     episodeNumber: row.ep_nr,
-    title: canUseCachedStreamingEpisodeTitles(row.anime_id)
-      ? row.title ?? fallbackEpisodeTitle(row.ep_nr)
-      : fallbackEpisodeTitle(row.ep_nr),
+    title: row.title ?? fallbackEpisodeTitle(row.ep_nr),
     fileName: baseFileName(row.file_path),
     filePath: row.file_path,
     thumbnail: `/api/anime/${row.anime_id}/episodes/${row.ep_nr}/thumbnail?season=${row.season_nr}`,
@@ -846,6 +810,81 @@ export function getMaxCachedStreamingEpisodeNumber(animeId: number) {
 }
 
 
+function extractSeasonMarkerFromTitle(value: string | null | undefined) {
+  if (!value) {
+    return null
+  }
+
+  const normalized = value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+  const seasonMatch = /\bseason\s*0*(\d{1,2})\b/i.exec(normalized)
+  const shortSeasonMatch = /\bs\s*0*(\d{1,2})\b/i.exec(normalized)
+  const season = parsePositiveInt(seasonMatch?.[1] ?? shortSeasonMatch?.[1])
+
+  return season && season > 0 ? season : null
+}
+
+function titleSeasonMarker(
+  row: Pick<
+    AnimeRow,
+    "title_user_preferred" | "title_english" | "title_romaji" | "title_native"
+  >
+) {
+  for (const title of rowTitles(row)) {
+    const season = extractSeasonMarkerFromTitle(title)
+
+    if (season) {
+      return season
+    }
+  }
+
+  return null
+}
+
+export function resolveLibrarySeasonNumberForAnime(input: {
+  animeId: number
+  parsedSeason: number
+  parsedPart?: number
+}) {
+  if (input.parsedPart && input.parsedPart > 1) {
+    return input.parsedSeason
+  }
+
+  const row = getDb()
+    .query<AnimeRow>("SELECT * FROM anime WHERE id = ?")
+    .get(input.animeId)
+
+  if (!row?.library_slug || !seriesFormats.has(row.format ?? "")) {
+    return input.parsedSeason
+  }
+
+  const markerSeason = titleSeasonMarker(row)
+
+  if (markerSeason) {
+    return markerSeason
+  }
+
+  const library = getDb()
+    .query<LibraryEntryRow>(
+      "SELECT slug, title, primary_anime_id FROM library_entries WHERE slug = ?"
+    )
+    .get(row.library_slug)
+
+  if (!library || row.id === library.primary_anime_id) {
+    return input.parsedSeason
+  }
+
+  const seriesVariants = listCachedAnimeVariants(row.library_slug).filter(
+    (variant) => seriesFormats.has(variant.format ?? "")
+  )
+  const variantIndex = seriesVariants.findIndex((variant) => variant.id === row.id)
+
+  return variantIndex >= 0 ? variantIndex + 1 : input.parsedSeason
+}
+
 export function upsertEpisode(input: {
   animeId: number
   seasonNr: number
@@ -856,7 +895,10 @@ export function upsertEpisode(input: {
   durationSeconds?: number | null
 }) {
   const now = nowIso()
-  const title = input.title ?? fallbackEpisodeTitle(input.epNr)
+  const title =
+    input.title ??
+    getCachedStreamingEpisodeTitle(input.animeId, input.epNr) ??
+    fallbackEpisodeTitle(input.epNr)
 
   console.log(
     `[Debug] [Library] Upserting episode row - Anime id ${input.animeId}, Season ${input.seasonNr}, Episode ${input.epNr}, Path ${input.filePath}`
@@ -1250,6 +1292,23 @@ export function deleteEpisodeByPath(filePath: string) {
 
   pruneAnimeIfEmpty(episode.animeId)
   return episode
+}
+
+export function deleteEpisodeRecord(input: {
+  animeId: number
+  seasonNr: number
+  epNr: number
+}) {
+  getDb()
+    .query(
+      "DELETE FROM episode_progress WHERE anime_id = ? AND season_nr = ? AND ep_nr = ?"
+    )
+    .run(input.animeId, input.seasonNr, input.epNr)
+  getDb()
+    .query(
+      "DELETE FROM episodes WHERE anime_id = ? AND season_nr = ? AND ep_nr = ?"
+    )
+    .run(input.animeId, input.seasonNr, input.epNr)
 }
 
 export function pruneAnimeIfEmpty(animeId: number) {

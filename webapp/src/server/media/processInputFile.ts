@@ -10,7 +10,9 @@ import {
 import path from "node:path"
 
 import {
+  deleteEpisodeRecord,
   getStoredEpisode,
+  resolveLibrarySeasonNumberForAnime,
   upsertAnime,
   upsertEpisode,
 } from "@/server/db/library"
@@ -34,6 +36,7 @@ import {
   isMediaFile,
   parseDurationSeconds,
   pathExists,
+  thumbnailPathForEpisode,
   type ProbeResult,
   waitForStableFile,
 } from "@/server/media/mediaFiles"
@@ -49,6 +52,7 @@ const hardwareMaxHevcBytesPerMinute = 20 * 1024 * 1024
 const cpuMaxHevcBytesPerMinute = 30 * 1024 * 1024
 const targetBytesPerMinute = 17 * 1024 * 1024
 const targetAudioKbps = 256
+const failedImportsFolderName = "_Failed Imports"
 
 export type ProcessInputFileResult = {
   ok: boolean
@@ -72,6 +76,19 @@ function debugError(jobId: string, message: string, error: unknown) {
 
 function isTranscodeWaitCancellation(error: unknown) {
   return errorMessage(error) === "Transcode request was cancelled"
+}
+
+function isInvalidMediaProbeError(error: unknown) {
+  const message = errorMessage(error).toLowerCase()
+
+  return (
+    message.includes("invalid data found when processing input") ||
+    message.includes("ebml header parsing failed") ||
+    message.includes("invalid as first byte of an ebml number") ||
+    message.includes("moov atom not found") ||
+    message.includes("could not find codec parameters") ||
+    message.includes("end of file")
+  )
 }
 
 function hasHevcVideo(probe: ProbeResult) {
@@ -256,6 +273,27 @@ async function replaceFile(
   }
 }
 
+async function uniqueDestinationPath(destination: string) {
+  if (!(await pathExists(destination))) {
+    return destination
+  }
+
+  const parsed = path.parse(destination)
+
+  for (let index = 1; index < 1000; index += 1) {
+    const candidate = path.join(
+      parsed.dir,
+      `${parsed.name} (${index})${parsed.ext}`
+    )
+
+    if (!(await pathExists(candidate))) {
+      return candidate
+    }
+  }
+
+  throw new Error(`Unable to find a free failed-import destination for ${destination}`)
+}
+
 function sleep(milliseconds: number) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
@@ -264,6 +302,74 @@ function isInsideInputDirectory(inputDir: string, current: string) {
   const relative = path.relative(inputDir, current)
 
   return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative)
+}
+
+function isInsideFailedImports(inputDir: string, current: string) {
+  const relative = path.relative(inputDir, path.resolve(current))
+
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+    return false
+  }
+
+  return relative.split(path.sep).includes(failedImportsFolderName)
+}
+
+async function moveInvalidInputToFailedImports(
+  filePath: string,
+  options: { jobId: string }
+) {
+  const inputDir = path.resolve(getServerConfig().inputDir)
+  const resolvedFilePath = path.resolve(filePath)
+
+  if (isInsideFailedImports(inputDir, resolvedFilePath)) {
+    debugImport(
+      options.jobId,
+      `Invalid media is already inside failed imports - ${resolvedFilePath}`
+    )
+    return resolvedFilePath
+  }
+
+  if (!isInsideInputDirectory(inputDir, resolvedFilePath)) {
+    throw new Error(`Refusing to quarantine a file outside the input folder: ${resolvedFilePath}`)
+  }
+
+  const relativePath = path.relative(inputDir, resolvedFilePath)
+  const destination = await uniqueDestinationPath(
+    path.resolve(inputDir, failedImportsFolderName, relativePath)
+  )
+
+  console.warn(
+    `[Warn] [Media] Invalid media file moved to failed imports - ${resolvedFilePath} -> ${destination}`
+  )
+  debugImport(options.jobId, `Moving invalid media to failed imports - ${destination}`)
+  await replaceFile(resolvedFilePath, destination, { jobId: options.jobId })
+  await removeNonMediaOnlyInputParents(resolvedFilePath, { jobId: options.jobId })
+
+  return destination
+}
+
+async function probeInputFileWithRetry(filePath: string, jobId: string) {
+  let lastError: unknown
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      return (await ffprobe(filePath)) as ProbeResult
+    } catch (error) {
+      lastError = error
+
+      if (!isInvalidMediaProbeError(error) || attempt === 3) {
+        break
+      }
+
+      console.warn(
+        `[Warn] [Media] ffprobe could not read input media; retrying ${attempt}/3 - ${fileName(filePath)} - ${errorMessage(error)}`
+      )
+      debugError(jobId, `ffprobe failed on attempt ${attempt}/3`, error)
+      await sleep(2000 * attempt)
+    }
+  }
+
+  throw lastError
 }
 
 async function unlinkFileWithRetry(
@@ -504,6 +610,23 @@ export async function processInputFile(
     debugImport(jobId, "Saving AniList metadata before media processing.")
     upsertAnime(metadata)
     debugImport(jobId, "AniList metadata saved.")
+
+    const librarySeason = resolveLibrarySeasonNumberForAnime({
+      animeId: metadata.id,
+      parsedSeason: parsed.season,
+      parsedPart: parsed.part,
+    })
+
+    if (librarySeason !== parsed.season) {
+      console.log(
+        `[Info] [Media] Resolved library season - Parsed Season ${parsed.season}, Library Season ${librarySeason}, Anime id ${metadata.id}`
+      )
+      debugImport(
+        jobId,
+        `Library season resolved from parsed season ${parsed.season} to ${librarySeason}.`
+      )
+    }
+
     console.log(
       `[Info] [Media] Resolved AniList metadata - Found match ${
         metadata.title.english ??
@@ -522,7 +645,35 @@ export async function processInputFile(
     debugImport(jobId, `Input file stat read - ${inputStat.size} bytes.`)
 
     debugImport(jobId, `Running ffprobe - ${filePath}`)
-    const probe = (await ffprobe(filePath)) as ProbeResult
+    let probe: ProbeResult
+
+    try {
+      probe = await probeInputFileWithRetry(filePath, jobId)
+    } catch (error) {
+      if (!isInvalidMediaProbeError(error)) {
+        throw error
+      }
+
+      const failedPath = await moveInvalidInputToFailedImports(filePath, { jobId })
+      const message = `Invalid media file was moved to failed imports: ${failedPath}`
+
+      updateJob(jobId, {
+        status: "failed",
+        error: errorMessage(error),
+        message,
+        finishedAt: new Date().toISOString(),
+      })
+
+      debugImport(jobId, message)
+
+      return {
+        ok: true,
+        filePath: failedPath,
+        planned: false,
+        message,
+      }
+    }
+
     debugImport(jobId, `ffprobe completed - Streams ${(probe.streams ?? []).length}.`)
 
     const durationSeconds = parseDurationSeconds(probe)
@@ -556,7 +707,7 @@ export async function processInputFile(
     const extension = needsFfmpegProcessing ? ".mkv" : path.extname(filePath)
     const finalName = formatEpisodeFileName({
       title: safeMediaTitle,
-      season: parsed.season,
+      season: librarySeason,
       episode: parsed.episode,
       extension,
     })
@@ -565,7 +716,7 @@ export async function processInputFile(
       safeLibraryTitle,
       ...mediaFolderSegments({
         format: metadata.format,
-        season: parsed.season,
+        season: librarySeason,
         mediaTitle: safeMediaTitle,
       }),
       finalName
@@ -581,19 +732,70 @@ export async function processInputFile(
     debugImport(jobId, "Checking for existing episode/file conflicts.")
     const existingEpisode = getStoredEpisode(
       metadata.id,
-      parsed.season,
+      librarySeason,
       parsed.episode
     )
+    const legacySeasonEpisode =
+      librarySeason !== parsed.season
+        ? getStoredEpisode(metadata.id, parsed.season, parsed.episode)
+        : null
 
     const existingEpisodeFileExists = existingEpisode
       ? await pathExists(existingEpisode.filePath)
       : false
-    const finalPathExists = await pathExists(finalPath)
+    let finalPathExists = await pathExists(finalPath)
 
-    if (existingEpisodeFileExists) {
-      throw new Error(
-        `Episode already exists in the library: ${safeLibraryTitle} S${String(parsed.season).padStart(2, "0")}E${String(parsed.episode).padStart(2, "0")}`
+    if (existingEpisodeFileExists && existingEpisode) {
+      const existingPath = path.resolve(existingEpisode.filePath)
+      const inputPath = path.resolve(filePath)
+      const message = `Episode already exists in the library: ${safeLibraryTitle} S${String(librarySeason).padStart(2, "0")}E${String(parsed.episode).padStart(2, "0")}`
+
+      console.warn(
+        `[Warn] [Media] ${message}; cleaning duplicate input if needed - ${filePath}`
       )
+      debugImport(jobId, `${message}; existing path ${existingPath}`)
+
+      if (existingPath !== inputPath && (await pathExists(filePath))) {
+        await unlinkFileWithRetry(filePath, { jobId })
+        await removeNonMediaOnlyInputParents(filePath, { jobId })
+      }
+
+      updateJob(jobId, {
+        status: "skipped",
+        outputPath: existingPath,
+        message,
+        finishedAt: new Date().toISOString(),
+      })
+
+      return {
+        ok: true,
+        filePath: existingPath,
+        planned: false,
+        message,
+      }
+    }
+
+    if (legacySeasonEpisode && (await pathExists(legacySeasonEpisode.filePath))) {
+      console.warn(
+        `[Warn] [Media] Existing episode was stored under parsed Season ${parsed.season}; moving it to library Season ${librarySeason} - ${legacySeasonEpisode.filePath}`
+      )
+
+      if (finalPathExists) {
+        await unlinkFileWithRetry(legacySeasonEpisode.filePath, { jobId })
+      } else {
+        await replaceFile(legacySeasonEpisode.filePath, finalPath, { jobId })
+        finalPathExists = true
+      }
+
+      await rm(thumbnailPathForEpisode(legacySeasonEpisode.filePath), {
+        force: true,
+      })
+      deleteEpisodeRecord({
+        animeId: metadata.id,
+        seasonNr: parsed.season,
+        epNr: parsed.episode,
+      })
+      debugImport(jobId, "Legacy parsed-season episode record removed.")
     }
 
     const useExistingOutput = finalPathExists
@@ -734,7 +936,7 @@ export async function processInputFile(
     debugImport(jobId, "Saving episode row.")
     upsertEpisode({
       animeId: metadata.id,
-      seasonNr: parsed.season,
+      seasonNr: librarySeason,
       epNr: parsed.episode,
       filePath: finalPath,
       thumbnailPath,
@@ -742,7 +944,7 @@ export async function processInputFile(
     })
 
     console.log(
-      `[Info] [Media] Episode added to database - Anime id ${metadata.id}, Season ${parsed.season}, Episode ${parsed.episode}`
+      `[Info] [Media] Episode added to database - Anime id ${metadata.id}, Season ${librarySeason}, Episode ${parsed.episode}`
     )
     debugImport(jobId, "Episode row saved.")
 
