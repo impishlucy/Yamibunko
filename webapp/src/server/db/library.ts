@@ -1429,6 +1429,115 @@ function rowTitles(row: Pick<AnimeRow, "title_user_preferred" | "title_english" 
   ]
 }
 
+function getOrdinalPartLabel(part: number) {
+  const ordinals: Record<number, string> = {
+    1: "1st",
+    2: "2nd",
+    3: "3rd",
+  }
+
+  return ordinals[part] ?? `${part}th`
+}
+
+function getWordPartLabel(part: number) {
+  const labels: Record<number, string> = {
+    1: "first",
+    2: "second",
+    3: "third",
+    4: "fourth",
+    5: "fifth",
+    6: "sixth",
+    7: "seventh",
+    8: "eighth",
+    9: "ninth",
+    10: "tenth",
+  }
+
+  return labels[part] ?? null
+}
+
+function getRomanPartLabel(part: number) {
+  const labels: Record<number, string> = {
+    1: "i",
+    2: "ii",
+    3: "iii",
+    4: "iv",
+    5: "v",
+    6: "vi",
+    7: "vii",
+    8: "viii",
+    9: "ix",
+    10: "x",
+  }
+
+  return labels[part] ?? null
+}
+
+function hasPartMarker(value: string, part: number) {
+  const normalized = value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+  const ordinalPart = getOrdinalPartLabel(part).toLowerCase()
+  const wordPart = getWordPartLabel(part)
+  const romanPart = getRomanPartLabel(part)
+  const markers = [
+    `part ${part}`,
+    `pt ${part}`,
+    `cour ${part}`,
+    `p ${part}`,
+    `c ${part}`,
+    `${ordinalPart} cour`,
+  ]
+
+  if (wordPart) {
+    markers.push(`${wordPart} cour`, `${wordPart} half`)
+  }
+
+  if (romanPart) {
+    markers.push(`part ${romanPart}`, `pt ${romanPart}`, `p ${romanPart}`)
+  }
+
+  return markers.some((marker) => normalized.includes(marker))
+}
+
+function rowHasPartMarker(
+  row: Pick<AnimeRow, "title_user_preferred" | "title_english" | "title_romaji" | "title_native">,
+  part?: number
+) {
+  if (!part || part <= 1) {
+    return true
+  }
+
+  return rowTitles(row)
+    .filter((title): title is string => Boolean(title))
+    .some((title) => hasPartMarker(title, part))
+}
+
+function rowHasSeasonMarker(
+  row: Pick<AnimeRow, "title_user_preferred" | "title_english" | "title_romaji" | "title_native">,
+  season?: number
+) {
+  if (!season || season <= 1) {
+    return true
+  }
+
+  const markers = [`season ${season}`, `s${season}`]
+
+  return rowTitles(row)
+    .filter((title): title is string => Boolean(title))
+    .some((title) => {
+      const normalized = title
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+
+      return markers.some((marker) => normalized.includes(marker))
+    })
+}
+
 function toMetadataFromRow(
   row: AnimeRow,
   visited = new Set<number>()
@@ -1548,7 +1657,7 @@ function findLibraryRootMatch(title: string) {
   return candidates.find((candidate) => candidate.score <= 2)?.row ?? null
 }
 
-function findSeasonVariant(librarySlug: string, season?: number) {
+function findSeasonVariant(librarySlug: string, season?: number, part?: number) {
   if (!season || season <= 1) {
     return null
   }
@@ -1557,20 +1666,32 @@ function findSeasonVariant(librarySlug: string, season?: number) {
     seriesFormats.has(row.format ?? "")
   )
 
+  if (part && part > 1) {
+    return (
+      seriesVariants.find(
+        (row) => rowHasPartMarker(row, part) && rowHasSeasonMarker(row, season)
+      ) ?? null
+    )
+  }
+
   return seriesVariants[season - 1] ?? null
 }
 
-export function findCachedAnimeMetadataForFile(title: string, season?: number) {
+export function findCachedAnimeMetadataForFile(
+  title: string,
+  season?: number,
+  part?: number
+) {
   const root = findLibraryRootMatch(title)
 
   if (root?.library_slug) {
-    const seasonVariant = findSeasonVariant(root.library_slug, season)
+    const seasonVariant = findSeasonVariant(root.library_slug, season, part)
 
     if (seasonVariant) {
       return toMetadataFromRow(seasonVariant)
     }
 
-    if (season && season > 1) {
+    if ((season && season > 1) || (part && part > 1)) {
       return null
     }
 
@@ -1578,6 +1699,7 @@ export function findCachedAnimeMetadataForFile(title: string, season?: number) {
   }
 
   const directMatch = listCachedAnimeCandidates()
+    .filter((row) => rowHasPartMarker(row, part))
     .map((row) => ({
       row,
       score: scoreTitleCandidate(title, rowTitles(row)),

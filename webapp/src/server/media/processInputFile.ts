@@ -274,14 +274,19 @@ export async function processInputFile(
     }
 
     console.log(
-      `[Info] [Media] Recognized input file - Title: ${parsed.title}, Season: ${parsed.season}, Episode: ${parsed.episode}`
+      `[Info] [Media] Recognized input file - Title: ${parsed.title}, Season: ${parsed.season}${parsed.part ? `, Part: ${parsed.part}` : ""}, Episode: ${parsed.episode}`
     )
 
     updateJob(jobId, {
       message: "Fetching AniList metadata.",
     })
 
-    const metadata = await findAnimeMetadata(parsed.title, parsed.season, parsed.episode)
+    const metadata = await findAnimeMetadata(
+      parsed.title,
+      parsed.season,
+      parsed.episode,
+      parsed.part
+    )
 
     if (!metadata) {
       throw new Error(`AniList could not match "${parsed.title}"`)

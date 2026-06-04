@@ -202,7 +202,66 @@ function toMetadata(media: AniListMediaNode, fullPayload = false): AnimeMetadata
   }
 }
 
-function getSearchCandidates(title: string, season?: number) {
+function getOrdinalPartLabel(part: number) {
+  const ordinals: Record<number, string> = {
+    1: "1st",
+    2: "2nd",
+    3: "3rd",
+  }
+
+  return ordinals[part] ?? `${part}th`
+}
+
+function getWordPartLabel(part: number) {
+  const labels: Record<number, string> = {
+    1: "First",
+    2: "Second",
+    3: "Third",
+    4: "Fourth",
+    5: "Fifth",
+    6: "Sixth",
+    7: "Seventh",
+    8: "Eighth",
+    9: "Ninth",
+    10: "Tenth",
+  }
+
+  return labels[part] ?? null
+}
+
+function getRomanPartLabel(part: number) {
+  const labels: Record<number, string> = {
+    1: "I",
+    2: "II",
+    3: "III",
+    4: "IV",
+    5: "V",
+    6: "VI",
+    7: "VII",
+    8: "VIII",
+    9: "IX",
+    10: "X",
+  }
+
+  return labels[part] ?? null
+}
+
+function uniqueCandidates(candidates: string[]) {
+  const seen = new Set<string>()
+
+  return candidates.filter((candidate) => {
+    const normalized = candidate.trim().replace(/\s+/g, " ")
+
+    if (!normalized || seen.has(normalized.toLowerCase())) {
+      return false
+    }
+
+    seen.add(normalized.toLowerCase())
+    return true
+  })
+}
+
+function getSearchCandidates(title: string, season?: number, part?: number) {
   const normalizedTitle = title.trim().replace(/\s+/g, " ")
 
   if (!normalizedTitle) {
@@ -213,11 +272,45 @@ function getSearchCandidates(title: string, season?: number) {
     return [normalizedTitle]
   }
 
-  return [
+  const seasonCandidates = [
     `${normalizedTitle} Season ${season}`,
     `${normalizedTitle} S${season}`,
     normalizedTitle,
   ]
+
+  if (!part || part <= 1) {
+    return seasonCandidates
+  }
+
+  const ordinalPart = getOrdinalPartLabel(part)
+  const wordPart = getWordPartLabel(part)
+  const romanPart = getRomanPartLabel(part)
+  const partCandidates = [
+    `${normalizedTitle} Season ${season} Part ${part}`,
+    `${normalizedTitle} Season ${season} Cour ${part}`,
+    `${normalizedTitle} Season ${season} ${ordinalPart} Cour`,
+    `${normalizedTitle} S${season} Part ${part}`,
+    `${normalizedTitle} S${season} Cour ${part}`,
+    `${normalizedTitle} S${season} ${ordinalPart} Cour`,
+  ]
+
+  if (romanPart) {
+    partCandidates.push(
+      `${normalizedTitle} Season ${season} Part ${romanPart}`,
+      `${normalizedTitle} S${season} Part ${romanPart}`
+    )
+  }
+
+  if (wordPart) {
+    partCandidates.push(
+      `${normalizedTitle} Season ${season} ${wordPart} Cour`,
+      `${normalizedTitle} Season ${season} ${wordPart} Half`,
+      `${normalizedTitle} S${season} ${wordPart} Cour`,
+      `${normalizedTitle} S${season} ${wordPart} Half`
+    )
+  }
+
+  return uniqueCandidates([...partCandidates, ...seasonCandidates])
 }
 
 function pickRootCandidate(metadata: AnimeMetadataInput) {
@@ -357,7 +450,53 @@ function tokenOverlap(search: string, title: string) {
   return matches.length / searchTokens.length
 }
 
-function scoreMediaCandidate(media: AniListMediaNode, search: string) {
+function hasPartMarker(value: string, part: number) {
+  const normalized = normalizeComparableTitle(value)
+  const ordinalPart = getOrdinalPartLabel(part)
+  const wordPart = getWordPartLabel(part)
+  const romanPart = getRomanPartLabel(part)
+  const markers = [
+    `part ${part}`,
+    `cour ${part}`,
+    `${ordinalPart} cour`,
+    `pt ${part}`,
+    `p ${part}`,
+    `c ${part}`,
+  ]
+
+  if (wordPart) {
+    markers.push(`${wordPart} cour`, `${wordPart} half`)
+  }
+
+  if (romanPart) {
+    markers.push(`part ${romanPart}`, `pt ${romanPart}`, `p ${romanPart}`)
+  }
+
+  return markers.some((marker) =>
+    normalized.includes(normalizeComparableTitle(marker))
+  )
+}
+
+function mediaHasPartMarker(media: AniListMediaNode, part?: number) {
+  if (!part || part <= 1) {
+    return true
+  }
+
+  return [
+    media.title?.userPreferred,
+    media.title?.english,
+    media.title?.romaji,
+    media.title?.native,
+  ]
+    .filter((title): title is string => Boolean(title))
+    .some((title) => hasPartMarker(title, part))
+}
+
+function scoreMediaCandidate(
+  media: AniListMediaNode,
+  search: string,
+  part?: number
+) {
   const normalizedSearch = normalizeComparableTitle(search)
   const titles = [
     media.title?.userPreferred,
@@ -368,20 +507,28 @@ function scoreMediaCandidate(media: AniListMediaNode, search: string) {
     .filter((title): title is string => Boolean(title))
     .map(normalizeComparableTitle)
 
-  if (titles.some((title) => title === normalizedSearch)) {
-    return 0
+  const score = (() => {
+    if (titles.some((title) => title === normalizedSearch)) {
+      return 0
+    }
+
+    if (titles.some((title) => title.includes(normalizedSearch))) {
+      return 1
+    }
+
+    const bestOverlap = Math.max(
+      ...titles.map((title) => tokenOverlap(normalizedSearch, title)),
+      0
+    )
+
+    return bestOverlap >= 0.5 ? 2 : 3
+  })()
+
+  if (part && part > 1 && !mediaHasPartMarker(media, part)) {
+    return 3
   }
 
-  if (titles.some((title) => title.includes(normalizedSearch))) {
-    return 1
-  }
-
-  const bestOverlap = Math.max(
-    ...titles.map((title) => tokenOverlap(normalizedSearch, title)),
-    0
-  )
-
-  return bestOverlap >= 0.5 ? 2 : 3
+  return score
 }
 
 function needsFullCachedRefresh(metadata: AnimeMetadataInput, episode?: number) {
@@ -401,9 +548,10 @@ function needsFullCachedRefresh(metadata: AnimeMetadataInput, episode?: number) 
 export async function findAnimeMetadata(
   title: string,
   season?: number,
-  episode?: number
+  episode?: number,
+  part?: number
 ) {
-  const cached = findCachedAnimeMetadataForFile(title, season)
+  const cached = findCachedAnimeMetadataForFile(title, season, part)
 
   if (cached) {
     if (needsFullCachedRefresh(cached, episode)) {
@@ -425,7 +573,7 @@ export async function findAnimeMetadata(
     return cached
   }
 
-  for (const candidate of getSearchCandidates(title, season)) {
+  for (const candidate of getSearchCandidates(title, season, part)) {
     console.log(`[Info] [Anilist] Searching anime metadata - ${candidate}`)
 
     const result = await queueAniListOperation(() =>
@@ -437,7 +585,7 @@ export async function findAnimeMetadata(
       .filter((item): item is AniListMediaNode => Boolean(item))
       .map((item) => ({
         item,
-        score: scoreMediaCandidate(item, candidate),
+        score: scoreMediaCandidate(item, candidate, part),
       }))
       .sort((left, right) => left.score - right.score)
     const match = rankedMedia.find((item) => item.score <= 2)

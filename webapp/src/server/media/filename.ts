@@ -10,6 +10,7 @@ export type ParsedAnimeFileName = {
   title: string
   season: number
   episode: number
+  part?: number
 }
 
 function normalizeTitle(value: string) {
@@ -28,6 +29,89 @@ function cleanTitleSegment(value: string) {
 
 function toPositiveInteger(value: string | undefined) {
   return parsePositiveInt(value)
+}
+
+const ordinalPartPattern =
+  /^(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|1st|2nd|3rd|[4-9]th|10th)$/i
+const romanPartPattern = /^(?:i|ii|iii|iv|v|vi|vii|viii|ix|x)$/i
+const partNumberPattern = String.raw`(?:\d{1,2}|[ivx]+|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|1st|2nd|3rd|[4-9]th|10th)`
+const partLabelPattern = String.raw`(?:part|pt\.?|cour|p|c)`
+const separatorPattern = String.raw`(?:\s*-\s*|\s+)`
+const optionalSeparatorPattern = String.raw`(?:\s*-\s*|\s*)`
+const seasonPartEpisodePatterns = [
+  new RegExp(
+    String.raw`^(.+?)${separatorPattern}S(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${optionalSeparatorPattern}E?\s*(\d{1,4})\b`,
+    "i"
+  ),
+  new RegExp(
+    String.raw`^(.+?)${separatorPattern}S(\d{1,2})${optionalSeparatorPattern}(${partNumberPattern})\s*(?:cour|half)${optionalSeparatorPattern}E?\s*(\d{1,4})\b`,
+    "i"
+  ),
+  new RegExp(
+    String.raw`^(.+?)${separatorPattern}Season\s*(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${optionalSeparatorPattern}E?\s*(\d{1,4})\b`,
+    "i"
+  ),
+  new RegExp(
+    String.raw`^(.+?)${separatorPattern}Season\s*(\d{1,2})${optionalSeparatorPattern}(${partNumberPattern})\s*(?:cour|half)${optionalSeparatorPattern}E?\s*(\d{1,4})\b`,
+    "i"
+  ),
+]
+
+function parseRomanNumeral(value: string) {
+  const romanValues: Record<string, number> = {
+    i: 1,
+    ii: 2,
+    iii: 3,
+    iv: 4,
+    v: 5,
+    vi: 6,
+    vii: 7,
+    viii: 8,
+    ix: 9,
+    x: 10,
+  }
+
+  return romanValues[value.toLowerCase()] ?? null
+}
+
+function parseWordNumber(value: string) {
+  const wordValues: Record<string, number> = {
+    first: 1,
+    second: 2,
+    third: 3,
+    fourth: 4,
+    fifth: 5,
+    sixth: 6,
+    seventh: 7,
+    eighth: 8,
+    ninth: 9,
+    tenth: 10,
+  }
+
+  return wordValues[value.toLowerCase()] ?? null
+}
+
+function parsePartNumber(value: string | undefined) {
+  if (!value) {
+    return null
+  }
+
+  const normalized = value.trim()
+  const numeric = parsePositiveInt(normalized.replace(/(?:st|nd|rd|th)$/i, ""))
+
+  if (numeric) {
+    return numeric
+  }
+
+  if (ordinalPartPattern.test(normalized)) {
+    return parseWordNumber(normalized)
+  }
+
+  if (romanPartPattern.test(normalized)) {
+    return parseRomanNumeral(normalized)
+  }
+
+  return null
 }
 
 export function parseAnimeFileName(
@@ -53,6 +137,27 @@ export function parseAnimeFileName(
         title: `${titlePrefix} ${titleSuffix}`,
         season: 1,
         episode,
+      }
+    }
+  }
+
+  for (const pattern of seasonPartEpisodePatterns) {
+    const seasonPartEpisode = pattern.exec(normalized)
+
+    if (!seasonPartEpisode) {
+      continue
+    }
+
+    const season = toPositiveInteger(seasonPartEpisode[2])
+    const part = parsePartNumber(seasonPartEpisode[3])
+    const episode = toPositiveInteger(seasonPartEpisode[4])
+
+    if (season && part && episode) {
+      return {
+        title: normalizeTitle(seasonPartEpisode[1] ?? ""),
+        season,
+        episode,
+        part,
       }
     }
   }

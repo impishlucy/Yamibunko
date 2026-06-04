@@ -26,6 +26,7 @@ type ParsedLibraryPath = {
   animeTitle: string
   season: number
   episode: number
+  part?: number
 }
 
 function parseSeasonFolder(value: string) {
@@ -104,6 +105,7 @@ function parseLibraryPath(filePath: string): ParsedLibraryPath | null {
     animeTitle,
     season,
     episode,
+    part: parsedFileName?.part,
   }
 }
 
@@ -154,10 +156,15 @@ export async function syncLibraryFile(filePath: string) {
   }
 
   console.log(
-    `[Info] [Media] Recognized library file - Title: ${parsed.animeTitle}, Season: ${parsed.season}, Episode: ${parsed.episode}`
+    `[Info] [Media] Recognized library file - Title: ${parsed.animeTitle}, Season: ${parsed.season}${parsed.part ? `, Part: ${parsed.part}` : ""}, Episode: ${parsed.episode}`
   )
 
-  const metadata = await findAnimeMetadata(parsed.animeTitle, parsed.season, parsed.episode)
+  const metadata = await findAnimeMetadata(
+    parsed.animeTitle,
+    parsed.season,
+    parsed.episode,
+    parsed.part
+  )
 
   if (!metadata) {
     throw new Error(`AniList could not match "${parsed.animeTitle}"`)
