@@ -440,8 +440,8 @@ public class ServerManager
 
         if (!process.Start())
         {
-            throw new InvalidOperationException($"Failed to start command: {fileName}");
             ShowLogsWindow();
+            throw new InvalidOperationException($"Failed to start command: {fileName}");
         }
 
         AssignProcessToServerJob(process);
@@ -453,8 +453,8 @@ public class ServerManager
         var result = new CommandResult(process.ExitCode, output.ToString(), error.ToString());
         if (options.ThrowOnError && result.ExitCode != 0)
         {
-            throw new InvalidOperationException($"Command failed ({fileName}) with exit code {result.ExitCode}: {result.Error.Trim()}");
             ShowLogsWindow();
+            throw new InvalidOperationException($"Command failed ({fileName}) with exit code {result.ExitCode}: {result.Error.Trim()}");
         }
 
         return result;
@@ -471,8 +471,8 @@ public class ServerManager
 
         if (!process.Start())
         {
-            throw new InvalidOperationException($"Failed to start command: {fileName}");
             ShowLogsWindow();
+            throw new InvalidOperationException($"Failed to start command: {fileName}");
         }
 
         AssignProcessToServerJob(process);
@@ -502,7 +502,9 @@ public class ServerManager
                     CreateNoWindow = true,
                     UseShellExecute = false
                 });
+#pragma warning disable CS8602 // Dereference of a possibly null reference.
                 await taskKill?.WaitForExitAsync();
+#pragma warning restore CS8602 // Dereference of a possibly null reference.
             }
             else
             {
@@ -513,7 +515,9 @@ public class ServerManager
                     CreateNoWindow = true,
                     UseShellExecute = false
                 });
+#pragma warning disable CS8602 // Dereference of a possibly null reference.
                 await killProcess?.WaitForExitAsync();
+#pragma warning restore CS8602 // Dereference of a possibly null reference.
             }
 
             if (process.WaitForExit(30000))
