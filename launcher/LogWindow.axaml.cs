@@ -26,6 +26,8 @@ public partial class LogWindow : Window
 
         listBox.ItemsSource = logs;
 
+        listBox.ScrollIntoView(logs[logs.Count - 1]);
+
         logs.CollectionChanged += (s, e) =>
         {
             if (logs.Count > 0)
