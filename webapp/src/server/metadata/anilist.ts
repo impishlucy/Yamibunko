@@ -381,39 +381,75 @@ function getSearchCandidates(title: string, season?: number, part?: number) {
   return uniqueCandidates(partCandidates)
 }
 
+function findRelatedSeries(
+  relations: NonNullable<AnimeMetadataInput["relations"]>,
+  relationTypes: string[]
+) {
+  return relations.find(
+    (relation) =>
+      relationTypes.includes(relation.relationType) &&
+      seriesFormats.has(relation.media.format ?? "")
+  )
+}
+
+function findRelatedLibraryMedia(
+  relations: NonNullable<AnimeMetadataInput["relations"]>,
+  relationTypes: string[]
+) {
+  return relations.find(
+    (relation) =>
+      relationTypes.includes(relation.relationType) &&
+      (seriesFormats.has(relation.media.format ?? "") ||
+        sideStoryFormats.has(relation.media.format ?? ""))
+  )
+}
+
 function pickRootCandidate(metadata: AnimeMetadataInput) {
   const relations = metadata.relations ?? []
   const format = metadata.format ?? ""
-  const parent = relations.find((relation) => relation.relationType === "PARENT")
+  const parent = findRelatedLibraryMedia(relations, ["PARENT"])
 
   if (parent) {
     return parent
   }
 
-  const prequel = relations.find(
-    (relation) =>
-      relation.relationType === "PREQUEL" &&
-      seriesFormats.has(relation.media.format ?? "")
-  )
+  const seriesPrequel = findRelatedSeries(relations, ["PREQUEL"])
 
-  if (prequel) {
-    return prequel
-  }
-
-  const anyPrequel = relations.find(
-    (relation) => relation.relationType === "PREQUEL"
-  )
-
-  if (anyPrequel) {
-    return anyPrequel
+  if (seriesPrequel) {
+    return seriesPrequel
   }
 
   if (sideStoryFormats.has(format)) {
-    return (
-      relations.find((relation) =>
-        seriesFormats.has(relation.media.format ?? "")
-      ) ?? null
-    )
+    const rootRelation = findRelatedSeries(relations, [
+      "PARENT",
+      "PREQUEL",
+      "SEQUEL",
+      "SIDE_STORY",
+      "SUMMARY",
+      "SPIN_OFF",
+      "COMPILATION",
+      "CONTAINS",
+    ])
+
+    if (rootRelation) {
+      return rootRelation
+    }
+  }
+
+  const seriesSideRelation = findRelatedSeries(relations, [
+    "SIDE_STORY",
+    "SUMMARY",
+    "SPIN_OFF",
+  ])
+
+  if (seriesSideRelation) {
+    return seriesSideRelation
+  }
+
+  const libraryPrequel = findRelatedLibraryMedia(relations, ["PREQUEL"])
+
+  if (libraryPrequel) {
+    return libraryPrequel
   }
 
   return null

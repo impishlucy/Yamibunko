@@ -83,6 +83,21 @@ type CachedAnimeCandidateRow = AnimeRow & {
 }
 
 const seriesFormats = new Set(["TV", "TV_SHORT", "ONA"])
+const libraryRelationTypes = new Set([
+  "LIBRARY_ROOT",
+  "PARENT",
+  "PREQUEL",
+  "SEQUEL",
+  "SIDE_STORY",
+  "SUMMARY",
+  "SPIN_OFF",
+  "COMPILATION",
+  "CONTAINS",
+])
+
+function isLibraryRelationType(relationType: string | null | undefined) {
+  return Boolean(relationType && libraryRelationTypes.has(relationType))
+}
 
 function animeTitle(metadata: Pick<AnimeMetadataInput, "id" | "title">) {
   const title =
@@ -732,6 +747,52 @@ function normalizeRelatedMetadata(
   }
 }
 
+function stripLibraryInfo(media: AnimeMetadataInput): AnimeMetadataInput {
+  return {
+    ...media,
+    library: undefined,
+  }
+}
+
+function unlinkExternalRelationsFromLibrary(input: {
+  librarySlug: string
+  primaryAnimeId: number
+  selectedAnimeId: number
+  relations: NonNullable<AnimeMetadataInput["relations"]>
+}) {
+  const externalRelationIds = input.relations
+    .filter((relation) => !isLibraryRelationType(relation.relationType))
+    .map((relation) => relation.media.id)
+    .filter(
+      (animeId) =>
+        animeId !== input.primaryAnimeId && animeId !== input.selectedAnimeId
+    )
+
+  if (externalRelationIds.length === 0) {
+    return
+  }
+
+  const placeholders = externalRelationIds.map(() => "?").join(", ")
+  const result = getDb()
+    .query(
+      `
+      UPDATE anime
+      SET library_slug = NULL,
+          relation_kind = NULL,
+          updated_at = ?
+      WHERE library_slug = ?
+        AND id IN (${placeholders})
+    `
+    )
+    .run(nowIso(), input.librarySlug, ...externalRelationIds)
+
+  if (result.changes > 0) {
+    console.warn(
+      `[Warn] [Library] Detached ${result.changes} external AniList relation(s) from library ${input.librarySlug}`
+    )
+  }
+}
+
 export function upsertAnime(metadata: AnimeMetadataInput) {
   const library = requireLibrary(metadata)
   const relations = metadata.relations ?? []
@@ -768,13 +829,18 @@ export function upsertAnime(metadata: AnimeMetadataInput) {
 
   for (const relation of relations) {
     upsertAnimeBase(
-      normalizeRelatedMetadata(
-        relation.media,
-        normalizedLibrary,
-        relation.relationType
-      )
+      relation.media.id === normalizedLibrary.primaryAnimeId
+        ? normalizeRelatedMetadata(relation.media, normalizedLibrary, "self")
+        : stripLibraryInfo(relation.media)
     )
   }
+
+  unlinkExternalRelationsFromLibrary({
+    librarySlug,
+    primaryAnimeId: normalizedLibrary.primaryAnimeId,
+    selectedAnimeId: metadata.id,
+    relations,
+  })
 
   console.log(
     `[Debug] [Library] Related anime rows upserted - Count ${relations.length}`
@@ -973,30 +1039,37 @@ export function listAnime(): AnimeSummary[] {
         root.anilist_raw_json,
         root.anilist_synced_at,
         root.streaming_episodes_synced_at,
-        COUNT(e.ep_nr) AS local_episode_count,
-        COUNT(DISTINCT a.id) AS media_count
+        0 AS local_episode_count,
+        0 AS media_count
       FROM library_entries le
-      INNER JOIN anime a ON a.library_slug = le.slug
-      INNER JOIN episodes e ON e.anime_id = a.id
       INNER JOIN anime root ON root.id = le.primary_anime_id
-      GROUP BY le.slug
-      HAVING local_episode_count > 0
       ORDER BY le.title ASC
     `
     )
     .all()
     .map((row) => {
+      const variants = listAnimeVariants(row.slug)
+      const localEpisodeCount = variants.reduce(
+        (total, variant) => total + variant.episodeCount,
+        0
+      )
+
+      if (localEpisodeCount <= 0) {
+        return null
+      }
+
       return {
         id: row.primary_anime_id,
         slug: row.slug,
         title: row.library_title,
         coverImage: row.cover_image ?? undefined,
         bannerImage: row.banner_image ?? undefined,
-        episodeCount: row.local_episode_count,
-        mediaCount: row.media_count,
+        episodeCount: localEpisodeCount,
+        mediaCount: variants.length,
         year: row.season_year ?? undefined,
       }
     })
+    .filter((row): row is AnimeSummary => Boolean(row))
 }
 
 function toAnimeVariant(row: AnimeVariantRow): AnimeVariant {
@@ -1008,6 +1081,46 @@ function toAnimeVariant(row: AnimeVariantRow): AnimeVariant {
     episodeCount: row.local_episode_count,
     seasonNumber: row.first_season_nr ?? undefined,
   }
+}
+
+function isLibraryMemberAnime(librarySlug: string, animeId: number) {
+  const library = getDb()
+    .query<LibraryEntryRow>(
+      "SELECT slug, title, primary_anime_id FROM library_entries WHERE slug = ?"
+    )
+    .get(librarySlug)
+
+  if (!library) {
+    return false
+  }
+
+  if (animeId === library.primary_anime_id) {
+    return true
+  }
+
+  const relationTypes = [...libraryRelationTypes]
+  const placeholders = relationTypes.map(() => "?").join(", ")
+  const relation = getDb()
+    .query<{ count: number }>(
+      `
+      SELECT COUNT(*) AS count
+      FROM anime_relations
+      WHERE (
+          (anime_id = ? AND related_anime_id = ?)
+          OR (anime_id = ? AND related_anime_id = ?)
+        )
+        AND relation_type IN (${placeholders})
+    `
+    )
+    .get(
+      animeId,
+      library.primary_anime_id,
+      library.primary_anime_id,
+      animeId,
+      ...relationTypes
+    )
+
+  return (relation?.count ?? 0) > 0
 }
 
 function listAnimeVariants(librarySlug: string) {
@@ -1038,6 +1151,7 @@ function listAnimeVariants(librarySlug: string) {
     `
     )
     .all(librarySlug)
+    .filter((row) => isLibraryMemberAnime(librarySlug, row.id))
     .map(toAnimeVariant)
 }
 
@@ -1063,6 +1177,7 @@ function listCachedAnimeVariants(librarySlug: string) {
     `
     )
     .all(librarySlug)
+    .filter((row) => isLibraryMemberAnime(librarySlug, row.id))
 }
 
 export function getLibraryEntry(
@@ -1787,7 +1902,12 @@ export function findCachedAnimeMetadataForFile(
   }
 
   const directMatch = listCachedAnimeCandidates()
-    .filter((row) => rowHasPartMarker(row, part))
+    .filter(
+      (row) =>
+        row.library_slug &&
+        isLibraryMemberAnime(row.library_slug, row.id) &&
+        rowHasPartMarker(row, part)
+    )
     .map((row) => ({
       row,
       score: scoreTitleCandidate(title, rowTitles(row)),
