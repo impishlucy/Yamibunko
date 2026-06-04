@@ -7,7 +7,10 @@ import { beginStreamServerShutdown } from "@/server/bandwidth/streamBandwidth"
 import { listEpisodeFilePaths } from "@/server/db/library"
 import { getServerConfigResult } from "@/server/config"
 import { isMediaFile, pathExists } from "@/server/media/mediaFiles"
-import { processInputFile } from "@/server/media/processInputFile"
+import {
+  isInputImportOutputActive,
+  processInputFile,
+} from "@/server/media/processInputFile"
 import {
   removeLibraryFile,
   syncLibraryFile,
@@ -52,6 +55,11 @@ function formatWorkResultEpisode(result: WorkResultEpisode | null) {
 }
 
 const scanIntervalMs = 5 * 60 * 1000
+const maxActiveWorkByKind: Record<WorkKind, number> = {
+  input: 2,
+  "library-sync": 2,
+  "library-delete": 1,
+}
 
 function msUntilNextDailyAniListSync() {
   const now = new Date()
@@ -135,6 +143,11 @@ export function startWorkers() {
   const queuedWork = new Set<string>()
   const pendingWorkStarts: QueuedWorkStart[] = []
   const activeWork = new Set<Promise<void>>()
+  const activeWorkByKind: Record<WorkKind, number> = {
+    input: 0,
+    "library-sync": 0,
+    "library-delete": 0,
+  }
   let shuttingDown = false
   let scanning = false
   let dailyAniListTimer: NodeJS.Timeout | undefined
@@ -202,6 +215,38 @@ export function startWorkers() {
     })
   }
 
+  function canStartWork(kind: WorkKind) {
+    return activeWorkByKind[kind] < maxActiveWorkByKind[kind]
+  }
+
+  function takeNextStartableWork() {
+    for (let index = 0; index < pendingWorkStarts.length; index += 1) {
+      const item = pendingWorkStarts[index]
+
+      if (!item) {
+        continue
+      }
+
+      if (!queuedWork.has(item.key)) {
+        pendingWorkStarts.splice(index, 1)
+        index -= 1
+        continue
+      }
+
+      if (canStartWork(item.kind)) {
+        return pendingWorkStarts.splice(index, 1)[0]
+      }
+    }
+
+    return undefined
+  }
+
+  function hasStartableWork() {
+    return pendingWorkStarts.some(
+      (item) => queuedWork.has(item.key) && canStartWork(item.kind)
+    )
+  }
+
   function startFileWork(kind: WorkKind, resolvedPath: string, key: string) {
     if (shuttingDown) {
       queuedWork.delete(key)
@@ -209,6 +254,13 @@ export function startWorkers() {
       return
     }
 
+    if (kind === "library-sync" && isInputImportOutputActive(resolvedPath)) {
+      queuedWork.delete(key)
+      debugWorkers(`Skipping library sync for active input output - ${resolvedPath}`)
+      return
+    }
+
+    activeWorkByKind[kind] += 1
     let deferredWorkRegistered = false
     const work = (async () => {
       try {
@@ -220,13 +272,17 @@ export function startWorkers() {
           const result = await processInputFile(resolvedPath, {
             transcodeWaitSignal: transcodeWaitShutdown.signal,
             deferVideoTranscodes: true,
-            onDeferredWork: (deferredWork) => {
+            deferAudioTranscodes: true,
+            deferDirectMoves: true,
+            onDeferredWork: (deferredWork, deferredInfo) => {
               deferredWorkRegistered = true
               const trackedDeferredWork = deferredWork.finally(() => {
                 queuedWork.delete(key)
-                debugWorkers(`Deferred input processing completed - ${key}`)
+                debugWorkers(
+                  `Deferred input processing completed - ${key} - ${deferredInfo.kind}`
+                )
               })
-              trackActiveWork(trackedDeferredWork, `${key}:deferred-video`)
+              trackActiveWork(trackedDeferredWork, `${key}:deferred-${deferredInfo.kind}`)
             },
           })
 
@@ -257,9 +313,13 @@ export function startWorkers() {
           `[Error] [Workers] Background file processing failed - startWorkers.ts - ${kind} - ${resolvedPath} - ${errorMessage(error)}`
         )
       } finally {
+        activeWorkByKind[kind] = Math.max(activeWorkByKind[kind] - 1, 0)
+
         if (!deferredWorkRegistered) {
           queuedWork.delete(key)
         }
+
+        scheduleQueuedWorkStart()
       }
     })()
 
@@ -289,13 +349,13 @@ export function startWorkers() {
         return
       }
 
-      const item = pendingWorkStarts.shift()
+      const item = takeNextStartableWork()
 
       if (item && queuedWork.has(item.key)) {
         startFileWork(item.kind, item.resolvedPath, item.key)
       }
 
-      if (pendingWorkStarts.length > 0) {
+      if (hasStartableWork()) {
         scheduleQueuedWorkStart()
       }
     })
@@ -312,6 +372,11 @@ export function startWorkers() {
 
     if (kind === "input" && isInsideNamedDirectory(config.inputDir, resolvedPath, failedImportsFolderName)) {
       debugWorkers(`Ignoring failed-import quarantine path - ${resolvedPath}`)
+      return
+    }
+
+    if (kind === "library-sync" && isInputImportOutputActive(resolvedPath)) {
+      debugWorkers(`Ignoring library sync for active input output - ${resolvedPath}`)
       return
     }
 

@@ -19,8 +19,9 @@ import {
   type ProbeResult,
   waitForStableFile,
 } from "@/server/media/mediaFiles"
+import { isInputImportOutputActive } from "@/server/media/processInputFile"
 import { findAnimeMetadata } from "@/server/metadata/anilist"
-import { fileName, parsePositiveInt } from "@/server/utils/format"
+import { errorMessage, fileName, parsePositiveInt } from "@/server/utils/format"
 import { debugLog } from "@/server/utils/debugLog"
 
 type ParsedLibraryPath = {
@@ -32,6 +33,85 @@ type ParsedLibraryPath = {
 
 function debugLibrarySync(message: string) {
   debugLog(`[Debug] [LibrarySync] ${message}`)
+}
+
+
+function sleep(milliseconds: number) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
+}
+
+function isTemporaryFileAccessError(error: unknown) {
+  const code = (error as NodeJS.ErrnoException).code
+  const message = errorMessage(error).toLowerCase()
+
+  return (
+    code === "EACCES" ||
+    code === "EPERM" ||
+    code === "EBUSY" ||
+    code === "ETXTBSY" ||
+    message.includes("permission denied") ||
+    message.includes("resource busy") ||
+    message.includes("file is locked") ||
+    message.includes("used by another process") ||
+    message.includes("process cannot access the file") ||
+    message.includes("access is denied")
+  )
+}
+
+function shouldSkipActiveInputOutput(filePath: string) {
+  if (!isInputImportOutputActive(filePath)) {
+    return false
+  }
+
+  console.log(
+    `[Info] [Media] Skipped library sync for active input output - ${fileName(filePath)}`
+  )
+  debugLibrarySync(`Skipped active input output - ${filePath}`)
+  return true
+}
+
+async function runWithTemporaryFileAccessRetry<T>(
+  label: string,
+  filePath: string,
+  work: () => Promise<T>
+) {
+  let lastError: unknown
+
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    if (shouldSkipActiveInputOutput(filePath)) {
+      return null
+    }
+
+    try {
+      return await work()
+    } catch (error) {
+      lastError = error
+
+      if (!isTemporaryFileAccessError(error)) {
+        throw error
+      }
+
+      if (attempt < 4) {
+        console.warn(
+          `[Warn] [Media] Library file is temporarily locked; retrying ${label} ${attempt}/4 - ${fileName(filePath)} - ${errorMessage(error)}`
+        )
+        debugLibrarySync(
+          `Temporary file access failure during ${label} attempt ${attempt}/4 - ${filePath} - ${errorMessage(error)}`
+        )
+        await sleep(1000 * attempt)
+        continue
+      }
+    }
+  }
+
+  console.warn(
+    `[Warn] [Media] Skipped temporarily locked library file after retries - ${fileName(filePath)} - ${errorMessage(lastError)}`
+  )
+  debugLibrarySync(
+    `Skipped temporarily locked library file after retries - ${filePath} - ${errorMessage(lastError)}`
+  )
+
+  return null
 }
 
 function parseSeasonFolder(value: string) {
@@ -138,8 +218,21 @@ export async function syncLibraryFile(filePath: string) {
     return removeLibraryFile(resolvedPath)
   }
 
+  if (shouldSkipActiveInputOutput(resolvedPath)) {
+    return null
+  }
+
   debugLibrarySync("Waiting for library file to become stable.")
-  await waitForStableFile(resolvedPath)
+  const stableFileResult = await runWithTemporaryFileAccessRetry(
+    "stability check",
+    resolvedPath,
+    () => waitForStableFile(resolvedPath)
+  )
+
+  if (stableFileResult === null) {
+    return null
+  }
+
   debugLibrarySync("Library file is stable.")
 
   debugLibrarySync("Checking for existing database episode by file path.")
@@ -192,20 +285,43 @@ export async function syncLibraryFile(filePath: string) {
     `[Info] [Media] Created anime from AniList metadata - ${parsed.animeTitle} - id ${animeId}`
   )
 
+  if (shouldSkipActiveInputOutput(resolvedPath)) {
+    return null
+  }
+
   debugLibrarySync(`Running ffprobe for library file - ${resolvedPath}`)
-  const probe = (await ffprobe(resolvedPath)) as ProbeResult
+  const probe = await runWithTemporaryFileAccessRetry(
+    "ffprobe",
+    resolvedPath,
+    async () => (await ffprobe(resolvedPath)) as ProbeResult
+  )
+
+  if (probe === null) {
+    return null
+  }
+
   debugLibrarySync(`ffprobe completed for library file - Streams ${(probe.streams ?? []).length}.`)
   const durationSeconds = parseDurationSeconds(probe)
   debugLibrarySync(`Parsed library file duration - ${durationSeconds}s.`)
+
+  if (shouldSkipActiveInputOutput(resolvedPath)) {
+    return null
+  }
 
   console.log(
     `[Info] [Media] Generating thumbnail for library file - ${fileName(resolvedPath)}`
   )
 
-  const thumbnailPath = await generateEpisodeThumbnail(
+  const thumbnailPath = await runWithTemporaryFileAccessRetry(
+    "thumbnail generation",
     resolvedPath,
-    durationSeconds
+    () => generateEpisodeThumbnail(resolvedPath, durationSeconds)
   )
+
+  if (thumbnailPath === null) {
+    return null
+  }
+
   debugLibrarySync(`Thumbnail generated for library file - ${thumbnailPath}`)
 
   debugLibrarySync("Saving library episode row.")

@@ -54,6 +54,7 @@ const cpuMaxHevcBytesPerMinute = 30 * 1024 * 1024
 const targetBytesPerMinute = 17 * 1024 * 1024
 const targetAudioKbps = 256
 const failedImportsFolderName = "_Failed Imports"
+const activeInputImportOutputs = new Map<string, number>()
 
 export type ProcessInputFileResult = {
   ok: boolean
@@ -62,10 +63,24 @@ export type ProcessInputFileResult = {
   message: string
 }
 
+export type DeferredInputWorkKind =
+  | "video-transcode"
+  | "audio-transcode"
+  | "direct-move"
+  | "existing-output"
+
+export type DeferredInputWork = {
+  kind: DeferredInputWorkKind
+  filePath: string
+  planned: boolean
+}
+
 export type ProcessInputFileOptions = {
   transcodeWaitSignal?: AbortSignal
   deferVideoTranscodes?: boolean
-  onDeferredWork?: (work: Promise<void>) => void
+  deferAudioTranscodes?: boolean
+  deferDirectMoves?: boolean
+  onDeferredWork?: (work: Promise<void>, deferredWork: DeferredInputWork) => void
 }
 
 function debugImport(jobId: string, message: string) {
@@ -75,6 +90,62 @@ function debugImport(jobId: string, message: string) {
 function debugError(jobId: string, message: string, error: unknown) {
   const details = error instanceof Error && error.stack ? error.stack : errorMessage(error)
   console.error(`[Error] [MediaImport:${jobId}] ${message} - ${details}`)
+}
+
+function normalizeActiveOutputPath(filePath: string) {
+  const resolvedPath = path.resolve(filePath)
+
+  return process.platform === "win32" ? resolvedPath.toLowerCase() : resolvedPath
+}
+
+export function isInputImportOutputActive(filePath: string) {
+  return activeInputImportOutputs.has(normalizeActiveOutputPath(filePath))
+}
+
+function markInputImportOutputActive(filePath: string) {
+  const normalizedPath = normalizeActiveOutputPath(filePath)
+  const activeCount = activeInputImportOutputs.get(normalizedPath) ?? 0
+  activeInputImportOutputs.set(normalizedPath, activeCount + 1)
+
+  return () => {
+    const nextCount = (activeInputImportOutputs.get(normalizedPath) ?? 1) - 1
+
+    if (nextCount <= 0) {
+      activeInputImportOutputs.delete(normalizedPath)
+      return
+    }
+
+    activeInputImportOutputs.set(normalizedPath, nextCount)
+  }
+}
+
+async function runWithActiveInputImportOutput<T>(
+  filePath: string,
+  work: () => Promise<T>
+) {
+  const release = markInputImportOutputActive(filePath)
+
+  try {
+    return await work()
+  } finally {
+    release()
+  }
+}
+
+function formatDeferredWorkKind(kind: DeferredInputWorkKind) {
+  if (kind === "video-transcode") {
+    return "video transcode"
+  }
+
+  if (kind === "audio-transcode") {
+    return "audio transcode"
+  }
+
+  if (kind === "existing-output") {
+    return "existing output finalization"
+  }
+
+  return "direct library move"
 }
 
 function isTranscodeWaitCancellation(error: unknown) {
@@ -951,49 +1022,7 @@ export async function processInputFile(
       debugImport(jobId, "Input parent cleanup completed.")
     }
 
-    async function runDeferredVideoTranscode() {
-      try {
-        await runFfmpegProcessing()
-        await finalizeImport({
-          planned: true,
-          completedMessage: "Media processed and added to the library.",
-        })
-      } catch (error) {
-        const message = errorMessage(error) || "Unknown media processing error"
-
-        if (
-          isTranscodeWaitCancellation(error) &&
-          options.transcodeWaitSignal?.aborted
-        ) {
-          const shutdownMessage = "Skipped queued video transcode because shutdown started."
-
-          console.warn(
-            `[Warn] [Media] Queued video transcode cancelled during shutdown - processInputFile.ts - ${filePath}`
-          )
-          debugImport(jobId, shutdownMessage)
-          updateJob(jobId, {
-            status: "skipped",
-            message: shutdownMessage,
-            finishedAt: new Date().toISOString(),
-          })
-          return
-        }
-
-        console.error(
-          `[Error] [Media] Deferred video transcode failed - processInputFile.ts - ${filePath} - ${message}`
-        )
-        debugError(jobId, "Deferred video transcode failed", error)
-
-        updateJob(jobId, {
-          status: "failed",
-          error: message,
-          message,
-          finishedAt: new Date().toISOString(),
-        })
-      }
-    }
-
-    if (useExistingOutput) {
+    async function finishExistingOutputImport() {
       if (await pathExists(filePath)) {
         debugImport(jobId, "Removing duplicate input source for existing output file.")
         await unlinkFileWithRetry(filePath, { jobId })
@@ -1009,27 +1038,7 @@ export async function processInputFile(
       })
     }
 
-    if (needsFfmpegProcessing && convertVideo && options.deferVideoTranscodes) {
-      updateJob(jobId, {
-        message: "Queued for video transcode.",
-      })
-      console.log(
-        `[Info] [Media] Queued video transcode and continuing import scan - ${fileName(filePath)}`
-      )
-      debugImport(jobId, "Video transcode deferred so direct-move and audio-only imports can continue.")
-
-      const deferredWork = runDeferredVideoTranscode()
-      options.onDeferredWork?.(deferredWork)
-
-      return {
-        ok: true,
-        filePath: finalPath,
-        planned: true,
-        message: "Queued for video transcode.",
-      }
-    }
-
-    if (needsFfmpegProcessing) {
+    async function runFfmpegImport() {
       await runFfmpegProcessing()
 
       return finalizeImport({
@@ -1038,30 +1047,177 @@ export async function processInputFile(
       })
     }
 
-    updateJob(jobId, {
-      message: "Moving direct-play media file.",
-    })
+    async function runDirectMoveImport() {
+      updateJob(jobId, {
+        message: "Moving direct-play media file.",
+      })
 
-    console.log(
-      `[Info] [Media] Skipping transcode and moving direct-play file - ${fileName(filePath)}`
-    )
+      console.log(
+        `[Info] [Media] Skipping transcode and moving direct-play file - ${fileName(filePath)}`
+      )
 
-    await replaceFile(filePath, finalPath, { jobId })
+      await replaceFile(filePath, finalPath, { jobId })
 
-    if (await pathExists(filePath)) {
-      debugImport(jobId, "Source still exists after direct-play move; removing it.")
-      await unlinkFileWithRetry(filePath, { jobId })
+      if (await pathExists(filePath)) {
+        debugImport(jobId, "Source still exists after direct-play move; removing it.")
+        await unlinkFileWithRetry(filePath, { jobId })
+      }
+
+      debugImport(jobId, "Direct-play file move completed.")
+      debugImport(jobId, "Cleaning input parent folders.")
+      await removeNonMediaOnlyInputParents(filePath, { jobId })
+      debugImport(jobId, "Input parent cleanup completed.")
+
+      return finalizeImport({
+        planned: false,
+        completedMessage: "Media added to the library without transcoding.",
+      })
     }
 
-    debugImport(jobId, "Direct-play file move completed.")
-    debugImport(jobId, "Cleaning input parent folders.")
-    await removeNonMediaOnlyInputParents(filePath, { jobId })
-    debugImport(jobId, "Input parent cleanup completed.")
+    async function runDeferredImportWork(input: {
+      kind: DeferredInputWorkKind
+      work: () => Promise<ProcessInputFileResult>
+    }) {
+      const label = formatDeferredWorkKind(input.kind)
 
-    return finalizeImport({
-      planned: false,
-      completedMessage: "Media added to the library without transcoding.",
-    })
+      try {
+        await runWithActiveInputImportOutput(finalPath, input.work)
+      } catch (error) {
+        const message = errorMessage(error) || "Unknown media processing error"
+
+        if (
+          isTranscodeWaitCancellation(error) &&
+          options.transcodeWaitSignal?.aborted
+        ) {
+          const shutdownMessage = `Skipped queued ${label} because shutdown started.`
+
+          console.warn(
+            `[Warn] [Media] Queued ${label} cancelled during shutdown - processInputFile.ts - ${filePath}`
+          )
+          debugImport(jobId, shutdownMessage)
+          updateJob(jobId, {
+            status: "skipped",
+            message: shutdownMessage,
+            finishedAt: new Date().toISOString(),
+          })
+          return
+        }
+
+        console.error(
+          `[Error] [Media] Deferred ${label} failed - processInputFile.ts - ${filePath} - ${message}`
+        )
+        debugError(jobId, `Deferred ${label} failed`, error)
+
+        updateJob(jobId, {
+          status: "failed",
+          error: message,
+          message,
+          finishedAt: new Date().toISOString(),
+        })
+      }
+    }
+
+    function queueDeferredImportWork(input: {
+      kind: DeferredInputWorkKind
+      planned: boolean
+      message: string
+      work: () => Promise<ProcessInputFileResult>
+    }): ProcessInputFileResult {
+      const deferredWork = runDeferredImportWork({
+        kind: input.kind,
+        work: input.work,
+      })
+      options.onDeferredWork?.(deferredWork, {
+        kind: input.kind,
+        filePath: finalPath,
+        planned: input.planned,
+      })
+
+      return {
+        ok: true,
+        filePath: finalPath,
+        planned: input.planned,
+        message: input.message,
+      }
+    }
+
+    if (useExistingOutput) {
+      if (options.deferDirectMoves) {
+        updateJob(jobId, {
+          message: "Queued existing output finalization.",
+        })
+        console.log(
+          `[Info] [Media] Queued existing output finalization and continuing import scan - ${fileName(filePath)}`
+        )
+        debugImport(jobId, "Existing output finalization deferred so input scanning can continue.")
+
+        return queueDeferredImportWork({
+          kind: "existing-output",
+          planned: false,
+          message: "Queued existing output finalization.",
+          work: finishExistingOutputImport,
+        })
+      }
+
+      return runWithActiveInputImportOutput(finalPath, finishExistingOutputImport)
+    }
+
+    if (needsFfmpegProcessing && convertVideo && options.deferVideoTranscodes) {
+      updateJob(jobId, {
+        message: "Queued for video transcode.",
+      })
+      console.log(
+        `[Info] [Media] Queued video transcode and continuing import scan - ${fileName(filePath)}`
+      )
+      debugImport(jobId, "Video transcode deferred so other import inspections can continue.")
+
+      return queueDeferredImportWork({
+        kind: "video-transcode",
+        planned: true,
+        message: "Queued for video transcode.",
+        work: runFfmpegImport,
+      })
+    }
+
+    if (needsFfmpegProcessing && !convertVideo && options.deferAudioTranscodes) {
+      updateJob(jobId, {
+        message: "Queued for audio transcode.",
+      })
+      console.log(
+        `[Info] [Media] Queued audio transcode and continuing import scan - ${fileName(filePath)}`
+      )
+      debugImport(jobId, "Audio-only transcode deferred into the audio-priority transcode queue.")
+
+      return queueDeferredImportWork({
+        kind: "audio-transcode",
+        planned: true,
+        message: "Queued for audio transcode.",
+        work: runFfmpegImport,
+      })
+    }
+
+    if (needsFfmpegProcessing) {
+      return runWithActiveInputImportOutput(finalPath, runFfmpegImport)
+    }
+
+    if (options.deferDirectMoves) {
+      updateJob(jobId, {
+        message: "Queued direct library move.",
+      })
+      console.log(
+        `[Info] [Media] Queued direct-play move and continuing import scan - ${fileName(filePath)}`
+      )
+      debugImport(jobId, "Direct-play move deferred so input scanning can continue.")
+
+      return queueDeferredImportWork({
+        kind: "direct-move",
+        planned: false,
+        message: "Queued direct library move.",
+        work: runDirectMoveImport,
+      })
+    }
+
+    return runWithActiveInputImportOutput(finalPath, runDirectMoveImport)
   } catch (error) {
     const message = errorMessage(error) || "Unknown media processing error"
 
