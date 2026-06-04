@@ -1047,7 +1047,7 @@ export function listAnime(): AnimeSummary[] {
     `
     )
     .all()
-    .map((row) => {
+    .flatMap((row): AnimeSummary[] => {
       const variants = listAnimeVariants(row.slug)
       const localEpisodeCount = variants.reduce(
         (total, variant) => total + variant.episodeCount,
@@ -1055,21 +1055,22 @@ export function listAnime(): AnimeSummary[] {
       )
 
       if (localEpisodeCount <= 0) {
-        return null
+        return []
       }
 
-      return {
-        id: row.primary_anime_id,
-        slug: row.slug,
-        title: row.library_title,
-        coverImage: row.cover_image ?? undefined,
-        bannerImage: row.banner_image ?? undefined,
-        episodeCount: localEpisodeCount,
-        mediaCount: variants.length,
-        year: row.season_year ?? undefined,
-      }
+      return [
+        {
+          id: row.primary_anime_id,
+          slug: row.slug,
+          title: row.library_title,
+          coverImage: row.cover_image ?? undefined,
+          bannerImage: row.banner_image ?? undefined,
+          episodeCount: localEpisodeCount,
+          mediaCount: variants.length,
+          year: row.season_year ?? undefined,
+        },
+      ]
     })
-    .filter((row): row is AnimeSummary => Boolean(row))
 }
 
 function toAnimeVariant(row: AnimeVariantRow): AnimeVariant {
