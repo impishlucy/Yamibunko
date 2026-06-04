@@ -12,6 +12,7 @@ import {
   acquireStreamUpload,
   estimateUploadKbps,
   getActiveStreamConflict,
+  isStreamServerShutdownActive,
   type StreamUploadLease,
 } from "@/server/bandwidth/streamBandwidth"
 import { getUser } from "@/server/db/users"
@@ -1006,6 +1007,10 @@ export async function GET(request: Request, context: StreamContext) {
     return jsonError("Episode not found.", 404)
   }
 
+  if (isStreamServerShutdownActive()) {
+    return jsonError("Server is shutting down. New streams are disabled.", 503)
+  }
+
   const streamUser = await resolveStreamUser({
     request,
     animeId,
@@ -1109,7 +1114,17 @@ export async function GET(request: Request, context: StreamContext) {
     console.warn(
       `[Warn] [Stream] Waiting stream upload reservation cancelled - stream/route.ts - Anime ${animeId}, Season ${seasonNumber}, Episode ${episodeNumber} - ${errorMessage(error)}`
     )
+
+    if (isStreamServerShutdownActive()) {
+      return jsonError("Server is shutting down. New streams are disabled.", 503)
+    }
+
     return jsonError("Stream upload reservation was cancelled.", 499)
+  }
+
+  if (isStreamServerShutdownActive()) {
+    uploadLease.release()
+    return jsonError("Server is shutting down. New streams are disabled.", 503)
   }
 
   markAniListWatchingStartedOnce({

@@ -27,6 +27,37 @@ function cleanTitleSegment(value: string) {
   return normalizeTitle(value).replace(/(?:\s*-\s*)+$/g, "").trim()
 }
 
+function cleanSeriesTitleSegment(value: string, season?: number, part?: number) {
+  let title = cleanTitleSegment(value)
+
+  if (part && part > 1) {
+    title = title
+      .replace(
+        new RegExp(
+          String.raw`\s+(?:part|pt\.?|cour)\s*(?:0?${part}|[ivx]+|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|1st|2nd|3rd|[4-9]th|10th)$`,
+          "i"
+        ),
+        ""
+      )
+      .replace(
+        new RegExp(
+          String.raw`\s+(?:0?${part}|[ivx]+|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|1st|2nd|3rd|[4-9]th|10th)\s+(?:cour|half)$`,
+          "i"
+        ),
+        ""
+      )
+  }
+
+  if (season) {
+    title = title.replace(
+      new RegExp(String.raw`\s+(?:season\s*0?${season}|s0?${season})$`, "i"),
+      ""
+    )
+  }
+
+  return cleanTitleSegment(title)
+}
+
 function toPositiveInteger(value: string | undefined) {
   return parsePositiveInt(value)
 }
@@ -39,6 +70,14 @@ const partLabelPattern = String.raw`(?:part|pt\.?|cour|p|c)`
 const separatorPattern = String.raw`(?:\s*-\s*|\s+)`
 const optionalSeparatorPattern = String.raw`(?:\s*-\s*|\s*)`
 const seasonPartEpisodePatterns = [
+  new RegExp(
+    String.raw`^(.+?)${separatorPattern}Season\s*(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${separatorPattern}S\d{1,2}E(\d{1,4})\b`,
+    "i"
+  ),
+  new RegExp(
+    String.raw`^(.+?)${separatorPattern}S(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${separatorPattern}S\d{1,2}E(\d{1,4})\b`,
+    "i"
+  ),
   new RegExp(
     String.raw`^(.+?)${separatorPattern}S(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${optionalSeparatorPattern}E?\s*(\d{1,4})\b`,
     "i"
@@ -154,7 +193,7 @@ export function parseAnimeFileName(
 
     if (season && part && episode) {
       return {
-        title: normalizeTitle(seasonPartEpisode[1] ?? ""),
+        title: cleanSeriesTitleSegment(seasonPartEpisode[1] ?? "", season, part),
         season,
         episode,
         part,
@@ -172,7 +211,7 @@ export function parseAnimeFileName(
 
     if (season && episode) {
       return {
-        title: normalizeTitle(seasonEpisode[1] ?? ""),
+        title: cleanSeriesTitleSegment(seasonEpisode[1] ?? "", season),
         season,
         episode,
       }
@@ -189,7 +228,7 @@ export function parseAnimeFileName(
 
     if (season && episode) {
       return {
-        title: normalizeTitle(seasonDashEpisode[1] ?? ""),
+        title: cleanSeriesTitleSegment(seasonDashEpisode[1] ?? "", season),
         season,
         episode,
       }

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process"
 
 import { requireApiUser } from "@/server/auth/api"
+import { isStreamServerShutdownActive } from "@/server/bandwidth/streamBandwidth"
 import { guardApiRequest } from "@/server/security/abuseGuard"
 import { getServerConfig } from "@/server/config"
 import { validateCastStreamToken } from "@/server/media/castTokens"
@@ -235,6 +236,13 @@ export async function GET(request: Request, context: SubtitleContext) {
 
   if (!episodeNumber || !seasonNumber || streamIndex === null) {
     return jsonError("Subtitle stream not found.", 404)
+  }
+
+  if (isStreamServerShutdownActive()) {
+    return jsonError(
+      "Server is shutting down. New subtitle streams are disabled.",
+      503
+    )
   }
 
   const user = await resolveSubtitleUser({

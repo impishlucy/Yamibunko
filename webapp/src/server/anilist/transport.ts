@@ -4,6 +4,7 @@ import { isRateLimitError } from "@api-wrappers/api-core"
 import { errorMessage } from "@/server/utils/format"
 
 const clients = new Map<string, Anilist>()
+const operationTimeoutMs = 30_000
 
 let queue = Promise.resolve()
 let queuedOperations = 0
@@ -19,6 +20,30 @@ async function waitForPause() {
 
   if (waitMs > 0) {
     await sleep(waitMs)
+  }
+}
+
+async function runWithTimeout<T>(operation: () => Promise<T>) {
+  let timeout: NodeJS.Timeout | undefined
+
+  try {
+    return await Promise.race<T>([
+      operation(),
+      new Promise<T>((_, reject) => {
+        timeout = setTimeout(() => {
+          reject(
+            new Error(
+              `AniList operation timed out after ${operationTimeoutMs}ms`
+            )
+          )
+        }, operationTimeoutMs)
+        timeout.unref?.()
+      }),
+    ])
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout)
+    }
   }
 }
 
@@ -48,14 +73,27 @@ export function getAniListRateLimitState() {
 
 export function queueAniListOperation<T>(operation: () => Promise<T>) {
   queuedOperations += 1
+  console.log(
+    `[Debug] [Anilist] Queued AniList operation - Queue depth ${queuedOperations}`
+  )
 
   const run = queue.then(async () => {
+    const startedAt = Date.now()
     queuedOperations = Math.max(queuedOperations - 1, 0)
     activeOperation = true
+
+    console.log(
+      `[Debug] [Anilist] Starting AniList operation - Remaining queue ${queuedOperations}`
+    )
+
     await waitForPause()
 
     try {
-      return await operation()
+      const result = await runWithTimeout(operation)
+      console.log(
+        `[Debug] [Anilist] AniList operation completed - ${Date.now() - startedAt}ms`
+      )
+      return result
     } catch (error) {
       const retryAfter = isRateLimitError(error)
         ? (error.retryAfterMs ?? 60_000)

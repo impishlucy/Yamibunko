@@ -408,6 +408,25 @@ function removePendingRequest(id: string) {
   }
 }
 
+export function cancelPendingLiveTranscodes(
+  reason = "Live transcode request was cancelled"
+) {
+  const pendingLiveRequests = pendingTranscodes.filter(
+    (request) => request.kind === "live"
+  )
+
+  for (const request of pendingLiveRequests) {
+    removePendingRequest(request.id)
+    request.reject(new Error(reason))
+  }
+
+  if (pendingLiveRequests.length > 0) {
+    console.log(
+      `[Info] [Transcode] Cancelled ${pendingLiveRequests.length} pending live transcode request(s).`
+    )
+  }
+}
+
 function sortPendingTranscodes() {
   pendingTranscodes.sort((left, right) => {
     if (left.priority !== right.priority) {
@@ -598,10 +617,11 @@ export function acquireLiveTranscode(
   })
 }
 
-export function acquireAudioTranscode(label: string) {
+export function acquireAudioTranscode(label: string, signal?: AbortSignal) {
   return acquireQueuedTranscode({
     label,
     kind: "audio",
+    signal,
   })
 }
 
@@ -612,9 +632,10 @@ export function acquireOtherTranscode(label: string) {
   })
 }
 
-export function acquireVideoTranscode(label: string) {
+export function acquireVideoTranscode(label: string, signal?: AbortSignal) {
   return acquireQueuedTranscode({
     label,
     kind: "video",
+    signal,
   })
 }

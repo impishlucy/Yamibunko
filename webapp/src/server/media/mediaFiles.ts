@@ -106,21 +106,24 @@ export async function generateEpisodeThumbnail(
 ) {
   const thumbnailPath = thumbnailPathForEpisode(filePath)
 
-  await runFfmpeg([
-    "-hide_banner",
-    "-loglevel",
-    "warning",
-    "-ss",
-    String(Math.max(durationSeconds / 2, 1)),
-    "-i",
-    filePath,
-    "-frames:v",
-    "1",
-    "-vf",
-    "scale=640:-2:force_original_aspect_ratio=decrease",
-    "-y",
-    thumbnailPath,
-  ])
+  await runFfmpeg(
+    [
+      "-hide_banner",
+      "-loglevel",
+      "warning",
+      "-ss",
+      String(Math.max(durationSeconds / 2, 1)),
+      "-i",
+      filePath,
+      "-frames:v",
+      "1",
+      "-vf",
+      "scale=640:-2:force_original_aspect_ratio=decrease",
+      "-y",
+      thumbnailPath,
+    ],
+    { protectFromParentSignals: true }
+  )
 
   return thumbnailPath
 }

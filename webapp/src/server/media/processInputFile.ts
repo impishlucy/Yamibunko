@@ -4,7 +4,6 @@ import {
   readdir,
   rename,
   rm,
-  rmdir,
   stat,
   unlink,
 } from "node:fs/promises"
@@ -56,6 +55,23 @@ export type ProcessInputFileResult = {
   filePath: string
   planned: boolean
   message: string
+}
+
+export type ProcessInputFileOptions = {
+  transcodeWaitSignal?: AbortSignal
+}
+
+function debugImport(jobId: string, message: string) {
+  console.log(`[Debug] [MediaImport:${jobId}] ${message}`)
+}
+
+function debugError(jobId: string, message: string, error: unknown) {
+  const details = error instanceof Error && error.stack ? error.stack : errorMessage(error)
+  console.error(`[Error] [MediaImport:${jobId}] ${message} - ${details}`)
+}
+
+function isTranscodeWaitCancellation(error: unknown) {
+  return errorMessage(error) === "Transcode request was cancelled"
 }
 
 function hasHevcVideo(probe: ProbeResult) {
@@ -161,40 +177,189 @@ function summarizeProbe(probe: ProbeResult) {
   }
 }
 
-async function replaceFile(source: string, destination: string) {
-  if (path.resolve(source) === path.resolve(destination)) {
+async function replaceFile(
+  source: string,
+  destination: string,
+  options?: { jobId?: string }
+) {
+  const jobId = options?.jobId
+  const resolvedSource = path.resolve(source)
+  const resolvedDestination = path.resolve(destination)
+
+  if (jobId) {
+    debugImport(
+      jobId,
+      `Preparing file replacement - Source ${resolvedSource}, Destination ${resolvedDestination}`
+    )
+  }
+
+  if (resolvedSource === resolvedDestination) {
+    if (jobId) {
+      debugImport(jobId, "Source and destination are identical; replacement skipped.")
+    }
     return
   }
 
-  await mkdir(path.dirname(destination), { recursive: true })
-  await rm(destination, { force: true })
+  await mkdir(path.dirname(resolvedDestination), { recursive: true })
+
+  if (jobId) {
+    debugImport(
+      jobId,
+      `Destination directory ensured - ${path.dirname(resolvedDestination)}`
+    )
+  }
+
+  await rm(resolvedDestination, { force: true })
+
+  if (jobId) {
+    debugImport(jobId, "Existing destination file removed if present.")
+  }
 
   try {
-    await rename(source, destination)
+    await rename(resolvedSource, resolvedDestination)
+
+    if (jobId) {
+      debugImport(jobId, "File moved with rename().")
+    }
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code
 
     if (code !== "EXDEV") {
+      if (jobId) {
+        debugError(jobId, "File rename failed", error)
+      }
       throw error
     }
 
-    await copyFile(source, destination)
-    await unlink(source)
+    if (jobId) {
+      debugImport(jobId, "Cross-device move detected; falling back to copy and unlink.")
+    }
+
+    await copyFile(resolvedSource, resolvedDestination)
+    await unlink(resolvedSource)
+
+    if (jobId) {
+      debugImport(jobId, "File copied to destination and original source removed.")
+    }
+  }
+
+  if (!(await pathExists(resolvedDestination))) {
+    throw new Error(`Destination file was not created: ${resolvedDestination}`)
+  }
+
+  if (jobId) {
+    const outputStat = await stat(resolvedDestination)
+    debugImport(
+      jobId,
+      `Destination file verified - ${resolvedDestination} (${outputStat.size} bytes)`
+    )
   }
 }
 
-async function removeEmptyInputParents(filePath: string) {
+function sleep(milliseconds: number) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
+}
+
+function isInsideInputDirectory(inputDir: string, current: string) {
+  const relative = path.relative(inputDir, current)
+
+  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative)
+}
+
+async function unlinkFileWithRetry(
+  filePath: string,
+  options?: { jobId?: string; attempts?: number }
+) {
+  const attempts = options?.attempts ?? 5
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await unlink(filePath)
+
+      if (options?.jobId) {
+        debugImport(options.jobId, `Removed input source file - ${filePath}`)
+      }
+
+      return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+
+      if (code === "ENOENT") {
+        return
+      }
+
+      if (attempt >= attempts) {
+        if (options?.jobId) {
+          debugError(options.jobId, "Input source file removal failed", error)
+        }
+        throw error
+      }
+
+      if (options?.jobId) {
+        debugImport(
+          options.jobId,
+          `Input source file removal failed; retrying ${attempt}/${attempts} - ${filePath}`
+        )
+      }
+
+      await sleep(250 * attempt)
+    }
+  }
+}
+
+async function directoryContainsMediaFile(directory: string): Promise<boolean> {
+  const entries = await readdir(directory, { withFileTypes: true }).catch(() => null)
+
+  if (!entries) {
+    return false
+  }
+
+  for (const entry of entries) {
+    const entryPath = path.join(directory, entry.name)
+
+    if (entry.isDirectory()) {
+      if (await directoryContainsMediaFile(entryPath)) {
+        return true
+      }
+
+      continue
+    }
+
+    if (entry.isFile() && isMediaFile(entryPath)) {
+      return true
+    }
+  }
+
+  return false
+}
+
+async function removeNonMediaOnlyInputParents(
+  filePath: string,
+  options?: { jobId?: string }
+) {
   const inputDir = path.resolve(getServerConfig().inputDir)
   let current = path.dirname(path.resolve(filePath))
 
-  while (current.startsWith(inputDir) && current !== inputDir) {
-    const entries = await readdir(current).catch(() => null)
+  while (isInsideInputDirectory(inputDir, current)) {
+    if (await directoryContainsMediaFile(current)) {
+      if (options?.jobId) {
+        debugImport(
+          options.jobId,
+          `Input cleanup stopped; media files still remain in ${current}`
+        )
+      }
 
-    if (!entries || entries.length > 0) {
       return
     }
 
-    await rmdir(current).catch(() => undefined)
+    if (options?.jobId) {
+      debugImport(
+        options.jobId,
+        `Removing input folder with only non-media leftovers - ${current}`
+      )
+    }
+
+    await rm(current, { force: true, recursive: true })
     current = path.dirname(current)
   }
 }
@@ -206,11 +371,12 @@ async function transcodeFile(
     convertVideo: boolean
     audioOutputIndexesToMp3: number[]
     videoBitrateKbps: number
+    jobId?: string
   }
 ) {
   await mkdir(path.dirname(outputPath), { recursive: true })
 
-  await runFfmpeg([
+  const args = [
     "-hide_banner",
     "-loglevel",
     "warning",
@@ -222,16 +388,47 @@ async function transcodeFile(
     ...getHevcFileArgs(options),
     "-y",
     outputPath,
-  ])
+  ]
+
+  if (options.jobId) {
+    debugImport(
+      options.jobId,
+      `Temporary transcode directory ensured - ${path.dirname(outputPath)}`
+    )
+    debugImport(options.jobId, `FFmpeg file-processing command - ${args.join(" ")}`)
+  }
+
+  try {
+    await runFfmpeg(args, { protectFromParentSignals: true })
+  } catch (error) {
+    if (options.jobId) {
+      debugError(options.jobId, "FFmpeg file processing failed", error)
+    }
+    throw error
+  }
+
+  if (!(await pathExists(outputPath))) {
+    throw new Error(`FFmpeg completed but did not create output file: ${outputPath}`)
+  }
+
+  if (options.jobId) {
+    const outputStat = await stat(outputPath)
+    debugImport(
+      options.jobId,
+      `FFmpeg output verified - ${outputPath} (${outputStat.size} bytes)`
+    )
+  }
 }
 
 export async function processInputFile(
-  filePath: string
+  filePath: string,
+  options: ProcessInputFileOptions = {}
 ): Promise<ProcessInputFileResult> {
   const jobId = createJob(filePath)
   console.log(
     `[Info] [Media] Input file processing started - ${fileName(filePath)}`
   )
+  debugImport(jobId, `Created media-processing job for ${filePath}`)
 
   try {
     updateJob(jobId, {
@@ -239,7 +436,9 @@ export async function processInputFile(
       startedAt: new Date().toISOString(),
       message: "Waiting for input file to become stable.",
     })
+    debugImport(jobId, "Job marked as processing.")
 
+    debugImport(jobId, `Checking media file extension - ${filePath}`)
     if (!isMediaFile(filePath)) {
       console.log(
         `[Info] [Media] Skipped non-media input file - ${fileName(filePath)}`
@@ -258,15 +457,19 @@ export async function processInputFile(
       }
     }
 
+    debugImport(jobId, `Checking input path exists - ${filePath}`)
     if (!(await pathExists(filePath))) {
       throw new Error("Input file is no longer available")
     }
+    debugImport(jobId, "Input path exists.")
 
     console.log(
       `[Info] [Media] Waiting for input file to become stable - ${fileName(filePath)}`
     )
     await waitForStableFile(filePath)
+    debugImport(jobId, "Input file is stable.")
 
+    debugImport(jobId, "Parsing anime filename.")
     const parsed = parseAnimeFileName(filePath)
 
     if (!parsed) {
@@ -276,11 +479,16 @@ export async function processInputFile(
     console.log(
       `[Info] [Media] Recognized input file - Title: ${parsed.title}, Season: ${parsed.season}${parsed.part ? `, Part: ${parsed.part}` : ""}, Episode: ${parsed.episode}`
     )
+    debugImport(
+      jobId,
+      `Parsed input file - Title ${parsed.title}, Season ${parsed.season}${parsed.part ? `, Part ${parsed.part}` : ""}, Episode ${parsed.episode}`
+    )
 
     updateJob(jobId, {
       message: "Fetching AniList metadata.",
     })
 
+    debugImport(jobId, "Starting AniList metadata lookup.")
     const metadata = await findAnimeMetadata(
       parsed.title,
       parsed.season,
@@ -292,7 +500,10 @@ export async function processInputFile(
       throw new Error(`AniList could not match "${parsed.title}"`)
     }
 
+    debugImport(jobId, `AniList metadata lookup completed - Anime id ${metadata.id}.`)
+    debugImport(jobId, "Saving AniList metadata before media processing.")
     upsertAnime(metadata)
+    debugImport(jobId, "AniList metadata saved.")
     console.log(
       `[Info] [Media] Resolved AniList metadata - Found match ${
         metadata.title.english ??
@@ -306,9 +517,16 @@ export async function processInputFile(
       message: "Inspecting media streams.",
     })
 
+    debugImport(jobId, `Reading input file stat - ${filePath}`)
     const inputStat = await stat(filePath)
+    debugImport(jobId, `Input file stat read - ${inputStat.size} bytes.`)
+
+    debugImport(jobId, `Running ffprobe - ${filePath}`)
     const probe = (await ffprobe(filePath)) as ProbeResult
+    debugImport(jobId, `ffprobe completed - Streams ${(probe.streams ?? []).length}.`)
+
     const durationSeconds = parseDurationSeconds(probe)
+    debugImport(jobId, `Parsed duration - ${durationSeconds}s.`)
     const inputBytesPerMinute = calculateBytesPerMinute(
       inputStat.size,
       durationSeconds
@@ -323,6 +541,11 @@ export async function processInputFile(
     const videoBitrateKbps = calculateVideoBitrateKbps()
     const mediaTitle = metadataTitle(metadata)
     const libraryTitle = metadata.library?.title
+
+    debugImport(
+      jobId,
+      `Processing decision - convertVideo ${convertVideo}, audioTracksToMp3 [${audioOutputIndexesToMp3.join(", ")}], needsFfmpegProcessing ${needsFfmpegProcessing}`
+    )
 
     if (!libraryTitle) {
       throw new Error(`AniList media ${metadata.id} did not resolve a library root`)
@@ -353,19 +576,38 @@ export async function processInputFile(
       jobId,
       finalName
     )
+    debugImport(jobId, `Resolved output path - ${finalPath}`)
+    debugImport(jobId, `Resolved temp path - ${tempPath}`)
+    debugImport(jobId, "Checking for existing episode/file conflicts.")
     const existingEpisode = getStoredEpisode(
       metadata.id,
       parsed.season,
       parsed.episode
     )
 
-    if (
-      (existingEpisode && (await pathExists(existingEpisode.filePath))) ||
-      (await pathExists(finalPath))
-    ) {
+    const existingEpisodeFileExists = existingEpisode
+      ? await pathExists(existingEpisode.filePath)
+      : false
+    const finalPathExists = await pathExists(finalPath)
+
+    if (existingEpisodeFileExists) {
       throw new Error(
         `Episode already exists in the library: ${safeLibraryTitle} S${String(parsed.season).padStart(2, "0")}E${String(parsed.episode).padStart(2, "0")}`
       )
+    }
+
+    const useExistingOutput = finalPathExists
+
+    if (useExistingOutput) {
+      console.warn(
+        `[Warn] [Media] Output file already exists without a stored episode; finishing database import and cleaning input duplicate - ${finalPath}`
+      )
+      debugImport(
+        jobId,
+        `Output already exists without a stored episode; using existing output - ${finalPath}`
+      )
+    } else {
+      debugImport(jobId, "No existing episode/file conflict found.")
     }
 
     const summary = summarizeProbe(probe)
@@ -374,7 +616,16 @@ export async function processInputFile(
       `[Info] [Media] Media stream inspection completed - ${fileName(filePath)} - Video: ${summary.videoCodecs.join(", ") || "unknown"}, Audio: ${summary.audioCodecs.join(", ") || "unknown"}, Duration: ${Math.round(durationSeconds)}s, Size: ${formatMegabytesPerMinute(inputBytesPerMinute)} MB/min`
     )
 
-    if (needsFfmpegProcessing) {
+    if (useExistingOutput) {
+      if (await pathExists(filePath)) {
+        debugImport(jobId, "Removing duplicate input source for existing output file.")
+        await unlinkFileWithRetry(filePath, { jobId })
+      }
+
+      debugImport(jobId, "Cleaning input parent folders after existing output recovery.")
+      await removeNonMediaOnlyInputParents(filePath, { jobId })
+      debugImport(jobId, "Input parent cleanup completed after existing output recovery.")
+    } else if (needsFfmpegProcessing) {
       const lease = convertVideo
         ? await (async () => {
             updateJob(jobId, {
@@ -384,10 +635,24 @@ export async function processInputFile(
             console.log(
               `[Info] [Media] Waiting for background transcode capacity - ${fileName(filePath)}`
             )
+            debugImport(jobId, "Waiting for video transcode lease.")
 
-            return acquireVideoTranscode(`video:${jobId}`)
+            const lease = await acquireVideoTranscode(
+              `video:${jobId}`,
+              options.transcodeWaitSignal
+            )
+            debugImport(jobId, `Video transcode lease acquired - ${lease.id}`)
+            return lease
           })()
-        : await acquireAudioTranscode(`audio:${jobId}`)
+        : await (async () => {
+            debugImport(jobId, "Waiting for audio transcode lease.")
+            const lease = await acquireAudioTranscode(
+              `audio:${jobId}`,
+              options.transcodeWaitSignal
+            )
+            debugImport(jobId, `Audio transcode lease acquired - ${lease.id}`)
+            return lease
+          })()
 
       try {
         updateJob(jobId, {
@@ -404,18 +669,26 @@ export async function processInputFile(
           convertVideo,
           audioOutputIndexesToMp3,
           videoBitrateKbps,
+          jobId,
         })
+        debugImport(jobId, "Transcode step completed successfully.")
       } finally {
         lease?.release()
+        debugImport(jobId, "Transcode lease released.")
       }
 
       console.log(
         `[Info] [Media] Media transcode completed - ${fileName(filePath)}`
       )
-      await replaceFile(tempPath, finalPath)
+      await replaceFile(tempPath, finalPath, { jobId })
+      debugImport(jobId, "Removing temporary job directory.")
       await rm(path.dirname(tempPath), { force: true, recursive: true })
-      await unlink(filePath).catch(() => undefined)
-      await removeEmptyInputParents(filePath)
+      debugImport(jobId, "Temporary job directory removed.")
+      debugImport(jobId, "Removing original input file after processed output move.")
+      await unlinkFileWithRetry(filePath, { jobId })
+      debugImport(jobId, "Cleaning input parent folders.")
+      await removeNonMediaOnlyInputParents(filePath, { jobId })
+      debugImport(jobId, "Input parent cleanup completed.")
     } else {
       updateJob(jobId, {
         message: "Moving direct-play media file.",
@@ -425,8 +698,17 @@ export async function processInputFile(
         `[Info] [Media] Skipping transcode and moving direct-play file - ${fileName(filePath)}`
       )
 
-      await replaceFile(filePath, finalPath)
-      await removeEmptyInputParents(filePath)
+      await replaceFile(filePath, finalPath, { jobId })
+
+      if (await pathExists(filePath)) {
+        debugImport(jobId, "Source still exists after direct-play move; removing it.")
+        await unlinkFileWithRetry(filePath, { jobId })
+      }
+
+      debugImport(jobId, "Direct-play file move completed.")
+      debugImport(jobId, "Cleaning input parent folders.")
+      await removeNonMediaOnlyInputParents(filePath, { jobId })
+      debugImport(jobId, "Input parent cleanup completed.")
     }
 
     updateJob(jobId, {
@@ -438,11 +720,18 @@ export async function processInputFile(
       `[Info] [Media] Generating episode thumbnail - ${fileName(finalPath)}`
     )
 
+    debugImport(jobId, `Checking output file before thumbnail - ${finalPath}`)
+    if (!(await pathExists(finalPath))) {
+      throw new Error(`Output file is missing before thumbnail generation: ${finalPath}`)
+    }
+
     const thumbnailPath = await generateEpisodeThumbnail(
       finalPath,
       durationSeconds
     )
+    debugImport(jobId, `Thumbnail generated - ${thumbnailPath}`)
 
+    debugImport(jobId, "Saving episode row.")
     upsertEpisode({
       animeId: metadata.id,
       seasonNr: parsed.season,
@@ -455,6 +744,7 @@ export async function processInputFile(
     console.log(
       `[Info] [Media] Episode added to database - Anime id ${metadata.id}, Season ${parsed.season}, Episode ${parsed.episode}`
     )
+    debugImport(jobId, "Episode row saved.")
 
     updateJob(jobId, {
       status: "completed",
@@ -464,6 +754,8 @@ export async function processInputFile(
         : "Media added to the library without transcoding.",
       finishedAt: new Date().toISOString(),
     })
+
+    debugImport(jobId, `Media import completed successfully - ${finalPath}`)
 
     return {
       ok: true,
@@ -476,9 +768,34 @@ export async function processInputFile(
   } catch (error) {
     const message = errorMessage(error) || "Unknown media processing error"
 
+    if (
+      isTranscodeWaitCancellation(error) &&
+      options.transcodeWaitSignal?.aborted
+    ) {
+      const shutdownMessage = "Skipped queued transcode because shutdown started."
+
+      console.warn(
+        `[Warn] [Media] Input file processing cancelled during shutdown - processInputFile.ts - ${filePath}`
+      )
+      debugImport(jobId, shutdownMessage)
+      updateJob(jobId, {
+        status: "skipped",
+        message: shutdownMessage,
+        finishedAt: new Date().toISOString(),
+      })
+
+      return {
+        ok: true,
+        filePath,
+        planned: true,
+        message: shutdownMessage,
+      }
+    }
+
     console.error(
       `[Error] [Media] Input file processing failed - processInputFile.ts - ${filePath} - ${errorMessage(error)}`
     )
+    debugError(jobId, "Input file processing failed", error)
 
     updateJob(jobId, {
       status: "failed",

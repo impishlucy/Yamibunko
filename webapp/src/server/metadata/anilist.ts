@@ -116,6 +116,24 @@ const AnimeWithStreamingEpisodesDocument = `
 
 const seriesFormats = new Set(["TV", "TV_SHORT", "ONA"])
 const sideStoryFormats = new Set(["MOVIE", "SPECIAL", "OVA"])
+const metadataLookupCacheMs = 10 * 60 * 1000
+
+const inFlightMetadataLookups = new Map<
+  string,
+  Promise<AnimeMetadataInput | null>
+>()
+const recentMetadataLookups = new Map<
+  string,
+  { metadata: AnimeMetadataInput | null; createdAt: number }
+>()
+
+function normalizeMetadataLookupTitle(title: string) {
+  return title.trim().replace(/\s+/g, " ").toLowerCase()
+}
+
+function metadataLookupKey(title: string, season?: number, part?: number) {
+  return [normalizeMetadataLookupTitle(title), season ?? "", part ?? ""].join("|")
+}
 
 function cleanDescription(value?: string | null) {
   if (!value) {
@@ -261,8 +279,58 @@ function uniqueCandidates(candidates: string[]) {
   })
 }
 
+function stripParsedSeasonPartFromTitle(
+  title: string,
+  season?: number,
+  part?: number
+) {
+  let normalizedTitle = title.trim().replace(/\s+/g, " ")
+
+  if (part && part > 1) {
+    const ordinalPart = getOrdinalPartLabel(part)
+    const wordPart = getWordPartLabel(part)
+    const romanPart = getRomanPartLabel(part)
+    const partLabels = [String(part), ordinalPart]
+
+    if (wordPart) {
+      partLabels.push(wordPart)
+    }
+
+    if (romanPart) {
+      partLabels.push(romanPart)
+    }
+
+    for (const label of partLabels) {
+      normalizedTitle = normalizedTitle
+        .replace(
+          new RegExp(
+            String.raw`\s+(?:part|pt\.?|cour|p|c)\s*${label}$`,
+            "i"
+          ),
+          ""
+        )
+        .replace(
+          new RegExp(
+            String.raw`\s+${label}\s+(?:cour|half)$`,
+            "i"
+          ),
+          ""
+        )
+    }
+  }
+
+  if (season && season > 0) {
+    normalizedTitle = normalizedTitle.replace(
+      new RegExp(String.raw`\s+(?:season\s*0?${season}|s0?${season})$`, "i"),
+      ""
+    )
+  }
+
+  return normalizedTitle.trim().replace(/\s+/g, " ")
+}
+
 function getSearchCandidates(title: string, season?: number, part?: number) {
-  const normalizedTitle = title.trim().replace(/\s+/g, " ")
+  const normalizedTitle = stripParsedSeasonPartFromTitle(title, season, part)
 
   if (!normalizedTitle) {
     return []
@@ -310,7 +378,7 @@ function getSearchCandidates(title: string, season?: number, part?: number) {
     )
   }
 
-  return uniqueCandidates([...partCandidates, ...seasonCandidates])
+  return uniqueCandidates(partCandidates)
 }
 
 function pickRootCandidate(metadata: AnimeMetadataInput) {
@@ -477,58 +545,157 @@ function hasPartMarker(value: string, part: number) {
   )
 }
 
-function mediaHasPartMarker(media: AniListMediaNode, part?: number) {
+type PreferredTitleValues = {
+  english: string[]
+  romaji: string[]
+  fallback: string[]
+  all: string[]
+}
+
+function uniqueTitleValues(values: Array<string | null | undefined>) {
+  const seen = new Set<string>()
+
+  return values.filter((value): value is string => {
+    const normalized = value?.trim()
+
+    if (!normalized) {
+      return false
+    }
+
+    const key = normalizeComparableTitle(normalized)
+
+    if (!key || seen.has(key)) {
+      return false
+    }
+
+    seen.add(key)
+    return true
+  })
+}
+
+function mediaTitleValues(media: AniListMediaNode): PreferredTitleValues {
+  const english = uniqueTitleValues([media.title?.english])
+  const romaji = uniqueTitleValues([media.title?.romaji])
+  const fallback = uniqueTitleValues([
+    media.title?.userPreferred,
+    media.title?.native,
+  ])
+
+  return {
+    english,
+    romaji,
+    fallback,
+    all: uniqueTitleValues([...english, ...romaji, ...fallback]),
+  }
+}
+
+function metadataTitleValues(metadata: AnimeMetadataInput): PreferredTitleValues {
+  const english = uniqueTitleValues([metadata.title.english])
+  const romaji = uniqueTitleValues([metadata.title.romaji])
+  const fallback = uniqueTitleValues([
+    metadata.title.userPreferred,
+    metadata.title.native,
+  ])
+
+  return {
+    english,
+    romaji,
+    fallback,
+    all: uniqueTitleValues([...english, ...romaji, ...fallback]),
+  }
+}
+
+function titlesHavePartMarker(titles: PreferredTitleValues, part?: number) {
   if (!part || part <= 1) {
     return true
   }
 
-  return [
-    media.title?.userPreferred,
-    media.title?.english,
-    media.title?.romaji,
-    media.title?.native,
-  ]
-    .filter((title): title is string => Boolean(title))
-    .some((title) => hasPartMarker(title, part))
+  return titles.all.some((title) => hasPartMarker(title, part))
+}
+
+function scoreTitleGroup(titles: string[], normalizedSearch: string) {
+  const normalizedTitles = titles.map(normalizeComparableTitle).filter(Boolean)
+
+  if (normalizedTitles.length === 0 || !normalizedSearch) {
+    return 3
+  }
+
+  if (normalizedTitles.some((title) => title === normalizedSearch)) {
+    return 0
+  }
+
+  if (normalizedTitles.some((title) => title.includes(normalizedSearch))) {
+    return 1
+  }
+
+  const bestOverlap = Math.max(
+    ...normalizedTitles.map((title) => tokenOverlap(normalizedSearch, title)),
+    0
+  )
+
+  return bestOverlap >= 0.5 ? 2 : 3
+}
+
+function isAcceptableCandidateScore(score: number) {
+  return score < 3
+}
+
+function scoreTitlesCandidate(
+  titles: PreferredTitleValues,
+  search: string,
+  options?: {
+    part?: number
+    requirePartMarker?: boolean
+  }
+) {
+  if (options?.requirePartMarker && options.part && options.part > 1) {
+    if (!titlesHavePartMarker(titles, options.part)) {
+      return 3
+    }
+  }
+
+  const normalizedSearch = normalizeComparableTitle(search)
+  const englishScore = scoreTitleGroup(titles.english, normalizedSearch)
+
+  if (isAcceptableCandidateScore(englishScore)) {
+    return englishScore
+  }
+
+  const romajiScore = scoreTitleGroup(titles.romaji, normalizedSearch)
+
+  if (isAcceptableCandidateScore(romajiScore)) {
+    return romajiScore + 0.1
+  }
+
+  if (titles.english.length > 0 || titles.romaji.length > 0) {
+    return 3
+  }
+
+  const fallbackScore = scoreTitleGroup(titles.fallback, normalizedSearch)
+
+  return isAcceptableCandidateScore(fallbackScore) ? fallbackScore + 0.2 : 3
 }
 
 function scoreMediaCandidate(
   media: AniListMediaNode,
   search: string,
-  part?: number
-) {
-  const normalizedSearch = normalizeComparableTitle(search)
-  const titles = [
-    media.title?.userPreferred,
-    media.title?.english,
-    media.title?.romaji,
-    media.title?.native,
-  ]
-    .filter((title): title is string => Boolean(title))
-    .map(normalizeComparableTitle)
-
-  const score = (() => {
-    if (titles.some((title) => title === normalizedSearch)) {
-      return 0
-    }
-
-    if (titles.some((title) => title.includes(normalizedSearch))) {
-      return 1
-    }
-
-    const bestOverlap = Math.max(
-      ...titles.map((title) => tokenOverlap(normalizedSearch, title)),
-      0
-    )
-
-    return bestOverlap >= 0.5 ? 2 : 3
-  })()
-
-  if (part && part > 1 && !mediaHasPartMarker(media, part)) {
-    return 3
+  options?: {
+    part?: number
+    requirePartMarker?: boolean
   }
+) {
+  return scoreTitlesCandidate(mediaTitleValues(media), search, options)
+}
 
-  return score
+function scoreMetadataCandidate(
+  metadata: AnimeMetadataInput,
+  search: string,
+  options?: {
+    part?: number
+    requirePartMarker?: boolean
+  }
+) {
+  return scoreTitlesCandidate(metadataTitleValues(metadata), search, options)
 }
 
 function needsFullCachedRefresh(metadata: AnimeMetadataInput, episode?: number) {
@@ -546,6 +713,40 @@ function needsFullCachedRefresh(metadata: AnimeMetadataInput, episode?: number) 
 }
 
 export async function findAnimeMetadata(
+  title: string,
+  season?: number,
+  episode?: number,
+  part?: number
+) {
+  const normalizedTitle = stripParsedSeasonPartFromTitle(title, season, part)
+  const key = metadataLookupKey(normalizedTitle, season, part)
+  const recentLookup = recentMetadataLookups.get(key)
+
+  if (recentLookup && Date.now() - recentLookup.createdAt < metadataLookupCacheMs) {
+    console.log(`[Debug] [Anilist] Reusing recent metadata lookup - ${key}`)
+    return recentLookup.metadata
+  }
+
+  const inFlightLookup = inFlightMetadataLookups.get(key)
+
+  if (inFlightLookup) {
+    console.log(`[Debug] [Anilist] Reusing in-flight metadata lookup - ${key}`)
+    return inFlightLookup
+  }
+
+  const lookup = findAnimeMetadataUncached(normalizedTitle, season, episode, part)
+  inFlightMetadataLookups.set(key, lookup)
+
+  try {
+    const metadata = await lookup
+    recentMetadataLookups.set(key, { metadata, createdAt: Date.now() })
+    return metadata
+  } finally {
+    inFlightMetadataLookups.delete(key)
+  }
+}
+
+async function findAnimeMetadataUncached(
   title: string,
   season?: number,
   episode?: number,
@@ -578,34 +779,92 @@ export async function findAnimeMetadata(
 
     const result = await queueAniListOperation(() =>
       getAniListClient().anime.getAnimeBySearch(candidate, 1, 5)
-    )
+    ).catch((error) => {
+      console.warn(
+        `[Warn] [Anilist] Anime metadata search failed - ${candidate} - ${errorMessage(error)}`
+      )
+      return null
+    })
+
+    if (!result) {
+      continue
+    }
+
+    const requirePartMarker = Boolean(part && part > 1)
     const rankedMedia = ((result.Page?.media ?? []) as Array<
       AniListMediaNode | null
     >)
       .filter((item): item is AniListMediaNode => Boolean(item))
       .map((item) => ({
         item,
-        score: scoreMediaCandidate(item, candidate, part),
+        score: scoreMediaCandidate(item, candidate, {
+          part,
+          requirePartMarker,
+        }),
       }))
       .sort((left, right) => left.score - right.score)
-    const match = rankedMedia.find((item) => item.score <= 2)
+
+    console.log(
+      `[Debug] [Anilist] Search candidate returned ${rankedMedia.length} result(s) - ${candidate}`
+    )
+
+    const match = rankedMedia.find((item) => isAcceptableCandidateScore(item.score))
     const media = match?.item
 
     if (media) {
       const metadata =
-        (await fetchAnimeMetadataById(media.id).catch(() => null)) ??
-        toMetadata(media, false)
+        (await fetchAnimeMetadataById(media.id).catch((error) => {
+          console.warn(
+            `[Warn] [Anilist] Full metadata fetch failed after search match - ${media.id} - ${errorMessage(error)}`
+          )
+          return null
+        })) ?? toMetadata(media, false)
 
       console.log(
         `[Info] [Anilist] Found match ${
-          media.title?.userPreferred ??
           media.title?.english ??
           media.title?.romaji ??
+          media.title?.userPreferred ??
           candidate
         } - id ${media.id}`
       )
       return attachLibraryInfo(metadata)
     }
+
+    if (rankedMedia.length === 1) {
+      const onlyMedia = rankedMedia[0].item
+      const metadata =
+        (await fetchAnimeMetadataById(onlyMedia.id).catch((error) => {
+          console.warn(
+            `[Warn] [Anilist] Full metadata fetch failed for single search result - ${onlyMedia.id} - ${errorMessage(error)}`
+          )
+          return null
+        })) ?? toMetadata(onlyMedia, false)
+      const fullScore = scoreMetadataCandidate(metadata, candidate, {
+        part,
+        requirePartMarker,
+      })
+
+      if (isAcceptableCandidateScore(fullScore)) {
+        console.log(
+          `[Info] [Anilist] Found single-result match ${
+            metadata.title.english ??
+            metadata.title.romaji ??
+            metadata.title.userPreferred ??
+            candidate
+          } - id ${metadata.id}`
+        )
+        return attachLibraryInfo(metadata)
+      }
+    }
+  }
+
+  if (part && part > 1) {
+    console.warn(
+      `[Warn] [Anilist] No part-specific metadata match found - ${title} S${season ?? 1} Part ${part}`
+    )
+
+    return null
   }
 
   console.warn(`[Warn] [Anilist] No anime metadata match found - ${title}`)

@@ -29,6 +29,10 @@ type ParsedLibraryPath = {
   part?: number
 }
 
+function debugLibrarySync(message: string) {
+  console.log(`[Debug] [LibrarySync] ${message}`)
+}
+
 function parseSeasonFolder(value: string) {
   const match = /^season\s*(\d{1,2})$/i.exec(value.trim())
 
@@ -111,11 +115,13 @@ function parseLibraryPath(filePath: string): ParsedLibraryPath | null {
 
 export async function syncLibraryFile(filePath: string) {
   const resolvedPath = path.resolve(filePath)
+  debugLibrarySync(`Sync requested - ${resolvedPath}`)
 
   console.log(
     `[Info] [Media] Library file sync started - ${fileName(resolvedPath)}`
   )
 
+  debugLibrarySync(`Checking media file extension - ${resolvedPath}`)
   if (!isMediaFile(resolvedPath)) {
     console.log(
       `[Info] [Media] Skipped non-media library file - ${fileName(resolvedPath)}`
@@ -123,6 +129,7 @@ export async function syncLibraryFile(filePath: string) {
     return null
   }
 
+  debugLibrarySync(`Checking library path exists - ${resolvedPath}`)
   if (!(await pathExists(resolvedPath))) {
     console.log(
       `[Info] [Media] Library file no longer exists, removing DB entry - ${resolvedPath}`
@@ -130,8 +137,11 @@ export async function syncLibraryFile(filePath: string) {
     return removeLibraryFile(resolvedPath)
   }
 
+  debugLibrarySync("Waiting for library file to become stable.")
   await waitForStableFile(resolvedPath)
+  debugLibrarySync("Library file is stable.")
 
+  debugLibrarySync("Checking for existing database episode by file path.")
   const existingEpisode = getEpisodeByPath(resolvedPath)
 
   if (existingEpisode) {
@@ -146,6 +156,7 @@ export async function syncLibraryFile(filePath: string) {
     }
   }
 
+  debugLibrarySync("Parsing library path.")
   const parsed = parseLibraryPath(resolvedPath)
 
   if (!parsed) {
@@ -159,6 +170,7 @@ export async function syncLibraryFile(filePath: string) {
     `[Info] [Media] Recognized library file - Title: ${parsed.animeTitle}, Season: ${parsed.season}${parsed.part ? `, Part: ${parsed.part}` : ""}, Episode: ${parsed.episode}`
   )
 
+  debugLibrarySync("Starting AniList metadata lookup for library file.")
   const metadata = await findAnimeMetadata(
     parsed.animeTitle,
     parsed.season,
@@ -170,14 +182,20 @@ export async function syncLibraryFile(filePath: string) {
     throw new Error(`AniList could not match "${parsed.animeTitle}"`)
   }
 
+  debugLibrarySync(`AniList metadata lookup completed - Anime id ${metadata.id}.`)
+  debugLibrarySync("Saving AniList metadata for library file.")
   upsertAnime(metadata)
+  debugLibrarySync("AniList metadata saved for library file.")
   const animeId = metadata.id
   console.log(
     `[Info] [Media] Created anime from AniList metadata - ${parsed.animeTitle} - id ${animeId}`
   )
 
+  debugLibrarySync(`Running ffprobe for library file - ${resolvedPath}`)
   const probe = (await ffprobe(resolvedPath)) as ProbeResult
+  debugLibrarySync(`ffprobe completed for library file - Streams ${(probe.streams ?? []).length}.`)
   const durationSeconds = parseDurationSeconds(probe)
+  debugLibrarySync(`Parsed library file duration - ${durationSeconds}s.`)
 
   console.log(
     `[Info] [Media] Generating thumbnail for library file - ${fileName(resolvedPath)}`
@@ -187,7 +205,9 @@ export async function syncLibraryFile(filePath: string) {
     resolvedPath,
     durationSeconds
   )
+  debugLibrarySync(`Thumbnail generated for library file - ${thumbnailPath}`)
 
+  debugLibrarySync("Saving library episode row.")
   upsertEpisode({
     animeId,
     seasonNr: parsed.season,
@@ -200,6 +220,7 @@ export async function syncLibraryFile(filePath: string) {
   console.log(
     `[Info] [Media] Library episode added to database - Anime id ${animeId}, Season ${parsed.season}, Episode ${parsed.episode}`
   )
+  debugLibrarySync("Library file sync completed.")
 
   return {
     animeId,

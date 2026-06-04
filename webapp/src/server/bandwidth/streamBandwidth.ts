@@ -8,6 +8,7 @@ export type StreamPriorityAction = {
     | "waitingForBandwidth"
     | "bandwidthRecheckStarted"
     | "bandwidthRecheckFinished"
+    | "serverShutdownStarted"
   message: string
   createdAt: string
 }
@@ -107,6 +108,8 @@ const streamEstimateOverheadFactor = 1.06
 const bandwidthRecheckClientPauseGraceMs = 1_500
 const bandwidthRecheckStreamDrainTimeoutMs = 5_000
 const bandwidthRecheckStreamDrainPollMs = 100
+const serverShutdownClientPauseGraceMs = 750
+const serverShutdownStreamDrainTimeoutMs = 5_000
 const activeStreams = new Map<string, ActiveStream>()
 const forcedDowngrades = new Map<string, ForcedDowngradeState>()
 const clientActions = new Map<string, StreamPriorityAction>()
@@ -118,6 +121,8 @@ const capacityWaiters = new Set<() => void>()
 const bandwidthRecheckWaiters = new Set<() => void>()
 const bandwidthRecheckClients = new Set<string>()
 let bandwidthRecheckActive = false
+let streamServerShutdownActive = false
+let streamServerShutdownAction: StreamPriorityAction | null = null
 
 function nowIso() {
   return new Date().toISOString()
@@ -384,6 +389,93 @@ function createBandwidthRecheckFinishedAction(failed: boolean): StreamPriorityAc
     createdAt: nowIso(),
   }
 }
+
+function getServerShutdownMessage() {
+  return "Server is shutting down. Playback was stopped and new streams are disabled until the server starts again."
+}
+
+function createServerShutdownStartedAction(): StreamPriorityAction {
+  return {
+    type: "serverShutdownStarted",
+    message: getServerShutdownMessage(),
+    createdAt: nowIso(),
+  }
+}
+
+function getKnownClientKeys() {
+  return new Set([
+    ...[...activeStreams.values()]
+      .map((stream) => stream.clientKey)
+      .filter((clientKey): clientKey is string => Boolean(clientKey)),
+    ...clientActionSubscribers.keys(),
+  ])
+}
+
+function publishServerShutdownAction() {
+  const action = streamServerShutdownAction ?? createServerShutdownStartedAction()
+  streamServerShutdownAction = action
+
+  for (const clientKey of getKnownClientKeys()) {
+    setClientActionByKey(clientKey, action)
+  }
+}
+
+function closeAllActiveStreams() {
+  for (const stream of [...activeStreams.values()]) {
+    closeActiveStream(stream)
+  }
+
+  notifyCapacityWaiters()
+}
+
+async function waitForServerShutdownStreamsToDrain() {
+  const deadline = Date.now() + serverShutdownStreamDrainTimeoutMs
+
+  while (activeStreams.size > 0 && Date.now() < deadline) {
+    await sleep(bandwidthRecheckStreamDrainPollMs)
+  }
+
+  if (activeStreams.size > 0) {
+    console.warn(
+      `[Warn] [Stream] Continuing server shutdown while ${activeStreams.size} client stream(s) are still closing.`
+    )
+  }
+}
+
+export function isStreamServerShutdownActive() {
+  return streamServerShutdownActive
+}
+
+export async function beginStreamServerShutdown() {
+  if (streamServerShutdownActive) {
+    publishServerShutdownAction()
+    closeAllActiveStreams()
+    await waitForServerShutdownStreamsToDrain()
+    return
+  }
+
+  streamServerShutdownActive = true
+  streamServerShutdownAction = createServerShutdownStartedAction()
+  const activeStreamCount = activeStreams.size
+
+  if (activeStreamCount > 0) {
+    console.log(
+      `[Info] [Stream] Stopping ${activeStreamCount} active client stream(s) for server shutdown.`
+    )
+  }
+
+  publishServerShutdownAction()
+  notifyCapacityWaiters()
+  notifyBandwidthRecheckWaiters()
+
+  if (activeStreamCount > 0) {
+    await sleep(serverShutdownClientPauseGraceMs)
+  }
+
+  closeAllActiveStreams()
+  await waitForServerShutdownStreamsToDrain()
+}
+
 
 function markBandwidthRecheckClient(clientKey: string | null) {
   if (clientKey) {
@@ -917,8 +1009,15 @@ function createLease(input: {
 
       const stream = activeStreams.get(id)
 
-      if (stream) {
-        stream.forceClose = handler
+      if (!stream) {
+        queueMicrotask(handler)
+        return
+      }
+
+      stream.forceClose = handler
+
+      if (streamServerShutdownActive) {
+        queueMicrotask(handler)
       }
     },
     release() {
@@ -976,6 +1075,17 @@ export function estimateUploadKbps(input: {
 export async function acquireStreamUpload(input: AcquireStreamUploadInput) {
   const clientKey = getClientKey(input.username, input.clientId)
 
+  if (streamServerShutdownActive) {
+    if (clientKey) {
+      setClientActionByKey(
+        clientKey,
+        streamServerShutdownAction ?? createServerShutdownStartedAction()
+      )
+    }
+
+    throw new Error("Server is shutting down. New streams are disabled")
+  }
+
   while (bandwidthRecheckActive) {
     markBandwidthRecheckClient(clientKey)
 
@@ -984,6 +1094,17 @@ export async function acquireStreamUpload(input: AcquireStreamUploadInput) {
     }
 
     await waitForBandwidthRecheck(input.signal)
+
+    if (streamServerShutdownActive) {
+      if (clientKey) {
+        setClientActionByKey(
+          clientKey,
+          streamServerShutdownAction ?? createServerShutdownStartedAction()
+        )
+      }
+
+      throw new Error("Server is shutting down. New streams are disabled")
+    }
   }
 
   const contentKey = getContentKey(input)
@@ -1045,6 +1166,17 @@ export async function acquireStreamUpload(input: AcquireStreamUploadInput) {
   }
 
   for (;;) {
+    if (streamServerShutdownActive) {
+      if (clientKey) {
+        setClientActionByKey(
+          clientKey,
+          streamServerShutdownAction ?? createServerShutdownStartedAction()
+        )
+      }
+
+      throw new Error("Server is shutting down. New streams are disabled")
+    }
+
     if (input.signal?.aborted) {
       throw new Error("Stream upload reservation was cancelled")
     }
@@ -1154,6 +1286,10 @@ export function subscribeStreamPriorityActions(input: {
   subscribers.add(input.onAction)
   clientActionSubscribers.set(key, subscribers)
   evaluateForcedDowngradeRestores()
+
+  if (streamServerShutdownActive) {
+    input.onAction(streamServerShutdownAction ?? createServerShutdownStartedAction())
+  }
 
   const pendingAction = clientActions.get(key)
   if (pendingAction) {

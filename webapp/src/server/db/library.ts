@@ -783,8 +783,13 @@ export function upsertAnime(metadata: AnimeMetadataInput) {
     )
   }
 
-  upsertAnimeBase(
-    normalizeRelatedMetadata(rootMetadata, library, "self")
+  console.log(
+    `[Debug] [Library] Upserting AniList metadata - Media id ${metadata.id}, Root id ${library.primaryAnimeId}, Library slug ${library.slug}`
+  )
+
+  upsertAnimeBase(normalizeRelatedMetadata(rootMetadata, library, "self"))
+  console.log(
+    `[Debug] [Library] Root anime row upserted - Anime id ${rootMetadata.id}`
   )
 
   const librarySlug = ensureLibraryEntry(library)
@@ -792,6 +797,10 @@ export function upsertAnime(metadata: AnimeMetadataInput) {
     ...library,
     slug: librarySlug,
   }
+
+  console.log(
+    `[Debug] [Library] Library entry upserted - Slug ${librarySlug}, Primary anime id ${normalizedLibrary.primaryAnimeId}`
+  )
 
   for (const relation of relations) {
     upsertAnimeBase(
@@ -803,11 +812,23 @@ export function upsertAnime(metadata: AnimeMetadataInput) {
     )
   }
 
+  console.log(
+    `[Debug] [Library] Related anime rows upserted - Count ${relations.length}`
+  )
+
   upsertAnimeBase(normalizeRelatedMetadata(metadata, normalizedLibrary, library.relationKind))
+  console.log(
+    `[Debug] [Library] Selected anime row upserted - Anime id ${metadata.id}`
+  )
+
   replaceAnimeGenres(metadata.id, metadata.genres ?? [])
   replaceAnimeTags(metadata.id, metadata.tags ?? [])
   replaceAnimeRelations(metadata.id, metadata.relations ?? [])
   replaceAnimeStreamingEpisodes(metadata.id, metadata.streamingEpisodes ?? [])
+
+  console.log(
+    `[Debug] [Library] AniList metadata upsert completed - Anime id ${metadata.id}`
+  )
 }
 
 export function getMaxCachedStreamingEpisodeNumber(animeId: number) {
@@ -836,6 +857,10 @@ export function upsertEpisode(input: {
 }) {
   const now = nowIso()
   const title = input.title ?? fallbackEpisodeTitle(input.epNr)
+
+  console.log(
+    `[Debug] [Library] Upserting episode row - Anime id ${input.animeId}, Season ${input.seasonNr}, Episode ${input.epNr}, Path ${input.filePath}`
+  )
 
   getDb()
     .query(
@@ -873,6 +898,10 @@ export function upsertEpisode(input: {
     )
 
   syncEpisodeTitlesFromCachedStreaming(input.animeId, now)
+
+  console.log(
+    `[Debug] [Library] Episode row upsert completed - Anime id ${input.animeId}, Season ${input.seasonNr}, Episode ${input.epNr}`
+  )
 }
 
 export function listAnime(): AnimeSummary[] {

@@ -1,8 +1,9 @@
 import chokidar, { type FSWatcher } from "chokidar"
-import { readdir } from "node:fs/promises"
+import { readdir, rm } from "node:fs/promises"
 import path from "node:path"
 
 import { runFullAniListRefresh } from "@/server/anilist/sync"
+import { beginStreamServerShutdown } from "@/server/bandwidth/streamBandwidth"
 import { listEpisodeFilePaths } from "@/server/db/library"
 import { getServerConfigResult } from "@/server/config"
 import { isMediaFile, pathExists } from "@/server/media/mediaFiles"
@@ -11,6 +12,7 @@ import {
   removeLibraryFile,
   syncLibraryFile,
 } from "@/server/media/syncLibraryFile"
+import { cancelPendingLiveTranscodes } from "@/server/transcode/transcodeCapacity"
 import { errorMessage, fileName } from "@/server/utils/format"
 
 type WorkerRuntime = {
@@ -23,6 +25,23 @@ type WorkKind = "input" | "library-sync" | "library-delete"
 type WorkerGlobalState = typeof globalThis & {
   __yamibunkoWorkerRuntime?: WorkerRuntime
   __yamibunkoSignalHandlersRegistered?: boolean
+}
+
+
+type WorkResultEpisode =
+  | { animeId: number; seasonNr: number; epNr: number }
+  | { animeId: number; seasonNumber: number; episodeNumber: number }
+
+function formatWorkResultEpisode(result: WorkResultEpisode | null) {
+  if (!result) {
+    return "no-op"
+  }
+
+  if ("seasonNr" in result) {
+    return `episode ${result.animeId}/${result.seasonNr}/${result.epNr}`
+  }
+
+  return `episode ${result.animeId}/${result.seasonNumber}/${result.episodeNumber}`
 }
 
 const scanIntervalMs = 5 * 60 * 1000
@@ -40,6 +59,10 @@ function msUntilNextDailyAniListSync() {
 }
 
 const workerGlobal = globalThis as WorkerGlobalState
+
+function debugWorkers(message: string) {
+  console.log(`[Debug] [Workers] ${message}`)
+}
 
 async function walkFiles(directory: string): Promise<string[]> {
   const entries = await readdir(directory, { withFileTypes: true })
@@ -76,12 +99,16 @@ export function startWorkers() {
   }
 
   const config = configResult.config
+  debugWorkers(
+    `Worker config loaded - Input ${config.inputDir}, Library ${config.mediaDir}, Temp ${config.tempDir}`
+  )
   const queuedWork = new Set<string>()
   const activeWork = new Set<Promise<void>>()
   let shuttingDown = false
   let scanning = false
   let dailyAniListTimer: NodeJS.Timeout | undefined
   let dailyAniListSyncRunning = false
+  const transcodeWaitShutdown = new AbortController()
 
   const inputWatcher = chokidar.watch(config.inputDir, {
     ignoreInitial: true,
@@ -100,26 +127,40 @@ export function startWorkers() {
 
   console.log("[Info] [Workers] Started background file watchers.")
 
-  function enqueue(kind: WorkKind, filePath: string) {
-    if (shuttingDown) {
-      return
+  async function pruneNonMediaOnlyDirectories(
+    directory: string,
+    root: string
+  ): Promise<boolean> {
+    const entries = await readdir(directory, { withFileTypes: true }).catch(() => null)
+
+    if (!entries) {
+      return false
     }
 
-    const resolvedPath = path.resolve(filePath)
+    let containsMedia = false
 
-    if (!isMediaFile(resolvedPath)) {
-      return
+    for (const entry of entries) {
+      const entryPath = path.join(directory, entry.name)
+
+      if (entry.isDirectory()) {
+        containsMedia = (await pruneNonMediaOnlyDirectories(entryPath, root)) || containsMedia
+        continue
+      }
+
+      if (entry.isFile() && isMediaFile(entryPath)) {
+        containsMedia = true
+      }
     }
 
-    const key = `${kind}:${resolvedPath}`
-
-    if (queuedWork.has(key)) {
-      return
+    if (path.resolve(directory) !== path.resolve(root) && !containsMedia) {
+      debugWorkers(`Removing input folder with only non-media leftovers - ${directory}`)
+      await rm(directory, { force: true, recursive: true })
     }
 
-    queuedWork.add(key)
-    console.log(`[Info] [Workers] Queued file work - ${fileName(resolvedPath)}`)
+    return containsMedia
+  }
 
+  function startFileWork(kind: WorkKind, resolvedPath: string, key: string) {
     const work = (async () => {
       try {
         console.log(
@@ -127,15 +168,27 @@ export function startWorkers() {
         )
 
         if (kind === "input") {
-          const result = await processInputFile(resolvedPath)
+          const result = await processInputFile(resolvedPath, {
+            transcodeWaitSignal: transcodeWaitShutdown.signal,
+          })
 
           if (!result.ok) {
             throw new Error(result.message)
           }
+
+          debugWorkers(
+            `Input processing returned ok - Planned ${result.planned}, Output ${result.filePath}`
+          )
         } else if (kind === "library-sync") {
-          await syncLibraryFile(resolvedPath)
+          const result = await syncLibraryFile(resolvedPath)
+          debugWorkers(
+            `Library sync returned ${formatWorkResultEpisode(result)} - ${resolvedPath}`
+          )
         } else {
-          await removeLibraryFile(resolvedPath)
+          const result = await removeLibraryFile(resolvedPath)
+          debugWorkers(
+            `Library delete returned ${formatWorkResultEpisode(result)} - ${resolvedPath}`
+          )
         }
 
         console.log(
@@ -153,7 +206,34 @@ export function startWorkers() {
     activeWork.add(work)
     void work.finally(() => {
       activeWork.delete(work)
+      debugWorkers(`Work removed from active set - ${key}`)
     })
+  }
+
+  function enqueue(kind: WorkKind, filePath: string) {
+    if (shuttingDown) {
+      debugWorkers(`Ignoring ${kind} work while shutting down - ${filePath}`)
+      return
+    }
+
+    const resolvedPath = path.resolve(filePath)
+    debugWorkers(`Enqueue requested - Kind ${kind}, Path ${resolvedPath}`)
+
+    if (!isMediaFile(resolvedPath)) {
+      debugWorkers(`Ignoring non-media file - Kind ${kind}, Path ${resolvedPath}`)
+      return
+    }
+
+    const key = `${kind}:${resolvedPath}`
+
+    if (queuedWork.has(key)) {
+      debugWorkers(`Ignoring duplicate queued work - ${key}`)
+      return
+    }
+
+    queuedWork.add(key)
+    console.log(`[Info] [Workers] Queued file work - ${fileName(resolvedPath)}`)
+    startFileWork(kind, resolvedPath, key)
   }
 
   async function scanInputDirectory() {
@@ -168,11 +248,16 @@ export function startWorkers() {
       const files = await walkFiles(config.inputDir)
       const mediaFiles = files.filter(isMediaFile)
 
+      debugWorkers(
+        `Input folder scan found ${files.length} files, ${mediaFiles.length} media files.`
+      )
       console.log("[Info] [Workers] Input folder scan completed.")
 
       for (const filePath of mediaFiles) {
         enqueue("input", filePath)
       }
+
+      await pruneNonMediaOnlyDirectories(config.inputDir, config.inputDir)
     } catch (error) {
       console.error(
         `[Error] [Workers] Input folder scan failed - startWorkers.ts - ${config.inputDir} - ${errorMessage(error)}`
@@ -194,6 +279,9 @@ export function startWorkers() {
       const files = await walkFiles(config.mediaDir)
       const mediaFiles = files.filter(isMediaFile)
 
+      debugWorkers(
+        `Library folder scan found ${files.length} files, ${mediaFiles.length} media files.`
+      )
       console.log("[Info] [Workers] Library folder scan found media files.")
 
       for (const filePath of mediaFiles) {
@@ -253,6 +341,7 @@ export function startWorkers() {
   }
 
   inputWatcher.on("add", (filePath) => {
+    debugWorkers(`Input watcher add event - ${filePath}`)
     enqueue("input", filePath)
   })
 
@@ -263,10 +352,12 @@ export function startWorkers() {
   })
 
   libraryWatcher.on("add", (filePath) => {
+    debugWorkers(`Library watcher add event - ${filePath}`)
     enqueue("library-sync", filePath)
   })
 
   libraryWatcher.on("unlink", (filePath) => {
+    debugWorkers(`Library watcher unlink event - ${filePath}`)
     enqueue("library-delete", filePath)
   })
 
@@ -287,6 +378,7 @@ export function startWorkers() {
     activeWork.delete(startupAniListSync)
   })
 
+  debugWorkers("Starting initial input/library scans.")
   void scanAllDirectories()
   scheduleDailyAniListSync()
 
@@ -297,6 +389,12 @@ export function startWorkers() {
 
     shuttingDown = true
     console.log("[Info] [Workers] Stopping background workers.")
+    await beginStreamServerShutdown()
+    cancelPendingLiveTranscodes(
+      "Server is shutting down. Live transcode request was cancelled"
+    )
+    transcodeWaitShutdown.abort()
+    debugWorkers("Cancelled pending background transcode waits.")
     clearInterval(scanTimer)
     if (dailyAniListTimer) {
       clearTimeout(dailyAniListTimer)
@@ -316,18 +414,42 @@ export function startWorkers() {
 
   if (!workerGlobal.__yamibunkoSignalHandlersRegistered) {
     workerGlobal.__yamibunkoSignalHandlersRegistered = true
-    process.once("SIGINT", () => {
-      console.log("[Info] [Workers] Received SIGINT.")
-      void workerGlobal.__yamibunkoWorkerRuntime
-        ?.stop()
-        .finally(() => process.exit(130))
-    })
-    process.once("SIGTERM", () => {
-      console.log("[Info] [Workers] Received SIGTERM.")
-      void workerGlobal.__yamibunkoWorkerRuntime
-        ?.stop()
-        .finally(() => process.exit(143))
-    })
+    let processShutdownStarted = false
+
+    function handleProcessShutdown(
+      signal: "SIGINT" | "SIGTERM",
+      exitCode: number
+    ) {
+      console.log(`[Info] [Workers] Received ${signal}.`)
+
+      if (processShutdownStarted) {
+        console.warn(
+          `[Warn] [Workers] Shutdown already in progress. Press again only after the current worker cleanup has finished.`
+        )
+        return
+      }
+
+      processShutdownStarted = true
+      const runtime = workerGlobal.__yamibunkoWorkerRuntime
+
+      if (!runtime) {
+        process.exit(exitCode)
+        return
+      }
+
+      void runtime
+        .stop()
+        .then(() => process.exit(exitCode))
+        .catch((error) => {
+          console.error(
+            `[Error] [Workers] Graceful shutdown failed - startWorkers.ts - ${errorMessage(error)}`
+          )
+          process.exit(exitCode)
+        })
+    }
+
+    process.on("SIGINT", () => handleProcessShutdown("SIGINT", 130))
+    process.on("SIGTERM", () => handleProcessShutdown("SIGTERM", 143))
   }
 
   return runtime

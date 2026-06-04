@@ -27,9 +27,18 @@ export async function ffprobe(file: string) {
   return JSON.parse(stdout) as unknown
 }
 
-export function runFfmpeg(args: string[]) {
+export function runFfmpeg(
+  args: string[],
+  options: { protectFromParentSignals?: boolean } = {}
+) {
   const config = getServerConfig()
-  return execa(config.ffmpegPath, args, { windowsHide: true })
+
+  return execa(config.ffmpegPath, args, {
+    windowsHide: true,
+    stdin: "ignore",
+    cleanup: !options.protectFromParentSignals,
+    detached: options.protectFromParentSignals,
+  })
 }
 
 function getAmdVaapiDevice() {

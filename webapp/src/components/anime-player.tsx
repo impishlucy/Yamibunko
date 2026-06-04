@@ -81,6 +81,7 @@ type StreamPriorityAction = {
     | "waitingForBandwidth"
     | "bandwidthRecheckStarted"
     | "bandwidthRecheckFinished"
+    | "serverShutdownStarted"
   message: string
   createdAt: string
 }
@@ -110,6 +111,7 @@ type PriorityInfo = {
     | "protectedDataSaver"
     | "bandwidthRecheckStarted"
     | "bandwidthRecheckFinished"
+    | "serverShutdownStarted"
   message: string
   createdAt: string
 }
@@ -1873,6 +1875,35 @@ export function AnimePlayer({
     ]
   )
 
+  const handleServerShutdownStarted = useCallback(
+    (action: StreamPriorityAction) => {
+      const session = getGoogleCastSession()
+
+      bandwidthRecheckHoldRef.current = false
+      bandwidthRecheckSnapshotRef.current = null
+      shouldAutoPlaySourceRef.current = false
+
+      if (session) {
+        void pauseGoogleCastMedia(session).catch((error) => {
+          flashCastError(error)
+          console.error(error)
+        })
+      }
+
+      blockLiveTranscodePlayback()
+      showPriorityInfoMessage(
+        {
+          type: action.type,
+          message: action.message,
+          createdAt: action.createdAt,
+        },
+        { autoClearMs: 30_000 }
+      )
+    },
+    [blockLiveTranscodePlayback, flashCastError, showPriorityInfoMessage]
+  )
+
+
   const handlePriorityAction = useCallback(
     (action: StreamPriorityAction) => {
       const actionKey = `${action.type}:${action.createdAt}:${action.message}`
@@ -1899,6 +1930,11 @@ export function AnimePlayer({
 
       if (action.type === "bandwidthRecheckFinished") {
         handleBandwidthRecheckFinished(action)
+        return
+      }
+
+      if (action.type === "serverShutdownStarted") {
+        handleServerShutdownStarted(action)
         return
       }
 
@@ -1963,6 +1999,7 @@ export function AnimePlayer({
       dataSaverProtectionKey,
       handleBandwidthRecheckFinished,
       handleBandwidthRecheckStarted,
+      handleServerShutdownStarted,
       markDataSaverProtectionOnServer,
       playbackKey,
       quality,
