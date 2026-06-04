@@ -4,6 +4,7 @@ import {
   fileName as baseFileName,
   parsePositiveInt,
 } from "@/server/utils/format"
+import { debugLog } from "@/server/utils/debugLog"
 
 type AnimeRow = {
   id: number
@@ -808,12 +809,12 @@ export function upsertAnime(metadata: AnimeMetadataInput) {
     )
   }
 
-  console.log(
+  debugLog(
     `[Debug] [Library] Upserting AniList metadata - Media id ${metadata.id}, Root id ${library.primaryAnimeId}, Library slug ${library.slug}`
   )
 
   upsertAnimeBase(normalizeRelatedMetadata(rootMetadata, library, "self"))
-  console.log(
+  debugLog(
     `[Debug] [Library] Root anime row upserted - Anime id ${rootMetadata.id}`
   )
 
@@ -823,7 +824,7 @@ export function upsertAnime(metadata: AnimeMetadataInput) {
     slug: librarySlug,
   }
 
-  console.log(
+  debugLog(
     `[Debug] [Library] Library entry upserted - Slug ${librarySlug}, Primary anime id ${normalizedLibrary.primaryAnimeId}`
   )
 
@@ -842,12 +843,12 @@ export function upsertAnime(metadata: AnimeMetadataInput) {
     relations,
   })
 
-  console.log(
+  debugLog(
     `[Debug] [Library] Related anime rows upserted - Count ${relations.length}`
   )
 
   upsertAnimeBase(normalizeRelatedMetadata(metadata, normalizedLibrary, library.relationKind))
-  console.log(
+  debugLog(
     `[Debug] [Library] Selected anime row upserted - Anime id ${metadata.id}`
   )
 
@@ -856,7 +857,7 @@ export function upsertAnime(metadata: AnimeMetadataInput) {
   replaceAnimeRelations(metadata.id, metadata.relations ?? [])
   replaceAnimeStreamingEpisodes(metadata.id, metadata.streamingEpisodes ?? [])
 
-  console.log(
+  debugLog(
     `[Debug] [Library] AniList metadata upsert completed - Anime id ${metadata.id}`
   )
 }
@@ -966,7 +967,7 @@ export function upsertEpisode(input: {
     getCachedStreamingEpisodeTitle(input.animeId, input.epNr) ??
     fallbackEpisodeTitle(input.epNr)
 
-  console.log(
+  debugLog(
     `[Debug] [Library] Upserting episode row - Anime id ${input.animeId}, Season ${input.seasonNr}, Episode ${input.epNr}, Path ${input.filePath}`
   )
 
@@ -1007,7 +1008,7 @@ export function upsertEpisode(input: {
 
   syncEpisodeTitlesFromCachedStreaming(input.animeId, now)
 
-  console.log(
+  debugLog(
     `[Debug] [Library] Episode row upsert completed - Anime id ${input.animeId}, Season ${input.seasonNr}, Episode ${input.epNr}`
   )
 }
@@ -1597,6 +1598,16 @@ function tokenOverlap(search: string, title: string) {
   return matches.length / searchTokens.length
 }
 
+function hasUnrequestedTitleSuffix(normalizedTitle: string, normalizedSearch: string) {
+  const searchTokens = normalizedSearch.split(" ").filter(Boolean)
+
+  if (searchTokens.length < 4 || normalizedTitle === normalizedSearch) {
+    return false
+  }
+
+  return normalizedTitle.startsWith(`${normalizedSearch} `)
+}
+
 function scoreTitleCandidate(search: string, titles: Array<string | null | undefined>) {
   const normalizedSearch = normalizeComparableTitle(search)
   const normalizedTitles = titles
@@ -1613,7 +1624,11 @@ function scoreTitleCandidate(search: string, titles: Array<string | null | undef
   }
 
   if (normalizedTitles.some((title) => title.includes(normalizedSearch))) {
-    return 1
+    const bestContainingTitle = normalizedTitles
+      .filter((title) => title.includes(normalizedSearch))
+      .sort((left, right) => left.length - right.length)[0]
+
+    return hasUnrequestedTitleSuffix(bestContainingTitle, normalizedSearch) ? 4 : 1
   }
 
   const bestOverlap = Math.max(

@@ -47,6 +47,7 @@ import {
 } from "@/server/transcode/transcodeCapacity"
 import { getAudioOutputIndexesToMp3 } from "@/server/media/streamMetadata"
 import { errorMessage, fileName } from "@/server/utils/format"
+import { debugLog } from "@/server/utils/debugLog"
 
 const hardwareMaxHevcBytesPerMinute = 20 * 1024 * 1024
 const cpuMaxHevcBytesPerMinute = 30 * 1024 * 1024
@@ -63,10 +64,12 @@ export type ProcessInputFileResult = {
 
 export type ProcessInputFileOptions = {
   transcodeWaitSignal?: AbortSignal
+  deferVideoTranscodes?: boolean
+  onDeferredWork?: (work: Promise<void>) => void
 }
 
 function debugImport(jobId: string, message: string) {
-  console.log(`[Debug] [MediaImport:${jobId}] ${message}`)
+  debugLog(`[Debug] [MediaImport:${jobId}] ${message}`)
 }
 
 function debugError(jobId: string, message: string, error: unknown) {
@@ -813,21 +816,70 @@ export async function processInputFile(
     }
 
     const summary = summarizeProbe(probe)
+    const importAnimeId = metadata.id
+    const importEpisodeNumber = parsed.episode
 
     console.log(
       `[Info] [Media] Media stream inspection completed - ${fileName(filePath)} - Video: ${summary.videoCodecs.join(", ") || "unknown"}, Audio: ${summary.audioCodecs.join(", ") || "unknown"}, Duration: ${Math.round(durationSeconds)}s, Size: ${formatMegabytesPerMinute(inputBytesPerMinute)} MB/min`
     )
 
-    if (useExistingOutput) {
-      if (await pathExists(filePath)) {
-        debugImport(jobId, "Removing duplicate input source for existing output file.")
-        await unlinkFileWithRetry(filePath, { jobId })
+    async function finalizeImport(input: {
+      planned: boolean
+      completedMessage: string
+    }): Promise<ProcessInputFileResult> {
+      updateJob(jobId, {
+        outputPath: finalPath,
+        message: "Generating thumbnail.",
+      })
+
+      console.log(
+        `[Info] [Media] Generating episode thumbnail - ${fileName(finalPath)}`
+      )
+
+      debugImport(jobId, `Checking output file before thumbnail - ${finalPath}`)
+      if (!(await pathExists(finalPath))) {
+        throw new Error(`Output file is missing before thumbnail generation: ${finalPath}`)
       }
 
-      debugImport(jobId, "Cleaning input parent folders after existing output recovery.")
-      await removeNonMediaOnlyInputParents(filePath, { jobId })
-      debugImport(jobId, "Input parent cleanup completed after existing output recovery.")
-    } else if (needsFfmpegProcessing) {
+      const thumbnailPath = await generateEpisodeThumbnail(
+        finalPath,
+        durationSeconds
+      )
+      debugImport(jobId, `Thumbnail generated - ${thumbnailPath}`)
+
+      debugImport(jobId, "Saving episode row.")
+      upsertEpisode({
+        animeId: importAnimeId,
+        seasonNr: librarySeason,
+        epNr: importEpisodeNumber,
+        filePath: finalPath,
+        thumbnailPath,
+        durationSeconds,
+      })
+
+      console.log(
+        `[Info] [Media] Episode added to database - Anime id ${importAnimeId}, Season ${librarySeason}, Episode ${importEpisodeNumber}`
+      )
+      debugImport(jobId, "Episode row saved.")
+
+      updateJob(jobId, {
+        status: "completed",
+        outputPath: finalPath,
+        message: input.completedMessage,
+        finishedAt: new Date().toISOString(),
+      })
+
+      debugImport(jobId, `Media import completed successfully - ${finalPath}`)
+
+      return {
+        ok: true,
+        filePath: finalPath,
+        planned: input.planned,
+        message: input.completedMessage,
+      }
+    }
+
+    async function runFfmpegProcessing() {
       const lease = convertVideo
         ? await (async () => {
             updateJob(jobId, {
@@ -847,6 +899,12 @@ export async function processInputFile(
             return lease
           })()
         : await (async () => {
+            updateJob(jobId, {
+              message: "Waiting for audio transcode capacity.",
+            })
+            console.log(
+              `[Info] [Media] Waiting for audio transcode capacity - ${fileName(filePath)}`
+            )
             debugImport(jobId, "Waiting for audio transcode lease.")
             const lease = await acquireAudioTranscode(
               `audio:${jobId}`,
@@ -875,7 +933,7 @@ export async function processInputFile(
         })
         debugImport(jobId, "Transcode step completed successfully.")
       } finally {
-        lease?.release()
+        lease.release()
         debugImport(jobId, "Transcode lease released.")
       }
 
@@ -891,82 +949,119 @@ export async function processInputFile(
       debugImport(jobId, "Cleaning input parent folders.")
       await removeNonMediaOnlyInputParents(filePath, { jobId })
       debugImport(jobId, "Input parent cleanup completed.")
-    } else {
-      updateJob(jobId, {
-        message: "Moving direct-play media file.",
-      })
+    }
 
-      console.log(
-        `[Info] [Media] Skipping transcode and moving direct-play file - ${fileName(filePath)}`
-      )
+    async function runDeferredVideoTranscode() {
+      try {
+        await runFfmpegProcessing()
+        await finalizeImport({
+          planned: true,
+          completedMessage: "Media processed and added to the library.",
+        })
+      } catch (error) {
+        const message = errorMessage(error) || "Unknown media processing error"
 
-      await replaceFile(filePath, finalPath, { jobId })
+        if (
+          isTranscodeWaitCancellation(error) &&
+          options.transcodeWaitSignal?.aborted
+        ) {
+          const shutdownMessage = "Skipped queued video transcode because shutdown started."
 
+          console.warn(
+            `[Warn] [Media] Queued video transcode cancelled during shutdown - processInputFile.ts - ${filePath}`
+          )
+          debugImport(jobId, shutdownMessage)
+          updateJob(jobId, {
+            status: "skipped",
+            message: shutdownMessage,
+            finishedAt: new Date().toISOString(),
+          })
+          return
+        }
+
+        console.error(
+          `[Error] [Media] Deferred video transcode failed - processInputFile.ts - ${filePath} - ${message}`
+        )
+        debugError(jobId, "Deferred video transcode failed", error)
+
+        updateJob(jobId, {
+          status: "failed",
+          error: message,
+          message,
+          finishedAt: new Date().toISOString(),
+        })
+      }
+    }
+
+    if (useExistingOutput) {
       if (await pathExists(filePath)) {
-        debugImport(jobId, "Source still exists after direct-play move; removing it.")
+        debugImport(jobId, "Removing duplicate input source for existing output file.")
         await unlinkFileWithRetry(filePath, { jobId })
       }
 
-      debugImport(jobId, "Direct-play file move completed.")
-      debugImport(jobId, "Cleaning input parent folders.")
+      debugImport(jobId, "Cleaning input parent folders after existing output recovery.")
       await removeNonMediaOnlyInputParents(filePath, { jobId })
-      debugImport(jobId, "Input parent cleanup completed.")
+      debugImport(jobId, "Input parent cleanup completed after existing output recovery.")
+
+      return finalizeImport({
+        planned: false,
+        completedMessage: "Existing output file was added to the library.",
+      })
+    }
+
+    if (needsFfmpegProcessing && convertVideo && options.deferVideoTranscodes) {
+      updateJob(jobId, {
+        message: "Queued for video transcode.",
+      })
+      console.log(
+        `[Info] [Media] Queued video transcode and continuing import scan - ${fileName(filePath)}`
+      )
+      debugImport(jobId, "Video transcode deferred so direct-move and audio-only imports can continue.")
+
+      const deferredWork = runDeferredVideoTranscode()
+      options.onDeferredWork?.(deferredWork)
+
+      return {
+        ok: true,
+        filePath: finalPath,
+        planned: true,
+        message: "Queued for video transcode.",
+      }
+    }
+
+    if (needsFfmpegProcessing) {
+      await runFfmpegProcessing()
+
+      return finalizeImport({
+        planned: true,
+        completedMessage: "Media processed and added to the library.",
+      })
     }
 
     updateJob(jobId, {
-      outputPath: finalPath,
-      message: "Generating thumbnail.",
+      message: "Moving direct-play media file.",
     })
 
     console.log(
-      `[Info] [Media] Generating episode thumbnail - ${fileName(finalPath)}`
+      `[Info] [Media] Skipping transcode and moving direct-play file - ${fileName(filePath)}`
     )
 
-    debugImport(jobId, `Checking output file before thumbnail - ${finalPath}`)
-    if (!(await pathExists(finalPath))) {
-      throw new Error(`Output file is missing before thumbnail generation: ${finalPath}`)
+    await replaceFile(filePath, finalPath, { jobId })
+
+    if (await pathExists(filePath)) {
+      debugImport(jobId, "Source still exists after direct-play move; removing it.")
+      await unlinkFileWithRetry(filePath, { jobId })
     }
 
-    const thumbnailPath = await generateEpisodeThumbnail(
-      finalPath,
-      durationSeconds
-    )
-    debugImport(jobId, `Thumbnail generated - ${thumbnailPath}`)
+    debugImport(jobId, "Direct-play file move completed.")
+    debugImport(jobId, "Cleaning input parent folders.")
+    await removeNonMediaOnlyInputParents(filePath, { jobId })
+    debugImport(jobId, "Input parent cleanup completed.")
 
-    debugImport(jobId, "Saving episode row.")
-    upsertEpisode({
-      animeId: metadata.id,
-      seasonNr: librarySeason,
-      epNr: parsed.episode,
-      filePath: finalPath,
-      thumbnailPath,
-      durationSeconds,
+    return finalizeImport({
+      planned: false,
+      completedMessage: "Media added to the library without transcoding.",
     })
-
-    console.log(
-      `[Info] [Media] Episode added to database - Anime id ${metadata.id}, Season ${librarySeason}, Episode ${parsed.episode}`
-    )
-    debugImport(jobId, "Episode row saved.")
-
-    updateJob(jobId, {
-      status: "completed",
-      outputPath: finalPath,
-      message: needsFfmpegProcessing
-        ? "Media processed and added to the library."
-        : "Media added to the library without transcoding.",
-      finishedAt: new Date().toISOString(),
-    })
-
-    debugImport(jobId, `Media import completed successfully - ${finalPath}`)
-
-    return {
-      ok: true,
-      filePath: finalPath,
-      planned: needsFfmpegProcessing,
-      message: needsFfmpegProcessing
-        ? "Media processed and added to the library."
-        : "Media added to the library without transcoding.",
-    }
   } catch (error) {
     const message = errorMessage(error) || "Unknown media processing error"
 

@@ -1,5 +1,5 @@
 import { constants } from "node:fs"
-import { access, stat } from "node:fs/promises"
+import { access, rm, stat } from "node:fs/promises"
 import path from "node:path"
 
 import { runFfmpeg } from "@/server/media/ffmpeg"
@@ -100,30 +100,90 @@ export function thumbnailPathForEpisode(filePath: string) {
   return `${filePath.slice(0, -extension.length)}.jpg`
 }
 
+function thumbnailSeekTimes(durationSeconds: number) {
+  const duration = Number.isFinite(durationSeconds) && durationSeconds > 0
+    ? durationSeconds
+    : 60
+
+  const maxSeek = Math.max(duration - 1, 1)
+  const candidates = [
+    duration / 2,
+    duration * 0.25,
+    Math.min(60, maxSeek),
+    Math.min(5, maxSeek),
+  ]
+
+  return Array.from(
+    new Set(
+      candidates
+        .map((time) => Math.min(Math.max(time, 1), maxSeek))
+        .map((time) => Number(time.toFixed(3)))
+    )
+  )
+}
+
+async function assertThumbnailWritten(thumbnailPath: string) {
+  const thumbnailStat = await stat(thumbnailPath)
+
+  if (!thumbnailStat.isFile() || thumbnailStat.size <= 0) {
+    throw new Error(`Thumbnail output was not written: ${thumbnailPath}`)
+  }
+}
+
+function thumbnailArgs(filePath: string, thumbnailPath: string, seekTime: number) {
+  return [
+    "-hide_banner",
+    "-loglevel",
+    "warning",
+    "-analyzeduration",
+    "100M",
+    "-probesize",
+    "100M",
+    "-ss",
+    String(seekTime),
+    "-i",
+    filePath,
+    "-map",
+    "0:v:0",
+    "-an",
+    "-sn",
+    "-dn",
+    "-frames:v",
+    "1",
+    "-vf",
+    "scale=640:-2:force_original_aspect_ratio=decrease,format=yuvj420p",
+    "-q:v",
+    "3",
+    "-strict",
+    "unofficial",
+    "-y",
+    thumbnailPath,
+  ]
+}
+
 export async function generateEpisodeThumbnail(
   filePath: string,
   durationSeconds: number
 ) {
   const thumbnailPath = thumbnailPathForEpisode(filePath)
+  let lastError: unknown = null
 
-  await runFfmpeg(
-    [
-      "-hide_banner",
-      "-loglevel",
-      "warning",
-      "-ss",
-      String(Math.max(durationSeconds / 2, 1)),
-      "-i",
-      filePath,
-      "-frames:v",
-      "1",
-      "-vf",
-      "scale=640:-2:force_original_aspect_ratio=decrease",
-      "-y",
-      thumbnailPath,
-    ],
-    { protectFromParentSignals: true }
-  )
+  for (const seekTime of thumbnailSeekTimes(durationSeconds)) {
+    try {
+      await rm(thumbnailPath, { force: true })
+      await runFfmpeg(thumbnailArgs(filePath, thumbnailPath, seekTime), {
+        protectFromParentSignals: true,
+      })
+      await assertThumbnailWritten(thumbnailPath)
 
-  return thumbnailPath
+      return thumbnailPath
+    } catch (error) {
+      lastError = error
+      await rm(thumbnailPath, { force: true })
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(`Thumbnail generation failed: ${filePath}`)
 }

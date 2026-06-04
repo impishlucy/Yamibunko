@@ -13,6 +13,7 @@ import {
   type AnimeStreamingEpisodeInput,
 } from "@/server/db/library"
 import { errorMessage } from "@/server/utils/format"
+import { debugLog } from "@/server/utils/debugLog"
 
 type AniListMediaNode = {
   id: number
@@ -554,6 +555,16 @@ function tokenOverlap(search: string, title: string) {
   return matches.length / searchTokens.length
 }
 
+function hasUnrequestedTitleSuffix(normalizedTitle: string, normalizedSearch: string) {
+  const searchTokens = normalizedSearch.split(" ").filter(Boolean)
+
+  if (searchTokens.length < 4 || normalizedTitle === normalizedSearch) {
+    return false
+  }
+
+  return normalizedTitle.startsWith(`${normalizedSearch} `)
+}
+
 function hasPartMarker(value: string, part: number) {
   const normalized = normalizeComparableTitle(value)
   const ordinalPart = getOrdinalPartLabel(part)
@@ -661,7 +672,11 @@ function scoreTitleGroup(titles: string[], normalizedSearch: string) {
   }
 
   if (normalizedTitles.some((title) => title.includes(normalizedSearch))) {
-    return 1
+    const bestContainingTitle = normalizedTitles
+      .filter((title) => title.includes(normalizedSearch))
+      .sort((left, right) => left.length - right.length)[0]
+
+    return hasUnrequestedTitleSuffix(bestContainingTitle, normalizedSearch) ? 3 : 1
   }
 
   const bestOverlap = Math.max(
@@ -669,7 +684,7 @@ function scoreTitleGroup(titles: string[], normalizedSearch: string) {
     0
   )
 
-  return bestOverlap >= 0.5 ? 2 : 3
+  return bestOverlap >= 0.7 ? 2 : 3
 }
 
 function isAcceptableCandidateScore(score: number) {
@@ -759,14 +774,14 @@ export async function findAnimeMetadata(
   const recentLookup = recentMetadataLookups.get(key)
 
   if (recentLookup && Date.now() - recentLookup.createdAt < metadataLookupCacheMs) {
-    console.log(`[Debug] [Anilist] Reusing recent metadata lookup - ${key}`)
+    debugLog(`[Debug] [Anilist] Reusing recent metadata lookup - ${key}`)
     return recentLookup.metadata
   }
 
   const inFlightLookup = inFlightMetadataLookups.get(key)
 
   if (inFlightLookup) {
-    console.log(`[Debug] [Anilist] Reusing in-flight metadata lookup - ${key}`)
+    debugLog(`[Debug] [Anilist] Reusing in-flight metadata lookup - ${key}`)
     return inFlightLookup
   }
 
@@ -814,7 +829,7 @@ async function findAnimeMetadataUncached(
     console.log(`[Info] [Anilist] Searching anime metadata - ${candidate}`)
 
     const result = await queueAniListOperation(() =>
-      getAniListClient().anime.getAnimeBySearch(candidate, 1, 5)
+      getAniListClient().anime.getAnimeBySearch(candidate, 1, 10)
     ).catch((error) => {
       console.warn(
         `[Warn] [Anilist] Anime metadata search failed - ${candidate} - ${errorMessage(error)}`
@@ -840,7 +855,7 @@ async function findAnimeMetadataUncached(
       }))
       .sort((left, right) => left.score - right.score)
 
-    console.log(
+    debugLog(
       `[Debug] [Anilist] Search candidate returned ${rankedMedia.length} result(s) - ${candidate}`
     )
 

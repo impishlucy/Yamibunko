@@ -2,6 +2,7 @@ import { Anilist } from "@api-wrappers/anilist-wrapper"
 import { isRateLimitError } from "@api-wrappers/api-core"
 
 import { errorMessage } from "@/server/utils/format"
+import { debugLog } from "@/server/utils/debugLog"
 
 const clients = new Map<string, Anilist>()
 const operationTimeoutMs = 30_000
@@ -73,7 +74,7 @@ export function getAniListRateLimitState() {
 
 export function queueAniListOperation<T>(operation: () => Promise<T>) {
   queuedOperations += 1
-  console.log(
+  debugLog(
     `[Debug] [Anilist] Queued AniList operation - Queue depth ${queuedOperations}`
   )
 
@@ -82,7 +83,7 @@ export function queueAniListOperation<T>(operation: () => Promise<T>) {
     queuedOperations = Math.max(queuedOperations - 1, 0)
     activeOperation = true
 
-    console.log(
+    debugLog(
       `[Debug] [Anilist] Starting AniList operation - Remaining queue ${queuedOperations}`
     )
 
@@ -90,7 +91,7 @@ export function queueAniListOperation<T>(operation: () => Promise<T>) {
 
     try {
       const result = await runWithTimeout(operation)
-      console.log(
+      debugLog(
         `[Debug] [Anilist] AniList operation completed - ${Date.now() - startedAt}ms`
       )
       return result

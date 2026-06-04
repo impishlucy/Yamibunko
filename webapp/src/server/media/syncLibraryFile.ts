@@ -21,6 +21,7 @@ import {
 } from "@/server/media/mediaFiles"
 import { findAnimeMetadata } from "@/server/metadata/anilist"
 import { fileName, parsePositiveInt } from "@/server/utils/format"
+import { debugLog } from "@/server/utils/debugLog"
 
 type ParsedLibraryPath = {
   animeTitle: string
@@ -30,7 +31,7 @@ type ParsedLibraryPath = {
 }
 
 function debugLibrarySync(message: string) {
-  console.log(`[Debug] [LibrarySync] ${message}`)
+  debugLog(`[Debug] [LibrarySync] ${message}`)
 }
 
 function parseSeasonFolder(value: string) {

@@ -14,6 +14,7 @@ import {
 } from "@/server/media/syncLibraryFile"
 import { cancelPendingLiveTranscodes } from "@/server/transcode/transcodeCapacity"
 import { errorMessage, fileName } from "@/server/utils/format"
+import { debugLog } from "@/server/utils/debugLog"
 
 type WorkerRuntime = {
   activeWork: Set<Promise<void>>
@@ -22,6 +23,12 @@ type WorkerRuntime = {
 }
 
 type WorkKind = "input" | "library-sync" | "library-delete"
+
+type QueuedWorkStart = {
+  kind: WorkKind
+  resolvedPath: string
+  key: string
+}
 type WorkerGlobalState = typeof globalThis & {
   __yamibunkoWorkerRuntime?: WorkerRuntime
   __yamibunkoSignalHandlersRegistered?: boolean
@@ -61,7 +68,11 @@ function msUntilNextDailyAniListSync() {
 const workerGlobal = globalThis as WorkerGlobalState
 
 function debugWorkers(message: string) {
-  console.log(`[Debug] [Workers] ${message}`)
+  debugLog(`[Debug] [Workers] ${message}`)
+}
+
+function yieldToEventLoop() {
+  return new Promise<void>((resolve) => setImmediate(resolve))
 }
 
 const failedImportsFolderName = "_Failed Imports"
@@ -122,11 +133,13 @@ export function startWorkers() {
     `Worker config loaded - Input ${config.inputDir}, Library ${config.mediaDir}, Temp ${config.tempDir}`
   )
   const queuedWork = new Set<string>()
+  const pendingWorkStarts: QueuedWorkStart[] = []
   const activeWork = new Set<Promise<void>>()
   let shuttingDown = false
   let scanning = false
   let dailyAniListTimer: NodeJS.Timeout | undefined
   let dailyAniListSyncRunning = false
+  let workStartScheduled = false
   const transcodeWaitShutdown = new AbortController()
 
   const inputWatcher = chokidar.watch(config.inputDir, {
@@ -181,7 +194,22 @@ export function startWorkers() {
     return containsMedia
   }
 
+  function trackActiveWork(work: Promise<void>, key: string) {
+    activeWork.add(work)
+    void work.finally(() => {
+      activeWork.delete(work)
+      debugWorkers(`Work removed from active set - ${key}`)
+    })
+  }
+
   function startFileWork(kind: WorkKind, resolvedPath: string, key: string) {
+    if (shuttingDown) {
+      queuedWork.delete(key)
+      debugWorkers(`Skipping queued work because shutdown started - ${key}`)
+      return
+    }
+
+    let deferredWorkRegistered = false
     const work = (async () => {
       try {
         console.log(
@@ -191,6 +219,15 @@ export function startWorkers() {
         if (kind === "input") {
           const result = await processInputFile(resolvedPath, {
             transcodeWaitSignal: transcodeWaitShutdown.signal,
+            deferVideoTranscodes: true,
+            onDeferredWork: (deferredWork) => {
+              deferredWorkRegistered = true
+              const trackedDeferredWork = deferredWork.finally(() => {
+                queuedWork.delete(key)
+                debugWorkers(`Deferred input processing completed - ${key}`)
+              })
+              trackActiveWork(trackedDeferredWork, `${key}:deferred-video`)
+            },
           })
 
           if (!result.ok) {
@@ -220,14 +257,47 @@ export function startWorkers() {
           `[Error] [Workers] Background file processing failed - startWorkers.ts - ${kind} - ${resolvedPath} - ${errorMessage(error)}`
         )
       } finally {
-        queuedWork.delete(key)
+        if (!deferredWorkRegistered) {
+          queuedWork.delete(key)
+        }
       }
     })()
 
-    activeWork.add(work)
-    void work.finally(() => {
-      activeWork.delete(work)
-      debugWorkers(`Work removed from active set - ${key}`)
+    trackActiveWork(work, key)
+  }
+
+  function scheduleQueuedWorkStart() {
+    if (workStartScheduled) {
+      return
+    }
+
+    workStartScheduled = true
+    setImmediate(() => {
+      workStartScheduled = false
+
+      if (shuttingDown) {
+        const cancelled = pendingWorkStarts.splice(0)
+
+        for (const item of cancelled) {
+          queuedWork.delete(item.key)
+        }
+
+        if (cancelled.length > 0) {
+          debugWorkers(`Cancelled ${cancelled.length} queued work item(s) before start.`)
+        }
+
+        return
+      }
+
+      const item = pendingWorkStarts.shift()
+
+      if (item && queuedWork.has(item.key)) {
+        startFileWork(item.kind, item.resolvedPath, item.key)
+      }
+
+      if (pendingWorkStarts.length > 0) {
+        scheduleQueuedWorkStart()
+      }
     })
   }
 
@@ -258,8 +328,9 @@ export function startWorkers() {
     }
 
     queuedWork.add(key)
+    pendingWorkStarts.push({ kind, resolvedPath, key })
     console.log(`[Info] [Workers] Queued file work - ${fileName(resolvedPath)}`)
-    startFileWork(kind, resolvedPath, key)
+    scheduleQueuedWorkStart()
   }
 
   async function scanInputDirectory() {
@@ -281,8 +352,12 @@ export function startWorkers() {
       )
       console.log("[Info] [Workers] Input folder scan completed.")
 
-      for (const filePath of mediaFiles) {
+      for (const [index, filePath] of mediaFiles.entries()) {
         enqueue("input", filePath)
+
+        if (index % 10 === 9) {
+          await yieldToEventLoop()
+        }
       }
 
       await pruneNonMediaOnlyDirectories(config.inputDir, config.inputDir)
@@ -312,8 +387,12 @@ export function startWorkers() {
       )
       console.log("[Info] [Workers] Library folder scan found media files.")
 
-      for (const filePath of mediaFiles) {
+      for (const [index, filePath] of mediaFiles.entries()) {
         enqueue("library-sync", filePath)
+
+        if (index % 10 === 9) {
+          await yieldToEventLoop()
+        }
       }
 
       for (const filePath of listEpisodeFilePaths()) {
@@ -417,6 +496,15 @@ export function startWorkers() {
 
     shuttingDown = true
     console.log("[Info] [Workers] Stopping background workers.")
+
+    const cancelled = pendingWorkStarts.splice(0)
+    for (const item of cancelled) {
+      queuedWork.delete(item.key)
+    }
+    if (cancelled.length > 0) {
+      debugWorkers(`Cancelled ${cancelled.length} queued work item(s) before shutdown.`)
+    }
+
     await beginStreamServerShutdown()
     cancelPendingLiveTranscodes(
       "Server is shutting down. Live transcode request was cancelled"
