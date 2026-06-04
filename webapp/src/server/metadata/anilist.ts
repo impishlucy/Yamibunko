@@ -17,6 +17,7 @@ import { debugLog } from "@/server/utils/debugLog"
 
 type AniListMediaNode = {
   id: number
+  type?: string | null
   format?: string | null
   title?: {
     romaji?: string | null
@@ -83,6 +84,7 @@ const AnimeWithStreamingEpisodesDocument = `
 
   fragment YamibunkoAnimeMedia on Media {
     id
+    type
     format
     title {
       romaji
@@ -115,8 +117,27 @@ const AnimeWithStreamingEpisodesDocument = `
 `
 
 
-const seriesFormats = new Set(["TV", "TV_SHORT", "ONA"])
-const sideStoryFormats = new Set(["MOVIE", "SPECIAL", "OVA"])
+const seriesFormats = new Set(["TV"])
+const libraryMediaFormats = new Set([
+  "TV",
+  "TV_SHORT",
+  "MOVIE",
+  "SPECIAL",
+  "OVA",
+  "ONA",
+])
+const nonRootLibraryMediaFormats = new Set([
+  "TV_SHORT",
+  "MOVIE",
+  "SPECIAL",
+  "OVA",
+  "ONA",
+])
+const rootRelationPriority = new Map([
+  ["PARENT", 0],
+  ["PREQUEL", 1],
+  ["SEQUEL", 2],
+])
 const metadataLookupCacheMs = 10 * 60 * 1000
 
 const inFlightMetadataLookups = new Map<
@@ -382,78 +403,202 @@ function getSearchCandidates(title: string, season?: number, part?: number) {
   return uniqueCandidates(partCandidates)
 }
 
-function findRelatedSeries(
-  relations: NonNullable<AnimeMetadataInput["relations"]>,
-  relationTypes: string[]
-) {
-  return relations.find(
-    (relation) =>
-      relationTypes.includes(relation.relationType) &&
-      seriesFormats.has(relation.media.format ?? "")
+function isAllowedLibraryMedia(media: AnimeMetadataInput) {
+  return libraryMediaFormats.has(media.format ?? "")
+}
+
+function isSeriesRootMedia(media: AnimeMetadataInput) {
+  return seriesFormats.has(media.format ?? "")
+}
+
+function isNonRootLibraryMedia(media: AnimeMetadataInput) {
+  return nonRootLibraryMediaFormats.has(media.format ?? "")
+}
+
+function titleValuesForRootResolution(metadata: AnimeMetadataInput) {
+  return uniqueTitleValues([
+    metadata.title.english,
+    metadata.title.romaji,
+    metadata.title.userPreferred,
+    metadata.title.native,
+  ]).map(normalizeComparableTitle)
+}
+
+function hasSharedRootTitle(metadata: AnimeMetadataInput, candidate: AnimeMetadataInput) {
+  const titles = titleValuesForRootResolution(metadata)
+  const candidateTitles = titleValuesForRootResolution(candidate)
+
+  return titles.some((title) =>
+    candidateTitles.some(
+      (candidateTitle) =>
+        title === candidateTitle ||
+        title.startsWith(`${candidateTitle} `) ||
+        candidateTitle.startsWith(`${title} `) ||
+        tokenOverlap(title, candidateTitle) >= 0.65 ||
+        tokenOverlap(candidateTitle, title) >= 0.65
+    )
   )
 }
 
-function findRelatedLibraryMedia(
-  relations: NonNullable<AnimeMetadataInput["relations"]>,
-  relationTypes: string[]
-) {
-  return relations.find(
-    (relation) =>
-      relationTypes.includes(relation.relationType) &&
-      (seriesFormats.has(relation.media.format ?? "") ||
-        sideStoryFormats.has(relation.media.format ?? ""))
+function hasRootTitlePrefix(metadata: AnimeMetadataInput, candidate: AnimeMetadataInput) {
+  const titles = titleValuesForRootResolution(metadata)
+  const candidateTitles = titleValuesForRootResolution(candidate)
+
+  return titles.some((title) =>
+    candidateTitles.some(
+      (candidateTitle) =>
+        title !== candidateTitle && title.startsWith(`${candidateTitle} `)
+    )
   )
 }
 
-function pickRootCandidate(metadata: AnimeMetadataInput) {
-  const relations = metadata.relations ?? []
-  const format = metadata.format ?? ""
-  const parent = findRelatedLibraryMedia(relations, ["PARENT"])
+function relationRootPriority(
+  relation: NonNullable<AnimeMetadataInput["relations"]>[number]
+) {
+  return rootRelationPriority.get(relation.relationType) ?? Number.MAX_SAFE_INTEGER
+}
 
-  if (parent) {
-    return parent
+function relationRootScore(
+  metadata: AnimeMetadataInput,
+  relation: NonNullable<AnimeMetadataInput["relations"]>[number]
+) {
+  const relationType = relation.relationType
+  const relationPriority = relationRootPriority(relation)
+
+  if (
+    relationPriority === Number.MAX_SAFE_INTEGER ||
+    !isAllowedLibraryMedia(relation.media) ||
+    !hasSharedRootTitle(metadata, relation.media)
+  ) {
+    return null
   }
 
-  const seriesPrequel = findRelatedSeries(relations, ["PREQUEL"])
+  const metadataYear = metadata.seasonYear ?? null
+  const relationYear = relation.media.seasonYear ?? null
+  const hasYearDirection = metadataYear !== null && relationYear !== null
+  const relationIsOlder = hasYearDirection && relationYear <= metadataYear
+  const metadataIsRootFormat = isSeriesRootMedia(metadata)
+  const relationIsRootFormat = isSeriesRootMedia(relation.media)
+  const relationIsNonRootFormat = isNonRootLibraryMedia(relation.media)
+  const rootTitlePrefix = hasRootTitlePrefix(metadata, relation.media)
 
-  if (seriesPrequel) {
-    return seriesPrequel
+  if (relationType === "SEQUEL" && metadataIsRootFormat) {
+    return null
   }
 
-  if (sideStoryFormats.has(format)) {
-    const rootRelation = findRelatedSeries(relations, [
-      "PARENT",
-      "PREQUEL",
-      "SEQUEL",
-      "SIDE_STORY",
-      "SUMMARY",
-      "SPIN_OFF",
-      "COMPILATION",
-      "CONTAINS",
-    ])
-
-    if (rootRelation) {
-      return rootRelation
-    }
+  if (
+    relationType === "PREQUEL" &&
+    metadataIsRootFormat &&
+    !relationIsRootFormat
+  ) {
+    return null
   }
 
-  const seriesSideRelation = findRelatedSeries(relations, [
-    "SIDE_STORY",
-    "SUMMARY",
-    "SPIN_OFF",
-  ])
-
-  if (seriesSideRelation) {
-    return seriesSideRelation
+  if (
+    relationType === "PARENT" &&
+    metadataIsRootFormat &&
+    relationIsNonRootFormat
+  ) {
+    return null
   }
 
-  const libraryPrequel = findRelatedLibraryMedia(relations, ["PREQUEL"])
-
-  if (libraryPrequel) {
-    return libraryPrequel
+  if (
+    relationType === "PREQUEL" &&
+    hasYearDirection &&
+    !relationIsOlder
+  ) {
+    return null
   }
 
-  return null
+  let score = relationPriority * 100
+
+  if (relationIsRootFormat) {
+    score -= 40
+  } else {
+    score += 20
+  }
+
+  if (rootTitlePrefix) {
+    score -= 20
+  }
+
+  if (relationType === "PARENT") {
+    score -= 20
+  } else if (relationType === "PREQUEL") {
+    score += relationIsOlder || !hasYearDirection ? 0 : 25
+  } else if (!relationIsRootFormat) {
+    score += 25
+  }
+
+  const yearSort = relationYear ?? Number.MAX_SAFE_INTEGER
+
+  return {
+    score,
+    yearSort,
+    relationPriority,
+  }
+}
+
+function pickRootCandidates(metadata: AnimeMetadataInput) {
+  const seen = new Set<number>()
+  const candidates = (metadata.relations ?? [])
+    .map((relation) => ({ relation, rootScore: relationRootScore(metadata, relation) }))
+    .filter(
+      (item): item is {
+        relation: NonNullable<AnimeMetadataInput["relations"]>[number]
+        rootScore: { score: number; yearSort: number; relationPriority: number }
+      } => Boolean(item.rootScore)
+    )
+    .filter(({ relation }) => {
+      if (seen.has(relation.media.id)) {
+        return false
+      }
+
+      seen.add(relation.media.id)
+      return true
+    })
+
+  const parentCandidates = candidates.filter(
+    (item) => item.relation.relationType === "PARENT"
+  )
+  const prequelCandidates = candidates.filter(
+    (item) => item.relation.relationType === "PREQUEL"
+  )
+  const primaryCandidates = [...parentCandidates, ...prequelCandidates]
+  const selectedCandidates = primaryCandidates.length > 0
+    ? primaryCandidates
+    : isSeriesRootMedia(metadata)
+      ? []
+      : candidates.filter((item) => item.relation.relationType === "SEQUEL")
+
+  return selectedCandidates
+    .sort((left, right) => {
+      const scoreDelta = left.rootScore.score - right.rootScore.score
+
+      if (scoreDelta !== 0) {
+        return scoreDelta
+      }
+
+      if (left.rootScore.yearSort !== right.rootScore.yearSort) {
+        return left.rootScore.yearSort - right.rootScore.yearSort
+      }
+
+      return left.relation.media.id - right.relation.media.id
+    })
+    .map((item) => item.relation)
+}
+
+function pickRootCandidate(
+  metadata: AnimeMetadataInput,
+  skippedMediaIds = new Set<number>()
+) {
+  return (
+    pickRootCandidates(metadata).find(
+      (candidate) =>
+        candidate.media.id !== metadata.id &&
+        !skippedMediaIds.has(candidate.media.id)
+    ) ?? null
+  )
 }
 
 async function fetchAnimeMetadataById(id: number) {
@@ -474,23 +619,52 @@ async function fetchAnimeMetadataById(id: number) {
 
 async function resolveLibraryRoot(
   metadata: AnimeMetadataInput,
-  depth = 0
+  visited = new Set<number>()
 ): Promise<AnimeMetadataInput> {
-  if (depth >= 4) {
+  if (visited.has(metadata.id) || visited.size >= 12) {
     return metadata
   }
 
-  const candidate = pickRootCandidate(metadata)
+  const nextVisited = new Set(visited)
+  nextVisited.add(metadata.id)
 
-  if (!candidate || candidate.media.id === metadata.id) {
-    return metadata
+  const skippedMediaIds = new Set(nextVisited)
+  const fallbackRoots: AnimeMetadataInput[] = []
+
+  while (true) {
+    const candidate = pickRootCandidate(metadata, skippedMediaIds)
+
+    if (!candidate) {
+      break
+    }
+
+    skippedMediaIds.add(candidate.media.id)
+
+    const fullCandidate =
+      (await fetchAnimeMetadataById(candidate.media.id).catch((error) => {
+        console.warn(
+          `[Warn] [Anilist] Related root metadata fetch failed - ${candidate.media.id} - ${errorMessage(error)}`
+        )
+        return null
+      })) ?? candidate.media
+    const root = await resolveLibraryRoot(fullCandidate, nextVisited)
+
+    if (root.id === metadata.id || !isAllowedLibraryMedia(root)) {
+      continue
+    }
+
+    if (isSeriesRootMedia(root)) {
+      return root
+    }
+
+    fallbackRoots.push(root)
   }
 
-  const fullCandidate =
-    (await fetchAnimeMetadataById(candidate.media.id).catch(() => null)) ??
-    candidate.media
+  if (!isSeriesRootMedia(metadata) && fallbackRoots.length > 0) {
+    return fallbackRoots[0]
+  }
 
-  return resolveLibraryRoot(fullCandidate, depth + 1)
+  return metadata
 }
 
 async function attachLibraryInfo(metadata: AnimeMetadataInput) {
@@ -822,7 +996,8 @@ async function findAnimeMetadataUncached(
     console.log(
       `[Info] [Anilist] Resolved anime metadata from local cache - ${title} - id ${cached.id}`
     )
-    return cached
+
+    return attachLibraryInfo(cached)
   }
 
   for (const candidate of getSearchCandidates(title, season, part)) {
