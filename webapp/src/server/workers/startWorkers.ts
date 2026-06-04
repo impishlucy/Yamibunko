@@ -127,7 +127,11 @@ export function startWorkers() {
         )
 
         if (kind === "input") {
-          await processInputFile(resolvedPath)
+          const result = await processInputFile(resolvedPath)
+
+          if (!result.ok) {
+            throw new Error(result.message)
+          }
         } else if (kind === "library-sync") {
           await syncLibraryFile(resolvedPath)
         } else {
