@@ -19,7 +19,7 @@
 
     <TrayIcon.Icons>
         <TrayIcons>
-            <TrayIcon Icon="avares://Launcher/Assets/icon.ico" ToolTipText="Sumire Server">
+            <TrayIcon Icon="avares://Launcher/Assets/icon.ico" ToolTipText="Yamibunko">
                 <TrayIcon.Menu>
                     <NativeMenu>
                         <NativeMenuItem Header="Show Logs" Click="OnShowLogsClicked"/>
