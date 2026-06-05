@@ -8,8 +8,6 @@
 
 Yamibunko is a local anime library server with a desktop launcher and a web UI. It processes your own media files, organizes them into a library, enriches entries with metadata, and plays them through the browser.
 
-<sub><ins>Yamibunko does not include, download, or provide access to copyrighted media.</ins></sub>
-
 <img width="48%" alt="library" src="https://github.com/user-attachments/assets/fe05f186-7b1e-42e2-b154-da7c737952bb" />
 <img width="48%" alt="overview" src="https://github.com/user-attachments/assets/97a719da-e392-4089-82be-fc1d983a979b" />
 <img width="48%" alt="player" src="https://github.com/user-attachments/assets/752f0712-4df7-4d7f-8c90-04585f7cdde4" />
@@ -145,4 +143,4 @@ You may share and adapt this project with attribution for non-commercial purpose
 
 Yamibunko is intended for organizing, processing, and playing local files that you own or are allowed to use.
 
-It does not include anime files, does not provide anime files, and does not provide access to licensed media.
+<ins>Yamibunko does not include, download, or provide access to copyrighted media.</ins>
