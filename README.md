@@ -18,24 +18,26 @@ Yamibunko is a local anime library server with a desktop launcher and a web UI. 
 
 Yamibunko is built around a local anime library workflow:
 
-* Self-made browser player designed for anime watching, with responsive controls, volume control, skip intro/outro buttons, stream info hints, and mobile-friendly layouts.
-* Direct-File play possible and live transcoding when the browser or device needs a compatible stream.
-* Data Saver mode for when bandwidth is low.
-* Bandwidth-aware streaming, uses a server limit and helps avoid overloading the host connection.
-* VIP priority streaming so selected users can get better access when the server is under load.
-* Google Cast support that respects stream limits, bandwidth rules, audio, subtitles, and playback mode.
-* Import conversion for smaller, more consistent files, including HEVC conversion and audio cleanup when needed.
+* Custom player designed for animes, with the usual controls, skip intro/outro buttons and Google casting.
+* Responsive layouts for all pages, on desktop, tablets, and phones.
+* Direct-File play and transcoding are possible.
+* Data Saver mode for when you're have a data cap.
+* Import conversion for smaller, more consistent files, using HEVC conversion and audio cleanup when needed.
 * Per-series library grouping, no more searching the library, its all grouped together.
 * AniList integration for metadata, tracking, watching progress and watching status.
-* One active stream per user, with confirmation when switching playback to another episode or device.
 * Desktop launcher that prepares the runtime, starts the webapp, and keeps setup easier for normal installs.
-* Responsive layouts for all pages, on desktop, tablets, and phones.
+* Bandwidth-aware streaming, uses a server limit and helps avoid overloading the host connection.
+* One active stream per user, with confirmation when switching playback to another episode or device.
+* VIP priority streaming so selected users can get better access when the server is under load.
 
 
 ## Install
 
-### Normal Install
+### Normal Install (with Launcher)
 
+The only required things are an 64bit OS and .NET 10.
+
+0. Install [.NET 10 Runtime](https://dotnet.microsoft.com/en-us/download/dotnet/10.0).
 1. Open the [Yamibunko releases](https://github.com/impishlucy/Yamibunko/releases) page.
 2. Download the latest release ZIP for your OS.
 3. Extract the ZIP completely.
@@ -43,15 +45,13 @@ Yamibunko is built around a local anime library workflow:
 5. Fill in the setup fields:
 
    * Base URL, usually `http://localhost:3000` or the website url of the app.
-   * Input folder for new files
-   * Library folder for processed files
-   * AniList API client ID and secret if you want AniList login, tracking, or metadata features
+   * Input folder for new files.
+   * Output folder for processed files.
+   * AniList API client ID and secret if you want AniList tracking.
 6. Save the setup and wait for the launcher to start the web UI.
 
-The launcher prepares the local runtime, starts the webapp, and downloads whats needed.
-If the web UI does not open automatically, check the launcher log window or tray status.
-
-For best results, use a 64-bit OS with more than 4 GB of RAM.
+The launcher prepares the local runtime, downloads whats needed and starts the webapp.
+If the web UI does not open automatically, check the launcher log window.
 
 ### AniList Setup
 
