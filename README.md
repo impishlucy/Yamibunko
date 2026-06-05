@@ -83,64 +83,14 @@ bun run start
 
 Supported `TRANSCODE_ACCEL` values in env are `nvenc`, `qsv`, and `cpu`.
 
-## Contributing
+## Disclaimer
 
-### Repository Setup
+Yamibunko is intended for organizing, processing, and playing local files that you own or are allowed to use.
 
-```bash
-git clone https://github.com/impishlucy/Yamibunko.git
-cd Yamibunko
-```
-
-### Webapp Development
-
-```bash
-cd webapp
-bun install
-cp .env.example .env
-bun run dev
-```
-
-Before opening a pull request, run:
-
-```bash
-bun run lint
-bun run typecheck
-bun run build
-```
-
-### Launcher Development
-
-The launcher is a C# Avalonia project in `launcher`.
-
-```bash
-dotnet restore launcher/Launcher.csproj
-dotnet build launcher/Launcher.csproj
-dotnet run --project launcher/Launcher.csproj
-```
-
-Use a .NET SDK that supports the launcher target framework in `launcher/Launcher.csproj`.
-
-## References and Thanks
-
-Yamibunko uses and is inspired by these projects:
-
-* [Next.js](https://nextjs.org/) for the webapp.
-* [Avalonia UI](https://avaloniaui.net/) for the desktop launcher.
-* [Bun](https://bun.sh/) for webapp package management and scripts.
-* [BtbN FFmpeg Builds](https://github.com/BtbN/FFmpeg-Builds) for FFmpeg builds used by the launcher.
-* [Vidstack](https://www.vidstack.io/) for media player UI tooling.
-* [`@api-wrappers/anilist-wrapper`](https://github.com/Api-Wrappers/anilist-wrapper) for AniList API access.
-* [`chokidar`](https://github.com/paulmillr/chokidar) for file watching.
+<ins>Yamibunko does not include, download, or provide access to copyrighted media.</ins>
 
 ## License
 
 This project is licensed under the [Creative Commons Attribution-NonCommercial 4.0 International License](https://creativecommons.org/licenses/by-nc/4.0/deed.en).
 
 You may share and adapt this project with attribution for non-commercial purposes. Commercial use is not permitted.
-
-## Disclaimer
-
-Yamibunko is intended for organizing, processing, and playing local files that you own or are allowed to use.
-
-<ins>Yamibunko does not include, download, or provide access to copyrighted media.</ins>
