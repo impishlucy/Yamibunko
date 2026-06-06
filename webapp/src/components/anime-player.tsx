@@ -151,11 +151,16 @@ type HtmlVideoElementWithAudioTracks = HTMLVideoElement & {
 type HtmlVideoElementWithNativePlayback = HTMLVideoElement & {
   disableRemotePlayback?: boolean
   remote?: {
+    state?: "connecting" | "connected" | "disconnected"
     prompt?: () => Promise<void>
     watchAvailability?: (callback: (available: boolean) => void) => Promise<number>
     cancelWatchAvailability?: (watchId: number) => Promise<void>
+    addEventListener?: (type: string, listener: EventListener) => void
+    removeEventListener?: (type: string, listener: EventListener) => void
   }
+  webkitCurrentPlaybackTargetIsWireless?: boolean
   webkitEnterFullscreen?: () => void
+  webkitPresentationMode?: string
   webkitShowPlaybackTargetPicker?: () => void
   webkitSupportsPresentationMode?: (mode: string) => boolean
   webkitSetPresentationMode?: (mode: string) => void
@@ -653,20 +658,34 @@ function getGoogleCastUnavailableMessage(input: {
   return "Casting is not available in this browser."
 }
 
-async function requestNativeRemotePlayback(video: HTMLVideoElement) {
+function requestNativeRemotePlayback(video: HTMLVideoElement) {
   const nativeVideo = video as HtmlVideoElementWithNativePlayback
-
-  if (typeof nativeVideo.remote?.prompt === "function") {
-    await nativeVideo.remote.prompt()
-    return true
-  }
 
   if (typeof nativeVideo.webkitShowPlaybackTargetPicker === "function") {
     nativeVideo.webkitShowPlaybackTargetPicker()
     return true
   }
 
+  if (typeof nativeVideo.remote?.prompt === "function") {
+    void nativeVideo.remote.prompt().catch(() => undefined)
+    return true
+  }
+
   return false
+}
+
+function isNativeRemotePlaybackConnected(video: HTMLVideoElement | null) {
+  if (!video) {
+    return false
+  }
+
+  const nativeVideo = video as HtmlVideoElementWithNativePlayback
+
+  return (
+    nativeVideo.webkitCurrentPlaybackTargetIsWireless === true ||
+    nativeVideo.remote?.state === "connected" ||
+    nativeVideo.remote?.state === "connecting"
+  )
 }
 
 function requestNativeVideoFullscreen(video: HTMLVideoElement | null) {
@@ -1377,6 +1396,7 @@ export function AnimePlayer({
   const lastProgressSavePositionRef = useRef(0)
   const lastNonZeroVolumeRef = useRef(1)
   const lastVolumePointerTypeRef = useRef<string | null>(null)
+  const touchControlClickSuppressionRef = useRef(false)
   const completedProgressRef = useRef(false)
   const directFallbackAttemptedRef = useRef(false)
   const currentTimeRef = useRef(0)
@@ -1389,6 +1409,8 @@ export function AnimePlayer({
   const shouldAutoPlaySourceRef = useRef(autoPlay)
   const sourceSwitchPauseSuppressionUntilRef = useRef(0)
   const isCastingRef = useRef(false)
+  const isNativeRemoteCastingRef = useRef(false)
+  const nativeRemoteFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const isCastLoadingRef = useRef(false)
   const isPlayingRef = useRef(false)
   const castContentIdRef = useRef<string | null>(null)
@@ -1460,6 +1482,7 @@ export function AnimePlayer({
   const [isPhoneViewport, setIsPhoneViewport] = useState(false)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [isCasting, setIsCasting] = useState(false)
+  const [isNativeRemoteCasting, setIsNativeRemoteCasting] = useState(false)
   const [isCastStarting, setIsCastStarting] = useState(false)
   const [isIosDevice, setIsIosDevice] = useState(false)
   const [nativeRemotePlaybackSupported, setNativeRemotePlaybackSupported] = useState(false)
@@ -1725,12 +1748,36 @@ export function AnimePlayer({
     setShowHardwareWait(false)
   }, [clearHardwareWaitTimer])
 
+  const clearNativeRemoteFallbackTimer = useCallback(() => {
+    if (nativeRemoteFallbackTimerRef.current) {
+      clearTimeout(nativeRemoteFallbackTimerRef.current)
+      nativeRemoteFallbackTimerRef.current = null
+    }
+  }, [])
+
+  const setNativeRemoteCastingState = useCallback(
+    (nextIsCasting: boolean) => {
+      isNativeRemoteCastingRef.current = nextIsCasting
+      setIsNativeRemoteCasting(nextIsCasting)
+
+      if (!nextIsCasting) {
+        clearNativeRemoteFallbackTimer()
+      }
+    },
+    [clearNativeRemoteFallbackTimer]
+  )
+
   const showControls = useCallback(
     (keepVisible = false) => {
       clearControlsTimer()
       setControlsVisible(true)
 
-      if (!keepVisible && isPlayingRef.current && !isCastingRef.current) {
+      if (
+        !keepVisible &&
+        isPlayingRef.current &&
+        !isCastingRef.current &&
+        !isNativeRemoteCastingRef.current
+      ) {
         controlsTimerRef.current = setTimeout(() => {
           setControlsVisible(false)
           setSettingsOpen(false)
@@ -1739,6 +1786,12 @@ export function AnimePlayer({
     },
     [clearControlsTimer]
   )
+
+  useEffect(() => {
+    return () => {
+      clearNativeRemoteFallbackTimer()
+    }
+  }, [clearNativeRemoteFallbackTimer])
 
   useEffect(() => {
     const removeListener = addGoogleCastSessionStateListener((event) => {
@@ -1840,10 +1893,30 @@ export function AnimePlayer({
       )
     }
 
+    function handleNativeTargetChanged() {
+      const connected = isNativeRemotePlaybackConnected(video)
+      setNativeRemoteCastingState(connected)
+
+      if (!connected) {
+        isCastLoadingRef.current = false
+        setIsCastStarting(false)
+        endMediaWait()
+        return
+      }
+
+      showControls(true)
+    }
+
     video.addEventListener(
       "webkitplaybacktargetavailabilitychanged",
       handleWebKitAvailability
     )
+    video.addEventListener(
+      "webkitcurrentplaybacktargetiswirelesschanged",
+      handleNativeTargetChanged
+    )
+    nativeVideo.remote?.addEventListener?.("connect", handleNativeTargetChanged)
+    nativeVideo.remote?.addEventListener?.("disconnect", handleNativeTargetChanged)
 
     if (typeof nativeVideo.remote?.watchAvailability === "function") {
       nativeVideo.remote
@@ -1876,12 +1949,18 @@ export function AnimePlayer({
         "webkitplaybacktargetavailabilitychanged",
         handleWebKitAvailability
       )
+      video.removeEventListener(
+        "webkitcurrentplaybacktargetiswirelesschanged",
+        handleNativeTargetChanged
+      )
+      nativeVideo.remote?.removeEventListener?.("connect", handleNativeTargetChanged)
+      nativeVideo.remote?.removeEventListener?.("disconnect", handleNativeTargetChanged)
 
       if (remoteWatchId !== null) {
         void nativeVideo.remote?.cancelWatchAvailability?.(remoteWatchId)
       }
     }
-  }, [sourceUrl])
+  }, [endMediaWait, setNativeRemoteCastingState, showControls, sourceUrl])
 
   useEffect(() => {
     const video = videoRef.current
@@ -1911,7 +1990,7 @@ export function AnimePlayer({
   }, [])
 
   useEffect(() => {
-    if (!isMobilePortraitViewport || isCasting || isFullscreen) {
+    if (!isMobilePortraitViewport || isCasting || isNativeRemoteCasting || isFullscreen) {
       return
     }
 
@@ -1920,7 +1999,7 @@ export function AnimePlayer({
     if (video && !video.paused) {
       video.pause()
     }
-  }, [isCasting, isFullscreen, isMobilePortraitViewport])
+  }, [isCasting, isFullscreen, isMobilePortraitViewport, isNativeRemoteCasting])
 
   useEffect(() => {
     if (!settingsOpen) {
@@ -3003,7 +3082,7 @@ export function AnimePlayer({
       return
     }
 
-    if (shouldBlockMobilePortraitPlayback) {
+    if (shouldBlockMobilePortraitPlayback && !isNativeRemoteCastingRef.current) {
       showControls(true)
       return
     }
@@ -3239,10 +3318,12 @@ export function AnimePlayer({
       return
     }
 
+    if (isIosBrowser() && requestNativeVideoFullscreen(video)) {
+      return
+    }
+
     if (target && typeof target.requestFullscreen === "function") {
-      void target.requestFullscreen().catch(() => {
-        requestNativeVideoFullscreen(video)
-      })
+      void target.requestFullscreen().catch(() => undefined)
       return
     }
 
@@ -3669,6 +3750,109 @@ export function AnimePlayer({
     void startGoogleCastingRef.current(video, isPlayingRef.current, getPlaybackPosition())
   }, [castSelectionKey, getPlaybackPosition, isCasting])
 
+  function getNativeRemotePlaybackUrl(startTime: number) {
+    const nativeRemoteBaseUrl = liveTranscodeEnabled
+      ? quality === "dataSaver"
+        ? playback.castDataSaverUrl
+        : playback.castTranscodeUrl
+      : playback.castDirectUrl
+
+    return getCastReceiverUrl(
+      withStreamParams(nativeRemoteBaseUrl, {
+        audioStreamId: selectedAudioStreamId,
+        startTime,
+        clientId: clientStreamIdRef.current,
+      })
+    )
+  }
+
+  async function startNativeRemotePlayback(video: HTMLVideoElement) {
+    const startTime = getPlaybackPosition()
+    const nativeRemoteUrl = getNativeRemotePlaybackUrl(startTime)
+    const canLocalDirect = supportsDirectPlayback({
+      video,
+      fileName,
+      media,
+      selectedAudioStream: playbackAudioStream,
+    })
+    const localFallbackStatus =
+      quality === "original" && (canLocalDirect || !liveTranscodeEnabled)
+        ? "direct"
+        : "transcoding"
+    const localFallbackSource =
+      localFallbackStatus === "direct" ? getDirectUrl() : getTranscodeUrl(quality)
+    const nextStatus: PlaybackStatusState = liveTranscodeEnabled ? "transcoding" : "direct"
+
+    localPlaybackBeforeCastRef.current = {
+      sourceUrl: sourceUrlRef.current ?? localFallbackSource,
+      status: localFallbackStatus,
+      quality,
+      directPossible: canLocalDirect,
+      position: startTime,
+      wasMuted: video.muted,
+    }
+    resumeLocalAfterCastEndRef.current = true
+    castContentIdRef.current = nativeRemoteUrl
+    castSourceStartOffsetRef.current = startTime
+    activeSourceStartRef.current = startTime
+    currentTimeRef.current = startTime
+    pendingSeekRef.current = null
+    sourceSwitchPauseSuppressionUntilRef.current = Date.now() + 5000
+    sourceUrlRef.current = nativeRemoteUrl
+    statusRef.current = nextStatus
+    setStatus(nextStatus)
+    setSourceUrl(nativeRemoteUrl)
+    setCurrentTime(startTime)
+    setNativeRemoteCastingState(true)
+    setIsCastStarting(true)
+    isCastLoadingRef.current = true
+    beginMediaWait(nextStatus === "transcoding")
+    showControls(true)
+
+    video.muted = false
+    video.src = nativeRemoteUrl
+    video.load()
+
+    const playPromise = video.play()
+
+    if (!requestNativeRemotePlayback(video)) {
+      void playPromise.catch(() => undefined)
+      video.pause()
+      setNativeRemoteCastingState(false)
+      setIsCastStarting(false)
+      isCastLoadingRef.current = false
+      endMediaWait()
+      restoreLocalSource({ preservePosition: true })
+      throw new Error("Native casting is not available right now.")
+    }
+
+    try {
+      await playPromise
+      setIsPlaying(true)
+      isPlayingRef.current = true
+      endMediaWait()
+    } catch (error) {
+      setNativeRemoteCastingState(false)
+      setIsCastStarting(false)
+      isCastLoadingRef.current = false
+      endMediaWait()
+      restoreLocalSource({ preservePosition: true })
+      throw error
+    }
+
+    nativeRemoteFallbackTimerRef.current = setTimeout(() => {
+      nativeRemoteFallbackTimerRef.current = null
+      isCastLoadingRef.current = false
+      setIsCastStarting(false)
+
+      if (!isNativeRemotePlaybackConnected(video)) {
+        return
+      }
+
+      setNativeRemoteCastingState(true)
+    }, 3000)
+  }
+
   async function startCasting() {
     const video = videoRef.current
 
@@ -3696,17 +3880,15 @@ export function AnimePlayer({
       }
 
       try {
-        if (await requestNativeRemotePlayback(video)) {
-          showControls(true)
-          return
-        }
+        await startNativeRemotePlayback(video)
       } catch (error) {
         flashCastError(error)
         console.error(error)
-        return
+      } finally {
+        setIsCastStarting(false)
+        isCastLoadingRef.current = false
       }
 
-      flashCastError(new Error("Native casting is not available right now."))
       return
     }
 
@@ -3750,6 +3932,37 @@ export function AnimePlayer({
     }
   }
 
+  function handleNativeRemoteEnded() {
+    const video = videoRef.current
+    const castPosition = currentTimeRef.current
+    const shouldResumeLocal = resumeLocalAfterCastEndRef.current
+
+    clearNativeRemoteFallbackTimer()
+    video?.pause()
+    castContentIdRef.current = null
+    castSourceStartOffsetRef.current = 0
+    castFinishedHandledRef.current = false
+    castStartPromiseRef.current = null
+    setIsCastStarting(false)
+    isCastLoadingRef.current = false
+    setNativeRemoteCastingState(false)
+    setIsPlaying(false)
+    isPlayingRef.current = false
+    endMediaWait()
+
+    if (localPlaybackBeforeCastRef.current) {
+      localPlaybackBeforeCastRef.current = {
+        ...localPlaybackBeforeCastRef.current,
+        position: castPosition,
+      }
+    }
+
+    shouldAutoPlaySourceRef.current = shouldResumeLocal
+    resumeLocalAfterCastEndRef.current = false
+    restoreLocalSource({ preservePosition: true })
+    showControls(true)
+  }
+
   function handleCastEnded() {
     const video = videoRef.current
     const castPosition = currentTimeRef.current
@@ -3765,6 +3978,7 @@ export function AnimePlayer({
     isCastLoadingRef.current = false
     isCastingRef.current = false
     setIsCasting(false)
+    setNativeRemoteCastingState(false)
     setIsPlaying(false)
     isPlayingRef.current = false
     endMediaWait()
@@ -3790,6 +4004,11 @@ export function AnimePlayer({
     const video = videoRef.current
 
     if (!video) {
+      return
+    }
+
+    if (isNativeRemoteCastingRef.current) {
+      handleNativeRemoteEnded()
       return
     }
 
@@ -3952,6 +4171,39 @@ export function AnimePlayer({
     showControls(true)
   }
 
+  function runTouchControlAction(
+    event: React.PointerEvent<HTMLElement>,
+    action: () => void
+  ) {
+    if (event.pointerType !== "touch" && event.pointerType !== "pen") {
+      return
+    }
+
+    event.preventDefault()
+    event.stopPropagation()
+    touchControlClickSuppressionRef.current = true
+    action()
+
+    window.setTimeout(() => {
+      touchControlClickSuppressionRef.current = false
+    }, 400)
+  }
+
+  function runClickControlAction(
+    event: React.MouseEvent<HTMLElement>,
+    action: () => void
+  ) {
+    event.stopPropagation()
+
+    if (touchControlClickSuppressionRef.current) {
+      event.preventDefault()
+      touchControlClickSuppressionRef.current = false
+      return
+    }
+
+    action()
+  }
+
   const displayedCurrentTime = seekPreview ?? currentTime
   const currentPlaybackKey = `${animeId}:${seasonNumber}:${episodeNumber}`
   const playerAspectRatio =
@@ -3961,11 +4213,12 @@ export function AnimePlayer({
   const canSkipIntro = duration > 90 && currentTime < 90
   const canSkipOutro = duration > 0 && currentTime >= duration * 0.8 && currentTime < duration - 1
   const castSkipLabel = canSkipIntro ? "Skip intro" : canSkipOutro ? "Skip outro" : "Skip intro/outro"
+  const isAnyCasting = isCasting || isNativeRemoteCasting
   const shouldBlockMobilePortraitPlayback =
-    isMobilePortraitViewport && !isCasting && !isFullscreen
+    isMobilePortraitViewport && !isAnyCasting && !isFullscreen
   const controlsAreVisible =
     !shouldBlockMobilePortraitPlayback &&
-    (controlsVisible || !isPlaying || isCasting || settingsOpen)
+    (controlsVisible || !isPlaying || isAnyCasting || settingsOpen)
   const castPreflightError = getCastPreflightError()
   const nativeCastUnavailableLabel = nativeRemotePlaybackSupported
     ? "No nearby playback target"
@@ -3980,7 +4233,7 @@ export function AnimePlayer({
   const centerToggleVisible =
     !shouldBlockMobilePortraitPlayback &&
     !isWaitingForMedia &&
-    !isCasting &&
+    !isAnyCasting &&
     (!isPlaying || controlsAreVisible)
   const settingsPanelClass = `fixed left-1/2 z-[100] w-[min(24rem,calc(100vw-1.5rem))] -translate-x-1/2 space-y-3 overflow-y-auto overscroll-contain rounded-xl border border-white/10 bg-zinc-950/95 p-3 text-xs shadow-2xl backdrop-blur lg:p-4 lg:text-sm ${
     isPortraitViewport
@@ -4016,7 +4269,7 @@ export function AnimePlayer({
         <video
           ref={videoRef}
           className={`yamibunko-player-video block h-full w-full bg-black object-cover transition-opacity ${
-            isCasting ? "opacity-0" : "opacity-100"
+            isAnyCasting ? "opacity-0" : "opacity-100"
           }`}
           playsInline
           preload="none"
@@ -4086,7 +4339,7 @@ export function AnimePlayer({
           }}
           onPause={handlePause}
           onPlay={(event) => {
-            if (shouldBlockMobilePortraitPlayback) {
+            if (shouldBlockMobilePortraitPlayback && !isNativeRemoteCastingRef.current) {
               event.currentTarget.pause()
               setIsPlaying(false)
               endMediaWait()
@@ -4099,7 +4352,7 @@ export function AnimePlayer({
             showControls()
           }}
           onPlaying={(event) => {
-            if (shouldBlockMobilePortraitPlayback) {
+            if (shouldBlockMobilePortraitPlayback && !isNativeRemoteCastingRef.current) {
               event.currentTarget.pause()
               setIsPlaying(false)
               endMediaWait()
@@ -4158,7 +4411,7 @@ export function AnimePlayer({
           </div>
         ) : null}
 
-        {isCasting ? (
+        {isAnyCasting ? (
           <div className="absolute inset-0 bg-black text-white">
             <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_18%,rgba(127,29,29,0.2),transparent_36%),linear-gradient(180deg,rgba(24,24,27,0.32),rgba(0,0,0,0.82))]" />
 
@@ -4229,7 +4482,7 @@ export function AnimePlayer({
                       variant="secondary"
                       size="icon"
                       className="size-14 rounded-2xl border border-white/10 bg-white/[0.06] text-white shadow-xl hover:border-white/20 hover:bg-white/10 disabled:opacity-35 sm:size-16 lg:size-20"
-                      disabled={!isCasting}
+                      disabled={!isAnyCasting}
                       aria-label={isPlaying ? "Pause" : "Play"}
                       onClick={(event) => {
                         event.stopPropagation()
@@ -4382,10 +4635,16 @@ export function AnimePlayer({
             type="button"
             className="grid size-20 place-items-center lg:size-24 rounded-full bg-black/45 text-white/70 hover:bg-black/60 hover:text-white"
             disabled={!sourceUrl}
-            onClick={(event) => {
-              event.stopPropagation()
-              void togglePlay()
-            }}
+            onPointerUp={(event) =>
+              runTouchControlAction(event, () => {
+                void togglePlay()
+              })
+            }
+            onClick={(event) =>
+              runClickControlAction(event, () => {
+                void togglePlay()
+              })
+            }
             aria-label={isPlaying ? "Pause" : "Play"}
           >
             {isPlaying ? (
@@ -4396,7 +4655,7 @@ export function AnimePlayer({
           </button>
         </HoverHint>
 
-        {controlsAreVisible && !isCasting && canSkipIntro ? (
+        {controlsAreVisible && !isAnyCasting && canSkipIntro ? (
           <Button
             type="button"
             variant="secondary"
@@ -4409,7 +4668,7 @@ export function AnimePlayer({
             Skip intro
           </Button>
         ) : null}
-        {controlsAreVisible && !isCasting && !canSkipIntro && canSkipOutro ? (
+        {controlsAreVisible && !isAnyCasting && !canSkipIntro && canSkipOutro ? (
           <Button
             type="button"
             variant="secondary"
@@ -4423,7 +4682,7 @@ export function AnimePlayer({
           </Button>
         ) : null}
 
-        {activeSubtitleTexts.length && !isCasting ? (
+        {activeSubtitleTexts.length && !isAnyCasting ? (
           <div className="pointer-events-none absolute inset-x-4 bottom-[5.25rem] z-10 flex justify-center px-4 text-center text-lg lg:bottom-24 font-semibold leading-snug text-white drop-shadow-[0_2px_5px_rgba(0,0,0,0.95)] sm:text-xl">
             <div className="max-w-[90%] whitespace-pre-line">
               {activeSubtitleTexts.join("\n")}
@@ -4516,7 +4775,7 @@ export function AnimePlayer({
           </div>
         ) : null}
 
-        {!isCasting ? (
+        {!isAnyCasting ? (
           <div
           className={`absolute inset-x-0 bottom-0 bg-zinc-950/40 p-3 backdrop-blur-md lg:p-4 transition-opacity duration-300 ${
             controlsAreVisible ? "opacity-100" : "pointer-events-none opacity-0"
@@ -4527,7 +4786,16 @@ export function AnimePlayer({
               <Button
                 type="button"
                 size="icon"
-                onClick={togglePlay}
+                onPointerUp={(event) =>
+                  runTouchControlAction(event, () => {
+                    void togglePlay()
+                  })
+                }
+                onClick={(event) =>
+                  runClickControlAction(event, () => {
+                    void togglePlay()
+                  })
+                }
                 disabled={!sourceUrl && !isCasting}
                 aria-label={isPlaying ? "Pause" : "Play"}
               >
@@ -4713,7 +4981,16 @@ export function AnimePlayer({
                 }`}
                 aria-label={castButtonLabel}
                 disabled={castButtonDisabled}
-                onClick={startCasting}
+                onPointerUp={(event) =>
+                  runTouchControlAction(event, () => {
+                    void startCasting()
+                  })
+                }
+                onClick={(event) =>
+                  runClickControlAction(event, () => {
+                    void startCasting()
+                  })
+                }
               >
                 <Cast className="size-4 lg:size-5" />
               </Button>
@@ -4725,7 +5002,12 @@ export function AnimePlayer({
                 variant="secondary"
                 size="icon"
                 className="bg-zinc-950/70"
-                onClick={requestFullscreen}
+                onPointerUp={(event) =>
+                  runTouchControlAction(event, requestFullscreen)
+                }
+                onClick={(event) =>
+                  runClickControlAction(event, requestFullscreen)
+                }
                 aria-label="Fullscreen"
               >
                 <Maximize2 className="size-4 lg:size-5" />
