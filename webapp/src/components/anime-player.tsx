@@ -193,6 +193,9 @@ const hevcMp4Checks = [
   'video/mp4; codecs="hev1"',
 ]
 
+const mediaErrorDecodeCode = 3
+const mediaErrorSourceNotSupportedCode = 4
+
 const iosExternalCastAppName = "Web Video Caster"
 const iosExternalCastAppStoreUrl =
   "https://apps.apple.com/app/web-video-cast-browser-to-tv/id1400866497"
@@ -617,6 +620,67 @@ function supportsDirectPlayback(input: {
   )
 }
 
+function getDirectAudioRemuxContainer(fileName: string) {
+  return getMediaContainer(fileName, undefined) === "webm" ? "webm" : "mp4"
+}
+
+function isOptimisticLocalDirectPlaybackCandidate(input: {
+  fileName: string
+  media: WatchPayload["media"]
+  selectedAudioStream: MediaStreamInfo | undefined
+  directAudioRemuxActive: boolean
+}) {
+  const container = input.directAudioRemuxActive
+    ? getDirectAudioRemuxContainer(input.fileName)
+    : getMediaContainer(input.fileName, input.media.container)
+
+  if (container !== "mp4" && container !== "mov") {
+    return false
+  }
+
+  const videoCodec = normalizeCodecName(input.media.videoCodec)
+  const videoSupported =
+    videoCodec === "h264" ||
+    videoCodec === "avc1" ||
+    videoCodec === "hevc" ||
+    videoCodec === "h265" ||
+    videoCodec === "hvc1" ||
+    videoCodec === "hev1"
+
+  if (!videoSupported) {
+    return false
+  }
+
+  if (!input.media.audioStreams.length) {
+    return true
+  }
+
+  const audioCodec = normalizeCodecName(input.selectedAudioStream?.codec)
+
+  return (
+    audioCodec === "aac" ||
+    audioCodec === "mp3" ||
+    audioCodec === "mp2" ||
+    audioCodec === "mp1" ||
+    audioCodec === "ac3" ||
+    audioCodec === "eac3"
+  )
+}
+
+function supportsLocalDirectPlayback(input: {
+  video: HTMLVideoElement
+  fileName: string
+  media: WatchPayload["media"]
+  selectedAudioStream: MediaStreamInfo | undefined
+  directAudioRemuxActive: boolean
+}) {
+  if (supportsDirectPlayback(input)) {
+    return true
+  }
+
+  return isOptimisticLocalDirectPlaybackCandidate(input)
+}
+
 function isAndroidBrowser() {
   if (typeof navigator === "undefined") {
     return false
@@ -929,6 +993,21 @@ function getUrlBase() {
   return typeof window === "undefined"
     ? "http://localhost"
     : window.location.href
+}
+
+function urlsPointToSameResource(left: string, right: string) {
+  try {
+    const leftUrl = new URL(left, getUrlBase())
+    const rightUrl = new URL(right, getUrlBase())
+
+    return (
+      leftUrl.origin === rightUrl.origin &&
+      leftUrl.pathname === rightUrl.pathname &&
+      leftUrl.search === rightUrl.search
+    )
+  } catch {
+    return left === right
+  }
 }
 
 function withStreamParams(
@@ -1563,6 +1642,7 @@ export function AnimePlayer({
       options?: SwitchSourceOptions
     ) => void
   >(() => undefined)
+  const handlePlayRequestFailureRef = useRef<(error: unknown) => boolean>(() => false)
   const handleCastEndedRef = useRef<() => void>(() => undefined)
   const [quality, setQuality] = useState<PlaybackProfile>("original")
   const [detectedPlayerAspectRatio, setDetectedPlayerAspectRatio] = useState<{
@@ -1613,11 +1693,13 @@ export function AnimePlayer({
   const [volumeOpen, setVolumeOpen] = useState(false)
 
   const playbackKey = `${animeId}:${seasonNumber}:${episodeNumber}`
+  const isIosDevice = isIosBrowser()
+  const isInsideWebVideoCaster = isWebVideoCasterBrowser()
   const liveTranscodeEnabled = playback.liveTranscodeEnabled !== false
   const importProcessingEnabled = playback.importEnabled !== false
   const automaticDataSaverSwitchingEnabled = !importProcessingEnabled
-  const dataSaverBlockedByDirect = liveTranscodeEnabled && importProcessingEnabled && directPossible
-  const showQualityControl = liveTranscodeEnabled && !dataSaverBlockedByDirect
+  const dataSaverUnavailable = !liveTranscodeEnabled || importProcessingEnabled
+  const showQualityControl = liveTranscodeEnabled && !importProcessingEnabled
   const selectedAudioStream = useMemo(
     () => media.audioStreams.find((stream) => stream.id === selectedAudioStreamId),
     [media.audioStreams, selectedAudioStreamId]
@@ -1633,6 +1715,7 @@ export function AnimePlayer({
     selectedAudioStreamId,
     media.directAudioStreamId
   )
+  const localDirectAudioRemuxActive = directAudioRemuxActive
   const supportedSubtitleStreams = useMemo(
     () => media.subtitleStreams.filter((stream) => stream.isSupported),
     [media.subtitleStreams]
@@ -1658,8 +1741,6 @@ export function AnimePlayer({
   })
   const displayMethod = statusLabel(status)
   const castSelectionKey = `${playbackKey}:${quality}:${selectedAudioStreamId ?? ""}:${selectedSubtitleStreamId ?? ""}`
-  const isIosDevice = isIosBrowser()
-  const isInsideWebVideoCaster = isWebVideoCasterBrowser()
 
   useEffect(() => {
     sourceUrlRef.current = sourceUrl
@@ -1696,7 +1777,7 @@ export function AnimePlayer({
   }, [liveTranscodeEnabled, quality])
 
   useEffect(() => {
-    if (!dataSaverBlockedByDirect || quality === "original") {
+    if (!dataSaverUnavailable || quality === "original") {
       return
     }
 
@@ -1705,7 +1786,7 @@ export function AnimePlayer({
     }, 0)
 
     return () => window.clearTimeout(timer)
-  }, [dataSaverBlockedByDirect, quality])
+  }, [dataSaverUnavailable, quality])
 
   useEffect(() => {
     const video = videoRef.current
@@ -2331,14 +2412,20 @@ export function AnimePlayer({
     const useWebVideoCasterSourceList = isIosDevice && isInsideWebVideoCaster
     const sourceUsesOffset =
       nextStatus === "transcoding" ||
-      (!useWebVideoCasterSourceList && directAudioRemuxActive)
+      (!useWebVideoCasterSourceList && localDirectAudioRemuxActive)
     const sourceStartTime = sourceUsesOffset
       ? options.transcodeStartTime ?? previousPosition
       : 0
     const sourceAudioStreamId =
-      useWebVideoCasterSourceList && nextStatus === "direct"
-        ? null
-        : selectedAudioStreamId
+      nextStatus !== "direct"
+        ? selectedAudioStreamId
+        : useWebVideoCasterSourceList
+          ? null
+          : sourceUsesOffset
+            ? selectedAudioStreamId
+            : isIosDevice
+              ? null
+              : selectedAudioStreamId
     const sourceToLoad = sourceUsesOffset
       ? withStreamParams(nextSourceUrl, {
           audioStreamId: sourceAudioStreamId,
@@ -2489,11 +2576,12 @@ export function AnimePlayer({
       const canUseDirect = useWebVideoCasterSources
         ? true
         : video
-          ? supportsDirectPlayback({
+          ? supportsLocalDirectPlayback({
               video,
               fileName,
               media,
               selectedAudioStream: playbackAudioStream,
+              directAudioRemuxActive: localDirectAudioRemuxActive,
             })
           : false
       const waitForPrioritySwitch = pendingPrioritySwitchRef.current
@@ -2558,6 +2646,7 @@ export function AnimePlayer({
     playbackKey,
     quality,
     playbackAudioStream,
+    localDirectAudioRemuxActive,
     flashCastError,
   ])
 
@@ -2572,15 +2661,14 @@ export function AnimePlayer({
       const timer = window.setTimeout(() => {
         shouldAutoPlaySourceRef.current = false
         beginMediaWait()
-        void video.play().catch(() => {
-          setIsPlaying(false)
-          endMediaWait()
+        void video.play().catch((error: unknown) => {
+          handlePlayRequestFailureRef.current(error)
         })
       }, 0)
 
       return () => window.clearTimeout(timer)
     }
-  }, [beginMediaWait, endMediaWait, sourceUrl])
+  }, [beginMediaWait, sourceUrl])
 
   useEffect(() => {
     let cancelled = false
@@ -2705,7 +2793,11 @@ export function AnimePlayer({
 
   const switchQualityFromPriority = useCallback(
     (nextQuality: PlaybackProfile) => {
-      if (!liveTranscodeEnabled || (dataSaverBlockedByDirect && nextQuality === "dataSaver")) {
+      if (nextQuality === "dataSaver" && dataSaverUnavailable) {
+        return
+      }
+
+      if (!liveTranscodeEnabled) {
         return
       }
 
@@ -2721,7 +2813,7 @@ export function AnimePlayer({
       setQuality(nextQuality)
       showControls(true)
     },
-    [beginMediaWait, dataSaverBlockedByDirect, liveTranscodeEnabled, showControls]
+    [beginMediaWait, dataSaverUnavailable, liveTranscodeEnabled, showControls]
   )
 
   const markDataSaverProtectionOnServer = useCallback(() => {
@@ -3202,11 +3294,12 @@ export function AnimePlayer({
 
     const video = videoRef.current
     const canUseDirect = video
-      ? supportsDirectPlayback({
+      ? supportsLocalDirectPlayback({
           video,
           fileName,
           media,
           selectedAudioStream: playbackAudioStream,
+          directAudioRemuxActive: localDirectAudioRemuxActive,
         })
       : false
 
@@ -3234,26 +3327,99 @@ export function AnimePlayer({
     })
   }
 
+  function shouldFallbackDirectPlaybackFailure() {
+    return (
+      statusRef.current === "direct" &&
+      quality === "original" &&
+      !directFallbackAttemptedRef.current &&
+      !(isIosDevice && isInsideWebVideoCaster)
+    )
+  }
+
   function fallbackDirectToTranscode() {
     directFallbackAttemptedRef.current = true
-    setDirectPossible(false)
 
     if (!liveTranscodeEnabled) {
       blockLiveTranscodePlayback()
       return
     }
 
-    switchSource(
+    switchSourceRef.current(
       isIosDevice && isInsideWebVideoCaster
         ? getWebVideoCasterTranscodeUrl()
         : getTranscodeUrl("original"),
       "transcoding",
       {
         preservePosition: true,
-        waitForMedia: isPlaying || autoPlay,
+        waitForMedia: isPlaying || autoPlay || isPlayingRef.current,
       }
     )
   }
+
+  function handleLocalPlaybackFailure() {
+    setIsPlaying(false)
+    endMediaWait()
+
+    if (!shouldFallbackDirectPlaybackFailure()) {
+      return false
+    }
+
+    fallbackDirectToTranscode()
+    return true
+  }
+
+  function isCurrentLocalVideoSource(video: HTMLVideoElement) {
+    const expectedSourceUrl = sourceUrlRef.current
+    const currentSourceUrl = video.currentSrc || video.src
+
+    if (!expectedSourceUrl || !currentSourceUrl) {
+      return true
+    }
+
+    return urlsPointToSameResource(currentSourceUrl, expectedSourceUrl)
+  }
+
+  function shouldFallbackFromPlayRejection(error: unknown, video: HTMLVideoElement) {
+    if (!isCurrentLocalVideoSource(video)) {
+      return false
+    }
+
+    const errorName = error instanceof DOMException ? error.name : undefined
+
+    if (errorName === "NotAllowedError" || errorName === "AbortError") {
+      return false
+    }
+
+    if (errorName === "NotSupportedError") {
+      return true
+    }
+
+    const mediaError = video.error
+
+    return Boolean(
+      mediaError &&
+        (mediaError.code === mediaErrorDecodeCode ||
+          mediaError.code === mediaErrorSourceNotSupportedCode)
+    )
+  }
+
+  function handlePlayRequestFailure(error: unknown) {
+    const video = videoRef.current
+
+    setIsPlaying(false)
+    endMediaWait()
+    showControls(true)
+
+    if (!video || !shouldFallbackFromPlayRejection(error, video)) {
+      return false
+    }
+
+    return handleLocalPlaybackFailure()
+  }
+
+  useEffect(() => {
+    handlePlayRequestFailureRef.current = handlePlayRequestFailure
+  })
 
   async function togglePlay() {
     if (isServerCastingRef.current) {
@@ -3281,8 +3447,8 @@ export function AnimePlayer({
 
     if (video.paused) {
       beginMediaWait()
-      await video.play().catch(() => {
-        endMediaWait()
+      await video.play().catch((error: unknown) => {
+        handlePlayRequestFailure(error)
       })
     } else {
       video.pause()
@@ -4712,7 +4878,13 @@ export function AnimePlayer({
   }
 
   function changeQuality(nextQuality: PlaybackProfile) {
-    if (!liveTranscodeEnabled || (dataSaverBlockedByDirect && nextQuality === "dataSaver")) {
+    if (nextQuality === "dataSaver" && dataSaverUnavailable) {
+      setQuality("original")
+      showControls(true)
+      return
+    }
+
+    if (!liveTranscodeEnabled) {
       setQuality("original")
       showControls(true)
       return
@@ -4956,7 +5128,7 @@ export function AnimePlayer({
             "x-webkit-airplay": "allow",
             "webkit-playsinline": "true",
           } as Record<string, string | boolean>)}
-          preload="none"
+          preload={isIosDevice && status === "direct" ? "metadata" : "none"}
           poster={thumbnailUrl}
           src={webVideoCasterSources ? webVideoCasterSources.directUrl : sourceUrl ?? undefined}
           onDurationChange={(event) => {
@@ -4985,7 +5157,7 @@ export function AnimePlayer({
             applyDirectAudioTrack(video, selectedAudioStream, media.audioStreams)
           }}
           onEnded={handleEnded}
-          onError={() => {
+          onError={(event) => {
             if (
               isCastingRef.current ||
               isCastLoadingRef.current ||
@@ -4994,24 +5166,16 @@ export function AnimePlayer({
               return
             }
 
-            setIsPlaying(false)
-            endMediaWait()
-            if (
-              status === "direct" &&
-              quality === "original" &&
-              !directFallbackAttemptedRef.current
-            ) {
-              if (isIosDevice && isInsideWebVideoCaster) {
-                setStatus("blocked")
-                showControls(true)
-                return
-              }
+            if (!webVideoCasterSources && !isCurrentLocalVideoSource(event.currentTarget)) {
+              return
+            }
 
-              fallbackDirectToTranscode()
+            if (handleLocalPlaybackFailure()) {
               return
             }
 
             setStatus("blocked")
+            statusRef.current = "blocked"
             showControls(true)
           }}
           onLoadStart={() => {
@@ -5601,21 +5765,10 @@ export function AnimePlayer({
             type="button"
             className="grid size-20 place-items-center lg:size-24 rounded-full bg-black/45 text-white/70 hover:bg-black/60 hover:text-white"
             disabled={!sourceUrl}
-            onTouchEnd={(event) =>
-              runTouchEndControlAction(event, () => {
-                void togglePlay()
-              })
-            }
-            onPointerUp={(event) =>
-              runTouchControlAction(event, () => {
-                void togglePlay()
-              })
-            }
-            onClick={(event) =>
-              runClickControlAction(event, () => {
-                void togglePlay()
-              })
-            }
+            onClick={(event) => {
+              event.stopPropagation()
+              void togglePlay()
+            }}
             aria-label={isPlaying ? "Pause" : "Play"}
           >
             {isPlaying ? (
@@ -5757,21 +5910,10 @@ export function AnimePlayer({
               <Button
                 type="button"
                 size="icon"
-                onTouchEnd={(event) =>
-                  runTouchEndControlAction(event, () => {
-                    void togglePlay()
-                  })
-                }
-                onPointerUp={(event) =>
-                  runTouchControlAction(event, () => {
-                    void togglePlay()
-                  })
-                }
-                onClick={(event) =>
-                  runClickControlAction(event, () => {
-                    void togglePlay()
-                  })
-                }
+                onClick={(event) => {
+                  event.stopPropagation()
+                  void togglePlay()
+                }}
                 disabled={!sourceUrl && !isCasting}
                 aria-label={isPlaying ? "Pause" : "Play"}
               >
@@ -5983,15 +6125,10 @@ export function AnimePlayer({
                 variant="secondary"
                 size="icon"
                 className="bg-zinc-950/70"
-                onTouchEnd={(event) =>
-                  runTouchEndControlAction(event, requestFullscreen)
-                }
-                onPointerUp={(event) =>
-                  runTouchControlAction(event, requestFullscreen)
-                }
-                onClick={(event) =>
-                  runClickControlAction(event, requestFullscreen)
-                }
+                onClick={(event) => {
+                  event.stopPropagation()
+                  requestFullscreen()
+                }}
                 aria-label="Fullscreen"
               >
                 <Maximize2 className="size-4 lg:size-5" />

@@ -161,11 +161,11 @@
 }
 
 @media (hover: none) and (pointer: coarse) and (orientation: landscape) and (max-height: 560px) and (max-width: 1000px) {
-  .yami-topbar {
+  .yami-watch-topbar {
     display: none;
   }
 
-  .yami-app-main {
+  .yami-watch-main {
     padding: 0.5rem;
   }
 

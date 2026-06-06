@@ -12,9 +12,9 @@ import Link from "next/link"
 import { usePathname } from "next/navigation"
 import {
   Gauge,
+  Import,
   Info,
   LogOut,
-  PackagePlus,
   RefreshCw,
   Settings,
   Snail,
@@ -137,6 +137,10 @@ function formatProcessingItemMeta(item: MediaImportProcessingItem) {
     return `${episode} · audio transcode`
   }
 
+  if (item.kind === "container-remux") {
+    return `${episode} · MP4 remux`
+  }
+
   return `${episode} · video transcode`
 }
 
@@ -227,6 +231,7 @@ export function Topbar({ user }: { user: CurrentUser }) {
     user.isAdmin && appUpdateStatus?.updateAvailable
   )
   const appUpdateReleaseUrl = appUpdateStatus?.releaseUrl ?? yamibunkoReleasesUrl
+  const isWatchRoute = pathname.startsWith("/watch")
 
   const loadRefreshState = useCallback(async () => {
     const response = await fetch("/api/anilist/refresh", {
@@ -670,7 +675,12 @@ export function Topbar({ user }: { user: CurrentUser }) {
   }
 
   return (
-    <header className="yami-topbar sticky top-0 z-30 border-b border-white/10 bg-[#0d0d12]/85 px-4 py-3 backdrop-blur sm:px-6 lg:px-8">
+    <header
+      className={cn(
+        "yami-topbar sticky top-0 z-30 border-b border-white/10 bg-[#0d0d12]/85 px-4 py-3 backdrop-blur sm:px-6 lg:px-8",
+        isWatchRoute ? "yami-watch-topbar" : null
+      )}
+    >
       <div className="relative flex items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2">
           <Link
@@ -714,12 +724,11 @@ export function Topbar({ user }: { user: CurrentUser }) {
                 ref={processingButtonRef}
                 type="button"
                 aria-label={processingLabel}
-                className="inline-flex h-9 items-center gap-1.5 rounded-full border border-cyan-300/30 bg-cyan-500/15 px-3 text-xs font-medium text-cyan-100 shadow-sm transition hover:border-cyan-300/45 hover:bg-cyan-500/20 focus-visible:ring-2 focus-visible:ring-white/30 focus-visible:outline-none"
+                className="inline-flex size-9 items-center justify-center rounded-full border border-cyan-300/30 bg-cyan-500/15 text-cyan-100 shadow-sm transition hover:border-cyan-300/45 hover:bg-cyan-500/20 focus-visible:ring-2 focus-visible:ring-white/30 focus-visible:outline-none"
                 onClick={() => setProcessingDialogOpen((value) => !value)}
                 onFocus={() => setProcessingDialogOpen(true)}
               >
-                <PackagePlus className="size-4" aria-hidden="true" />
-                <span>{processingLabel}</span>
+                <Import className="size-4" aria-hidden="true" />
               </button>
 
               {processingDialogOpen ? (

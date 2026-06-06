@@ -5,6 +5,7 @@ export type MediaImportProcessingKind =
   | "direct-move"
   | "video-transcode"
   | "audio-transcode"
+  | "container-remux"
 
 export type MediaImportProcessingStatus = "queued" | "active"
 

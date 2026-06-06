@@ -68,13 +68,14 @@ export type ProcessInputFileResult = {
 export type DeferredInputWorkKind =
   | "video-transcode"
   | "audio-transcode"
+  | "container-remux"
   | "direct-move"
   | "existing-output"
   | "catalog-only"
 
 export type DeferredInputProcessingInfo = {
   id: string
-  kind: "direct-move" | "video-transcode" | "audio-transcode"
+  kind: "direct-move" | "video-transcode" | "audio-transcode" | "container-remux"
   animeTitle: string
   subtitle?: string | null
   seasonNumber: number
@@ -205,6 +206,10 @@ function formatDeferredWorkKind(kind: DeferredInputWorkKind) {
     return "audio transcode"
   }
 
+  if (kind === "container-remux") {
+    return "MP4 remux"
+  }
+
   if (kind === "existing-output") {
     return "existing output finalization"
   }
@@ -241,6 +246,34 @@ function hasHevcVideo(probe: ProbeResult) {
   )
 }
 
+const mp4ContainerFormatNames = new Set([
+  "mov",
+  "mp4",
+  "m4a",
+  "3gp",
+  "3g2",
+  "mj2",
+])
+
+function getProbeFormatNames(probe: ProbeResult) {
+  return (probe.format?.format_name ?? "")
+    .split(",")
+    .map((format) => format.trim().toLowerCase())
+    .filter(Boolean)
+}
+
+function usesMp4OutputContainer(filePath: string, probe: ProbeResult) {
+  if (path.extname(filePath).toLowerCase() !== ".mp4") {
+    return false
+  }
+
+  const formatNames = getProbeFormatNames(probe)
+
+  return (
+    formatNames.length === 0 ||
+    formatNames.some((formatName) => mp4ContainerFormatNames.has(formatName))
+  )
+}
 
 const mp4SubtitleCodecs = new Set([
   "ass",
@@ -1294,12 +1327,14 @@ export async function processInputFile(
     const audioOutputIndexesToAac = getAudioOutputIndexesToAac(probe)
     const subtitleStreamIndexesToMovText = getMp4SubtitleStreamIndexes(probe)
     const convertAudioToAac = audioOutputIndexesToAac.length > 0
-    const needsFfmpegProcessing = convertVideo || convertAudioToAac
+    const requiresMp4ContainerRemux = !usesMp4OutputContainer(filePath, probe)
+    const needsFfmpegProcessing =
+      convertVideo || convertAudioToAac || requiresMp4ContainerRemux
     const videoBitrateKbps = calculateVideoBitrateKbps()
 
     debugImport(
       jobId,
-      `Processing decision - convertVideo ${convertVideo}, audioTracksToAac [${audioOutputIndexesToAac.join(", ")}], subtitleTracksToMovText [${subtitleStreamIndexesToMovText.join(", ")}], needsFfmpegProcessing ${needsFfmpegProcessing}`
+      `Processing decision - convertVideo ${convertVideo}, audioTracksToAac [${audioOutputIndexesToAac.join(", ")}], subtitleTracksToMovText [${subtitleStreamIndexesToMovText.join(", ")}], mp4ContainerRemux ${requiresMp4ContainerRemux}, needsFfmpegProcessing ${needsFfmpegProcessing}`
     )
 
     const safeLibraryTitle = safePathSegment(libraryTitle, "Library title")
@@ -1556,11 +1591,13 @@ export async function processInputFile(
         updateJob(jobId, {
           message: convertVideo
             ? "Transcoding media file."
-            : "Converting audio tracks to LC-AAC.",
+            : convertAudioToAac
+              ? "Converting audio tracks to LC-AAC."
+              : "Remuxing media file to MP4.",
         })
 
         console.log(
-          `[Info] [Media] Starting media transcode - ${fileName(filePath)} - Accel: ${config.transcodeAccel}, HW decode: ${convertVideo ? getHardwareInputLabel() : "not needed"}, HEVC: ${convertVideo ? `yes (${inputHasHevcVideo ? `over ${formatMegabytesPerMinute(maxHevcBytesPerMinute)} MB/min` : "source is not HEVC"})` : "copy"}, AAC audio tracks: ${audioOutputIndexesToAac.length ? audioOutputIndexesToAac.join(", ") : "none"}, Target: ${formatMegabytesPerMinute(targetBytesPerMinute)} MB/min, Bitrate: ${videoBitrateKbps}k, Maxrate: ${calculateVideoBitrateKbps(maxHevcBytesPerMinute)}k`
+          `[Info] [Media] Starting media transcode - ${fileName(filePath)} - Accel: ${config.transcodeAccel}, HW decode: ${convertVideo ? getHardwareInputLabel() : "not needed"}, HEVC: ${convertVideo ? `yes (${inputHasHevcVideo ? `over ${formatMegabytesPerMinute(maxHevcBytesPerMinute)} MB/min` : "source is not HEVC"})` : "copy"}, AAC audio tracks: ${audioOutputIndexesToAac.length ? audioOutputIndexesToAac.join(", ") : "none"}, MP4 remux: ${requiresMp4ContainerRemux ? "yes" : "no"}, Target: ${formatMegabytesPerMinute(targetBytesPerMinute)} MB/min, Bitrate: ${videoBitrateKbps}k, Maxrate: ${calculateVideoBitrateKbps(maxHevcBytesPerMinute)}k`
         )
 
         await transcodeFile(filePath, tempPath, {
@@ -1689,23 +1726,32 @@ export async function processInputFile(
     }
 
     if (needsFfmpegProcessing && !convertVideo && options.deferAudioTranscodes) {
+      const queueMessage = convertAudioToAac
+        ? "Queued for audio transcode."
+        : "Queued for MP4 remux."
+
       updateJob(jobId, {
-        message: "Queued for audio transcode.",
+        message: queueMessage,
       })
       console.log(
-        `[Info] [Media] Queued audio transcode and continuing import scan - ${fileName(filePath)}`
+        `[Info] [Media] ${convertAudioToAac ? "Queued audio transcode" : "Queued MP4 remux"} and continuing import scan - ${fileName(filePath)}`
       )
-      debugImport(jobId, "Audio-only LC-AAC transcode deferred into the audio-priority transcode queue.")
+      debugImport(
+        jobId,
+        convertAudioToAac
+          ? "Audio-only LC-AAC transcode deferred into the audio-priority transcode queue."
+          : "Container remux deferred into the audio-priority transcode queue."
+      )
 
       return queueDeferredImportWork({
-        kind: "audio-transcode",
+        kind: convertAudioToAac ? "audio-transcode" : "container-remux",
         outputPath: finalPath,
         planned: true,
-        message: "Queued for audio transcode.",
+        message: queueMessage,
         work: runFfmpegImport,
         processing: {
           ...processingInfo,
-          kind: "audio-transcode",
+          kind: convertAudioToAac ? "audio-transcode" : "container-remux",
         },
       })
     }

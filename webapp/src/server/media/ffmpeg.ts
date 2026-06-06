@@ -585,5 +585,7 @@ export function getHevcFileArgs(input: {
     "-dn",
     "-movflags",
     "+faststart",
+    "-f",
+    "mp4",
   ]
 }
