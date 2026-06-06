@@ -10,6 +10,7 @@ import { requireApiUser } from "@/server/auth/api"
 import { guardApiRequest } from "@/server/security/abuseGuard"
 import {
   acquireStreamUpload,
+  createUnmeteredStreamUploadLease,
   estimateUploadKbps,
   getActiveStreamConflict,
   isStreamServerShutdownActive,
@@ -17,6 +18,7 @@ import {
 } from "@/server/bandwidth/streamBandwidth"
 import { getUser } from "@/server/db/users"
 import { getServerConfig } from "@/server/config"
+import { isLocalStreamBandwidthBypassRequest } from "@/server/http/request"
 import {
   ffprobe,
   getLiveH264Args,
@@ -57,10 +59,10 @@ const aniListWatchingStartMarks = new Map<string, number>()
 function streamCorsHeaders() {
   return {
     "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET, OPTIONS",
+    "access-control-allow-methods": "GET, HEAD, OPTIONS",
     "access-control-allow-headers": "Range, Content-Type",
     "access-control-expose-headers":
-      "Accept-Ranges, Content-Length, Content-Range, Content-Type",
+      "Accept-Ranges, Content-Disposition, Content-Duration, Content-Length, Content-Range, Content-Type, X-Content-Duration, X-Yamibunko-Stream-Source",
   }
 }
 
@@ -68,6 +70,91 @@ export function OPTIONS() {
   return new Response(null, {
     status: 204,
     headers: streamCorsHeaders(),
+  })
+}
+
+export async function HEAD(request: Request, context: StreamContext) {
+  const abuseError = await guardApiRequest(request)
+
+  if (abuseError) {
+    return abuseError
+  }
+
+  const { animeId, epNr } = await context.params
+  const animeIdNumber = parsePositiveInt(animeId)
+  const episodeNumber = parsePositiveInt(epNr)
+
+  if (!animeIdNumber || !episodeNumber) {
+    return jsonError("Episode not found.", 404)
+  }
+
+  const url = new URL(request.url)
+  const seasonNumber = parsePositiveInt(url.searchParams.get("season") ?? "1")
+  const mode = getMode(url.searchParams.get("mode"))
+  const clientId = parseClientId(url.searchParams.get("clientId"))
+
+  if (!clientId) {
+    return jsonError("Missing stream client id.", 400)
+  }
+
+  if (!seasonNumber) {
+    return jsonError("Episode not found.", 404)
+  }
+
+  if (mode === "transcode" && !liveTranscodingEnabled()) {
+    return jsonError(
+      "Live transcoding is disabled when TRANSCODE_ACCEL=cpu.",
+      403
+    )
+  }
+
+  const streamUser = await resolveStreamUser({
+    request,
+    animeId,
+    seasonNumber,
+    episodeNumber,
+    mode,
+    castToken: url.searchParams.get("castToken"),
+  })
+
+  if (!streamUser.ok) {
+    return streamUser.response
+  }
+
+  let resolved: Awaited<ReturnType<typeof resolveReadableFile>>
+
+  try {
+    resolved = await resolveReadableFile(animeId, seasonNumber, episodeNumber)
+  } catch (error) {
+    console.error(
+      `[Error] [Stream] Unable to resolve media file for probe - stream/route.ts - Anime ${animeId}, Season ${seasonNumber}, Episode ${episodeNumber} - ${errorMessage(error)}`
+    )
+    return jsonError("Media file could not be resolved.", 500)
+  }
+
+  if (!resolved) {
+    return jsonError("Media file not found.", 404)
+  }
+
+  const headers = new Headers({
+    ...streamCorsHeaders(),
+    "accept-ranges": mode === "direct" ? "bytes" : "none",
+    "cache-control": mode === "direct" ? "private, max-age=0, no-transform" : "no-store",
+    "content-disposition": getInlineContentDispositionForRequest(request, resolved.file, mode),
+    "content-type": mode === "direct" ? getDirectContentType(resolved.file) : "video/mp4",
+    "x-content-type-options": "nosniff",
+  })
+
+  setDurationHeaders(headers, resolved.durationSeconds)
+  setStreamSourceHeaders(headers, request, mode)
+
+  if (mode === "direct") {
+    headers.set("content-length", String(resolved.size))
+  }
+
+  return new Response(null, {
+    status: 200,
+    headers,
   })
 }
 
@@ -390,10 +477,82 @@ function getDirectContentType(file: string) {
   return "application/octet-stream"
 }
 
+function setDurationHeaders(headers: Headers, durationSeconds?: number) {
+  if (!durationSeconds || durationSeconds <= 0 || !Number.isFinite(durationSeconds)) {
+    return
+  }
+
+  const duration = durationSeconds.toFixed(3)
+  headers.set("x-content-duration", duration)
+  headers.set("content-duration", duration)
+}
+
+function getInlineContentDisposition(file: string) {
+  return getInlineContentDispositionForName(fileName(file))
+}
+
+function getInlineContentDispositionForRequest(
+  request: Request,
+  file: string,
+  mode: PlaybackMode
+) {
+  const url = new URL(request.url)
+  const wvcSource = getWebVideoCasterSource(url, mode)
+
+  if (!wvcSource) {
+    return getInlineContentDisposition(file)
+  }
+
+  const baseName = fileName(file).replace(/\.[^.]+$/, "")
+  const extension = wvcSource === "transcode" ? ".mp4" : path.extname(file)
+  const sourceLabel = wvcSource === "transcode"
+    ? "Yamibunko Compatibility Transcode"
+    : "Yamibunko Direct Play"
+
+  return getInlineContentDispositionForName(`${sourceLabel} - ${baseName}${extension}`)
+}
+
+function getInlineContentDispositionForName(name: string) {
+  const normalizedName = name.replace(/["\r\n]/g, "_").trim() || "Yamibunko.mp4"
+  const asciiName = normalizedName.replace(/[^\x20-\x7E]/g, "_")
+  const encodedName = encodeURIComponent(normalizedName)
+
+  return `inline; filename="${asciiName}"; filename*=UTF-8''${encodedName}`
+}
+
+function getWebVideoCasterSource(url: URL, mode: PlaybackMode) {
+  const source = url.searchParams.get("wvc")
+
+  if (source === "direct") {
+    return "direct" as const
+  }
+
+  if (source === "transcode") {
+    return "transcode" as const
+  }
+
+  return mode === "transcode" ? "transcode" : null
+}
+
+function setStreamSourceHeaders(
+  headers: Headers,
+  request: Request,
+  mode: PlaybackMode
+) {
+  const source = getWebVideoCasterSource(new URL(request.url), mode)
+
+  if (!source) {
+    return
+  }
+
+  headers.set("x-yamibunko-stream-source", source)
+}
+
 async function handleDirect(input: {
   request: Request
   file: string
   size: number
+  durationSeconds?: number
   uploadLease: StreamUploadLease
 }) {
   const { request, file, size, uploadLease } = input
@@ -418,8 +577,13 @@ async function handleDirect(input: {
   const headers = new Headers({
     ...streamCorsHeaders(),
     "accept-ranges": "bytes",
+    "cache-control": "private, max-age=0, no-transform",
+    "content-disposition": getInlineContentDispositionForRequest(request, file, "direct"),
     "content-type": getDirectContentType(file),
+    "x-content-type-options": "nosniff",
   })
+  setDurationHeaders(headers, input.durationSeconds)
+  setStreamSourceHeaders(headers, request, "direct")
 
   function bindFileStream(fileStream: ReturnType<typeof createReadStream>) {
     fileStream.on("data", (chunk: Buffer) => {
@@ -511,6 +675,7 @@ async function handleDirectAudioRemux(input: {
   animeId: string
   seasonNumber: number
   episodeNumber: number
+  durationSeconds?: number
   username: string
   profile: PlaybackProfile
   startSeconds: number
@@ -678,13 +843,16 @@ async function handleDirectAudioRemux(input: {
     },
   })
 
-  return new Response(body, {
-    headers: {
-      ...streamCorsHeaders(),
-      "cache-control": "no-store",
-      "content-type": target.contentType,
-    },
+  const headers = new Headers({
+    ...streamCorsHeaders(),
+    "cache-control": "no-store",
+    "content-disposition": getInlineContentDispositionForRequest(input.request, input.file, "direct"),
+    "content-type": target.contentType,
   })
+  setDurationHeaders(headers, input.durationSeconds)
+  setStreamSourceHeaders(headers, input.request, "direct")
+
+  return new Response(body, { headers })
 }
 
 function resolveAudioSelection(input: {
@@ -723,6 +891,7 @@ async function handleTranscode(
   isVip: boolean,
   profile: PlaybackProfile,
   startSeconds: number,
+  durationSeconds?: number,
   sourceBitrateKbps?: number,
   audioStreamIndex?: number,
   uploadLease?: StreamUploadLease
@@ -985,13 +1154,16 @@ async function handleTranscode(
     },
   })
 
-  return new Response(body, {
-    headers: {
-      ...streamCorsHeaders(),
-      "cache-control": "no-store",
-      "content-type": "video/mp4",
-    },
+  const headers = new Headers({
+    ...streamCorsHeaders(),
+    "cache-control": "no-store",
+    "content-disposition": getInlineContentDispositionForRequest(request, file, "transcode"),
+    "content-type": "video/mp4",
   })
+  setDurationHeaders(headers, durationSeconds)
+  setStreamSourceHeaders(headers, request, "transcode")
+
+  return new Response(body, { headers })
 }
 
 export async function GET(request: Request, context: StreamContext) {
@@ -1018,6 +1190,7 @@ export async function GET(request: Request, context: StreamContext) {
   const requestedAudioStreamIndex = parseOptionalStreamIndex(
     url.searchParams.get("audio")
   )
+  const bypassUploadBandwidth = await isLocalStreamBandwidthBypassRequest(request)
 
   if (!clientId) {
     return jsonError("Missing stream client id.", 400)
@@ -1044,10 +1217,12 @@ export async function GET(request: Request, context: StreamContext) {
     return streamUser.response
   }
 
-  const activeStreamConflict = getActiveStreamConflict({
-    username: streamUser.username,
-    clientId,
-  })
+  const activeStreamConflict = bypassUploadBandwidth
+    ? null
+    : getActiveStreamConflict({
+        username: streamUser.username,
+        clientId,
+      })
 
   if (activeStreamConflict) {
     return jsonError("Only one active stream is allowed at a time.", 403)
@@ -1120,32 +1295,44 @@ export async function GET(request: Request, context: StreamContext) {
   })
   let uploadLease: StreamUploadLease
 
-  try {
-    uploadLease = await acquireStreamUpload({
+  if (bypassUploadBandwidth) {
+    uploadLease = createUnmeteredStreamUploadLease({
       clientId,
       username: streamUser.username,
-      isVip: streamUser.isVip,
       mode,
       profile,
-      estimatedUploadKbps: requestedUploadKbps,
-      dataSaverUploadKbps,
-      canTranscodeDataSaver:
-        liveTranscodingEnabled() && automaticDataSaverSwitchingEnabled(),
       animeId,
       seasonNumber,
       episodeNumber,
-      signal: request.signal,
     })
-  } catch (error) {
-    console.warn(
-      `[Warn] [Stream] Waiting stream upload reservation cancelled - stream/route.ts - Anime ${animeId}, Season ${seasonNumber}, Episode ${episodeNumber} - ${errorMessage(error)}`
-    )
+  } else {
+    try {
+      uploadLease = await acquireStreamUpload({
+        clientId,
+        username: streamUser.username,
+        isVip: streamUser.isVip,
+        mode,
+        profile,
+        estimatedUploadKbps: requestedUploadKbps,
+        dataSaverUploadKbps,
+        canTranscodeDataSaver:
+          liveTranscodingEnabled() && automaticDataSaverSwitchingEnabled(),
+        animeId,
+        seasonNumber,
+        episodeNumber,
+        signal: request.signal,
+      })
+    } catch (error) {
+      console.warn(
+        `[Warn] [Stream] Waiting stream upload reservation cancelled - stream/route.ts - Anime ${animeId}, Season ${seasonNumber}, Episode ${episodeNumber} - ${errorMessage(error)}`
+      )
 
-    if (isStreamServerShutdownActive()) {
-      return jsonError("Server is shutting down. New streams are disabled.", 503)
+      if (isStreamServerShutdownActive()) {
+        return jsonError("Server is shutting down. New streams are disabled.", 503)
+      }
+
+      return jsonError("Stream upload reservation was cancelled.", 499)
     }
-
-    return jsonError("Stream upload reservation was cancelled.", 499)
   }
 
   if (isStreamServerShutdownActive()) {
@@ -1172,6 +1359,7 @@ export async function GET(request: Request, context: StreamContext) {
         animeId,
         seasonNumber,
         episodeNumber,
+        durationSeconds: resolved.durationSeconds,
         username: streamUser.displayUsername,
         profile: effectiveProfile,
         startSeconds,
@@ -1194,6 +1382,7 @@ export async function GET(request: Request, context: StreamContext) {
       request,
       file: resolved.file,
       size: resolved.size,
+      durationSeconds: resolved.durationSeconds,
       uploadLease,
     })
   }
@@ -1208,6 +1397,7 @@ export async function GET(request: Request, context: StreamContext) {
     streamUser.isVip,
     effectiveProfile,
     startSeconds,
+    resolved.durationSeconds,
     sourceBitrateKbps,
     audioSelection.requestedAudioStreamIndex,
     uploadLease

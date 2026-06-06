@@ -1052,6 +1052,45 @@ function createLease(input: {
   }
 }
 
+
+export function createUnmeteredStreamUploadLease(input: {
+  clientId: string | null
+  username: string
+  mode: PlaybackMode
+  profile: PlaybackProfile
+  animeId: string
+  seasonNumber: number
+  episodeNumber: number
+}): StreamUploadLease {
+  const clientKey = getClientKey(input.username, input.clientId)
+  const contentKey = getContentKey(input)
+  let released = false
+
+  closeActiveStreamsForClientKey(clientKey, { exceptContentKey: contentKey })
+  clearClientAction(input.username, input.clientId)
+  clearForcedDowngrade(input.username, input.clientId)
+
+  return {
+    id: createId(),
+    effectiveMode: input.mode,
+    effectiveProfile: input.profile,
+    downgraded: false,
+    observeUploadBytes() {},
+    setForceClose(handler: () => void) {
+      if (released) {
+        return
+      }
+
+      if (streamServerShutdownActive) {
+        queueMicrotask(handler)
+      }
+    },
+    release() {
+      released = true
+    },
+  }
+}
+
 function applyStreamEstimateOverhead(kbps: number) {
   return Math.max(Math.ceil(kbps * streamEstimateOverheadFactor), 1)
 }

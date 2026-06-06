@@ -1,6 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { createPortal } from "react-dom"
 import {
   Cast,
   Info,
@@ -21,6 +22,18 @@ import { Button } from "@/components/ui/button"
 import { HoverHint } from "@/components/ui/hover-hint"
 import { getPreferredPlayerAspectRatio } from "@/lib/player-aspect-ratio"
 import {
+  serverCastControlApiPath,
+  serverCastDevicesApiPath,
+  serverCastStartApiPath,
+  serverCastStatusApiPath,
+  type ServerCastCandidate,
+  type ServerCastDevice,
+  type ServerCastDevicesResponse,
+  type ServerCastMediaState,
+  type ServerCastStartResponse,
+  type ServerCastStatusResponse,
+} from "@/lib/server-cast"
+import {
   addGoogleCastMediaStateListener,
   addGoogleCastSessionStateListener,
   assertGoogleCastReceiverUrlReachable,
@@ -31,6 +44,7 @@ import {
   getGoogleCastSession,
   getGoogleCastCurrentPageSenderUnavailableReason,
   getGoogleCastReceiverUrlUnavailableReason,
+  isPrivateLanIpv4Host,
   googleCastMediaUrlMessage,
   googleCastUnreachableUrlErrorCode,
   isGoogleCastConnectedState,
@@ -166,10 +180,6 @@ type HtmlVideoElementWithNativePlayback = HTMLVideoElement & {
   webkitSetPresentationMode?: (mode: string) => void
 }
 
-type WebKitPlaybackTargetAvailabilityEvent = Event & {
-  availability?: "available" | "not-available"
-}
-
 type SubtitleCue = {
   start: number
   end: number
@@ -182,6 +192,13 @@ const hevcMp4Checks = [
   'video/mp4; codecs="hvc1"',
   'video/mp4; codecs="hev1"',
 ]
+
+const iosExternalCastAppName = "Web Video Caster"
+const iosExternalCastAppStoreUrl =
+  "https://apps.apple.com/app/web-video-cast-browser-to-tv/id1400866497"
+const iosExternalCastOpenTimeoutMs = 1600
+const iosExternalCastBrowserMarkerParam = "yamibunko_wvc"
+const iosExternalCastBrowserMarkerValue = "1"
 
 function createClientStreamId() {
   return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`
@@ -200,6 +217,21 @@ function supportsHevcDecode(video: HTMLVideoElement) {
 
 function normalizeCodecName(codec: string | undefined) {
   return codec?.trim().toLowerCase().replace(/[._-]+/g, "") ?? ""
+}
+
+function getWebVideoCasterSourceFileName(
+  source: "direct" | "transcode",
+  inputFileName: string
+) {
+  const baseName = inputFileName.replace(/\.[^.]+$/, "") || "Episode"
+  const extension =
+    source === "transcode" ? "mp4" : inputFileName.split(".").at(-1) ?? "mp4"
+  const label =
+    source === "transcode"
+      ? "Yamibunko Compatibility Transcode"
+      : "Yamibunko Direct Play"
+
+  return `${label} - ${baseName}.${extension}`
 }
 
 function getMediaContainer(fileName: string, container: string | undefined) {
@@ -604,39 +636,86 @@ function isIosBrowser() {
   )
 }
 
-function hasNativeRemotePlaybackPicker(video: HTMLVideoElement | null) {
-  if (!video) {
+function isIphoneBrowser() {
+  if (typeof navigator === "undefined") {
     return false
   }
 
-  const nativeVideo = video as HtmlVideoElementWithNativePlayback
-
-  return typeof nativeVideo.webkitShowPlaybackTargetPicker === "function"
+  return /iPhone|iPod/i.test(navigator.userAgent)
 }
 
-function hasNativeRemotePlaybackPrompt(video: HTMLVideoElement | null) {
-  if (!video) {
+function isWebVideoCasterMarkedUrl() {
+  if (typeof window === "undefined") {
     return false
   }
 
-  const nativeVideo = video as HtmlVideoElementWithNativePlayback
+  const params = new URLSearchParams(window.location.search)
 
-  return typeof nativeVideo.remote?.prompt === "function"
+  if (params.get(iosExternalCastBrowserMarkerParam) === iosExternalCastBrowserMarkerValue) {
+    return true
+  }
+
+  return window.location.hash.includes(
+    `${iosExternalCastBrowserMarkerParam}=${iosExternalCastBrowserMarkerValue}`
+  )
 }
 
-function canUseNativeRemotePlayback(video: HTMLVideoElement | null) {
-  if (!video) {
+function isWebVideoCasterBrowser() {
+  if (isWebVideoCasterMarkedUrl()) {
+    return true
+  }
+
+  if (typeof navigator === "undefined") {
     return false
   }
 
-  return hasNativeRemotePlaybackPrompt(video) || hasNativeRemotePlaybackPicker(video)
+  return /Web\s*Video\s*Cast(?:er)?|WebVideoCast(?:er)?|WebVideoCaster|WVC|InstantBits|instantbits|wvc/i.test(navigator.userAgent)
 }
 
-function canUseNativeRemotePlaybackFallback(
-  video: HTMLVideoElement | null,
-  targetAvailable: boolean
-) {
-  return isIosBrowser() && targetAvailable && canUseNativeRemotePlayback(video)
+function getIosExternalCastPageUrl() {
+  if (typeof window === "undefined") {
+    return ""
+  }
+
+  const url = new URL(window.location.href)
+  url.searchParams.set(iosExternalCastBrowserMarkerParam, iosExternalCastBrowserMarkerValue)
+  return url.toString()
+}
+
+function isCurrentPageHttpPrivateLanOrigin() {
+  if (typeof window === "undefined") {
+    return false
+  }
+
+  return window.location.protocol === "http:" && isPrivateLanIpv4Host(window.location.hostname)
+}
+
+function getCurrentPageLanOrigin() {
+  if (typeof window === "undefined") {
+    return null
+  }
+
+  if (!isCurrentPageHttpPrivateLanOrigin()) {
+    return null
+  }
+
+  return window.location.origin
+}
+
+function shouldOpenIosExternalCastApp() {
+  if (!isIosBrowser() || isWebVideoCasterBrowser()) {
+    return false
+  }
+
+  if (typeof window === "undefined") {
+    return true
+  }
+
+  return !isCurrentPageHttpPrivateLanOrigin()
+}
+
+function shouldUseIosServerCastBridge() {
+  return isIosBrowser() && !isWebVideoCasterBrowser() && isCurrentPageHttpPrivateLanOrigin()
 }
 
 function getGoogleCastUnavailableMessage(input: {
@@ -655,37 +734,11 @@ function getGoogleCastUnavailableMessage(input: {
     return "Google Cast did not become available in Android Chrome. Make sure Chrome is up to date, the phone is on the same network as the Cast receiver, and Google Play Services is available."
   }
 
+  if (isWebVideoCasterBrowser()) {
+    return "Google Cast did not become available inside Web Video Caster. Use Web Video Caster's own cast controls if its embedded browser does not expose the Google Cast Sender SDK."
+  }
+
   return "Casting is not available in this browser."
-}
-
-function requestNativeRemotePlayback(video: HTMLVideoElement) {
-  const nativeVideo = video as HtmlVideoElementWithNativePlayback
-
-  if (typeof nativeVideo.webkitShowPlaybackTargetPicker === "function") {
-    nativeVideo.webkitShowPlaybackTargetPicker()
-    return true
-  }
-
-  if (typeof nativeVideo.remote?.prompt === "function") {
-    void nativeVideo.remote.prompt().catch(() => undefined)
-    return true
-  }
-
-  return false
-}
-
-function isNativeRemotePlaybackConnected(video: HTMLVideoElement | null) {
-  if (!video) {
-    return false
-  }
-
-  const nativeVideo = video as HtmlVideoElementWithNativePlayback
-
-  return (
-    nativeVideo.webkitCurrentPlaybackTargetIsWireless === true ||
-    nativeVideo.remote?.state === "connected" ||
-    nativeVideo.remote?.state === "connecting"
-  )
 }
 
 function requestNativeVideoFullscreen(video: HTMLVideoElement | null) {
@@ -694,6 +747,17 @@ function requestNativeVideoFullscreen(video: HTMLVideoElement | null) {
   }
 
   const nativeVideo = video as HtmlVideoElementWithNativePlayback
+
+  if (typeof nativeVideo.webkitEnterFullscreen === "function") {
+    try {
+      nativeVideo.webkitEnterFullscreen()
+      return true
+    } catch {
+      if (isIphoneBrowser()) {
+        return false
+      }
+    }
+  }
 
   if (
     typeof nativeVideo.webkitSupportsPresentationMode === "function" &&
@@ -704,12 +768,44 @@ function requestNativeVideoFullscreen(video: HTMLVideoElement | null) {
     return true
   }
 
-  if (typeof nativeVideo.webkitEnterFullscreen === "function") {
-    nativeVideo.webkitEnterFullscreen()
-    return true
+  return false
+}
+
+function getIosExternalCastDeepLink(input: { url: string; title: string }) {
+  const deepLink = new URL("wvc-x-callback://open")
+
+  deepLink.searchParams.set("url", input.url)
+  deepLink.searchParams.set("title", input.title)
+  deepLink.searchParams.set("secure_uri", "true")
+
+  return deepLink.toString()
+}
+
+function isLcAacAudioProfile(profile: string | undefined) {
+  const normalized = profile?.trim().toLowerCase()
+
+  return !normalized || normalized === "lc" || normalized === "aac lc"
+}
+
+function isCastDirectAudioSafe(stream: MediaStreamInfo | undefined) {
+  if (!stream) {
+    return false
   }
 
-  return false
+  const audioCodec = normalizeCodecName(stream.codec)
+  const channels = stream.channels
+  const hasSafeChannelLayout =
+    typeof channels !== "number" || channels <= 0 || channels <= 2
+
+  if (!hasSafeChannelLayout) {
+    return false
+  }
+
+  if (audioCodec === "aac") {
+    return isLcAacAudioProfile(stream.profile)
+  }
+
+  return audioCodec === "mp3"
 }
 
 function supportsCastDirectPlayback(input: {
@@ -719,7 +815,6 @@ function supportsCastDirectPlayback(input: {
 }) {
   const container = getMediaContainer(input.fileName, input.media.container)
   const videoCodec = normalizeCodecName(input.media.videoCodec)
-  const audioCodec = normalizeCodecName(input.selectedAudioStream?.codec)
 
   if (container !== "mp4") {
     return false
@@ -740,7 +835,7 @@ function supportsCastDirectPlayback(input: {
     return true
   }
 
-  return audioCodec === "aac" || audioCodec === "mp3"
+  return isCastDirectAudioSafe(input.selectedAudioStream)
 }
 
 function isPlayerControlTarget(target: EventTarget | null) {
@@ -1391,12 +1486,15 @@ export function AnimePlayer({
   const settingsButtonRef = useRef<HTMLDivElement>(null)
   const volumeControlRef = useRef<HTMLDivElement>(null)
   const playbackKeyRef = useRef(`${animeId}:${seasonNumber}:${episodeNumber}`)
-  const clientStreamIdRef = useRef(clientStreamId ?? createClientStreamId())
+  const [stableClientStreamId] = useState(() => clientStreamId ?? createClientStreamId())
+  const clientStreamIdRef = useRef(stableClientStreamId)
   const castSelectionKeyRef = useRef("")
   const lastProgressSavePositionRef = useRef(0)
   const lastNonZeroVolumeRef = useRef(1)
   const lastVolumePointerTypeRef = useRef<string | null>(null)
   const touchControlClickSuppressionRef = useRef(false)
+  const touchControlActionSuppressedRef = useRef(false)
+  const touchControlActionSuppressionTimerRef = useRef<number | null>(null)
   const completedProgressRef = useRef(false)
   const directFallbackAttemptedRef = useRef(false)
   const currentTimeRef = useRef(0)
@@ -1407,9 +1505,16 @@ export function AnimePlayer({
   const statusRef = useRef<PlaybackStatusState>("checking")
   const activeSourceStartRef = useRef(0)
   const shouldAutoPlaySourceRef = useRef(autoPlay)
-  const sourceSwitchPauseSuppressionUntilRef = useRef(0)
+  const sourceSwitchPauseSuppressedRef = useRef(false)
+  const sourceSwitchPauseSuppressionTimerRef = useRef<number | null>(null)
   const isCastingRef = useRef(false)
   const isNativeRemoteCastingRef = useRef(false)
+  const isServerCastingRef = useRef(false)
+  const serverCastSessionIdRef = useRef<string | null>(null)
+  const serverCastDeviceIdRef = useRef<string | null>(null)
+  const serverCastProgressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const serverCastStatusGraceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const serverCastStatusGraceActiveRef = useRef(false)
   const nativeRemoteFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const isCastLoadingRef = useRef(false)
   const isPlayingRef = useRef(false)
@@ -1444,6 +1549,13 @@ export function AnimePlayer({
       startTimeOverride?: number
     ) => Promise<boolean>
   >(async () => false)
+  const startServerCastingToDeviceRef = useRef<
+    (
+      deviceId: string,
+      shouldResume: boolean,
+      startTimeOverride?: number
+    ) => Promise<void>
+  >(async () => undefined)
   const switchSourceRef = useRef<
     (
       nextSourceUrl: string,
@@ -1483,10 +1595,15 @@ export function AnimePlayer({
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [isCasting, setIsCasting] = useState(false)
   const [isNativeRemoteCasting, setIsNativeRemoteCasting] = useState(false)
+  const [isServerCasting, setIsServerCasting] = useState(false)
+  const [serverCastDevices, setServerCastDevices] = useState<ServerCastDevice[]>([])
+  const [serverCastDeviceModalOpen, setServerCastDeviceModalOpen] = useState(false)
+  const [serverCastOverlayPortalRoot] = useState<HTMLElement | null>(() =>
+    typeof document === "undefined" ? null : document.body
+  )
+  const [serverCastDevicesLoading, setServerCastDevicesLoading] = useState(false)
+  const [iosExternalCastAppUnavailable, setIosExternalCastAppUnavailable] = useState(false)
   const [isCastStarting, setIsCastStarting] = useState(false)
-  const [isIosDevice, setIsIosDevice] = useState(false)
-  const [nativeRemotePlaybackSupported, setNativeRemotePlaybackSupported] = useState(false)
-  const [nativeRemotePlaybackAvailable, setNativeRemotePlaybackAvailable] = useState(false)
   const [castErrorFlash, setCastErrorFlash] = useState(false)
   const [castErrorMessage, setCastErrorMessage] = useState<string | null>(null)
   const [subtitleCues, setSubtitleCues] = useState<SubtitleCue[]>([])
@@ -1541,6 +1658,8 @@ export function AnimePlayer({
   })
   const displayMethod = statusLabel(status)
   const castSelectionKey = `${playbackKey}:${quality}:${selectedAudioStreamId ?? ""}:${selectedSubtitleStreamId ?? ""}`
+  const isIosDevice = isIosBrowser()
+  const isInsideWebVideoCaster = isWebVideoCasterBrowser()
 
   useEffect(() => {
     sourceUrlRef.current = sourceUrl
@@ -1727,6 +1846,31 @@ export function AnimePlayer({
     }
   }, [])
 
+  const clearServerCastStatusGrace = useCallback(() => {
+    if (serverCastStatusGraceTimerRef.current) {
+      clearTimeout(serverCastStatusGraceTimerRef.current)
+      serverCastStatusGraceTimerRef.current = null
+    }
+
+    serverCastStatusGraceActiveRef.current = false
+  }, [])
+
+  const startServerCastStatusGrace = useCallback(() => {
+    clearServerCastStatusGrace()
+    serverCastStatusGraceActiveRef.current = true
+    serverCastStatusGraceTimerRef.current = setTimeout(() => {
+      serverCastStatusGraceActiveRef.current = false
+      serverCastStatusGraceTimerRef.current = null
+    }, 10_000)
+  }, [clearServerCastStatusGrace])
+
+  const clearServerCastMediaSync = useCallback(() => {
+    if (serverCastProgressTimerRef.current) {
+      clearInterval(serverCastProgressTimerRef.current)
+      serverCastProgressTimerRef.current = null
+    }
+  }, [])
+
   const beginMediaWait = useCallback(
     (forceTranscodeWait = false) => {
       clearHardwareWaitTimer()
@@ -1767,6 +1911,25 @@ export function AnimePlayer({
     [clearNativeRemoteFallbackTimer]
   )
 
+  function clearSourceSwitchPauseSuppression() {
+    if (sourceSwitchPauseSuppressionTimerRef.current) {
+      window.clearTimeout(sourceSwitchPauseSuppressionTimerRef.current)
+      sourceSwitchPauseSuppressionTimerRef.current = null
+    }
+
+    sourceSwitchPauseSuppressedRef.current = false
+  }
+
+  function startSourceSwitchPauseSuppression() {
+    clearSourceSwitchPauseSuppression()
+    sourceSwitchPauseSuppressedRef.current = true
+
+    sourceSwitchPauseSuppressionTimerRef.current = window.setTimeout(() => {
+      sourceSwitchPauseSuppressedRef.current = false
+      sourceSwitchPauseSuppressionTimerRef.current = null
+    }, 5000)
+  }
+
   const showControls = useCallback(
     (keepVisible = false) => {
       clearControlsTimer()
@@ -1784,7 +1947,7 @@ export function AnimePlayer({
         }, 2500)
       }
     },
-    [clearControlsTimer]
+    [clearControlsTimer, setControlsVisible, setSettingsOpen]
   )
 
   useEffect(() => {
@@ -1792,6 +1955,14 @@ export function AnimePlayer({
       clearNativeRemoteFallbackTimer()
     }
   }, [clearNativeRemoteFallbackTimer])
+
+  useEffect(() => {
+    if (isIosBrowser()) {
+      return
+    }
+
+    void ensureGoogleCastFramework().catch(() => undefined)
+  }, [])
 
   useEffect(() => {
     const removeListener = addGoogleCastSessionStateListener((event) => {
@@ -1838,129 +2009,6 @@ export function AnimePlayer({
       phoneQuery.removeEventListener("change", syncViewport)
     }
   }, [])
-
-  useEffect(() => {
-    const video = videoRef.current
-    const isIos = isIosBrowser()
-    let cancelled = false
-    let remoteWatchId: number | null = null
-    let initialSyncTimer: ReturnType<typeof setTimeout> | null = null
-
-    function syncNativePlaybackState() {
-      if (cancelled) {
-        return
-      }
-
-      setIsIosDevice(isIos)
-
-      if (!video || !isIos) {
-        setNativeRemotePlaybackSupported(false)
-        setNativeRemotePlaybackAvailable(false)
-        return
-      }
-
-      const supportsNativePlayback = canUseNativeRemotePlayback(video)
-      setNativeRemotePlaybackSupported(supportsNativePlayback)
-      setNativeRemotePlaybackAvailable(
-        supportsNativePlayback &&
-          (hasNativeRemotePlaybackPrompt(video) || hasNativeRemotePlaybackPicker(video))
-      )
-    }
-
-    initialSyncTimer = setTimeout(syncNativePlaybackState, 0)
-
-    if (!video || !isIos) {
-      return () => {
-        cancelled = true
-        if (initialSyncTimer) {
-          clearTimeout(initialSyncTimer)
-        }
-      }
-    }
-
-    const nativeVideo = video as HtmlVideoElementWithNativePlayback
-    nativeVideo.disableRemotePlayback = false
-    nativeVideo.setAttribute("x-webkit-airplay", "allow")
-    nativeVideo.setAttribute("webkit-playsinline", "")
-    nativeVideo.setAttribute("playsinline", "")
-
-    function handleWebKitAvailability(event: Event) {
-      const availability = (event as WebKitPlaybackTargetAvailabilityEvent).availability
-      setNativeRemotePlaybackAvailable(
-        availability === "available" ||
-          hasNativeRemotePlaybackPrompt(video) ||
-          hasNativeRemotePlaybackPicker(video)
-      )
-    }
-
-    function handleNativeTargetChanged() {
-      const connected = isNativeRemotePlaybackConnected(video)
-      setNativeRemoteCastingState(connected)
-
-      if (!connected) {
-        isCastLoadingRef.current = false
-        setIsCastStarting(false)
-        endMediaWait()
-        return
-      }
-
-      showControls(true)
-    }
-
-    video.addEventListener(
-      "webkitplaybacktargetavailabilitychanged",
-      handleWebKitAvailability
-    )
-    video.addEventListener(
-      "webkitcurrentplaybacktargetiswirelesschanged",
-      handleNativeTargetChanged
-    )
-    nativeVideo.remote?.addEventListener?.("connect", handleNativeTargetChanged)
-    nativeVideo.remote?.addEventListener?.("disconnect", handleNativeTargetChanged)
-
-    if (typeof nativeVideo.remote?.watchAvailability === "function") {
-      nativeVideo.remote
-        .watchAvailability((available) => {
-          if (!cancelled) {
-            setNativeRemotePlaybackAvailable(
-              available ||
-                hasNativeRemotePlaybackPrompt(video) ||
-                hasNativeRemotePlaybackPicker(video)
-            )
-          }
-        })
-        .then((watchId) => {
-          if (cancelled) {
-            void nativeVideo.remote?.cancelWatchAvailability?.(watchId)
-            return
-          }
-
-          remoteWatchId = watchId
-        })
-        .catch(() => undefined)
-    }
-
-    return () => {
-      cancelled = true
-      if (initialSyncTimer) {
-        clearTimeout(initialSyncTimer)
-      }
-      video.removeEventListener(
-        "webkitplaybacktargetavailabilitychanged",
-        handleWebKitAvailability
-      )
-      video.removeEventListener(
-        "webkitcurrentplaybacktargetiswirelesschanged",
-        handleNativeTargetChanged
-      )
-      nativeVideo.remote?.removeEventListener?.("connect", handleNativeTargetChanged)
-      nativeVideo.remote?.removeEventListener?.("disconnect", handleNativeTargetChanged)
-
-      if (remoteWatchId !== null) {
-        void nativeVideo.remote?.cancelWatchAvailability?.(remoteWatchId)
-      }
-    }
-  }, [endMediaWait, setNativeRemoteCastingState, showControls, sourceUrl])
 
   useEffect(() => {
     const video = videoRef.current
@@ -2132,7 +2180,10 @@ export function AnimePlayer({
 
     if (completedEnough && nextEpisode && onEpisodeChange) {
       onEpisodeChange(nextEpisode, true)
+      return true
     }
+
+    return false
   }
 
   useEffect(
@@ -2142,6 +2193,8 @@ export function AnimePlayer({
       clearPriorityInfoTimer()
       clearCastErrorFlashTimer()
       clearCastMediaSync()
+      clearServerCastMediaSync()
+      clearServerCastStatusGrace()
       clearSeekPreviewFrameTimer()
       clearSubtitleAnimationFrame()
     },
@@ -2151,6 +2204,8 @@ export function AnimePlayer({
       clearPriorityInfoTimer,
       clearCastErrorFlashTimer,
       clearCastMediaSync,
+      clearServerCastMediaSync,
+      clearServerCastStatusGrace,
       clearSeekPreviewFrameTimer,
       clearSubtitleAnimationFrame,
     ]
@@ -2216,9 +2271,9 @@ export function AnimePlayer({
       withStreamParams(playback.directUrl, {
         audioStreamId: selectedAudioStreamId,
         startTime: directAudioRemuxActive ? startTime : null,
-        clientId: clientStreamIdRef.current,
+        clientId: stableClientStreamId,
       }),
-    [directAudioRemuxActive, playback.directUrl, selectedAudioStreamId]
+    [directAudioRemuxActive, playback.directUrl, selectedAudioStreamId, stableClientStreamId]
   )
 
   const getTranscodeUrl = useCallback(
@@ -2230,11 +2285,41 @@ export function AnimePlayer({
         {
           audioStreamId: selectedAudioStreamId,
           startTime,
-          clientId: clientStreamIdRef.current,
+          clientId: stableClientStreamId,
         }
       ),
-    [playback.dataSaverUrl, playback.originalTranscodeUrl, selectedAudioStreamId]
+    [playback.dataSaverUrl, playback.originalTranscodeUrl, selectedAudioStreamId, stableClientStreamId]
   )
+
+  const getWebVideoCasterDirectUrl = useCallback(() => {
+    const url = new URL(
+      withStreamParams(playback.castDirectUrl, {
+        audioStreamId: null,
+        startTime: null,
+        clientId: stableClientStreamId,
+      }),
+      window.location.href
+    )
+
+    url.searchParams.set("wvc", "direct")
+
+    return url.toString()
+  }, [playback.castDirectUrl, stableClientStreamId])
+
+  const getWebVideoCasterTranscodeUrl = useCallback(() => {
+    const url = new URL(
+      withStreamParams(playback.castTranscodeUrl, {
+        audioStreamId: selectedAudioStreamId,
+        startTime: null,
+        clientId: stableClientStreamId,
+      }),
+      window.location.href
+    )
+
+    url.searchParams.set("wvc", "transcode")
+
+    return url.toString()
+  }, [playback.castTranscodeUrl, selectedAudioStreamId, stableClientStreamId])
 
   function switchSource(
     nextSourceUrl: string,
@@ -2243,18 +2328,25 @@ export function AnimePlayer({
   ) {
     const video = videoRef.current
     const previousPosition = options.preservePosition ? getPlaybackPosition() : 0
-    const sourceUsesOffset = nextStatus === "transcoding" || directAudioRemuxActive
+    const useWebVideoCasterSourceList = isIosDevice && isInsideWebVideoCaster
+    const sourceUsesOffset =
+      nextStatus === "transcoding" ||
+      (!useWebVideoCasterSourceList && directAudioRemuxActive)
     const sourceStartTime = sourceUsesOffset
       ? options.transcodeStartTime ?? previousPosition
       : 0
+    const sourceAudioStreamId =
+      useWebVideoCasterSourceList && nextStatus === "direct"
+        ? null
+        : selectedAudioStreamId
     const sourceToLoad = sourceUsesOffset
       ? withStreamParams(nextSourceUrl, {
-          audioStreamId: selectedAudioStreamId,
+          audioStreamId: sourceAudioStreamId,
           startTime: sourceStartTime,
           clientId: clientStreamIdRef.current,
         })
       : withStreamParams(nextSourceUrl, {
-          audioStreamId: selectedAudioStreamId,
+          audioStreamId: sourceAudioStreamId,
           startTime: null,
           clientId: clientStreamIdRef.current,
         })
@@ -2284,9 +2376,9 @@ export function AnimePlayer({
 
     if (sourceChanged && shouldResume) {
       shouldAutoPlaySourceRef.current = true
-      sourceSwitchPauseSuppressionUntilRef.current = Date.now() + 5000
+      startSourceSwitchPauseSuppression()
     } else if (sourceChanged) {
-      sourceSwitchPauseSuppressionUntilRef.current = 0
+      clearSourceSwitchPauseSuppression()
     }
 
     setStatus(nextStatus)
@@ -2295,8 +2387,13 @@ export function AnimePlayer({
     if (sourceChanged) {
       sourceUrlRef.current = sourceToLoad
       if (video) {
-        video.src = sourceToLoad
-        video.load()
+        if (useWebVideoCasterSourceList && nextStatus === "direct") {
+          video.removeAttribute("src")
+          video.load()
+        } else {
+          video.src = sourceToLoad
+          video.load()
+        }
       }
       setSourceUrl(sourceToLoad)
     }
@@ -2362,35 +2459,58 @@ export function AnimePlayer({
         directFallbackAttemptedRef.current = false
       }
 
-      if (isCastingRef.current) {
+      if (isCastingRef.current || isServerCastingRef.current) {
         const video = videoRef.current
 
         if (episodeChanged && video) {
-          void startGoogleCastingRef.current(
-            video,
-            autoPlay || isPlayingRef.current,
-            0
-          )
+          if (isServerCastingRef.current && serverCastDeviceIdRef.current) {
+            void startServerCastingToDeviceRef.current(
+              serverCastDeviceIdRef.current,
+              autoPlay || isPlayingRef.current,
+              0
+            ).catch((error) => {
+              flashCastError(error)
+              console.error(error)
+            })
+          } else {
+            void startGoogleCastingRef.current(
+              video,
+              autoPlay || isPlayingRef.current,
+              0
+            )
+          }
         }
 
         return
       }
 
       const video = videoRef.current
-      const canUseDirect = video
-        ? supportsDirectPlayback({
-            video,
-            fileName,
-            media,
-            selectedAudioStream: playbackAudioStream,
-          })
-        : false
+      const useWebVideoCasterSources = isIosDevice && isInsideWebVideoCaster
+      const canUseDirect = useWebVideoCasterSources
+        ? true
+        : video
+          ? supportsDirectPlayback({
+              video,
+              fileName,
+              media,
+              selectedAudioStream: playbackAudioStream,
+            })
+          : false
       const waitForPrioritySwitch = pendingPrioritySwitchRef.current
       pendingPrioritySwitchRef.current = false
 
       setDirectPossible(canUseDirect)
       setStatus("checking")
       endMediaWait()
+
+      if (useWebVideoCasterSources) {
+        directFallbackAttemptedRef.current = false
+        switchSourceRef.current(getWebVideoCasterDirectUrl(), "direct", {
+          preservePosition: Boolean(previousSourceUrl) && !episodeChanged,
+          waitForMedia: waitForPrioritySwitch,
+        })
+        return
+      }
 
       if (quality === "original" && canUseDirect) {
         directFallbackAttemptedRef.current = false
@@ -2430,11 +2550,15 @@ export function AnimePlayer({
     fileName,
     getDirectUrl,
     getTranscodeUrl,
+    getWebVideoCasterDirectUrl,
+    isInsideWebVideoCaster,
+    isIosDevice,
     liveTranscodeEnabled,
     media,
     playbackKey,
     quality,
     playbackAudioStream,
+    flashCastError,
   ])
 
   useEffect(() => {
@@ -2616,7 +2740,7 @@ export function AnimePlayer({
   const handleBandwidthRecheckStarted = useCallback(
     (action: StreamPriorityAction) => {
       const video = videoRef.current
-      const wasCasting = isCastingRef.current || isCastLoadingRef.current
+      const wasCasting = isCastingRef.current || isServerCastingRef.current || isCastLoadingRef.current
       const wasPlaying = wasCasting
         ? isPlayingRef.current
         : Boolean(video && !video.paused) || isPlayingRef.current
@@ -2635,7 +2759,25 @@ export function AnimePlayer({
       if (wasCasting) {
         const session = getGoogleCastSession()
 
-        if (session && wasPlaying) {
+        if (isServerCastingRef.current && wasPlaying) {
+          const sessionId = serverCastSessionIdRef.current
+
+          if (sessionId) {
+            void fetch(serverCastControlApiPath, {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+              },
+              body: JSON.stringify({
+                action: "pause",
+                sessionId,
+              }),
+            }).catch((error) => {
+              flashCastError(error)
+              console.error(error)
+            })
+          }
+        } else if (session && wasPlaying) {
           void pauseGoogleCastMedia(session).catch((error) => {
             flashCastError(error)
             console.error(error)
@@ -2700,6 +2842,20 @@ export function AnimePlayer({
         }
 
         beginMediaWait(true)
+
+        if (isServerCastingRef.current && serverCastDeviceIdRef.current) {
+          void startServerCastingToDeviceRef.current(
+            serverCastDeviceIdRef.current,
+            snapshot.wasPlaying,
+            snapshot.position
+          ).catch((error) => {
+            flashCastError(error)
+            console.error(error)
+            endMediaWait()
+          })
+          return
+        }
+
         void startGoogleCastingRef.current(
           video,
           snapshot.wasPlaying,
@@ -2747,7 +2903,25 @@ export function AnimePlayer({
       bandwidthRecheckSnapshotRef.current = null
       shouldAutoPlaySourceRef.current = false
 
-      if (session) {
+      if (isServerCastingRef.current) {
+        const sessionId = serverCastSessionIdRef.current
+
+        if (sessionId) {
+          void fetch(serverCastControlApiPath, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              action: "pause",
+              sessionId,
+            }),
+          }).catch((error) => {
+            flashCastError(error)
+            console.error(error)
+          })
+        }
+      } else if (session) {
         void pauseGoogleCastMedia(session).catch((error) => {
           flashCastError(error)
           console.error(error)
@@ -3069,13 +3243,25 @@ export function AnimePlayer({
       return
     }
 
-    switchSource(getTranscodeUrl("original"), "transcoding", {
-      preservePosition: true,
-      waitForMedia: isPlaying || autoPlay,
-    })
+    switchSource(
+      isIosDevice && isInsideWebVideoCaster
+        ? getWebVideoCasterTranscodeUrl()
+        : getTranscodeUrl("original"),
+      "transcoding",
+      {
+        preservePosition: true,
+        waitForMedia: isPlaying || autoPlay,
+      }
+    )
   }
 
   async function togglePlay() {
+    if (isServerCastingRef.current) {
+      await toggleServerCastPlayback()
+      showControls()
+      return
+    }
+
     if (isCastingRef.current) {
       await toggleGoogleCastPlayback()
       showControls()
@@ -3106,6 +3292,47 @@ export function AnimePlayer({
   }
 
   async function seekTo(seconds: number) {
+    if (isServerCastingRef.current) {
+      const target = clampTime(seconds, duration)
+
+      currentTimeRef.current = target
+      setCurrentTime(target)
+
+      if (statusRef.current === "transcoding" || directAudioRemuxActive) {
+        const deviceId = serverCastDeviceIdRef.current
+
+        if (!deviceId) {
+          flashCastError(new Error("Server-side Chromecast device is missing"))
+          return
+        }
+
+        beginMediaWait(statusRef.current === "transcoding")
+
+        try {
+          await startServerCastingToDeviceRef.current(deviceId, isPlayingRef.current, target)
+        } catch (error) {
+          flashCastError(error)
+          console.error(error)
+        }
+
+        showControls()
+        return
+      }
+
+      try {
+        await sendServerCastControl({
+          action: "seek",
+          currentTime: target,
+        })
+      } catch (error) {
+        flashCastError(error)
+        console.error(error)
+      }
+
+      showControls()
+      return
+    }
+
     if (isCastingRef.current) {
       const target = clampTime(seconds, duration)
 
@@ -3318,8 +3545,14 @@ export function AnimePlayer({
       return
     }
 
-    if (isIosBrowser() && requestNativeVideoFullscreen(video)) {
-      return
+    if (isIosBrowser()) {
+      if (video && video.readyState === 0) {
+        video.load()
+      }
+
+      if (requestNativeVideoFullscreen(video)) {
+        return
+      }
     }
 
     if (target && typeof target.requestFullscreen === "function") {
@@ -3372,14 +3605,30 @@ export function AnimePlayer({
     }
   }
 
+  function waitForGoogleCastSessionWarmup() {
+    const delayMs = isAndroidBrowser() ? 1200 : 650
+
+    return new Promise<void>((resolve) => {
+      window.setTimeout(resolve, delayMs)
+    })
+  }
+
+  function waitForGoogleCastLoadRetryDelay() {
+    return new Promise<void>((resolve) => {
+      window.setTimeout(resolve, isAndroidBrowser() ? 900 : 500)
+    })
+  }
+
   async function loadGoogleCastMedia(input: {
     session: GoogleCastSessionHandle
     url: string
     contentType: string
     shouldResume: boolean
     startTime: number
+    durationSeconds?: number
     textTrack?: CastTextTrack
     timeoutMs?: number | null
+    bufferingIsLoaded?: boolean
   }) {
     if (input.textTrack) {
       assertGoogleCastReceiverUrlReachable(input.textTrack.url)
@@ -3390,6 +3639,7 @@ export function AnimePlayer({
       contentType: input.contentType,
       autoplay: input.shouldResume,
       currentTime: input.startTime,
+      durationSeconds: input.durationSeconds,
       textTrack: input.textTrack,
     })
 
@@ -3397,13 +3647,35 @@ export function AnimePlayer({
       throw new Error("Google Cast media request could not be created")
     }
 
-    await input.session.loadMedia(request)
+    const mediaSession = await input.session.loadMedia(request)
 
-    return await waitForGoogleCastMediaLoad({
+    const result = await waitForGoogleCastMediaLoad({
       session: input.session,
       contentId: input.url,
+      initialMediaSession: mediaSession,
       timeoutMs: input.timeoutMs,
+      bufferingIsLoaded: input.bufferingIsLoaded,
     })
+
+    if (result === "loaded" && input.shouldResume) {
+      await playGoogleCastMedia(input.session).catch(() => undefined)
+    }
+
+    return result
+  }
+
+  async function loadGoogleCastMediaWithRetry(input: Parameters<typeof loadGoogleCastMedia>[0] & {
+    retryOnce: boolean
+  }) {
+    const { retryOnce, ...loadInput } = input
+    const firstResult = await loadGoogleCastMedia(loadInput)
+
+    if (!retryOnce || firstResult === "loaded") {
+      return firstResult
+    }
+
+    await waitForGoogleCastLoadRetryDelay()
+    return loadGoogleCastMedia(loadInput)
   }
 
   function syncCastMediaState(state: GoogleCastMediaState) {
@@ -3443,7 +3715,12 @@ export function AnimePlayer({
     if (state.playerState === "IDLE") {
       if (state.idleReason === "FINISHED" && !castFinishedHandledRef.current) {
         castFinishedHandledRef.current = true
-        completePlayback(sourcePosition, knownDuration)
+        const autoAdvanced = completePlayback(sourcePosition, knownDuration)
+
+        if (!autoAdvanced) {
+          handleCastEndedRef.current()
+        }
+
         return
       }
 
@@ -3453,6 +3730,17 @@ export function AnimePlayer({
 
       handleCastEndedRef.current()
     }
+  }
+
+  function syncServerCastMediaState(state: GoogleCastMediaState) {
+    if (
+      serverCastStatusGraceActiveRef.current &&
+      (!state.isAlive || state.playerState === "IDLE")
+    ) {
+      return
+    }
+
+    syncCastMediaState(state)
   }
 
   function attachCastMediaSync(session: GoogleCastSessionHandle, contentId: string) {
@@ -3474,6 +3762,44 @@ export function AnimePlayer({
     )
     castProgressTimerRef.current = setInterval(emitCurrentState, 1000)
     emitCurrentState()
+  }
+
+  async function loadServerCastStatus() {
+    const sessionId = serverCastSessionIdRef.current
+
+    if (!sessionId) {
+      return
+    }
+
+    const url = new URL(serverCastStatusApiPath, window.location.href)
+    url.searchParams.set("sessionId", sessionId)
+
+    const response = await fetch(url)
+
+    if (!response.ok) {
+      throw new Error("Server-side Chromecast status failed.")
+    }
+
+    const payload = (await response.json()) as ServerCastStatusResponse
+    syncServerCastMediaState(payload.state)
+  }
+
+  function attachServerCastMediaSync(contentId: string) {
+    clearServerCastMediaSync()
+    castContentIdRef.current = contentId
+    castFinishedHandledRef.current = false
+
+    serverCastProgressTimerRef.current = setInterval(() => {
+      void loadServerCastStatus().catch((error) => {
+        flashCastError(error)
+        handleCastEndedRef.current()
+      })
+    }, 1000)
+
+    void loadServerCastStatus().catch((error) => {
+      flashCastError(error)
+      handleCastEndedRef.current()
+    })
   }
 
   function suspendLocalVideoForCast() {
@@ -3501,12 +3827,35 @@ export function AnimePlayer({
     isCastLoadingRef.current = false
     isCastingRef.current = true
     castSelectionKeyRef.current = castSelectionKey
+    setIsCastStarting(false)
     setIsCasting(true)
     setStatus(nextStatus)
     statusRef.current = nextStatus
     endMediaWait()
     suspendLocalVideoForCast()
     attachCastMediaSync(session, contentId)
+  }
+
+  function activateServerCastPlayback(input: {
+    candidate: ServerCastCandidate
+    sessionId: string
+    deviceId: string
+  }) {
+    castSourceStartOffsetRef.current = Math.max(input.candidate.sourceStartOffset, 0)
+    isCastLoadingRef.current = false
+    isServerCastingRef.current = true
+    serverCastSessionIdRef.current = input.sessionId
+    serverCastDeviceIdRef.current = input.deviceId
+    castSelectionKeyRef.current = castSelectionKey
+    startServerCastStatusGrace()
+    setIsCastStarting(false)
+    setIsServerCasting(true)
+    setServerCastDeviceModalOpen(false)
+    setStatus(input.candidate.id === "direct" ? "direct" : "transcoding")
+    statusRef.current = input.candidate.id === "direct" ? "direct" : "transcoding"
+    endMediaWait()
+    suspendLocalVideoForCast()
+    attachServerCastMediaSync(input.candidate.url)
   }
 
   async function toggleGoogleCastPlayback() {
@@ -3535,14 +3884,70 @@ export function AnimePlayer({
     }
   }
 
+  async function sendServerCastControl(input: {
+    action: "pause" | "play" | "seek" | "stop"
+    currentTime?: number
+  }) {
+    const sessionId = serverCastSessionIdRef.current
+
+    if (!sessionId) {
+      throw new Error("Server-side Chromecast session is missing")
+    }
+
+    const response = await fetch(serverCastControlApiPath, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        ...input,
+        sessionId,
+      }),
+    })
+
+    const payload = (await response.json().catch(() => null)) as
+      | { ok?: boolean; error?: string; state?: ServerCastMediaState }
+      | null
+
+    if (!response.ok || !payload?.ok || !payload.state) {
+      throw new Error(payload?.error ?? "Server-side Chromecast command failed.")
+    }
+
+    syncCastMediaState(payload.state)
+  }
+
+  async function toggleServerCastPlayback() {
+    try {
+      if (isPlaying) {
+        await sendServerCastControl({ action: "pause" })
+        resumeLocalAfterCastEndRef.current = false
+        setIsPlaying(false)
+      } else {
+        await sendServerCastControl({ action: "play" })
+        resumeLocalAfterCastEndRef.current = true
+        setIsPlaying(true)
+      }
+    } catch (error) {
+      flashCastError(error)
+      console.error(error)
+      handleCastEnded()
+    }
+  }
+
   function keepLocalPausedAfterFailedCastStart() {
     isCastLoadingRef.current = false
     isCastingRef.current = false
+    isServerCastingRef.current = false
+    serverCastSessionIdRef.current = null
+    serverCastDeviceIdRef.current = null
+    clearServerCastMediaSync()
+    clearServerCastStatusGrace()
     resumeLocalAfterCastEndRef.current = false
     shouldAutoPlaySourceRef.current = false
     endMediaWait()
     restoreLocalSource({ preservePosition: true })
     setIsCasting(false)
+    setIsServerCasting(false)
     setIsPlaying(false)
     isPlayingRef.current = false
     showControls(true)
@@ -3629,7 +4034,13 @@ export function AnimePlayer({
     beginMediaWait(false)
     showControls(true)
 
-    const session = getGoogleCastSession() ?? (await requestGoogleCastSession())
+    const existingSession = getGoogleCastSession()
+    const isFreshCastSession = !existingSession
+    const session = existingSession ?? (await requestGoogleCastSession())
+
+    if (isFreshCastSession) {
+      await waitForGoogleCastSessionWarmup()
+    }
 
     try {
       await setGoogleCastReceiverVolumeOnce(session, 1)
@@ -3641,14 +4052,17 @@ export function AnimePlayer({
     if (directFirst) {
       try {
         assertGoogleCastReceiverUrlReachable(directCastUrl)
-        const result = await loadGoogleCastMedia({
+        const result = await loadGoogleCastMediaWithRetry({
           session,
           url: directCastUrl,
           contentType: getCastDirectContentType(fileName, directAudioRemuxActive),
           shouldResume,
           startTime: directCastRequestTime,
+          durationSeconds,
           textTrack: directTextTrack,
-          timeoutMs: 60_000,
+          timeoutMs: 20_000,
+          bufferingIsLoaded: !isAndroidBrowser(),
+          retryOnce: isFreshCastSession && isAndroidBrowser(),
         })
         if (result === "loaded") {
           activateGoogleCastPlayback(
@@ -3688,14 +4102,17 @@ export function AnimePlayer({
     beginMediaWait(true)
     try {
       assertGoogleCastReceiverUrlReachable(transcodeCastUrl)
-      const result = await loadGoogleCastMedia({
+      const result = await loadGoogleCastMediaWithRetry({
         session,
         url: transcodeCastUrl,
         contentType: "video/mp4",
         shouldResume,
         startTime: 0,
+        durationSeconds,
         textTrack: transcodeTextTrack,
-        timeoutMs: null,
+        timeoutMs: 90_000,
+        bufferingIsLoaded: !isAndroidBrowser(),
+        retryOnce: isFreshCastSession && isAndroidBrowser(),
       })
 
       if (result === "loaded") {
@@ -3726,17 +4143,254 @@ export function AnimePlayer({
     }
   }
 
+
+
+  function buildServerCastCandidates(video: HTMLVideoElement, startTime: number) {
+    const canLocalDirect = supportsDirectPlayback({
+      video,
+      fileName,
+      media,
+      selectedAudioStream: playbackAudioStream,
+    })
+    const canCastDirect = supportsCastDirectPlayback({
+      fileName,
+      media,
+      selectedAudioStream: playbackAudioStream,
+    })
+    const directFirst = quality === "original" && canCastDirect
+    const directCastUsesOffset = directAudioRemuxActive && startTime > 0.25
+    const directCastStartOffset = directCastUsesOffset ? startTime : 0
+    const directCastRequestTime = directCastUsesOffset ? 0 : startTime
+    const directCastUrl = getCastReceiverUrl(
+      withStreamParams(playback.castDirectUrl, {
+        audioStreamId: selectedAudioStreamId,
+        startTime: directCastUsesOffset ? startTime : null,
+        clientId: clientStreamIdRef.current,
+      })
+    )
+    const castTranscodeBaseUrl =
+      quality === "dataSaver" ? playback.castDataSaverUrl : playback.castTranscodeUrl
+    const transcodeCastStartOffset = startTime > 0.25 ? startTime : 0
+    const transcodeCastUrl = getCastReceiverUrl(
+      withStreamParams(castTranscodeBaseUrl, {
+        audioStreamId: selectedAudioStreamId,
+        startTime: transcodeCastStartOffset,
+        clientId: clientStreamIdRef.current,
+      })
+    )
+    const title = document.title || `${animeId} S${seasonNumber.toString().padStart(2, "0")}E${episodeNumber
+      .toString()
+      .padStart(2, "0")}`
+    const candidates: ServerCastCandidate[] = []
+
+    if (directFirst) {
+      candidates.push({
+        id: "direct",
+        url: directCastUrl,
+        contentType: getCastDirectContentType(fileName, directAudioRemuxActive),
+        currentTime: directCastRequestTime,
+        sourceStartOffset: directCastStartOffset,
+        durationSeconds,
+        textTrack: getSelectedCastTextTrack(directCastStartOffset),
+        title,
+      })
+    }
+
+    if (liveTranscodeEnabled) {
+      candidates.push({
+        id: "transcode",
+        url: transcodeCastUrl,
+        contentType: "video/mp4",
+        currentTime: 0,
+        sourceStartOffset: transcodeCastStartOffset,
+        durationSeconds,
+        textTrack: getSelectedCastTextTrack(transcodeCastStartOffset),
+        title,
+      })
+    }
+
+    return {
+      candidates,
+      localFallbackSource:
+        quality === "original" && (canLocalDirect || !liveTranscodeEnabled)
+          ? getDirectUrl()
+          : getTranscodeUrl(quality),
+      localFallbackStatus:
+        quality === "original" && (canLocalDirect || !liveTranscodeEnabled)
+          ? "direct"
+          : "transcoding",
+      canLocalDirect,
+    } satisfies {
+      candidates: ServerCastCandidate[]
+      localFallbackSource: string
+      localFallbackStatus: PlaybackStatusState
+      canLocalDirect: boolean
+    }
+  }
+
+  async function startServerCastingToDevice(deviceId: string, shouldResume: boolean, startTimeOverride?: number) {
+    const video = videoRef.current
+
+    if (!video) {
+      throw new Error("Video player is not ready.")
+    }
+
+    const startTime = startTimeOverride ?? getPlaybackPosition()
+    const built = buildServerCastCandidates(video, startTime)
+
+    if (!built.candidates.length) {
+      throw new Error("Live transcoding is disabled and this file cannot be cast directly.")
+    }
+
+    localPlaybackBeforeCastRef.current = {
+      sourceUrl: sourceUrlRef.current ?? built.localFallbackSource,
+      status: built.localFallbackStatus,
+      quality,
+      directPossible: built.canLocalDirect,
+      position: startTime,
+      wasMuted: video.muted,
+    }
+    resumeLocalAfterCastEndRef.current = shouldResume
+    video.muted = true
+    video.pause()
+    setIsPlaying(false)
+    isPlayingRef.current = false
+    isCastLoadingRef.current = true
+    beginMediaWait(false)
+    showControls(true)
+
+    const response = await fetch(serverCastStartApiPath, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        autoplay: shouldResume,
+        candidates: built.candidates,
+        deviceId,
+        receiverBaseUrl: getCurrentPageLanOrigin(),
+      }),
+    })
+    const payload = (await response.json().catch(() => null)) as
+      | ({ ok?: boolean; error?: string } & Partial<ServerCastStartResponse>)
+      | null
+
+    if (!response.ok || !payload?.ok || !payload.candidate || !payload.sessionId) {
+      keepLocalPausedAfterFailedCastStart()
+      throw new Error(payload?.error ?? "Server-side Chromecast failed to start.")
+    }
+
+    activateServerCastPlayback({
+      candidate: payload.candidate,
+      deviceId,
+      sessionId: payload.sessionId,
+    })
+    syncServerCastMediaState(payload.state ?? {
+      contentId: payload.candidate.url,
+      isAlive: true,
+      playerState: shouldResume ? "PLAYING" : "PAUSED",
+      positionSeconds: 0,
+    })
+  }
+
+  async function loadServerCastDevices() {
+    setServerCastDeviceModalOpen(true)
+    setServerCastDevicesLoading(true)
+    setServerCastDevices([])
+
+    try {
+      const receiverBaseUrl = getCurrentPageLanOrigin()
+      const devicesUrl = new URL(serverCastDevicesApiPath, window.location.href)
+
+      if (receiverBaseUrl) {
+        devicesUrl.searchParams.set("receiverBaseUrl", receiverBaseUrl)
+      }
+
+      const response = await fetch(devicesUrl)
+
+      if (!response.ok) {
+        throw new Error("Server-side Chromecast discovery failed.")
+      }
+
+      const payload = (await response.json()) as ServerCastDevicesResponse
+      setServerCastDevices(payload.devices)
+
+      if (!payload.devices.length) {
+        flashCastError(new Error("No Chromecast / Google TV devices were found on the server network."))
+      }
+    } catch (error) {
+      flashCastError(error)
+      console.error(error)
+    } finally {
+      setServerCastDevicesLoading(false)
+    }
+  }
+
+  async function startSelectedServerCastDevice(deviceId: string) {
+    const video = videoRef.current
+
+    if (!video) {
+      flashCastError(new Error("Video player is not ready."))
+      return
+    }
+
+    const startTime = getPlaybackPosition()
+    const shouldResume = !video.paused || isPlayingRef.current || startTime <= 0.35
+    const startPromise = startServerCastingToDevice(deviceId, shouldResume, startTime)
+
+    setServerCastDeviceModalOpen(false)
+    castStartPromiseRef.current = startPromise.then(() => true)
+    setIsCastStarting(true)
+
+    try {
+      await startPromise
+    } catch (error) {
+      flashCastError(error)
+      console.error(error)
+    } finally {
+      castStartPromiseRef.current = null
+      setIsCastStarting(false)
+    }
+  }
+
+  useEffect(() => {
+    startServerCastingToDeviceRef.current = startServerCastingToDevice
+  })
+
   useEffect(() => {
     startGoogleCastingRef.current = startGoogleCasting
   })
 
   useEffect(() => {
-    if (!isCasting) {
+    const receiverCastActive = isCasting || isServerCasting
+
+    if (!receiverCastActive) {
       castSelectionKeyRef.current = castSelectionKey
       return
     }
 
     if (castSelectionKeyRef.current === castSelectionKey) {
+      return
+    }
+
+    castSelectionKeyRef.current = castSelectionKey
+
+    if (isServerCasting) {
+      const deviceId = serverCastDeviceIdRef.current
+
+      if (!deviceId) {
+        handleCastEndedRef.current()
+        return
+      }
+
+      void startServerCastingToDeviceRef.current(
+        deviceId,
+        isPlayingRef.current,
+        getPlaybackPosition()
+      ).catch((error) => {
+        flashCastError(error)
+        console.error(error)
+      })
       return
     }
 
@@ -3746,111 +4400,72 @@ export function AnimePlayer({
       return
     }
 
-    castSelectionKeyRef.current = castSelectionKey
     void startGoogleCastingRef.current(video, isPlayingRef.current, getPlaybackPosition())
-  }, [castSelectionKey, getPlaybackPosition, isCasting])
+  }, [castSelectionKey, getPlaybackPosition, isCasting, isServerCasting, flashCastError])
 
-  function getNativeRemotePlaybackUrl(startTime: number) {
-    const nativeRemoteBaseUrl = liveTranscodeEnabled
-      ? quality === "dataSaver"
-        ? playback.castDataSaverUrl
-        : playback.castTranscodeUrl
-      : playback.castDirectUrl
-
-    return getCastReceiverUrl(
-      withStreamParams(nativeRemoteBaseUrl, {
-        audioStreamId: selectedAudioStreamId,
-        startTime,
-        clientId: clientStreamIdRef.current,
-      })
-    )
-  }
-
-  async function startNativeRemotePlayback(video: HTMLVideoElement) {
-    const startTime = getPlaybackPosition()
-    const nativeRemoteUrl = getNativeRemotePlaybackUrl(startTime)
-    const canLocalDirect = supportsDirectPlayback({
-      video,
-      fileName,
-      media,
-      selectedAudioStream: playbackAudioStream,
+  function startIosExternalCastHandoff(video: HTMLVideoElement) {
+    const pageUrl = getIosExternalCastPageUrl()
+    const deepLink = getIosExternalCastDeepLink({
+      url: pageUrl,
+      title: document.title || `${animeId} S${seasonNumber.toString().padStart(2, "0")}E${episodeNumber
+        .toString()
+        .padStart(2, "0")}`,
     })
-    const localFallbackStatus =
-      quality === "original" && (canLocalDirect || !liveTranscodeEnabled)
-        ? "direct"
-        : "transcoding"
-    const localFallbackSource =
-      localFallbackStatus === "direct" ? getDirectUrl() : getTranscodeUrl(quality)
-    const nextStatus: PlaybackStatusState = liveTranscodeEnabled ? "transcoding" : "direct"
+    let appOpened = false
+    let finished = false
 
-    localPlaybackBeforeCastRef.current = {
-      sourceUrl: sourceUrlRef.current ?? localFallbackSource,
-      status: localFallbackStatus,
-      quality,
-      directPossible: canLocalDirect,
-      position: startTime,
-      wasMuted: video.muted,
+    function markOpened() {
+      appOpened = true
     }
-    resumeLocalAfterCastEndRef.current = true
-    castContentIdRef.current = nativeRemoteUrl
-    castSourceStartOffsetRef.current = startTime
-    activeSourceStartRef.current = startTime
-    currentTimeRef.current = startTime
-    pendingSeekRef.current = null
-    sourceSwitchPauseSuppressionUntilRef.current = Date.now() + 5000
-    sourceUrlRef.current = nativeRemoteUrl
-    statusRef.current = nextStatus
-    setStatus(nextStatus)
-    setSourceUrl(nativeRemoteUrl)
-    setCurrentTime(startTime)
-    setNativeRemoteCastingState(true)
-    setIsCastStarting(true)
-    isCastLoadingRef.current = true
-    beginMediaWait(nextStatus === "transcoding")
+
+    function cleanup() {
+      window.removeEventListener("pagehide", markOpened)
+      document.removeEventListener("visibilitychange", handleVisibilityChange)
+    }
+
+    function handleVisibilityChange() {
+      if (document.visibilityState === "hidden") {
+        markOpened()
+      }
+    }
+
+    window.addEventListener("pagehide", markOpened)
+    document.addEventListener("visibilitychange", handleVisibilityChange)
+
+    video.pause()
+    setIsPlaying(false)
+    isPlayingRef.current = false
+    setIosExternalCastAppUnavailable(false)
     showControls(true)
 
-    video.muted = false
-    video.src = nativeRemoteUrl
-    video.load()
-
-    const playPromise = video.play()
-
-    if (!requestNativeRemotePlayback(video)) {
-      void playPromise.catch(() => undefined)
-      video.pause()
-      setNativeRemoteCastingState(false)
-      setIsCastStarting(false)
-      isCastLoadingRef.current = false
-      endMediaWait()
-      restoreLocalSource({ preservePosition: true })
-      throw new Error("Native casting is not available right now.")
-    }
-
     try {
-      await playPromise
-      setIsPlaying(true)
-      isPlayingRef.current = true
-      endMediaWait()
+      window.location.assign(deepLink)
     } catch (error) {
-      setNativeRemoteCastingState(false)
-      setIsCastStarting(false)
-      isCastLoadingRef.current = false
-      endMediaWait()
-      restoreLocalSource({ preservePosition: true })
+      finished = true
+      cleanup()
+      setIosExternalCastAppUnavailable(true)
       throw error
     }
 
-    nativeRemoteFallbackTimerRef.current = setTimeout(() => {
-      nativeRemoteFallbackTimerRef.current = null
-      isCastLoadingRef.current = false
-      setIsCastStarting(false)
-
-      if (!isNativeRemotePlaybackConnected(video)) {
+    window.setTimeout(() => {
+      if (finished) {
         return
       }
 
-      setNativeRemoteCastingState(true)
-    }, 3000)
+      finished = true
+      cleanup()
+
+      if (appOpened || document.visibilityState === "hidden") {
+        return
+      }
+
+      setIosExternalCastAppUnavailable(true)
+      flashCastError(
+        new Error(
+          `Install ${iosExternalCastAppName} from the App Store (${iosExternalCastAppStoreUrl}), then reload this page and tap Cast again. Yamibunko opens this watch page in that app because iPhone browsers cannot use the normal Google Cast Web Sender path.`
+        )
+      )
+    }, iosExternalCastOpenTimeoutMs)
   }
 
   async function startCasting() {
@@ -3862,33 +4477,28 @@ export function AnimePlayer({
       return
     }
 
+    if (isIosBrowser() && isWebVideoCasterBrowser()) {
+      flashCastError(new Error("Use Web Video Caster's own cast controls on iOS."))
+      return
+    }
+
     if (castStartPromiseRef.current || isCastLoadingRef.current) {
       showControls(true)
       return
     }
 
-    if (isIosBrowser()) {
-      if (!canUseNativeRemotePlaybackFallback(video, nativeRemotePlaybackAvailable)) {
-        flashCastError(
-          new Error(
-            nativeRemotePlaybackSupported
-              ? "No nearby playback target is available. Make sure Chrome has Local Network permission and the receiver is on the same Wi-Fi."
-              : "Native casting is not available in this iPhone browser."
-          )
-        )
-        return
-      }
-
+    if (shouldOpenIosExternalCastApp()) {
       try {
-        await startNativeRemotePlayback(video)
+        startIosExternalCastHandoff(video)
       } catch (error) {
         flashCastError(error)
         console.error(error)
-      } finally {
-        setIsCastStarting(false)
-        isCastLoadingRef.current = false
       }
+      return
+    }
 
+    if (shouldUseIosServerCastBridge()) {
+      await loadServerCastDevices()
       return
     }
 
@@ -3970,6 +4580,8 @@ export function AnimePlayer({
 
     video?.pause()
     clearCastMediaSync()
+    clearServerCastMediaSync()
+    clearServerCastStatusGrace()
     castContentIdRef.current = null
     castSourceStartOffsetRef.current = 0
     castFinishedHandledRef.current = false
@@ -3977,7 +4589,11 @@ export function AnimePlayer({
     setIsCastStarting(false)
     isCastLoadingRef.current = false
     isCastingRef.current = false
+    isServerCastingRef.current = false
+    serverCastSessionIdRef.current = null
+    serverCastDeviceIdRef.current = null
     setIsCasting(false)
+    setIsServerCasting(false)
     setNativeRemoteCastingState(false)
     setIsPlaying(false)
     isPlayingRef.current = false
@@ -4001,14 +4617,16 @@ export function AnimePlayer({
   })
 
   function stopCasting() {
-    const video = videoRef.current
-
-    if (!video) {
+    if (isNativeRemoteCastingRef.current) {
+      handleNativeRemoteEnded()
       return
     }
 
-    if (isNativeRemoteCastingRef.current) {
-      handleNativeRemoteEnded()
+    if (serverCastSessionIdRef.current || isServerCastingRef.current || isServerCasting) {
+      void sendServerCastControl({ action: "stop" }).catch((error) => {
+        flashCastError(error)
+        console.error(error)
+      })
       return
     }
 
@@ -4058,7 +4676,7 @@ export function AnimePlayer({
 
     if (
       shouldAutoPlaySourceRef.current &&
-      Date.now() < sourceSwitchPauseSuppressionUntilRef.current
+      sourceSwitchPauseSuppressedRef.current
     ) {
       return
     }
@@ -4171,6 +4789,25 @@ export function AnimePlayer({
     showControls(true)
   }
 
+  function markTouchControlActionHandled() {
+    if (touchControlActionSuppressionTimerRef.current) {
+      window.clearTimeout(touchControlActionSuppressionTimerRef.current)
+    }
+
+    touchControlActionSuppressedRef.current = true
+    touchControlClickSuppressionRef.current = true
+
+    touchControlActionSuppressionTimerRef.current = window.setTimeout(() => {
+      touchControlActionSuppressedRef.current = false
+      touchControlClickSuppressionRef.current = false
+      touchControlActionSuppressionTimerRef.current = null
+    }, 520)
+  }
+
+  function wasTouchControlActionRecentlyHandled() {
+    return touchControlActionSuppressedRef.current
+  }
+
   function runTouchControlAction(
     event: React.PointerEvent<HTMLElement>,
     action: () => void
@@ -4181,12 +4818,28 @@ export function AnimePlayer({
 
     event.preventDefault()
     event.stopPropagation()
-    touchControlClickSuppressionRef.current = true
-    action()
 
-    window.setTimeout(() => {
-      touchControlClickSuppressionRef.current = false
-    }, 400)
+    if (wasTouchControlActionRecentlyHandled()) {
+      return
+    }
+
+    markTouchControlActionHandled()
+    action()
+  }
+
+  function runTouchEndControlAction(
+    event: React.TouchEvent<HTMLElement>,
+    action: () => void
+  ) {
+    event.preventDefault()
+    event.stopPropagation()
+
+    if (wasTouchControlActionRecentlyHandled()) {
+      return
+    }
+
+    markTouchControlActionHandled()
+    action()
   }
 
   function runClickControlAction(
@@ -4195,9 +4848,8 @@ export function AnimePlayer({
   ) {
     event.stopPropagation()
 
-    if (touchControlClickSuppressionRef.current) {
+    if (touchControlClickSuppressionRef.current || wasTouchControlActionRecentlyHandled()) {
       event.preventDefault()
-      touchControlClickSuppressionRef.current = false
       return
     }
 
@@ -4213,23 +4865,37 @@ export function AnimePlayer({
   const canSkipIntro = duration > 90 && currentTime < 90
   const canSkipOutro = duration > 0 && currentTime >= duration * 0.8 && currentTime < duration - 1
   const castSkipLabel = canSkipIntro ? "Skip intro" : canSkipOutro ? "Skip outro" : "Skip intro/outro"
-  const isAnyCasting = isCasting || isNativeRemoteCasting
+  const receiverCastActive = isCasting || isServerCasting
+  const isAnyCasting = receiverCastActive || isNativeRemoteCasting
+  const shouldShowCastOverlay = isAnyCasting || isCastStarting
+  const shouldShowCastLoadingOverlay = isCastStarting && !isAnyCasting
+  const canControlActiveCast = receiverCastActive || isNativeRemoteCasting
+  const castControlSubtitle = isServerCasting
+    ? "Yamibunko is controlling this Chromecast through the server."
+    : "Yamibunko is controlling this Chromecast / Google TV."
   const shouldBlockMobilePortraitPlayback =
     isMobilePortraitViewport && !isAnyCasting && !isFullscreen
   const controlsAreVisible =
     !shouldBlockMobilePortraitPlayback &&
     (controlsVisible || !isPlaying || isAnyCasting || settingsOpen)
   const castPreflightError = getCastPreflightError()
-  const nativeCastUnavailableLabel = nativeRemotePlaybackSupported
-    ? "No nearby playback target"
-    : "Native casting is not available"
-  const castButtonLabel = isIosDevice
-    ? nativeRemotePlaybackAvailable
-      ? "Cast / AirPlay"
-      : nativeCastUnavailableLabel
-    : castPreflightError ?? "Google Cast"
+  const shouldDisableIosWebVideoCasterCast = isIosDevice && isInsideWebVideoCaster
+  const shouldUseIosExternalCastHandoff = isIosDevice && !isInsideWebVideoCaster && shouldOpenIosExternalCastApp()
+  const shouldUseIosServerCast = isIosDevice && !isInsideWebVideoCaster && shouldUseIosServerCastBridge()
+  const shouldShowIosExternalCastEpisodeNav =
+    shouldBlockMobilePortraitPlayback && isIosDevice && isInsideWebVideoCaster
+  const castButtonLabel = shouldDisableIosWebVideoCasterCast
+    ? "Use Web Video Caster's cast controls"
+    : shouldUseIosExternalCastHandoff
+    ? `Open in ${iosExternalCastAppName}`
+    : shouldUseIosServerCast
+      ? "Chromecast"
+      : castPreflightError ?? "Google Cast"
   const castButtonDisabled =
-    !sourceUrl || isCastStarting || (isIosDevice && !nativeRemotePlaybackAvailable)
+    !sourceUrl ||
+    isCastStarting ||
+    shouldDisableIosWebVideoCasterCast ||
+    (shouldUseIosExternalCastHandoff && iosExternalCastAppUnavailable)
   const centerToggleVisible =
     !shouldBlockMobilePortraitPlayback &&
     !isWaitingForMedia &&
@@ -4242,6 +4908,19 @@ export function AnimePlayer({
   }`
   const settingsSelectClass =
     "h-8 w-full rounded-md lg:h-10 border border-white/10 bg-zinc-950 px-2 text-xs text-zinc-100 outline-none focus:border-violet-400"
+  const webVideoCasterSources = isInsideWebVideoCaster
+    ? {
+        directUrl: getWebVideoCasterDirectUrl(),
+        transcodeUrl: liveTranscodeEnabled ? getWebVideoCasterTranscodeUrl() : null,
+        directContentType: getCastDirectContentType(fileName, false),
+        directFileName: getWebVideoCasterSourceFileName("direct", fileName),
+        transcodeFileName: getWebVideoCasterSourceFileName("transcode", fileName),
+        durationSeconds,
+      }
+    : null
+
+  const shouldShowCastErrorPortal = Boolean(castErrorMessage && serverCastOverlayPortalRoot && (shouldUseIosServerCast || serverCastDeviceModalOpen))
+
   return (
     <div className="space-y-3 lg:space-y-4">
       <div
@@ -4272,9 +4951,14 @@ export function AnimePlayer({
             isAnyCasting ? "opacity-0" : "opacity-100"
           }`}
           playsInline
+          {...({
+            disableRemotePlayback: false,
+            "x-webkit-airplay": "allow",
+            "webkit-playsinline": "true",
+          } as Record<string, string | boolean>)}
           preload="none"
           poster={thumbnailUrl}
-          src={sourceUrl ?? undefined}
+          src={webVideoCasterSources ? webVideoCasterSources.directUrl : sourceUrl ?? undefined}
           onDurationChange={(event) => {
             const nextDuration = getStableDuration(
               durationSeconds,
@@ -4317,6 +5001,12 @@ export function AnimePlayer({
               quality === "original" &&
               !directFallbackAttemptedRef.current
             ) {
+              if (isIosDevice && isInsideWebVideoCaster) {
+                setStatus("blocked")
+                showControls(true)
+                return
+              }
+
               fallbackDirectToTranscode()
               return
             }
@@ -4347,7 +5037,7 @@ export function AnimePlayer({
               return
             }
 
-            sourceSwitchPauseSuppressionUntilRef.current = 0
+            clearSourceSwitchPauseSuppression()
             setIsPlaying(true)
             showControls()
           }}
@@ -4360,7 +5050,7 @@ export function AnimePlayer({
               return
             }
 
-            sourceSwitchPauseSuppressionUntilRef.current = 0
+            clearSourceSwitchPauseSuppression()
             setIsPlaying(true)
             endMediaWait()
             showControls()
@@ -4377,12 +5067,88 @@ export function AnimePlayer({
             aria-live="polite"
           >
             <div className="absolute inset-0 animate-pulse bg-[radial-gradient(circle_at_50%_30%,rgba(168,85,247,0.18),transparent_34%),linear-gradient(180deg,rgba(24,24,27,0.85),rgba(0,0,0,0.98))]" />
-            <div className="relative flex flex-col items-center gap-4 px-6 text-center">
-              <div className="grid size-20 place-items-center rounded-full border border-violet-300/30 bg-white/[0.06] text-violet-200 shadow-2xl sm:size-24">
-                <RefreshCw className="size-10 sm:size-12" />
-              </div>
-              <div className="text-2xl font-semibold tracking-wide text-zinc-100 sm:text-3xl">
-                rotate to play
+            <div className="relative flex w-full max-w-md flex-col items-center gap-4 px-6 text-center">
+              <div className="grid w-full grid-cols-[3.25rem_minmax(0,1fr)_3.25rem] items-center gap-3 sm:grid-cols-[4rem_minmax(0,1fr)_4rem] sm:gap-4">
+                {shouldShowIosExternalCastEpisodeNav ? (
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="icon"
+                    className="size-14 rounded-2xl border border-white/15 bg-zinc-950/70 text-white shadow-xl hover:border-white/25 hover:bg-zinc-900 disabled:opacity-35 sm:size-16"
+                    disabled={!previousEpisode || !onEpisodeChange}
+                    aria-label="Previous episode"
+                    onTouchEnd={(event) =>
+                      runTouchEndControlAction(event, () => {
+                        if (previousEpisode && onEpisodeChange) {
+                          onEpisodeChange(previousEpisode, false)
+                        }
+                      })
+                    }
+                    onPointerUp={(event) =>
+                      runTouchControlAction(event, () => {
+                        if (previousEpisode && onEpisodeChange) {
+                          onEpisodeChange(previousEpisode, false)
+                        }
+                      })
+                    }
+                    onClick={(event) =>
+                      runClickControlAction(event, () => {
+                        if (previousEpisode && onEpisodeChange) {
+                          onEpisodeChange(previousEpisode, false)
+                        }
+                      })
+                    }
+                  >
+                    <SkipBack className="size-6 sm:size-8" />
+                  </Button>
+                ) : (
+                  <div />
+                )}
+
+                <div className="flex min-w-0 flex-col items-center gap-3">
+                  <div className="grid size-20 place-items-center rounded-full border border-violet-300/30 bg-white/[0.06] text-violet-200 shadow-2xl sm:size-24">
+                    <RefreshCw className="size-10 sm:size-12" />
+                  </div>
+                  <div className="text-2xl font-semibold tracking-wide text-zinc-100 sm:text-3xl">
+                    rotate to play
+                  </div>
+                </div>
+
+                {shouldShowIosExternalCastEpisodeNav ? (
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="icon"
+                    className="size-14 rounded-2xl border border-white/15 bg-zinc-950/70 text-white shadow-xl hover:border-white/25 hover:bg-zinc-900 disabled:opacity-35 sm:size-16"
+                    disabled={!nextEpisode || !onEpisodeChange}
+                    aria-label="Next episode"
+                    onTouchEnd={(event) =>
+                      runTouchEndControlAction(event, () => {
+                        if (nextEpisode && onEpisodeChange) {
+                          onEpisodeChange(nextEpisode, false)
+                        }
+                      })
+                    }
+                    onPointerUp={(event) =>
+                      runTouchControlAction(event, () => {
+                        if (nextEpisode && onEpisodeChange) {
+                          onEpisodeChange(nextEpisode, false)
+                        }
+                      })
+                    }
+                    onClick={(event) =>
+                      runClickControlAction(event, () => {
+                        if (nextEpisode && onEpisodeChange) {
+                          onEpisodeChange(nextEpisode, false)
+                        }
+                      })
+                    }
+                  >
+                    <SkipForward className="size-6 sm:size-8" />
+                  </Button>
+                ) : (
+                  <div />
+                )}
               </div>
               <Button
                 type="button"
@@ -4394,15 +5160,26 @@ export function AnimePlayer({
                 }`}
                 aria-label={castButtonLabel}
                 disabled={castButtonDisabled}
-                onClick={(event) => {
-                  event.stopPropagation()
-                  void startCasting()
-                }}
+                onTouchEnd={(event) =>
+                  runTouchEndControlAction(event, () => {
+                    void startCasting()
+                  })
+                }
+                onPointerUp={(event) =>
+                  runTouchControlAction(event, () => {
+                    void startCasting()
+                  })
+                }
+                onClick={(event) =>
+                  runClickControlAction(event, () => {
+                    void startCasting()
+                  })
+                }
               >
                 <Cast className="size-4" />
                 <span>Cast</span>
               </Button>
-              {castErrorMessage ? (
+              {castErrorMessage && !shouldShowCastErrorPortal ? (
                 <div className="max-w-[min(28rem,calc(100vw-2rem))] rounded-xl border border-red-400/30 bg-red-950/90 px-4 py-3 text-sm font-semibold text-white shadow-2xl backdrop-blur">
                   {castErrorMessage}
                 </div>
@@ -4411,25 +5188,177 @@ export function AnimePlayer({
           </div>
         ) : null}
 
-        {isAnyCasting ? (
-          <div className="absolute inset-0 bg-black text-white">
+        {shouldShowCastErrorPortal && serverCastOverlayPortalRoot ? (
+          createPortal(
+            <div
+              className="pointer-events-none fixed inset-x-0 z-[130] flex justify-center px-4 text-white"
+              style={{
+                bottom: "max(1rem, env(safe-area-inset-bottom))",
+              }}
+            >
+              <div className="max-h-[min(14rem,45dvh)] max-w-[min(36rem,calc(100vw-2rem))] overflow-y-auto rounded-2xl border border-red-400/30 bg-red-950/95 px-4 py-3 text-sm font-semibold shadow-2xl backdrop-blur">
+                {castErrorMessage}
+              </div>
+            </div>,
+            serverCastOverlayPortalRoot
+          )
+        ) : null}
+
+        {serverCastDeviceModalOpen && serverCastOverlayPortalRoot ? (
+          createPortal(
+            <div
+            className="fixed inset-0 z-[120] flex items-start justify-center overflow-y-auto bg-black/75 px-4 text-white backdrop-blur-sm"
+            style={{
+              paddingTop: "max(1rem, env(safe-area-inset-top))",
+              paddingBottom: "max(1rem, env(safe-area-inset-bottom))",
+            }}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="max-h-[calc(100dvh-2rem)] w-full max-w-md overflow-y-auto rounded-3xl border border-white/10 bg-zinc-950/95 p-4 shadow-2xl sm:p-5">
+              <div className="space-y-1">
+                <div className="text-lg font-semibold">Choose Chromecast</div>
+                <div className="text-sm text-zinc-300">
+                  Yamibunko will cast from the server LAN address, so this also works when iPhone browsers cannot use the normal Google Cast button.
+                </div>
+              </div>
+
+              <div className="mt-4 max-h-64 space-y-2 overflow-y-auto pr-1">
+                {serverCastDevicesLoading ? (
+                  <div className="flex items-center gap-2 rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-3 text-sm text-zinc-200">
+                    <Loader2 className="size-4 animate-spin" />
+                    Searching for Chromecast / Google TV devices…
+                  </div>
+                ) : serverCastDevices.length ? (
+                  serverCastDevices.map((device) => (
+                    <button
+                      key={device.id}
+                      type="button"
+                      className="flex w-full items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-3 text-left transition hover:border-violet-300/40 hover:bg-violet-500/10 disabled:opacity-50"
+                      disabled={isCastStarting}
+                      onClick={() => {
+                        void startSelectedServerCastDevice(device.id)
+                      }}
+                    >
+                      <span className="min-w-0">
+                        <span className="block truncate text-sm font-semibold text-zinc-100">
+                          {device.name}
+                        </span>
+                        <span className="block truncate text-xs text-zinc-400">
+                          {device.modelName ? `${device.modelName} · ` : ""}{device.host}:{device.port}
+                        </span>
+                      </span>
+                      {isCastStarting ? (
+                        <Loader2 className="size-4 shrink-0 animate-spin text-violet-200" />
+                      ) : (
+                        <Cast className="size-4 shrink-0 text-violet-200" />
+                      )}
+                    </button>
+                  ))
+                ) : (
+                  <div className="rounded-2xl border border-yellow-400/20 bg-yellow-950/30 px-3 py-3 text-sm text-yellow-50">
+                    No Chromecast / Google TV devices were found by the Yamibunko server. Your phone is using the server LAN address; make sure the TV is on the same subnet and the server PC/firewall allows local Cast discovery.
+                  </div>
+                )}
+              </div>
+
+              <div className="mt-4 flex flex-wrap justify-end gap-2">
+                {shouldUseIosExternalCastHandoff ? (
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    className="rounded-2xl bg-zinc-900"
+                    disabled={iosExternalCastAppUnavailable}
+                    onClick={() => {
+                      const video = videoRef.current
+
+                      if (!video) {
+                        return
+                      }
+
+                      try {
+                        startIosExternalCastHandoff(video)
+                        setServerCastDeviceModalOpen(false)
+                      } catch (error) {
+                        flashCastError(error)
+                        console.error(error)
+                      }
+                    }}
+                  >
+                    Open in {iosExternalCastAppName}
+                  </Button>
+                ) : null}
+                <Button
+                  type="button"
+                  variant="secondary"
+                  className="rounded-2xl bg-zinc-900"
+                  onClick={() => {
+                    setServerCastDeviceModalOpen(false)
+                  }}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          </div>,
+            serverCastOverlayPortalRoot
+          )
+        ) : null}
+
+        {shouldShowCastOverlay ? (
+          <div className="absolute inset-0 z-30 bg-black text-white">
             <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_18%,rgba(127,29,29,0.2),transparent_36%),linear-gradient(180deg,rgba(24,24,27,0.32),rgba(0,0,0,0.82))]" />
 
-            <div className="relative z-10 flex h-full flex-col items-center px-4 py-4 sm:px-6 lg:px-10 lg:py-8">
-              <div className="flex w-full justify-center">
-                <div className="flex w-full max-w-5xl flex-wrap items-center justify-center gap-3 rounded-3xl border border-white/10 bg-zinc-950/35 p-2 shadow-2xl backdrop-blur-md sm:w-auto sm:p-3">
+            {shouldShowCastLoadingOverlay ? (
+              <div className="relative z-10 flex h-full flex-col items-center justify-center gap-4 px-4 text-center">
+                <div className="grid size-20 place-items-center rounded-full border border-violet-300/25 bg-violet-500/10 shadow-2xl shadow-violet-950/30">
+                  <Loader2 className="size-9 animate-spin text-violet-100" />
+                </div>
+                <div className="space-y-1">
+                  <div className="text-xl font-semibold text-white">Starting Cast</div>
+                  <div className="max-w-sm text-sm text-zinc-300">
+                    Loading the episode on your Chromecast / Google TV.
+                  </div>
+                </div>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  className="rounded-2xl border border-white/20 bg-zinc-950/70 px-4 text-white hover:bg-zinc-900"
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    stopCasting()
+                  }}
+                >
+                  Cancel cast
+                </Button>
+              </div>
+            ) : (
+            <div
+              className={`relative z-10 flex h-full flex-col items-center px-3 py-3 sm:px-6 lg:px-10 lg:py-8 ${
+                isPhoneViewport ? "justify-center gap-2" : ""
+              }`}
+            >
+              <div className="flex w-full flex-col items-center gap-2 text-center">
+                <div
+                  className={`flex w-full max-w-5xl flex-wrap items-center justify-center border border-white/10 bg-zinc-950/35 shadow-2xl backdrop-blur-md sm:w-auto ${
+                    isPhoneViewport ? "gap-2 rounded-2xl p-1.5" : "gap-3 rounded-3xl p-2 sm:p-3"
+                  }`}
+                >
                   <HoverHint label="Stop casting">
                     <Button
                       type="button"
                       variant="secondary"
-                      className="h-12 rounded-2xl border border-white/30 bg-zinc-950/70 px-4 text-sm font-medium text-white shadow-xl hover:border-white/45 hover:bg-zinc-900 disabled:opacity-45 lg:h-14 lg:px-5 lg:text-base"
+                      className={`border border-white/30 bg-zinc-950/70 font-medium text-white shadow-xl hover:border-white/45 hover:bg-zinc-900 disabled:opacity-45 ${
+                        isPhoneViewport
+                          ? "h-10 rounded-xl px-3 text-xs"
+                          : "h-12 rounded-2xl px-4 text-sm lg:h-14 lg:px-5 lg:text-base"
+                      }`}
                       aria-label="Stop casting"
                       onClick={(event) => {
                         event.stopPropagation()
                         stopCasting()
                       }}
                     >
-                      <RadioOffIcon className="size-5 lg:size-6" />
+                      <RadioOffIcon className={isPhoneViewport ? "size-4" : "size-5 lg:size-6"} />
                       <span>Stop casting</span>
                     </Button>
                   </HoverHint>
@@ -4437,7 +5366,11 @@ export function AnimePlayer({
                   <Button
                     type="button"
                     variant="secondary"
-                    className="h-12 rounded-2xl border border-white/30 bg-zinc-950/70 px-6 text-sm font-medium text-white shadow-xl hover:border-white/45 hover:bg-zinc-900 disabled:opacity-45 lg:h-14 lg:px-8 lg:text-base"
+                    className={`border border-white/30 bg-zinc-950/70 font-medium text-white shadow-xl hover:border-white/45 hover:bg-zinc-900 disabled:opacity-45 ${
+                      isPhoneViewport
+                        ? "h-10 rounded-xl px-3 text-xs"
+                        : "h-12 rounded-2xl px-6 text-sm lg:h-14 lg:px-8 lg:text-base"
+                    }`}
                     disabled={!canSkipIntro && !canSkipOutro}
                     onClick={(event) => {
                       event.stopPropagation()
@@ -4453,16 +5386,36 @@ export function AnimePlayer({
                     {castSkipLabel}
                   </Button>
                 </div>
+                <div
+                  className={`max-w-md text-zinc-300 ${
+                    isPhoneViewport ? "text-[0.68rem] leading-snug" : "text-xs sm:text-sm"
+                  }`}
+                >
+                  {castControlSubtitle}
+                </div>
               </div>
 
-              <div className="flex min-h-0 w-full flex-1 items-center justify-center py-4 lg:py-8">
-                <div className="grid grid-cols-4 items-center gap-2 rounded-[2rem] border border-white/10 bg-zinc-950/35 p-3 shadow-2xl backdrop-blur-md sm:gap-4 sm:p-4 lg:gap-5 lg:p-5">
+
+              <div
+                className={`flex min-h-0 w-full items-center justify-center ${
+                  isPhoneViewport ? "py-0" : "flex-1 py-4 lg:py-8"
+                }`}
+              >
+                <div
+                  className={`grid grid-cols-4 items-center border border-white/10 bg-zinc-950/35 shadow-2xl backdrop-blur-md ${
+                    isPhoneViewport
+                      ? "gap-1.5 rounded-2xl p-2"
+                      : "gap-2 rounded-[2rem] p-3 sm:gap-4 sm:p-4 lg:gap-5 lg:p-5"
+                  }`}
+                >
                   <HoverHint label="Previous episode">
                     <Button
                       type="button"
                       variant="secondary"
                       size="icon"
-                      className="size-14 rounded-2xl border border-white/10 bg-white/[0.06] text-white shadow-xl hover:border-white/20 hover:bg-white/10 disabled:opacity-35 sm:size-16 lg:size-20"
+                      className={`rounded-2xl border border-white/10 bg-white/[0.06] text-white shadow-xl hover:border-white/20 hover:bg-white/10 disabled:opacity-35 ${
+                        isPhoneViewport ? "size-11" : "size-14 sm:size-16 lg:size-20"
+                      }`}
                       disabled={!previousEpisode}
                       aria-label="Previous episode"
                       onClick={(event) => {
@@ -4472,7 +5425,7 @@ export function AnimePlayer({
                         }
                       }}
                     >
-                      <SkipBack className="size-8 sm:size-9 lg:size-11" />
+                      <SkipBack className={isPhoneViewport ? "size-6" : "size-8 sm:size-9 lg:size-11"} />
                     </Button>
                   </HoverHint>
 
@@ -4481,8 +5434,10 @@ export function AnimePlayer({
                       type="button"
                       variant="secondary"
                       size="icon"
-                      className="size-14 rounded-2xl border border-white/10 bg-white/[0.06] text-white shadow-xl hover:border-white/20 hover:bg-white/10 disabled:opacity-35 sm:size-16 lg:size-20"
-                      disabled={!isAnyCasting}
+                      className={`rounded-2xl border border-white/10 bg-white/[0.06] text-white shadow-xl hover:border-white/20 hover:bg-white/10 disabled:opacity-35 ${
+                        isPhoneViewport ? "size-11" : "size-14 sm:size-16 lg:size-20"
+                      }`}
+                      disabled={!canControlActiveCast}
                       aria-label={isPlaying ? "Pause" : "Play"}
                       onClick={(event) => {
                         event.stopPropagation()
@@ -4490,9 +5445,9 @@ export function AnimePlayer({
                       }}
                     >
                       {isPlaying ? (
-                        <Pause className="size-8 sm:size-9 lg:size-11" />
+                        <Pause className={isPhoneViewport ? "size-6" : "size-8 sm:size-9 lg:size-11"} />
                       ) : (
-                        <Play className="ml-1 size-8 sm:size-9 lg:size-11" />
+                        <Play className={isPhoneViewport ? "ml-0.5 size-6" : "ml-1 size-8 sm:size-9 lg:size-11"} />
                       )}
                     </Button>
                   </HoverHint>
@@ -4502,7 +5457,9 @@ export function AnimePlayer({
                       type="button"
                       variant="secondary"
                       size="icon"
-                      className="size-14 rounded-2xl border border-white/10 bg-white/[0.06] text-white shadow-xl hover:border-white/20 hover:bg-white/10 disabled:opacity-35 sm:size-16 lg:size-20"
+                      className={`rounded-2xl border border-white/10 bg-white/[0.06] text-white shadow-xl hover:border-white/20 hover:bg-white/10 disabled:opacity-35 ${
+                        isPhoneViewport ? "size-11" : "size-14 sm:size-16 lg:size-20"
+                      }`}
                       disabled={!nextEpisode}
                       aria-label="Next episode"
                       onClick={(event) => {
@@ -4512,7 +5469,7 @@ export function AnimePlayer({
                         }
                       }}
                     >
-                      <SkipForward className="size-8 sm:size-9 lg:size-11" />
+                      <SkipForward className={isPhoneViewport ? "size-6" : "size-8 sm:size-9 lg:size-11"} />
                     </Button>
                   </HoverHint>
 
@@ -4522,7 +5479,9 @@ export function AnimePlayer({
                         type="button"
                         variant="secondary"
                         size="icon"
-                        className="size-14 rounded-2xl border border-white/10 bg-white/[0.06] text-white shadow-xl hover:border-white/20 hover:bg-white/10 sm:size-16 lg:size-20"
+                        className={`rounded-2xl border border-white/10 bg-white/[0.06] text-white shadow-xl hover:border-white/20 hover:bg-white/10 ${
+                          isPhoneViewport ? "size-11" : "size-14 sm:size-16 lg:size-20"
+                        }`}
                         onClick={(event) => {
                           event.stopPropagation()
                           setSettingsOpen((open) => !open)
@@ -4530,15 +5489,21 @@ export function AnimePlayer({
                         }}
                         aria-label="Settings"
                       >
-                        <Settings className="size-8 sm:size-9 lg:size-11" />
+                        <Settings className={isPhoneViewport ? "size-6" : "size-8 sm:size-9 lg:size-11"} />
                       </Button>
                     </HoverHint>
                   </div>
                 </div>
               </div>
 
-              <div className="w-full max-w-5xl pb-1 sm:pb-2 lg:pb-4">
-                <div className="relative rounded-3xl border border-white/10 bg-zinc-950/35 px-4 py-4 shadow-2xl backdrop-blur-md sm:px-6 lg:px-8 lg:py-5">
+              <div className={isPhoneViewport ? "w-full max-w-md pb-0" : "w-full max-w-5xl pb-1 sm:pb-2 lg:pb-4"}>
+                <div
+                  className={`relative border border-white/10 bg-zinc-950/35 shadow-2xl backdrop-blur-md ${
+                    isPhoneViewport
+                      ? "rounded-2xl px-3 py-2"
+                      : "rounded-3xl px-4 py-4 sm:px-6 lg:px-8 lg:py-5"
+                  }`}
+                >
                   {seekPreviewFrame ? (
                     <div
                       className="pointer-events-none absolute bottom-[5.7rem] z-10 w-48 -translate-x-1/2 overflow-hidden rounded-xl border border-white/15 bg-zinc-950 shadow-2xl lg:bottom-[6.5rem] lg:w-64"
@@ -4589,10 +5554,11 @@ export function AnimePlayer({
                 </div>
               </div>
             </div>
+            )}
           </div>
         ) : null}
 
-        {isWaitingForMedia ? (
+        {isWaitingForMedia && !shouldShowCastLoadingOverlay ? (
           <div className="pointer-events-none absolute inset-0 grid place-items-center">
             <div className="flex flex-col items-center gap-3">
               <Loader2 className="size-12 animate-spin text-white/80" />
@@ -4635,6 +5601,11 @@ export function AnimePlayer({
             type="button"
             className="grid size-20 place-items-center lg:size-24 rounded-full bg-black/45 text-white/70 hover:bg-black/60 hover:text-white"
             disabled={!sourceUrl}
+            onTouchEnd={(event) =>
+              runTouchEndControlAction(event, () => {
+                void togglePlay()
+              })
+            }
             onPointerUp={(event) =>
               runTouchControlAction(event, () => {
                 void togglePlay()
@@ -4691,7 +5662,7 @@ export function AnimePlayer({
         ) : null}
 
 
-        {castErrorMessage ? (
+        {castErrorMessage && !shouldShowCastErrorPortal ? (
           <div className="pointer-events-none absolute inset-x-4 bottom-[5.25rem] z-30 flex justify-center lg:bottom-24">
             <div className="max-w-[min(34rem,calc(100vw-2rem))] rounded-xl border border-red-400/30 bg-red-950/90 px-4 py-3 text-sm font-semibold text-white shadow-2xl backdrop-blur">
               {castErrorMessage}
@@ -4786,6 +5757,11 @@ export function AnimePlayer({
               <Button
                 type="button"
                 size="icon"
+                onTouchEnd={(event) =>
+                  runTouchEndControlAction(event, () => {
+                    void togglePlay()
+                  })
+                }
                 onPointerUp={(event) =>
                   runTouchControlAction(event, () => {
                     void togglePlay()
@@ -4981,6 +5957,11 @@ export function AnimePlayer({
                 }`}
                 aria-label={castButtonLabel}
                 disabled={castButtonDisabled}
+                onTouchEnd={(event) =>
+                  runTouchEndControlAction(event, () => {
+                    void startCasting()
+                  })
+                }
                 onPointerUp={(event) =>
                   runTouchControlAction(event, () => {
                     void startCasting()
@@ -5002,6 +5983,9 @@ export function AnimePlayer({
                 variant="secondary"
                 size="icon"
                 className="bg-zinc-950/70"
+                onTouchEnd={(event) =>
+                  runTouchEndControlAction(event, requestFullscreen)
+                }
                 onPointerUp={(event) =>
                   runTouchControlAction(event, requestFullscreen)
                 }
@@ -5017,6 +6001,83 @@ export function AnimePlayer({
         </div>
         ) : null}
       </div>
+
+      {webVideoCasterSources ? (
+        <div className="rounded-2xl border border-violet-300/20 bg-violet-950/20 p-3 text-sm text-violet-50 shadow-lg">
+          <div className="font-semibold">Web Video Caster sources</div>
+          <p className="mt-1 text-xs text-violet-100/80">
+            Yamibunko exposes both receiver-safe video URLs. Use Web Video Caster&apos;s own cast controls and let it choose a source; transcoding only starts if that transcode URL is actually opened.
+          </p>
+          <div className="mt-3 grid gap-3">
+            <div className="rounded-xl border border-white/10 bg-zinc-950/55 p-2">
+              <div className="mb-2 flex items-center justify-between gap-3 text-xs">
+                <span className="font-medium text-white">Direct Play</span>
+                <a
+                  href={webVideoCasterSources.directUrl}
+                  type={webVideoCasterSources.directContentType}
+                  download={webVideoCasterSources.directFileName}
+                  title={webVideoCasterSources.directFileName}
+                  data-yamibunko-wvc-source="direct-link"
+                  data-yamibunko-wvc-label="Direct Play"
+                  data-yamibunko-wvc-filename={webVideoCasterSources.directFileName}
+                  data-yamibunko-duration-seconds={webVideoCasterSources.durationSeconds ?? undefined}
+                  className="rounded-full border border-white/10 bg-zinc-950/70 px-3 py-1 text-[11px] font-medium text-white transition hover:border-violet-300/50 hover:bg-violet-500/20"
+                >
+                  Open Direct
+                </a>
+              </div>
+              <video
+                controls
+                playsInline
+                preload="metadata"
+                poster={thumbnailUrl}
+                src={webVideoCasterSources.directUrl}
+                title={webVideoCasterSources.directFileName}
+                aria-label={webVideoCasterSources.directFileName}
+                data-yamibunko-wvc-source="direct-video"
+                data-yamibunko-wvc-label="Direct Play"
+                data-yamibunko-wvc-filename={webVideoCasterSources.directFileName}
+                data-yamibunko-duration-seconds={webVideoCasterSources.durationSeconds ?? undefined}
+                className="h-16 w-full rounded-lg bg-black object-cover"
+              />
+            </div>
+            {webVideoCasterSources.transcodeUrl ? (
+              <div className="rounded-xl border border-white/10 bg-zinc-950/55 p-2">
+                <div className="mb-2 flex items-center justify-between gap-3 text-xs">
+                  <span className="font-medium text-white">Compatibility Transcode</span>
+                  <a
+                    href={webVideoCasterSources.transcodeUrl}
+                    type="video/mp4"
+                    download={webVideoCasterSources.transcodeFileName}
+                    title={webVideoCasterSources.transcodeFileName}
+                    data-yamibunko-wvc-source="transcode-link"
+                    data-yamibunko-wvc-label="Compatibility Transcode"
+                    data-yamibunko-wvc-filename={webVideoCasterSources.transcodeFileName}
+                    data-yamibunko-duration-seconds={webVideoCasterSources.durationSeconds ?? undefined}
+                    className="rounded-full border border-white/10 bg-zinc-950/70 px-3 py-1 text-[11px] font-medium text-white transition hover:border-violet-300/50 hover:bg-violet-500/20"
+                  >
+                    Open Transcode
+                  </a>
+                </div>
+                <video
+                  controls
+                  playsInline
+                  preload="none"
+                  poster={thumbnailUrl}
+                  src={webVideoCasterSources.transcodeUrl}
+                  title={webVideoCasterSources.transcodeFileName}
+                  aria-label={webVideoCasterSources.transcodeFileName}
+                  data-yamibunko-wvc-source="transcode-video"
+                  data-yamibunko-wvc-label="Compatibility Transcode"
+                  data-yamibunko-wvc-filename={webVideoCasterSources.transcodeFileName}
+                  data-yamibunko-duration-seconds={webVideoCasterSources.durationSeconds ?? undefined}
+                  className="h-16 w-full rounded-lg bg-black object-cover"
+                />
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
 
       <p className="sr-only">
         Player for {animeId} season {seasonNumber} episode {episodeNumber}

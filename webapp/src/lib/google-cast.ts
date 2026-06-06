@@ -516,6 +516,7 @@ export function createGoogleCastLoadRequest(input: {
   contentType: string
   autoplay: boolean
   currentTime: number
+  durationSeconds?: number
   textTrack?: {
     id: number
     language?: string
@@ -535,6 +536,10 @@ export function createGoogleCastLoadRequest(input: {
   )
   mediaInfo.streamType =
     apis.chromeCast.media.StreamType?.BUFFERED ?? "BUFFERED"
+
+  if (input.durationSeconds && input.durationSeconds > 0 && Number.isFinite(input.durationSeconds)) {
+    mediaInfo.duration = input.durationSeconds
+  }
 
   if (input.textTrack) {
     const trackType = apis.chromeCast.media.TrackType?.TEXT ?? "TEXT"
@@ -574,17 +579,17 @@ function isMatchingMediaSession(
 }
 
 function isFailedMediaSession(mediaSession: GoogleCastMediaSession | null) {
-  return (
-    mediaSession?.playerState === "IDLE" && mediaSession.idleReason === "ERROR"
-  )
+  return mediaSession?.playerState === "IDLE"
 }
 
-function isLoadedMediaSession(mediaSession: GoogleCastMediaSession | null) {
+function isLoadedMediaSession(
+  mediaSession: GoogleCastMediaSession | null,
+  bufferingIsLoaded = false
+) {
   return (
     mediaSession?.playerState === "PLAYING" ||
     mediaSession?.playerState === "PAUSED" ||
-    mediaSession?.playerState === "BUFFERING" ||
-    mediaSession?.playerState === "IDLE"
+    (bufferingIsLoaded && mediaSession?.playerState === "BUFFERING")
   )
 }
 
@@ -614,7 +619,12 @@ export function getGoogleCastMediaState(
   }
 
   if (!mediaSession) {
-    return null
+    return {
+      isAlive: false,
+      positionSeconds: 0,
+      playerState: "IDLE",
+      idleReason: "NO_MEDIA",
+    }
   }
 
   return {
@@ -748,7 +758,9 @@ export function seekGoogleCastMedia(
 export function waitForGoogleCastMediaLoad(input: {
   session: GoogleCastSession
   contentId: string
+  initialMediaSession?: GoogleCastMediaSession | null
   timeoutMs?: number | null
+  bufferingIsLoaded?: boolean
 }) {
   const timeoutMs = input.timeoutMs === undefined ? 12_000 : input.timeoutMs
 
@@ -803,7 +815,7 @@ export function waitForGoogleCastMediaLoad(input: {
         return
       }
 
-      if (isLoadedMediaSession(mediaSession)) {
+      if (isLoadedMediaSession(mediaSession, input.bufferingIsLoaded ?? false)) {
         finish("loaded")
       }
     }
@@ -838,6 +850,13 @@ export function waitForGoogleCastMediaLoad(input: {
     const pollTimer = setInterval(attachMediaListener, 250)
     const timeoutTimer =
       timeoutMs === null ? null : setTimeout(() => finish("timeout"), timeoutMs)
+
+    if (input.initialMediaSession) {
+      mediaSession = input.initialMediaSession
+      updateListener = () => inspect()
+      mediaSession.addUpdateListener(updateListener)
+      inspect(input.initialMediaSession)
+    }
 
     attachMediaListener()
   })

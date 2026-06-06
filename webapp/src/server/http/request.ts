@@ -72,7 +72,7 @@ function parseIpv4(hostname: string) {
   return octets as [number, number, number, number]
 }
 
-function isDeviceLocalHost(hostname: string) {
+export function isDeviceLocalHost(hostname: string) {
   const normalized = hostname.trim().toLowerCase()
 
   if (normalized === "localhost" || normalized === "::1" || normalized === "[::1]") {
@@ -84,7 +84,7 @@ function isDeviceLocalHost(hostname: string) {
   return octets?.[0] === 127 || octets?.[0] === 0
 }
 
-function isPrivateLanIpv4Host(hostname: string) {
+export function isPrivateLanIpv4Host(hostname: string) {
   const octets = parseIpv4(hostname.trim())
 
   if (!octets) {
@@ -98,6 +98,25 @@ function isPrivateLanIpv4Host(hostname: string) {
     (first === 172 && second >= 16 && second <= 31) ||
     (first === 192 && second === 168)
   )
+}
+
+
+export function isHttpLocalNetworkOrigin(origin: string) {
+  try {
+    const url = new URL(origin)
+
+    if (url.protocol !== "http:") {
+      return false
+    }
+
+    return isDeviceLocalHost(url.hostname) || isPrivateLanIpv4Host(url.hostname)
+  } catch {
+    return false
+  }
+}
+
+export async function isLocalStreamBandwidthBypassRequest(request: Request) {
+  return isHttpLocalNetworkOrigin(await getHeaderDerivedOrigin(request))
 }
 
 function isCastReachableOrigin(origin: string) {
