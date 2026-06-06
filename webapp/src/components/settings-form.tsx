@@ -1,13 +1,14 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import { EyeOff, KeyRound, Link2Off, UserRound } from "lucide-react"
+import { BellOff, EyeOff, KeyRound, Link2Off, UserRound } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { isStrongPassword } from "@/lib/password-policy"
+import { appUpdatePreferenceChangedEvent } from "@/lib/app-update"
 import type { SafeSettings, SpoilerSettings } from "@/lib/types"
 
 type SettingsFormProps = {
@@ -87,6 +88,12 @@ export function SettingsForm({ settings }: SettingsFormProps) {
   const [message, setMessage] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  const [disableUpdateBadges, setDisableUpdateBadges] = useState(
+    settings.account.disableUpdateBadges
+  )
+  const [updateBadgeSaving, setUpdateBadgeSaving] = useState(false)
+  const [updateBadgeMessage, setUpdateBadgeMessage] = useState<string | null>(null)
+  const [updateBadgeError, setUpdateBadgeError] = useState<string | null>(null)
   const [spoilerSettings, setSpoilerSettings] = useState(settings.spoilers)
   const [spoilerSaving, setSpoilerSaving] = useState(false)
   const [spoilerMessage, setSpoilerMessage] = useState<string | null>(null)
@@ -156,6 +163,54 @@ export function SettingsForm({ settings }: SettingsFormProps) {
       )
     } finally {
       setSubmitting(false)
+    }
+  }
+
+  async function saveUpdateBadgeSetting(disabled: boolean) {
+    const previousDisabled = disableUpdateBadges
+    setDisableUpdateBadges(disabled)
+    setUpdateBadgeSaving(true)
+    setUpdateBadgeMessage(null)
+    setUpdateBadgeError(null)
+
+    try {
+      const response = await fetch("/api/settings", {
+        method: "PATCH",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          account: {
+            disableUpdateBadges: disabled,
+          },
+        }),
+      })
+      const payload = (await response.json().catch(() => null)) as {
+        ok?: boolean
+        settings?: SafeSettings
+      } | null
+
+      if (!response.ok || !payload?.ok || !payload.settings) {
+        throw new Error("Unable to update badge setting")
+      }
+
+      const nextDisabled = payload.settings.account.disableUpdateBadges
+      setDisableUpdateBadges(nextDisabled)
+      setUpdateBadgeMessage("Update badge setting updated.")
+      window.dispatchEvent(
+        new CustomEvent(appUpdatePreferenceChangedEvent, {
+          detail: { disableUpdateBadges: nextDisabled },
+        })
+      )
+    } catch (saveError) {
+      setDisableUpdateBadges(previousDisabled)
+      setUpdateBadgeError(
+        saveError instanceof Error
+          ? saveError.message
+          : "Unable to update badge setting"
+      )
+    } finally {
+      setUpdateBadgeSaving(false)
     }
   }
 
@@ -271,6 +326,40 @@ export function SettingsForm({ settings }: SettingsFormProps) {
               {submitting ? "Saving..." : "Change password"}
             </Button>
           </form>
+
+          {settings.account.isAdmin ? (
+            <div className="mt-5 border-t border-white/10 pt-4">
+              <label className="flex cursor-pointer items-start justify-between gap-4 rounded-lg border border-white/10 bg-zinc-950/40 px-3 py-3">
+                <span>
+                  <span className="flex items-center gap-2 text-sm font-medium text-zinc-100">
+                    <BellOff className="size-4 text-amber-300" />
+                    Disable Update badges
+                  </span>
+                  <span className="mt-1 block text-sm text-zinc-400">
+                    Not recommended. Hide admin update badges even when a newer Yamibunko release is available.
+                  </span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={disableUpdateBadges}
+                  disabled={updateBadgeSaving}
+                  onChange={(event) =>
+                    void saveUpdateBadgeSetting(event.target.checked)
+                  }
+                  className="mt-1 size-4 accent-violet-500"
+                />
+              </label>
+
+              {updateBadgeError ? (
+                <p className="mt-2 text-sm text-red-300">{updateBadgeError}</p>
+              ) : null}
+              {updateBadgeMessage ? (
+                <p className="mt-2 text-sm text-emerald-300">
+                  {updateBadgeMessage}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
         </CardContent>
       </Card>
 

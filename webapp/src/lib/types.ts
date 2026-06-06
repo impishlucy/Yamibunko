@@ -148,6 +148,7 @@ export type SafeSettings = {
   account: {
     userName: string
     isAdmin: boolean
+    disableUpdateBadges: boolean
   }
   spoilers: SpoilerSettings
 }

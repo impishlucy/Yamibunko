@@ -1,4 +1,5 @@
 import { defaultSpoilerSettings, type SpoilerSettings } from "@/lib/types"
+import { getCurrentAppVersion } from "@/server/app/updateCheck"
 import { getDb, nowIso } from "@/server/db/sqlite"
 
 type UserRow = {
@@ -7,6 +8,8 @@ type UserRow = {
   is_admin: number
   is_vip: number
   anilist_refresh_pressed_at: string | null
+  ignored_app_update_version: string | null
+  disable_update_badges: number
   blur_episode_thumbnails: number
   remove_unwatched_episode_titles: number
   created_at: string
@@ -19,6 +22,8 @@ export type StoredUser = {
   isAdmin: boolean
   isVip: boolean
   aniListRefreshPressedAt: string | null
+  ignoredAppUpdateVersion: string | null
+  disableUpdateBadges: boolean
   spoilerSettings: SpoilerSettings
   createdAt: string
   updatedAt: string
@@ -32,6 +37,8 @@ const userSelectColumns = `
   is_admin,
   is_vip,
   anilist_refresh_pressed_at,
+  ignored_app_update_version,
+  disable_update_badges,
   blur_episode_thumbnails,
   remove_unwatched_episode_titles,
   created_at,
@@ -45,6 +52,8 @@ function toUser(row: UserRow): StoredUser {
     isAdmin: row.is_admin === 1,
     isVip: row.is_vip === 1,
     aniListRefreshPressedAt: row.anilist_refresh_pressed_at,
+    ignoredAppUpdateVersion: row.ignored_app_update_version,
+    disableUpdateBadges: row.disable_update_badges === 1,
     spoilerSettings: {
       blurEpisodeThumbnails: row.blur_episode_thumbnails === 1,
       removeUnwatchedEpisodeTitles:
@@ -99,11 +108,13 @@ export function createUser(input: {
         password_hash,
         is_admin,
         is_vip,
+        ignored_app_update_version,
+        disable_update_badges,
         blur_episode_thumbnails,
         remove_unwatched_episode_titles,
         created_at,
         updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `
     )
     .run(
@@ -111,6 +122,8 @@ export function createUser(input: {
       input.passwordHash ?? null,
       input.isAdmin ? 1 : 0,
       isVip ? 1 : 0,
+      input.isAdmin ? getCurrentAppVersion() : null,
+      0,
       defaultSpoilerSettings.blurEpisodeThumbnails ? 1 : 0,
       defaultSpoilerSettings.removeUnwatchedEpisodeTitles ? 1 : 0,
       now,
@@ -142,6 +155,76 @@ export function setUserVip(username: string, isVip: boolean) {
   getDb()
     .query("UPDATE users SET is_vip = ?, updated_at = ? WHERE username = ?")
     .run(isVip ? 1 : 0, nowIso(), username.trim())
+}
+
+
+export function getUserDisableUpdateBadges(username: string) {
+  const row = getDb()
+    .query<{ disable_update_badges: number }>(
+      "SELECT disable_update_badges FROM users WHERE username = ?"
+    )
+    .get(username.trim())
+
+  return row?.disable_update_badges === 1
+}
+
+export function setUserDisableUpdateBadges(
+  username: string,
+  disabled: boolean
+) {
+  getDb()
+    .query(
+      `
+      UPDATE users
+      SET disable_update_badges = ?,
+          updated_at = ?
+      WHERE username = ?
+        AND is_admin = 1
+    `
+    )
+    .run(disabled ? 1 : 0, nowIso(), username.trim())
+
+  return getUserDisableUpdateBadges(username)
+}
+
+export function getUserIgnoredAppUpdateVersion(username: string) {
+  const row = getDb()
+    .query<{ ignored_app_update_version: string | null }>(
+      "SELECT ignored_app_update_version FROM users WHERE username = ?"
+    )
+    .get(username.trim())
+
+  return row?.ignored_app_update_version ?? null
+}
+
+export function setUserIgnoredAppUpdateVersion(
+  username: string,
+  version: string
+) {
+  getDb()
+    .query(
+      `
+      UPDATE users
+      SET ignored_app_update_version = ?,
+          updated_at = ?
+      WHERE username = ?
+        AND is_admin = 1
+    `
+    )
+    .run(version.trim(), nowIso(), username.trim())
+}
+
+export function resetAdminIgnoredAppUpdateVersions(version: string) {
+  getDb()
+    .query(
+      `
+      UPDATE users
+      SET ignored_app_update_version = ?,
+          updated_at = ?
+      WHERE is_admin = 1
+    `
+    )
+    .run(version.trim(), nowIso())
 }
 
 export function getUserSpoilerSettings(username: string) {

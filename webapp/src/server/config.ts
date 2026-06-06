@@ -156,6 +156,7 @@ export function getSafeServerSettings(input: {
     account: input.account ?? {
       userName: "Unknown",
       isAdmin: false,
+      disableUpdateBadges: false,
     },
     spoilers: input.spoilers ?? defaultSpoilerSettings,
   }

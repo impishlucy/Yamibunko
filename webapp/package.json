@@ -1,6 +1,6 @@
 {
   "name": "yamibunko",
-  "version": "2.1",
+  "version": "2.2",
   "type": "module",
   "private": true,
   "trustedDependencies": [

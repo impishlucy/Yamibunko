@@ -3,6 +3,7 @@ import { SettingsForm } from "@/components/settings-form"
 import { UserManagement } from "@/components/user-management"
 import { getSafeServerSettings } from "@/server/config"
 import { requireCurrentUser } from "@/server/auth/session"
+import { getCurrentAppVersion } from "@/server/app/updateCheck"
 
 export default async function SettingsPage() {
   const user = await requireCurrentUser()
@@ -10,6 +11,7 @@ export default async function SettingsPage() {
     account: {
       userName: user?.username ?? "Unknown",
       isAdmin: user?.isAdmin ?? false,
+      disableUpdateBadges: user?.disableUpdateBadges ?? false,
     },
     spoilers: user?.spoilerSettings,
   })
@@ -21,7 +23,10 @@ export default async function SettingsPage() {
       </div>
       <SettingsForm settings={settings} />
       {user?.isAdmin ? <UserManagement /> : null}
-      <SettingsAbout isAdmin={settings.account.isAdmin} />
+      <SettingsAbout
+        isAdmin={settings.account.isAdmin}
+        version={getCurrentAppVersion()}
+      />
     </div>
   )
 }

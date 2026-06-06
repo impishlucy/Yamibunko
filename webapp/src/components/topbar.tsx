@@ -1,9 +1,26 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import {
+  type MouseEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
 import Link from "next/link"
 import { usePathname } from "next/navigation"
-import { Gauge, Info, LogOut, PackagePlus, RefreshCw, Settings, Snail, UserRound } from "lucide-react"
+import {
+  Gauge,
+  Info,
+  LogOut,
+  PackagePlus,
+  RefreshCw,
+  Settings,
+  Snail,
+  UserRound,
+  X,
+} from "lucide-react"
 import { SiAnilist } from "@icons-pack/react-simple-icons"
 
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
@@ -15,6 +32,12 @@ import {
   type MediaImportProcessingItem,
   type MediaImportProcessingState,
 } from "@/lib/import-processing"
+import {
+  appUpdatePreferenceChangedEvent,
+  appUpdateStatusPath,
+  yamibunkoReleasesUrl,
+  type AppUpdateStatus,
+} from "@/lib/app-update"
 import { clientLibraryRefreshEvent } from "@/lib/library-events"
 import { cn } from "@/lib/utils"
 import type { CurrentUser } from "@/server/auth/session"
@@ -128,6 +151,7 @@ export function Topbar({ user }: { user: CurrentUser }) {
   const [refreshMessage, setRefreshMessage] = useState<string | null>(null)
   const [bandwidthSnapshot, setBandwidthSnapshot] = useState<BandwidthSnapshot | null>(null)
   const [processingState, setProcessingState] = useState<MediaImportProcessingState | null>(null)
+  const [appUpdateStatus, setAppUpdateStatus] = useState<AppUpdateStatus | null>(null)
   const [processingDialogOpen, setProcessingDialogOpen] = useState(false)
   const [bandwidthDialogOpen, setBandwidthDialogOpen] = useState(false)
   const [bandwidthLimitUpdating, setBandwidthLimitUpdating] = useState(false)
@@ -199,6 +223,10 @@ export function Topbar({ user }: { user: CurrentUser }) {
     processingCount === 1
       ? "Adding 1 new episode"
       : `Adding ${processingCount} new episodes`
+  const appUpdateAvailable = Boolean(
+    user.isAdmin && appUpdateStatus?.updateAvailable
+  )
+  const appUpdateReleaseUrl = appUpdateStatus?.releaseUrl ?? yamibunkoReleasesUrl
 
   const loadRefreshState = useCallback(async () => {
     const response = await fetch("/api/anilist/refresh", {
@@ -253,6 +281,28 @@ export function Topbar({ user }: { user: CurrentUser }) {
     }
   }, [])
 
+  const loadAppUpdateStatus = useCallback(async () => {
+    if (!user.isAdmin) {
+      return
+    }
+
+    const response = await fetch(appUpdateStatusPath, {
+      cache: "no-store",
+    }).catch(() => null)
+
+    if (!response?.ok) {
+      return
+    }
+
+    const payload = (await response.json().catch(() => null)) as
+      | AppUpdateStatus
+      | null
+
+    if (payload) {
+      setAppUpdateStatus(payload)
+    }
+  }, [user.isAdmin])
+
   useEffect(() => {
     const timer = window.setTimeout(() => {
       void loadRefreshState()
@@ -261,7 +311,6 @@ export function Topbar({ user }: { user: CurrentUser }) {
     return () => window.clearTimeout(timer)
   }, [loadRefreshState])
 
-
   useEffect(() => {
     const timer = window.setTimeout(() => {
       void loadProcessingState()
@@ -269,6 +318,57 @@ export function Topbar({ user }: { user: CurrentUser }) {
 
     return () => window.clearTimeout(timer)
   }, [loadProcessingState])
+
+  useEffect(() => {
+    if (!user.isAdmin) {
+      return
+    }
+
+    let timer: number | null = null
+    let cancelled = false
+
+    const poll = async () => {
+      await loadAppUpdateStatus()
+
+      if (cancelled) {
+        return
+      }
+
+      timer = window.setTimeout(poll, 30 * 60 * 1000)
+    }
+
+    timer = window.setTimeout(poll, 0)
+
+    return () => {
+      cancelled = true
+
+      if (timer !== null) {
+        window.clearTimeout(timer)
+      }
+    }
+  }, [loadAppUpdateStatus, user.isAdmin])
+
+  useEffect(() => {
+    if (!user.isAdmin) {
+      return
+    }
+
+    function onUpdateBadgePreferenceChanged() {
+      void loadAppUpdateStatus()
+    }
+
+    window.addEventListener(
+      appUpdatePreferenceChangedEvent,
+      onUpdateBadgePreferenceChanged
+    )
+
+    return () => {
+      window.removeEventListener(
+        appUpdatePreferenceChangedEvent,
+        onUpdateBadgePreferenceChanged
+      )
+    }
+  }, [loadAppUpdateStatus, user.isAdmin])
 
   useEffect(() => {
     const source = new EventSource(importProcessingEventsPath)
@@ -509,6 +609,31 @@ export function Topbar({ user }: { user: CurrentUser }) {
     }
   }
 
+  async function dismissAppUpdate(event: MouseEvent<HTMLButtonElement>) {
+    event.preventDefault()
+    event.stopPropagation()
+
+    if (!user.isAdmin || !appUpdateAvailable) {
+      return
+    }
+
+    const response = await fetch(appUpdateStatusPath, {
+      method: "PATCH",
+    }).catch(() => null)
+
+    if (!response?.ok) {
+      return
+    }
+
+    const payload = (await response.json().catch(() => null)) as
+      | AppUpdateStatus
+      | null
+
+    if (payload) {
+      setAppUpdateStatus(payload)
+    }
+  }
+
   async function toggleBandwidthLimit() {
     if (bandwidthLimitUpdating) {
       return
@@ -547,13 +672,36 @@ export function Topbar({ user }: { user: CurrentUser }) {
   return (
     <header className="sticky top-0 z-30 border-b border-white/10 bg-[#0d0d12]/85 px-4 py-3 backdrop-blur sm:px-6 lg:px-8">
       <div className="relative flex items-center justify-between gap-3">
-        <Link
-          href="/library"
-          prefetch={false}
-          className="text-sm font-semibold tracking-normal text-zinc-100 transition hover:text-violet-200"
-        >
-          Yamibunko
-        </Link>
+        <div className="flex min-w-0 items-center gap-2">
+          <Link
+            href="/library"
+            prefetch={false}
+            className="shrink-0 text-sm font-semibold tracking-normal text-zinc-100 transition hover:text-violet-200"
+          >
+            Yamibunko
+          </Link>
+
+          {appUpdateAvailable ? (
+            <div className="inline-flex h-7 shrink-0 items-center gap-1 rounded-full border border-amber-300/35 bg-amber-500/15 px-1 py-1 text-xs font-medium text-amber-100 shadow-sm">
+              <a
+                href={appUpdateReleaseUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex h-5 items-center rounded-full px-2 transition hover:text-amber-50 focus-visible:ring-2 focus-visible:ring-white/30 focus-visible:outline-none"
+              >
+                Update is available
+              </a>
+              <button
+                type="button"
+                aria-label="Hide update badge until another update is available"
+                className="inline-flex size-5 items-center justify-center rounded-full border border-amber-200/20 bg-amber-950/45 text-amber-100/80 transition hover:border-amber-200/35 hover:bg-amber-900/60 hover:text-amber-50 focus-visible:ring-2 focus-visible:ring-white/30 focus-visible:outline-none"
+                onClick={(event) => void dismissAppUpdate(event)}
+              >
+                <X className="size-3.5" aria-hidden="true" />
+              </button>
+            </div>
+          ) : null}
+        </div>
 
         <div className="relative flex items-center gap-2">
           {processingCount > 0 ? (

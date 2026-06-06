@@ -18,7 +18,7 @@ type YamibunkoDatabase = DatabaseSync & {
 
 let database: YamibunkoDatabase | undefined
 
-const currentSchemaVersion = 11
+const currentSchemaVersion = 13
 
 function getDatabasePath() {
   return path.join(
@@ -83,6 +83,8 @@ function initializeSchema(db: YamibunkoDatabase) {
       is_admin INTEGER NOT NULL DEFAULT 0,
       is_vip INTEGER NOT NULL DEFAULT 0,
       anilist_refresh_pressed_at TEXT,
+      ignored_app_update_version TEXT,
+      disable_update_badges INTEGER NOT NULL DEFAULT 0,
       blur_episode_thumbnails INTEGER NOT NULL DEFAULT 0,
       remove_unwatched_episode_titles INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
@@ -702,6 +704,24 @@ function runSchemaMigrations(db: YamibunkoDatabase) {
       WHERE blur_episode_thumbnails = 1
     `
     ).run(nowIso())
+  }
+
+  if (version < 12) {
+    ensureColumn(
+      db,
+      "users",
+      "ignored_app_update_version",
+      "ignored_app_update_version TEXT"
+    )
+  }
+
+  if (version < 13) {
+    ensureColumn(
+      db,
+      "users",
+      "disable_update_badges",
+      "disable_update_badges INTEGER NOT NULL DEFAULT 0"
+    )
   }
 
   setUserVersion(db, currentSchemaVersion)

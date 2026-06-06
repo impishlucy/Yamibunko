@@ -6,9 +6,10 @@ import { HoverHint } from "@/components/ui/hover-hint"
 
 type SettingsAboutProps = {
   isAdmin: boolean
+  version: string
 }
 
-export function SettingsAbout({ isAdmin }: SettingsAboutProps) {
+export function SettingsAbout({ isAdmin, version }: SettingsAboutProps) {
   return (
     <Card className="rounded-lg border-white/10 bg-zinc-900/75">
       <CardContent className="space-y-4 text-sm text-zinc-300">
@@ -99,19 +100,22 @@ export function SettingsAbout({ isAdmin }: SettingsAboutProps) {
           All media is provided by the Hoster of this Yamibunko Instance.
         </p>
 
-        <p className="flex flex-wrap items-center gap-1.5">
-          <span>Yaminunko was made with</span>
-          <Heart className="size-4 fill-pink-400 text-pink-400" />
-          <span>by</span>
-          <a
-            href="https://github.com/impishlucy"
-            target="_blank"
-            rel="noreferrer"
-            className="font-medium text-violet-200 underline-offset-4 hover:text-violet-100 hover:underline"
-          >
-            Lucy
-          </a>
-        </p>
+        <div className="space-y-1.5">
+          <p className="flex flex-wrap items-center gap-1.5">
+            <span>Yaminunko was made with</span>
+            <Heart className="size-4 fill-pink-400 text-pink-400" />
+            <span>by</span>
+            <a
+              href="https://github.com/impishlucy"
+              target="_blank"
+              rel="noreferrer"
+              className="font-medium text-violet-200 underline-offset-4 hover:text-violet-100 hover:underline"
+            >
+              Lucy
+            </a>
+          </p>
+          <p className="text-xs text-zinc-500">Version {version}</p>
+        </div>
       </CardContent>
     </Card>
   )

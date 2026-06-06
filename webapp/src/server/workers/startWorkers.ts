@@ -3,8 +3,13 @@ import { readdir, rm } from "node:fs/promises"
 import path from "node:path"
 
 import { runFullAniListRefresh } from "@/server/anilist/sync"
+import {
+  checkForYamibunkoUpdate,
+  getCurrentAppVersion,
+} from "@/server/app/updateCheck"
 import { beginStreamServerShutdown } from "@/server/bandwidth/streamBandwidth"
 import { listEpisodeFilePaths } from "@/server/db/library"
+import { resetAdminIgnoredAppUpdateVersions } from "@/server/db/users"
 import { getServerConfigResult } from "@/server/config"
 import { isMediaFile, pathExists } from "@/server/media/mediaFiles"
 import {
@@ -148,6 +153,8 @@ export function startWorkers() {
   if (workerGlobal.__yamibunkoWorkerRuntime) {
     return workerGlobal.__yamibunkoWorkerRuntime
   }
+
+  resetAdminIgnoredAppUpdateVersions(getCurrentAppVersion())
 
   const configResult = getServerConfigResult()
 
@@ -676,7 +683,10 @@ export function startWorkers() {
     }
   }
 
-  async function runDailyAniListSync() {
+  async function runDailyAniListSync(
+    reason = "daily maintenance",
+    includeUpdateCheck = true
+  ) {
     if (shuttingDown || dailyAniListSyncRunning) {
       return
     }
@@ -691,6 +701,12 @@ export function startWorkers() {
       console.error(
         `[Error] [Workers] Daily AniList sync failed - startWorkers.ts - ${errorMessage(error)}`
       )
+    }
+
+    try {
+      if (includeUpdateCheck) {
+        await checkForYamibunkoUpdate(reason)
+      }
     } finally {
       dailyAniListSyncRunning = false
     }
@@ -746,10 +762,18 @@ export function startWorkers() {
   }, scanIntervalMs)
   scanTimer.unref?.()
 
-  const startupAniListSync = runDailyAniListSync()
+  const startupAniListSync = runDailyAniListSync("startup", false)
   activeWork.add(startupAniListSync)
   void startupAniListSync.finally(() => {
     activeWork.delete(startupAniListSync)
+  })
+
+  const startupUpdateCheck = checkForYamibunkoUpdate("startup").then(
+    () => undefined
+  )
+  activeWork.add(startupUpdateCheck)
+  void startupUpdateCheck.finally(() => {
+    activeWork.delete(startupUpdateCheck)
   })
 
   debugWorkers("Starting initial input/library scans.")

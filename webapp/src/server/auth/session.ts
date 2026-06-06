@@ -26,6 +26,7 @@ export type CurrentUser = {
   isAdmin: boolean
   isVip: boolean
   hasPassword: boolean
+  disableUpdateBadges: boolean
   spoilerSettings: SpoilerSettings
 }
 
@@ -103,6 +104,7 @@ export async function getCurrentUserSession(): Promise<CurrentUserSession | null
       isAdmin: user.isAdmin,
       isVip: user.isVip,
       hasPassword: Boolean(user.passwordHash),
+      disableUpdateBadges: user.disableUpdateBadges,
       spoilerSettings: user.spoilerSettings,
     },
     sessionTokenHash: tokenHash,
