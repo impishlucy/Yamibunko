@@ -4922,10 +4922,10 @@ export function AnimePlayer({
   const shouldShowCastErrorPortal = Boolean(castErrorMessage && serverCastOverlayPortalRoot && (shouldUseIosServerCast || serverCastDeviceModalOpen))
 
   return (
-    <div className="space-y-3 lg:space-y-4">
+    <div className="yami-anime-player space-y-3 lg:space-y-4">
       <div
         ref={playerRef}
-        className={`group/player relative overflow-hidden rounded-xl border border-white/10 bg-black shadow-[0_28px_90px_rgba(0,0,0,0.45)] ${
+        className={`yami-anime-player-frame group/player relative overflow-hidden rounded-xl border border-white/10 bg-black shadow-[0_28px_90px_rgba(0,0,0,0.45)] ${
           controlsAreVisible ? "" : "cursor-none"
         }`}
         style={{ aspectRatio: playerAspectRatio }}

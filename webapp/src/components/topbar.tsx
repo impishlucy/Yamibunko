@@ -670,7 +670,7 @@ export function Topbar({ user }: { user: CurrentUser }) {
   }
 
   return (
-    <header className="sticky top-0 z-30 border-b border-white/10 bg-[#0d0d12]/85 px-4 py-3 backdrop-blur sm:px-6 lg:px-8">
+    <header className="yami-topbar sticky top-0 z-30 border-b border-white/10 bg-[#0d0d12]/85 px-4 py-3 backdrop-blur sm:px-6 lg:px-8">
       <div className="relative flex items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2">
           <Link

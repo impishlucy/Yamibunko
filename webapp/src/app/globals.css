@@ -159,3 +159,36 @@
   text-shadow: 0 2px 5px rgb(0 0 0 / 90%);
   background: transparent;
 }
+
+@media (hover: none) and (pointer: coarse) and (orientation: landscape) and (max-height: 560px) and (max-width: 1000px) {
+  .yami-topbar {
+    display: none;
+  }
+
+  .yami-app-main {
+    padding: 0.5rem;
+  }
+
+  .yami-watch-view {
+    min-height: calc(100dvh - 1rem);
+    justify-content: center;
+    gap: 0;
+  }
+
+  .yami-watch-heading {
+    display: none;
+  }
+
+  .yami-watch-player-shell.yami-player-width {
+    width: var(--yami-phone-landscape-player-width, min(calc(100vw - 1rem), calc(100dvh - 1rem)));
+    max-width: var(--yami-phone-landscape-player-width, min(calc(100vw - 1rem), calc(100dvh - 1rem)));
+  }
+
+  .yami-watch-player-shell .yami-anime-player {
+    width: 100%;
+  }
+
+  .yami-watch-player-shell .yami-anime-player-frame {
+    max-height: calc(100dvh - 1rem);
+  }
+}

@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { type CSSProperties, useEffect, useState } from "react"
 import { useRouter } from "next/navigation"
 
 import { AnimePlayer } from "@/components/anime-player"
@@ -19,20 +19,97 @@ type StreamSessionResponse = {
   hasActiveStream: boolean
 }
 
+type PhoneLandscapePlayerStyle = CSSProperties & {
+  "--yami-phone-landscape-player-width"?: string
+}
+
+type ViewportSize = {
+  width: number
+  height: number
+}
+
+function readViewportSize(): ViewportSize | null {
+  if (typeof window === "undefined") {
+    return null
+  }
+
+  return {
+    width: window.visualViewport?.width ?? window.innerWidth,
+    height: window.visualViewport?.height ?? window.innerHeight,
+  }
+}
+
+function useViewportSize() {
+  const [viewportSize, setViewportSize] = useState<ViewportSize | null>(null)
+
+  useEffect(() => {
+    const updateViewportSize = () => setViewportSize(readViewportSize())
+
+    updateViewportSize()
+    window.addEventListener("resize", updateViewportSize)
+    window.addEventListener("orientationchange", updateViewportSize)
+    window.visualViewport?.addEventListener("resize", updateViewportSize)
+
+    return () => {
+      window.removeEventListener("resize", updateViewportSize)
+      window.removeEventListener("orientationchange", updateViewportSize)
+      window.visualViewport?.removeEventListener("resize", updateViewportSize)
+    }
+  }, [])
+
+  return viewportSize
+}
+
+function getAspectRatioValue(aspectRatio: string) {
+  const [width, height] = aspectRatio
+    .split("/")
+    .map((part) => Number.parseFloat(part.trim()))
+
+  if (!width || !height || width <= 0 || height <= 0) {
+    return 16 / 9
+  }
+
+  return width / height
+}
+
+function getPhoneLandscapePlayerStyle(
+  aspectRatio: string,
+  viewportSize: ViewportSize | null
+): PhoneLandscapePlayerStyle {
+  if (!viewportSize) {
+    return {
+      "--yami-phone-landscape-player-width": "min(calc(100vw - 1rem), calc(100dvh - 1rem))",
+    }
+  }
+
+  const ratio = getAspectRatioValue(aspectRatio)
+  const maxWidth = Math.max(viewportSize.width - 16, 0)
+  const maxHeight = Math.max(viewportSize.height - 16, 0)
+  const width = Math.max(Math.min(maxWidth, maxHeight * ratio), 0)
+
+  return {
+    "--yami-phone-landscape-player-width": `${Math.floor(width)}px`,
+  }
+}
+
 function WatchSkeleton({
   aspectRatio = DEFAULT_PLAYER_ASPECT_RATIO,
+  viewportSize,
 }: {
   aspectRatio?: string
+  viewportSize: ViewportSize | null
 }) {
+  const playerStyle = getPhoneLandscapePlayerStyle(aspectRatio, viewportSize)
+
   return (
-    <div className="space-y-4 lg:space-y-6">
-      <section className="mx-auto flex max-w-5xl flex-wrap items-center justify-center gap-2 text-center lg:gap-3">
+    <div className="yami-watch-view flex flex-col gap-4 lg:gap-6">
+      <section className="yami-watch-heading mx-auto flex max-w-5xl flex-wrap items-center justify-center gap-2 text-center lg:gap-3">
         <Skeleton className="h-8 w-64 max-w-full rounded-lg bg-zinc-900 sm:h-9 sm:w-80 lg:h-8 lg:w-[22rem]" />
         <Skeleton className="h-6 w-20 rounded-full bg-zinc-900 lg:h-6 lg:w-[5.5rem]" />
         <Skeleton className="h-6 w-24 rounded-full bg-zinc-900 lg:h-6 lg:w-[6.5rem]" />
       </section>
 
-      <div className="yami-player-width mx-auto">
+      <div className="yami-watch-player-shell yami-player-width mx-auto" style={playerStyle}>
         <div className="space-y-3">
           <div className="relative overflow-hidden rounded-lg border border-white/10 bg-black shadow-[0_28px_90px_rgba(0,0,0,0.45)]">
             <Skeleton
@@ -75,6 +152,7 @@ export function WatchView({
   const [streamBlocked, setStreamBlocked] = useState<boolean | null>(null)
   const [replacing, setReplacing] = useState(false)
   const [clientStreamId] = useState(createClientStreamId)
+  const viewportSize = useViewportSize()
 
   useEffect(() => {
     let cancelled = false
@@ -176,6 +254,7 @@ export function WatchView({
                 )
               : undefined
           }
+          viewportSize={viewportSize}
         />
         <StreamLimitDialog
           open={Boolean(payload && streamBlocked)}
@@ -190,9 +269,15 @@ export function WatchView({
     )
   }
 
+  const playerAspectRatio = getPreferredPlayerAspectRatio(
+    payload.media.videoWidth,
+    payload.media.videoHeight
+  )
+  const playerStyle = getPhoneLandscapePlayerStyle(playerAspectRatio, viewportSize)
+
   return (
-    <div className="space-y-4 lg:space-y-6">
-      <section className="mx-auto flex max-w-5xl flex-wrap items-center justify-center gap-2 text-center lg:gap-3">
+    <div className="yami-watch-view flex flex-col gap-4 lg:gap-6">
+      <section className="yami-watch-heading mx-auto flex max-w-5xl flex-wrap items-center justify-center gap-2 text-center lg:gap-3">
         <h1 className="min-w-0 truncate text-xl font-semibold text-zinc-50">
           {payload.anime.title}
         </h1>
@@ -210,7 +295,7 @@ export function WatchView({
         </h1>
       </section>
 
-      <div className="yami-player-width mx-auto">
+      <div className="yami-watch-player-shell yami-player-width mx-auto" style={playerStyle}>
         <AnimePlayer
           animeId={animeId}
           seasonNumber={payload.episode.seasonNumber}
