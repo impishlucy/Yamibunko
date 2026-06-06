@@ -14,11 +14,21 @@ public partial class SetupWindow : Window
     private static readonly Regex ClientIdRegex = new(@"^\d+$", RegexOptions.Compiled);
 
     public event Action<AppSettings>? OnSetupComplete;
+    private readonly AppSettings? _initialSettings;
     private bool _isSetupComplete;
 
     public SetupWindow()
     {
         AvaloniaXamlLoader.Load(this);
+        UpdateFileProcessingState();
+        ValidateForm();
+    }
+
+    public SetupWindow(AppSettings settings)
+    {
+        _initialSettings = settings;
+        AvaloniaXamlLoader.Load(this);
+        PopulateForm(settings);
         UpdateFileProcessingState();
         ValidateForm();
     }
@@ -47,6 +57,11 @@ public partial class SetupWindow : Window
             Title = "Select Input Folder Directory",
             AllowMultiple = false
         });
+
+        if (folders.Count == 0)
+        {
+            return;
+        }
 
         var uri = folders[0].Path;
         if (uri != null && uri.IsAbsoluteUri)
@@ -96,6 +111,21 @@ public partial class SetupWindow : Window
         }
     }
 
+    private void PopulateForm(AppSettings settings)
+    {
+        SetTextBoxValue("BaseUrlBox", settings.BaseUrl ?? "");
+        SetTextBoxValue("InputFolderBox", settings.InputFolderPath ?? "");
+        SetTextBoxValue("OutputFolderBox", settings.OutputFolderPath ?? "");
+        SetTextBoxValue("ClientIdBox", settings.AnilistClientId ?? "");
+        SetTextBoxValue("ClientSecretBox", settings.AnilistClientSecret ?? "");
+
+        var disableFileProcessingBox = this.FindControl<CheckBox>("DisableFileProcessingBox");
+        if (disableFileProcessingBox != null)
+        {
+            disableFileProcessingBox.IsChecked = !settings.ImportEnabled;
+        }
+    }
+
     private void ValidateForm()
     {
         var saveButton = this.FindControl<Button>("SaveButton");
@@ -128,8 +158,11 @@ public partial class SetupWindow : Window
             InputFolderPath = GetTextBoxValue("InputFolderBox"),
             OutputFolderPath = GetTextBoxValue("OutputFolderBox"),
             ImportEnabled = !IsFileProcessingDisabled(),
+            FfmpegDir = _initialSettings?.FfmpegDir ?? "",
+            TranscodeAccel = _initialSettings?.TranscodeAccel ?? "cpu",
             AnilistClientId = GetTextBoxValue("ClientIdBox"),
-            AnilistClientSecret = GetTextBoxValue("ClientSecretBox")
+            AnilistClientSecret = GetTextBoxValue("ClientSecretBox"),
+            BunPath = _initialSettings?.BunPath ?? ""
         };
 
         settings.Save();

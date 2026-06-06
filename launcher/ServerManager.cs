@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using Avalonia;
+using Avalonia.Controls.ApplicationLifetimes;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
@@ -66,6 +68,11 @@ public class ServerManager
 
     public async Task StartServerAsync(AppSettings settings)
     {
+        if (!await EnsureValidStartupSettingsAsync(settings))
+        {
+            return;
+        }
+
         try
         {
             Log("Setting up the server, please wait...");
@@ -103,6 +110,44 @@ public class ServerManager
         {
             Log($"[CRITICAL ERROR] {ex.Message}");
         }
+    }
+
+    private async Task<bool> EnsureValidStartupSettingsAsync(AppSettings settings)
+    {
+        if (settings.IsValidForStartup(out var validationErrors))
+        {
+            return true;
+        }
+
+        Log("Launcher setup is incomplete. Opening setup window.");
+        foreach (var validationError in validationErrors)
+        {
+            Log(validationError);
+        }
+
+        await OpenSetupWindowAsync(settings);
+        return false;
+    }
+
+    private async Task OpenSetupWindowAsync(AppSettings settings)
+    {
+        await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+        {
+            var setupWindow = new SetupWindow(settings);
+            setupWindow.OnSetupComplete += async newSettings =>
+            {
+                setupWindow.Close();
+                await StartServerAsync(newSettings);
+            };
+
+            if (Application.Current?.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+            {
+                desktop.MainWindow = setupWindow;
+            }
+
+            setupWindow.Show();
+            setupWindow.Activate();
+        });
     }
 
     public void StopServer()
