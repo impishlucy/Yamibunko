@@ -148,6 +148,23 @@ type HtmlVideoElementWithAudioTracks = HTMLVideoElement & {
   audioTracks?: BrowserAudioTrackList
 }
 
+type HtmlVideoElementWithNativePlayback = HTMLVideoElement & {
+  disableRemotePlayback?: boolean
+  remote?: {
+    prompt?: () => Promise<void>
+    watchAvailability?: (callback: (available: boolean) => void) => Promise<number>
+    cancelWatchAvailability?: (watchId: number) => Promise<void>
+  }
+  webkitEnterFullscreen?: () => void
+  webkitShowPlaybackTargetPicker?: () => void
+  webkitSupportsPresentationMode?: (mode: string) => boolean
+  webkitSetPresentationMode?: (mode: string) => void
+}
+
+type WebKitPlaybackTargetAvailabilityEvent = Event & {
+  availability?: "available" | "not-available"
+}
+
 type SubtitleCue = {
   start: number
   end: number
@@ -561,6 +578,119 @@ function supportsDirectPlayback(input: {
     supportsDirectVideoTrack(input) &&
     supportsDirectAudioTrack(input)
   )
+}
+
+function isAndroidBrowser() {
+  if (typeof navigator === "undefined") {
+    return false
+  }
+
+  return /\bAndroid\b/i.test(navigator.userAgent)
+}
+
+function isIosBrowser() {
+  if (typeof navigator === "undefined") {
+    return false
+  }
+
+  return (
+    /iP(?:hone|ad|od)/i.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+  )
+}
+
+function hasNativeRemotePlaybackPicker(video: HTMLVideoElement | null) {
+  if (!video) {
+    return false
+  }
+
+  const nativeVideo = video as HtmlVideoElementWithNativePlayback
+
+  return typeof nativeVideo.webkitShowPlaybackTargetPicker === "function"
+}
+
+function hasNativeRemotePlaybackPrompt(video: HTMLVideoElement | null) {
+  if (!video) {
+    return false
+  }
+
+  const nativeVideo = video as HtmlVideoElementWithNativePlayback
+
+  return typeof nativeVideo.remote?.prompt === "function"
+}
+
+function canUseNativeRemotePlayback(video: HTMLVideoElement | null) {
+  if (!video) {
+    return false
+  }
+
+  return hasNativeRemotePlaybackPrompt(video) || hasNativeRemotePlaybackPicker(video)
+}
+
+function canUseNativeRemotePlaybackFallback(
+  video: HTMLVideoElement | null,
+  targetAvailable: boolean
+) {
+  return isIosBrowser() && targetAvailable && canUseNativeRemotePlayback(video)
+}
+
+function getGoogleCastUnavailableMessage(input: {
+  castPreflightError: string | null
+  senderPreflightError: string | null
+}) {
+  if (input.castPreflightError) {
+    return input.castPreflightError
+  }
+
+  if (input.senderPreflightError) {
+    return input.senderPreflightError
+  }
+
+  if (isAndroidBrowser()) {
+    return "Google Cast did not become available in Android Chrome. Make sure Chrome is up to date, the phone is on the same network as the Cast receiver, and Google Play Services is available."
+  }
+
+  return "Casting is not available in this browser."
+}
+
+async function requestNativeRemotePlayback(video: HTMLVideoElement) {
+  const nativeVideo = video as HtmlVideoElementWithNativePlayback
+
+  if (typeof nativeVideo.remote?.prompt === "function") {
+    await nativeVideo.remote.prompt()
+    return true
+  }
+
+  if (typeof nativeVideo.webkitShowPlaybackTargetPicker === "function") {
+    nativeVideo.webkitShowPlaybackTargetPicker()
+    return true
+  }
+
+  return false
+}
+
+function requestNativeVideoFullscreen(video: HTMLVideoElement | null) {
+  if (!video) {
+    return false
+  }
+
+  const nativeVideo = video as HtmlVideoElementWithNativePlayback
+
+  if (
+    typeof nativeVideo.webkitSupportsPresentationMode === "function" &&
+    typeof nativeVideo.webkitSetPresentationMode === "function" &&
+    nativeVideo.webkitSupportsPresentationMode("fullscreen")
+  ) {
+    nativeVideo.webkitSetPresentationMode("fullscreen")
+    return true
+  }
+
+  if (typeof nativeVideo.webkitEnterFullscreen === "function") {
+    nativeVideo.webkitEnterFullscreen()
+    return true
+  }
+
+  return false
 }
 
 function supportsCastDirectPlayback(input: {
@@ -1327,9 +1457,13 @@ export function AnimePlayer({
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [isPortraitViewport, setIsPortraitViewport] = useState(false)
   const [isMobilePortraitViewport, setIsMobilePortraitViewport] = useState(false)
+  const [isPhoneViewport, setIsPhoneViewport] = useState(false)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [isCasting, setIsCasting] = useState(false)
   const [isCastStarting, setIsCastStarting] = useState(false)
+  const [isIosDevice, setIsIosDevice] = useState(false)
+  const [nativeRemotePlaybackSupported, setNativeRemotePlaybackSupported] = useState(false)
+  const [nativeRemotePlaybackAvailable, setNativeRemotePlaybackAvailable] = useState(false)
   const [castErrorFlash, setCastErrorFlash] = useState(false)
   const [castErrorMessage, setCastErrorMessage] = useState<string | null>(null)
   const [subtitleCues, setSubtitleCues] = useState<SubtitleCue[]>([])
@@ -1630,32 +1764,149 @@ export function AnimePlayer({
     const mobilePortraitQuery = window.matchMedia(
       "(max-width: 767px) and (orientation: portrait)"
     )
+    const phoneQuery = window.matchMedia(
+      "(pointer: coarse) and (max-width: 767px), (pointer: coarse) and (max-height: 480px)"
+    )
 
-    function syncPortraitViewport() {
+    function syncViewport() {
       setIsPortraitViewport(portraitQuery.matches)
       setIsMobilePortraitViewport(mobilePortraitQuery.matches)
+      setIsPhoneViewport(phoneQuery.matches)
     }
 
-    syncPortraitViewport()
-    portraitQuery.addEventListener("change", syncPortraitViewport)
-    mobilePortraitQuery.addEventListener("change", syncPortraitViewport)
+    syncViewport()
+    portraitQuery.addEventListener("change", syncViewport)
+    mobilePortraitQuery.addEventListener("change", syncViewport)
+    phoneQuery.addEventListener("change", syncViewport)
 
     return () => {
-      portraitQuery.removeEventListener("change", syncPortraitViewport)
-      mobilePortraitQuery.removeEventListener("change", syncPortraitViewport)
+      portraitQuery.removeEventListener("change", syncViewport)
+      mobilePortraitQuery.removeEventListener("change", syncViewport)
+      phoneQuery.removeEventListener("change", syncViewport)
     }
   }, [])
 
   useEffect(() => {
+    const video = videoRef.current
+    const isIos = isIosBrowser()
+    let cancelled = false
+    let remoteWatchId: number | null = null
+    let initialSyncTimer: ReturnType<typeof setTimeout> | null = null
+
+    function syncNativePlaybackState() {
+      if (cancelled) {
+        return
+      }
+
+      setIsIosDevice(isIos)
+
+      if (!video || !isIos) {
+        setNativeRemotePlaybackSupported(false)
+        setNativeRemotePlaybackAvailable(false)
+        return
+      }
+
+      const supportsNativePlayback = canUseNativeRemotePlayback(video)
+      setNativeRemotePlaybackSupported(supportsNativePlayback)
+      setNativeRemotePlaybackAvailable(
+        supportsNativePlayback &&
+          (hasNativeRemotePlaybackPrompt(video) || hasNativeRemotePlaybackPicker(video))
+      )
+    }
+
+    initialSyncTimer = setTimeout(syncNativePlaybackState, 0)
+
+    if (!video || !isIos) {
+      return () => {
+        cancelled = true
+        if (initialSyncTimer) {
+          clearTimeout(initialSyncTimer)
+        }
+      }
+    }
+
+    const nativeVideo = video as HtmlVideoElementWithNativePlayback
+    nativeVideo.disableRemotePlayback = false
+    nativeVideo.setAttribute("x-webkit-airplay", "allow")
+    nativeVideo.setAttribute("webkit-playsinline", "")
+    nativeVideo.setAttribute("playsinline", "")
+
+    function handleWebKitAvailability(event: Event) {
+      const availability = (event as WebKitPlaybackTargetAvailabilityEvent).availability
+      setNativeRemotePlaybackAvailable(
+        availability === "available" ||
+          hasNativeRemotePlaybackPrompt(video) ||
+          hasNativeRemotePlaybackPicker(video)
+      )
+    }
+
+    video.addEventListener(
+      "webkitplaybacktargetavailabilitychanged",
+      handleWebKitAvailability
+    )
+
+    if (typeof nativeVideo.remote?.watchAvailability === "function") {
+      nativeVideo.remote
+        .watchAvailability((available) => {
+          if (!cancelled) {
+            setNativeRemotePlaybackAvailable(
+              available ||
+                hasNativeRemotePlaybackPrompt(video) ||
+                hasNativeRemotePlaybackPicker(video)
+            )
+          }
+        })
+        .then((watchId) => {
+          if (cancelled) {
+            void nativeVideo.remote?.cancelWatchAvailability?.(watchId)
+            return
+          }
+
+          remoteWatchId = watchId
+        })
+        .catch(() => undefined)
+    }
+
+    return () => {
+      cancelled = true
+      if (initialSyncTimer) {
+        clearTimeout(initialSyncTimer)
+      }
+      video.removeEventListener(
+        "webkitplaybacktargetavailabilitychanged",
+        handleWebKitAvailability
+      )
+
+      if (remoteWatchId !== null) {
+        void nativeVideo.remote?.cancelWatchAvailability?.(remoteWatchId)
+      }
+    }
+  }, [sourceUrl])
+
+  useEffect(() => {
+    const video = videoRef.current
+
     function syncFullscreenState() {
+      setIsFullscreen(Boolean(document.fullscreenElement))
+    }
+
+    function markNativeFullscreen() {
+      setIsFullscreen(true)
+    }
+
+    function clearNativeFullscreen() {
       setIsFullscreen(Boolean(document.fullscreenElement))
     }
 
     syncFullscreenState()
     document.addEventListener("fullscreenchange", syncFullscreenState)
+    video?.addEventListener("webkitbeginfullscreen", markNativeFullscreen)
+    video?.addEventListener("webkitendfullscreen", clearNativeFullscreen)
 
     return () => {
       document.removeEventListener("fullscreenchange", syncFullscreenState)
+      video?.removeEventListener("webkitbeginfullscreen", markNativeFullscreen)
+      video?.removeEventListener("webkitendfullscreen", clearNativeFullscreen)
     }
   }, [])
 
@@ -2980,27 +3231,25 @@ export function AnimePlayer({
   }
 
   function requestFullscreen() {
-    const target = playerRef.current ?? videoRef.current
-
-    if (!target) {
-      return
-    }
+    const target = playerRef.current
+    const video = videoRef.current
 
     if (document.fullscreenElement) {
       void document.exitFullscreen().catch(() => undefined)
       return
     }
 
-    void target.requestFullscreen().catch(() => undefined)
+    if (target && typeof target.requestFullscreen === "function") {
+      void target.requestFullscreen().catch(() => {
+        requestNativeVideoFullscreen(video)
+      })
+      return
+    }
+
+    requestNativeVideoFullscreen(video)
   }
 
   function getCastPreflightError() {
-    const senderReason = getGoogleCastCurrentPageSenderUnavailableReason()
-
-    if (senderReason) {
-      return senderReason
-    }
-
     const castUrls = [
       playback.castDirectUrl,
       playback.castTranscodeUrl,
@@ -3434,25 +3683,55 @@ export function AnimePlayer({
       return
     }
 
+    if (isIosBrowser()) {
+      if (!canUseNativeRemotePlaybackFallback(video, nativeRemotePlaybackAvailable)) {
+        flashCastError(
+          new Error(
+            nativeRemotePlaybackSupported
+              ? "No nearby playback target is available. Make sure Chrome has Local Network permission and the receiver is on the same Wi-Fi."
+              : "Native casting is not available in this iPhone browser."
+          )
+        )
+        return
+      }
+
+      try {
+        if (await requestNativeRemotePlayback(video)) {
+          showControls(true)
+          return
+        }
+      } catch (error) {
+        flashCastError(error)
+        console.error(error)
+        return
+      }
+
+      flashCastError(new Error("Native casting is not available right now."))
+      return
+    }
+
     const startTime = getPlaybackPosition()
     const shouldResume = !video.paused || isPlayingRef.current || startTime <= 0.35
-
-    pauseLocalPlaybackForCastAttempt(video)
-
     const castPreflightError = getCastPreflightError()
-
-    if (castPreflightError) {
-      flashCastError(new Error(castPreflightError))
-      return
-    }
-
+    const senderPreflightError = getGoogleCastCurrentPageSenderUnavailableReason()
     const googleCastReady =
-      Boolean(getGoogleCastContext()) || (await ensureGoogleCastFramework())
+      !senderPreflightError &&
+      !castPreflightError &&
+      (Boolean(getGoogleCastContext()) || (await ensureGoogleCastFramework()))
 
     if (!googleCastReady) {
-      flashCastError(new Error("Google Cast is not available in this browser."))
+      flashCastError(
+        new Error(
+          getGoogleCastUnavailableMessage({
+            castPreflightError,
+            senderPreflightError,
+          })
+        )
+      )
       return
     }
+
+    pauseLocalPlaybackForCastAttempt(video)
 
     const startPromise = startGoogleCasting(video, shouldResume, startTime)
     castStartPromiseRef.current = startPromise
@@ -3688,8 +3967,16 @@ export function AnimePlayer({
     !shouldBlockMobilePortraitPlayback &&
     (controlsVisible || !isPlaying || isCasting || settingsOpen)
   const castPreflightError = getCastPreflightError()
-  const castButtonLabel = castPreflightError ?? "Google Cast"
-  const castButtonDisabled = !sourceUrl || isCastStarting || Boolean(castPreflightError)
+  const nativeCastUnavailableLabel = nativeRemotePlaybackSupported
+    ? "No nearby playback target"
+    : "Native casting is not available"
+  const castButtonLabel = isIosDevice
+    ? nativeRemotePlaybackAvailable
+      ? "Cast / AirPlay"
+      : nativeCastUnavailableLabel
+    : castPreflightError ?? "Google Cast"
+  const castButtonDisabled =
+    !sourceUrl || isCastStarting || (isIosDevice && !nativeRemotePlaybackAvailable)
   const centerToggleVisible =
     !shouldBlockMobilePortraitPlayback &&
     !isWaitingForMedia &&
@@ -3844,6 +4131,29 @@ export function AnimePlayer({
               <div className="text-2xl font-semibold tracking-wide text-zinc-100 sm:text-3xl">
                 rotate to play
               </div>
+              <Button
+                type="button"
+                variant="secondary"
+                className={`h-11 rounded-2xl border border-white/15 bg-zinc-950/70 px-5 text-sm font-medium text-white shadow-xl hover:border-white/25 hover:bg-zinc-900 disabled:opacity-45 ${
+                  castErrorFlash
+                    ? "border-red-500/70 text-red-300 ring-2 ring-red-500/40"
+                    : ""
+                }`}
+                aria-label={castButtonLabel}
+                disabled={castButtonDisabled}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  void startCasting()
+                }}
+              >
+                <Cast className="size-4" />
+                <span>Cast</span>
+              </Button>
+              {castErrorMessage ? (
+                <div className="max-w-[min(28rem,calc(100vw-2rem))] rounded-xl border border-red-400/30 bg-red-950/90 px-4 py-3 text-sm font-semibold text-white shadow-2xl backdrop-blur">
+                  {castErrorMessage}
+                </div>
+              ) : null}
             </div>
           </div>
         ) : null}
@@ -4018,9 +4328,11 @@ export function AnimePlayer({
                     className="h-4 w-full accent-red-600 lg:h-5"
                     aria-label="Seek cast playback"
                   />
-                  <div className="mt-3 text-center text-2xl font-semibold tracking-wide text-zinc-100 tabular-nums lg:mt-4 lg:text-4xl">
-                    {formatTime(displayedCurrentTime)} / {formatTime(duration)}
-                  </div>
+                  {!isPhoneViewport ? (
+                    <div className="mt-3 text-center text-2xl font-semibold tracking-wide text-zinc-100 tabular-nums lg:mt-4 lg:text-4xl">
+                      {formatTime(displayedCurrentTime)} / {formatTime(duration)}
+                    </div>
+                  ) : null}
                 </div>
               </div>
             </div>
@@ -4261,9 +4573,11 @@ export function AnimePlayer({
               </Button>
             </HoverHint>
 
-            <span className="shrink-0 text-xs text-zinc-200 tabular-nums lg:text-base">
-              {formatTime(displayedCurrentTime)} / {formatTime(duration)}
-            </span>
+            {!isPhoneViewport ? (
+              <span className="shrink-0 text-xs text-zinc-200 tabular-nums lg:text-base">
+                {formatTime(displayedCurrentTime)} / {formatTime(duration)}
+              </span>
+            ) : null}
 
             <div className="relative min-w-0 flex-1">
               {seekPreviewFrame ? (

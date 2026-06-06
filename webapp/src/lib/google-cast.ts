@@ -163,7 +163,7 @@ export const googleCastUnreachableUrlErrorCode = "CAST_RECEIVER_URL_NOT_REACHABL
 export const googleCastMediaUrlMessage =
   "Google Cast media URLs need HTTPS or an HTTP LAN IPv4 address the TV can reach. Set BASE_URL to your device IPv4 address, for example http://192.168.1.101:3000."
 export const googleCastSenderUrlMessage =
-  "Google Cast sender pages need HTTPS with a valid domain/IP or http://localhost for local use. For localhost, set BASE_URL to your device LAN IPv4 address."
+  "Google Cast sender pages need HTTPS, http://localhost, or an HTTP LAN IPv4 address. Set BASE_URL to your device IPv4 address, for example http://192.168.1.101:3000."
 let castFrameworkPromise: Promise<boolean> | null = null
 let castFrameworkInitialized = false
 const castVolumeInitializedSessions = new WeakSet<object>()
@@ -357,7 +357,9 @@ export function getGoogleCastSenderOriginUnavailableReason(value: string) {
     return "Google Cast local sender pages need http://localhost or HTTPS. LAN casting still needs BASE_URL to use an IPv4 address."
   }
 
-  return isLocalhostName(url.hostname) ? null : googleCastSenderUrlMessage
+  return isLocalhostName(url.hostname) || isPrivateLanIpv4Host(url.hostname)
+    ? null
+    : googleCastSenderUrlMessage
 }
 
 export function isGoogleCastSenderOriginAllowed(value: string) {
