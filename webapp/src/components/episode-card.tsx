@@ -9,7 +9,12 @@ import { Clock3, PlayCircle } from "lucide-react"
 import { StreamLimitDialog } from "@/components/stream-limit-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent } from "@/components/ui/card"
-import type { Episode } from "@/lib/types"
+import { cn } from "@/lib/utils"
+import {
+  defaultSpoilerSettings,
+  type Episode,
+  type SpoilerSettings,
+} from "@/lib/types"
 
 function formatDuration(seconds?: number) {
   if (!seconds) {
@@ -18,6 +23,18 @@ function formatDuration(seconds?: number) {
 
   const minutes = Math.round(seconds / 60)
   return `${minutes} min`
+}
+
+function fallbackEpisodeTitle(episode: Episode) {
+  return `Episode ${String(episode.episodeNumber).padStart(2, "0")}`
+}
+
+function isWatchedEpisode(episode: Episode) {
+  if (episode.progress?.completed) {
+    return true
+  }
+
+  return (episode.progress?.ratio ?? 0) >= 0.8
 }
 
 async function hasActiveStream() {
@@ -47,7 +64,13 @@ async function replaceActiveStream() {
   }
 }
 
-export function EpisodeCard({ episode }: { episode: Episode }) {
+export function EpisodeCard({
+  episode,
+  spoilerSettings = defaultSpoilerSettings,
+}: {
+  episode: Episode
+  spoilerSettings?: SpoilerSettings
+}) {
   const router = useRouter()
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [pendingHref, setPendingHref] = useState<string | null>(null)
@@ -56,6 +79,16 @@ export function EpisodeCard({ episode }: { episode: Episode }) {
   const progressRatio = episode.progress?.completed
     ? 1
     : (episode.progress?.ratio ?? 0)
+  const shouldProtectEpisode = !isWatchedEpisode(episode)
+  const shouldBlurThumbnail =
+    spoilerSettings.blurEpisodeThumbnails && shouldProtectEpisode
+  const shouldHideTitle =
+    spoilerSettings.removeUnwatchedEpisodeTitles &&
+    shouldProtectEpisode &&
+    Boolean(episode.title)
+  const displayTitle = shouldHideTitle
+    ? fallbackEpisodeTitle(episode)
+    : episode.title ?? episode.fileName
 
   async function openEpisode() {
     try {
@@ -113,7 +146,7 @@ export function EpisodeCard({ episode }: { episode: Episode }) {
       >
         <Card className="rounded-lg border-white/10 bg-zinc-900/75 py-0 transition hover:border-violet-400/40 hover:bg-zinc-900">
           <div className="grid grid-cols-[104px_1fr] overflow-hidden sm:grid-cols-[148px_1fr] lg:grid-cols-[200px_1fr]">
-            <div className="relative bg-zinc-800">
+            <div className="relative overflow-hidden bg-zinc-800">
               {episode.thumbnail ? (
                 <Image
                   src={episode.thumbnail}
@@ -121,7 +154,10 @@ export function EpisodeCard({ episode }: { episode: Episode }) {
                   fill
                   unoptimized
                   sizes="(min-width: 1024px) 185px, (min-width: 640px) 148px, 104px"
-                  className="h-full w-full object-cover opacity-80 transition group-hover:opacity-100"
+                  className={cn(
+                    "h-full w-full object-cover opacity-80 transition group-hover:opacity-100",
+                    shouldBlurThumbnail ? "scale-105 blur-md" : null
+                  )}
                 />
               ) : (
                 <div className="h-full w-full bg-[linear-gradient(135deg,#272333,#121217)]" />
@@ -149,7 +185,7 @@ export function EpisodeCard({ episode }: { episode: Episode }) {
                   {String(episode.episodeNumber).padStart(2, "0")}
                 </Badge>
                 <h3 className="truncate px-2 py-0.5 text-lg font-medium text-zinc-100 lg:text-base">
-                  {episode.title ?? episode.fileName}
+                  {displayTitle}
                 </h3>
                 <p className="inline-flex items-center gap-1 px-2 py-0.5 text-xs text-zinc-500 lg:text-base">
                   <Clock3 className="size-3.5" />

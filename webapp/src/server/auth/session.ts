@@ -1,5 +1,7 @@
 import { createHash, randomBytes } from "node:crypto"
 
+import type { SpoilerSettings } from "@/lib/types"
+
 import { cookies } from "next/headers"
 
 import {
@@ -24,6 +26,7 @@ export type CurrentUser = {
   isAdmin: boolean
   isVip: boolean
   hasPassword: boolean
+  spoilerSettings: SpoilerSettings
 }
 
 export type CurrentUserSession = {
@@ -100,6 +103,7 @@ export async function getCurrentUserSession(): Promise<CurrentUserSession | null
       isAdmin: user.isAdmin,
       isVip: user.isVip,
       hasPassword: Boolean(user.passwordHash),
+      spoilerSettings: user.spoilerSettings,
     },
     sessionTokenHash: tokenHash,
   }

@@ -1,8 +1,9 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useCallback, useEffect, useState } from "react"
 
 import { Button } from "@/components/ui/button"
+import { clientLibraryRefreshEvent } from "@/lib/library-events"
 
 type AniListTrackingState = {
   configured: boolean
@@ -33,24 +34,48 @@ export function AniListTracking({ animeId }: { animeId: number }) {
   const [state, setState] = useState<AniListTrackingState | null>(null)
   const [busy, setBusy] = useState(false)
 
-  useEffect(() => {
-    let cancelled = false
-
-    fetch(`/api/anilist/status?animeId=${animeId}`, {
+  const loadTrackingState = useCallback(async (signal?: AbortSignal) => {
+    const response = await fetch(`/api/anilist/status?animeId=${animeId}`, {
       cache: "no-store",
-    })
-      .then((response) => (response.ok ? response.json() : null))
-      .then((payload: AniListTrackingState | null) => {
-        if (!cancelled && payload) {
-          setState(payload)
-        }
-      })
-      .catch(() => undefined)
+      signal,
+    }).catch(() => null)
 
-    return () => {
-      cancelled = true
+    if (!response?.ok) {
+      return
+    }
+
+    const payload = (await response.json().catch(() => null)) as
+      | AniListTrackingState
+      | null
+
+    if (payload) {
+      setState(payload)
     }
   }, [animeId])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    const timer = window.setTimeout(() => {
+      void loadTrackingState(controller.signal)
+    }, 0)
+
+    return () => {
+      controller.abort()
+      window.clearTimeout(timer)
+    }
+  }, [loadTrackingState])
+
+  useEffect(() => {
+    const onRefresh = () => {
+      void loadTrackingState()
+    }
+
+    window.addEventListener(clientLibraryRefreshEvent, onRefresh)
+
+    return () => {
+      window.removeEventListener(clientLibraryRefreshEvent, onRefresh)
+    }
+  }, [loadTrackingState])
 
   async function track() {
     setBusy(true)
@@ -68,16 +93,7 @@ export function AniListTracking({ animeId }: { animeId: number }) {
       })
 
       if (response.ok) {
-        const refreshed = await fetch(
-          `/api/anilist/status?animeId=${animeId}`,
-          {
-            cache: "no-store",
-          }
-        )
-
-        if (refreshed.ok) {
-          setState((await refreshed.json()) as AniListTrackingState)
-        }
+        await loadTrackingState()
       }
     } finally {
       setBusy(false)

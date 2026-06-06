@@ -3,6 +3,7 @@ import path from "node:path"
 import {
   deleteEpisodeByPath,
   getEpisodeByPath,
+  getLibraryEventTargetForAnime,
   upsertAnime,
   upsertEpisode,
 } from "@/server/db/library"
@@ -18,6 +19,7 @@ import {
   type ProbeResult,
   waitForStableFile,
 } from "@/server/media/mediaFiles"
+import { emitLibraryChange } from "@/server/media/libraryEvents"
 import { isInputImportOutputActive } from "@/server/media/processInputFile"
 import { findAnimeMetadata } from "@/server/metadata/anilist"
 import { errorMessage, fileName, parsePositiveInt } from "@/server/utils/format"
@@ -37,6 +39,18 @@ function debugLibrarySync(message: string) {
 
 function sleep(milliseconds: number) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
+}
+
+function yieldToEventLoop() {
+  return new Promise<void>((resolve) => setImmediate(resolve))
+}
+
+async function runCooperativeSyncStep<T>(work: () => T) {
+  await yieldToEventLoop()
+  const result = work()
+  await yieldToEventLoop()
+
+  return result
 }
 
 function isTemporaryFileAccessError(error: unknown) {
@@ -235,7 +249,9 @@ export async function syncLibraryFile(filePath: string) {
   debugLibrarySync("Library file is stable.")
 
   debugLibrarySync("Checking for existing database episode by file path.")
-  const existingEpisode = getEpisodeByPath(resolvedPath)
+  const existingEpisode = await runCooperativeSyncStep(() =>
+    getEpisodeByPath(resolvedPath)
+  )
 
   if (existingEpisode) {
     console.log(
@@ -277,7 +293,7 @@ export async function syncLibraryFile(filePath: string) {
 
   debugLibrarySync(`AniList metadata lookup completed - Anime id ${metadata.id}.`)
   debugLibrarySync("Saving AniList metadata for library file.")
-  upsertAnime(metadata)
+  await runCooperativeSyncStep(() => upsertAnime(metadata))
   debugLibrarySync("AniList metadata saved for library file.")
   const animeId = metadata.id
   console.log(
@@ -324,14 +340,27 @@ export async function syncLibraryFile(filePath: string) {
   debugLibrarySync(`Thumbnail generated for library file - ${thumbnailPath}`)
 
   debugLibrarySync("Saving library episode row.")
-  upsertEpisode({
-    animeId,
-    seasonNr: parsed.season,
-    epNr: parsed.episode,
-    filePath: resolvedPath,
-    thumbnailPath,
-    durationSeconds,
-  })
+  await runCooperativeSyncStep(() =>
+    upsertEpisode({
+      animeId,
+      seasonNr: parsed.season,
+      epNr: parsed.episode,
+      filePath: resolvedPath,
+      thumbnailPath,
+      durationSeconds,
+    })
+  )
+
+  if (metadata.library) {
+    emitLibraryChange({
+      type: "episode-added",
+      animeId,
+      rootAnimeId: metadata.library.primaryAnimeId,
+      librarySlug: metadata.library.slug,
+      seasonNumber: parsed.season,
+      episodeNumber: parsed.episode,
+    })
+  }
 
   console.log(
     `[Info] [Media] Library episode added to database - Anime id ${animeId}, Season ${parsed.season}, Episode ${parsed.episode}`
@@ -348,12 +377,34 @@ export async function syncLibraryFile(filePath: string) {
 
 export async function removeLibraryFile(filePath: string) {
   const resolvedPath = path.resolve(filePath)
-  const episode = deleteEpisodeByPath(resolvedPath)
+  const existingEpisode = await runCooperativeSyncStep(() =>
+    getEpisodeByPath(resolvedPath)
+  )
+  const eventTarget = existingEpisode
+    ? await runCooperativeSyncStep(() =>
+        getLibraryEventTargetForAnime(existingEpisode.animeId)
+      )
+    : null
+  const episode = await runCooperativeSyncStep(() =>
+    deleteEpisodeByPath(resolvedPath)
+  )
 
   if (episode) {
     console.log(
       `[Info] [Media] Removed deleted library file from database - Anime id ${episode.animeId}, Season ${episode.seasonNumber}, Episode ${episode.episodeNumber}`
     )
+
+    if (eventTarget) {
+      emitLibraryChange({
+        type: "episode-removed",
+        animeId: eventTarget.animeId,
+        rootAnimeId: eventTarget.rootAnimeId,
+        librarySlug: eventTarget.librarySlug,
+        seasonNumber: episode.seasonNumber,
+        episodeNumber: episode.episodeNumber,
+      })
+    }
+
     await removeEpisodeThumbnails(resolvedPath).catch(() => undefined)
   } else {
     console.log(

@@ -83,6 +83,18 @@ function liveTranscodingEnabled() {
   return getServerConfig().transcodeAccel !== "cpu"
 }
 
+function yieldToEventLoop() {
+  return new Promise<void>((resolve) => setImmediate(resolve))
+}
+
+async function runCooperativeSyncStep<T>(work: () => T) {
+  await yieldToEventLoop()
+  const result = work()
+  await yieldToEventLoop()
+
+  return result
+}
+
 function automaticDataSaverSwitchingEnabled() {
   return !getServerConfig().importEnabled
 }
@@ -165,7 +177,9 @@ async function resolveReadableFile(
   seasonNumber: number,
   episodeNumber: number
 ) {
-  const media = resolveEpisodeMedia(animeId, seasonNumber, episodeNumber)
+  const media = await runCooperativeSyncStep(() =>
+    resolveEpisodeMedia(animeId, seasonNumber, episodeNumber)
+  )
 
   if (!media) {
     return null
@@ -215,7 +229,9 @@ async function resolveStreamUser(input: {
         ok: true as const,
         username: castAuth.username,
         displayUsername: `${castAuth.username} (cast)`,
-        isVip: getUser(castAuth.username)?.isVip ?? false,
+        isVip:
+          (await runCooperativeSyncStep(() => getUser(castAuth.username)))?.isVip ??
+          false,
       }
     }
   }
@@ -1064,18 +1080,23 @@ export async function GET(request: Request, context: StreamContext) {
     defaultDirectAudioStreamIndex: undefined,
   }
 
-  try {
-    const metadata = getMediaStreamMetadata(
-      (await ffprobe(resolved.file)) as ProbeResult
-    )
-    audioSelection = resolveAudioSelection({
-      metadata,
-      requestedAudioStreamIndex,
-    })
-  } catch (error) {
-    console.warn(
-      `[Warn] [Stream] Unable to inspect audio streams, using first audio stream - stream/route.ts - ${resolved.file} - ${errorMessage(error)}`
-    )
+  const shouldInspectStreams =
+    mode === "transcode" || typeof requestedAudioStreamIndex === "number"
+
+  if (shouldInspectStreams) {
+    try {
+      const metadata = getMediaStreamMetadata(
+        (await ffprobe(resolved.file)) as ProbeResult
+      )
+      audioSelection = resolveAudioSelection({
+        metadata,
+        requestedAudioStreamIndex,
+      })
+    } catch (error) {
+      console.warn(
+        `[Warn] [Stream] Unable to inspect audio streams, using first audio stream - stream/route.ts - ${resolved.file} - ${errorMessage(error)}`
+      )
+    }
   }
 
   const sourceBitrateKbps = calculateSourceBitrateKbps(resolved)

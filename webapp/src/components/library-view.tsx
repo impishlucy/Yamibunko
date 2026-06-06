@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import { Search } from "lucide-react"
 
 import { AnimeCard } from "@/components/anime-card"
@@ -8,6 +8,11 @@ import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import { apiGet } from "@/lib/api"
+import {
+  clientLibraryRefreshEvent,
+  libraryEventsPath,
+  type LibraryChangeEvent,
+} from "@/lib/library-events"
 import type { AnimeSummary } from "@/lib/types"
 
 function AnimeCardSkeleton({ index }: { index: number }) {
@@ -36,19 +41,81 @@ export function LibraryView() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  useEffect(() => {
-    apiGet<AnimeSummary[]>("/api/anime/library")
-      .then((library) => {
-        setItems(library)
-        setError(null)
-      })
-      .catch(() => {
-        setError("Library unavailable")
-      })
-      .finally(() => {
+  const loadLibrary = useCallback(async (showLoading = false) => {
+    if (showLoading) {
+      setLoading(true)
+    }
+
+    try {
+      const library = await apiGet<AnimeSummary[]>("/api/anime/library")
+      setItems(library)
+      setError(null)
+    } catch {
+      setError("Library unavailable")
+    } finally {
+      if (showLoading) {
         setLoading(false)
-      })
+      }
+    }
   }, [])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void loadLibrary(true)
+    }, 0)
+
+    return () => window.clearTimeout(timer)
+  }, [loadLibrary])
+
+  useEffect(() => {
+    let refreshTimer: number | null = null
+
+    const scheduleRefresh = () => {
+      if (refreshTimer !== null) {
+        return
+      }
+
+      refreshTimer = window.setTimeout(() => {
+        refreshTimer = null
+        void loadLibrary()
+      }, 250)
+    }
+
+    const onLibraryChange = (event: Event) => {
+      const message = event as MessageEvent<string>
+      let payload: LibraryChangeEvent
+
+      try {
+        payload = JSON.parse(message.data) as LibraryChangeEvent
+      } catch {
+        return
+      }
+
+      if (!payload.type) {
+        return
+      }
+
+      scheduleRefresh()
+    }
+
+    const onClientRefresh = () => {
+      scheduleRefresh()
+    }
+
+    const source = new EventSource(libraryEventsPath)
+    source.addEventListener("library-change", onLibraryChange)
+    window.addEventListener(clientLibraryRefreshEvent, onClientRefresh)
+
+    return () => {
+      source.removeEventListener("library-change", onLibraryChange)
+      source.close()
+      window.removeEventListener(clientLibraryRefreshEvent, onClientRefresh)
+
+      if (refreshTimer !== null) {
+        window.clearTimeout(refreshTimer)
+      }
+    }
+  }, [loadLibrary])
 
   const filteredItems = useMemo(() => {
     const normalized = query.trim().toLowerCase()

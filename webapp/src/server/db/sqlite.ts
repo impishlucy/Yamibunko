@@ -18,7 +18,7 @@ type YamibunkoDatabase = DatabaseSync & {
 
 let database: YamibunkoDatabase | undefined
 
-const currentSchemaVersion = 9
+const currentSchemaVersion = 11
 
 function getDatabasePath() {
   return path.join(
@@ -83,6 +83,8 @@ function initializeSchema(db: YamibunkoDatabase) {
       is_admin INTEGER NOT NULL DEFAULT 0,
       is_vip INTEGER NOT NULL DEFAULT 0,
       anilist_refresh_pressed_at TEXT,
+      blur_episode_thumbnails INTEGER NOT NULL DEFAULT 0,
+      remove_unwatched_episode_titles INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -674,6 +676,32 @@ function runSchemaMigrations(db: YamibunkoDatabase) {
         CREATE INDEX IF NOT EXISTS sessions_expires_at_idx ON sessions(expires_at);
       `)
     }
+  }
+
+  if (version < 10) {
+    ensureColumn(
+      db,
+      "users",
+      "blur_episode_thumbnails",
+      "blur_episode_thumbnails INTEGER NOT NULL DEFAULT 0"
+    )
+    ensureColumn(
+      db,
+      "users",
+      "remove_unwatched_episode_titles",
+      "remove_unwatched_episode_titles INTEGER NOT NULL DEFAULT 0"
+    )
+  }
+
+  if (version === 10) {
+    db.query(
+      `
+      UPDATE users
+      SET blur_episode_thumbnails = 0,
+          updated_at = ?
+      WHERE blur_episode_thumbnails = 1
+    `
+    ).run(nowIso())
   }
 
   setUserVersion(db, currentSchemaVersion)

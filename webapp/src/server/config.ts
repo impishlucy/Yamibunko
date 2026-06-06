@@ -3,7 +3,7 @@ import path from "node:path"
 
 import { z } from "zod"
 
-import type { SafeSettings } from "@/lib/types"
+import { defaultSpoilerSettings, type SafeSettings } from "@/lib/types"
 import { normalizeBaseUrl } from "@/server/http/baseUrl"
 
 export type TranscodeAcceleration = "nvenc" | "qsv" | "amd" | "cpu"
@@ -148,13 +148,15 @@ export function getServerConfig(): ServerConfig {
   return result.config
 }
 
-export function getSafeServerSettings(
-  account: SafeSettings["account"] = {
-    userName: "Unknown",
-    isAdmin: false,
-  }
-): SafeSettings {
+export function getSafeServerSettings(input: {
+  account?: SafeSettings["account"]
+  spoilers?: SafeSettings["spoilers"]
+} = {}): SafeSettings {
   return {
-    account,
+    account: input.account ?? {
+      userName: "Unknown",
+      isAdmin: false,
+    },
+    spoilers: input.spoilers ?? defaultSpoilerSettings,
   }
 }

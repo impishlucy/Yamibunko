@@ -45,6 +45,31 @@ export type AnimeInfo = AnimeSummary & {
   variants?: AnimeVariant[]
 }
 
+export type AnimeLibraryEntry = {
+  slug: string
+  title: string
+  variants: AnimeVariant[]
+  selected: AnimeInfo & {
+    variants: AnimeVariant[]
+  }
+}
+
+export type SpoilerSettings = {
+  blurEpisodeThumbnails: boolean
+  removeUnwatchedEpisodeTitles: boolean
+}
+
+export const defaultSpoilerSettings: SpoilerSettings = {
+  blurEpisodeThumbnails: false,
+  removeUnwatchedEpisodeTitles: false,
+}
+
+export type AnimeDetailPayload = {
+  libraryEntry: AnimeLibraryEntry
+  episodes: Episode[]
+  spoilers: SpoilerSettings
+}
+
 export type Episode = {
   animeId: number
   seasonNumber: number
@@ -124,4 +149,5 @@ export type SafeSettings = {
     userName: string
     isAdmin: boolean
   }
+  spoilers: SpoilerSettings
 }

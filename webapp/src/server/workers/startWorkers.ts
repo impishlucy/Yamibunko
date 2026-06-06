@@ -10,11 +10,15 @@ import { isMediaFile, pathExists } from "@/server/media/mediaFiles"
 import {
   isInputImportOutputActive,
   processInputFile,
+  type DeferredInputWork,
+  type QueueInputFileMove,
+  type QueuedInputFileMove,
 } from "@/server/media/processInputFile"
 import {
   removeLibraryFile,
   syncLibraryFile,
 } from "@/server/media/syncLibraryFile"
+import { registerMediaImportProcessingItem } from "@/server/media/importProcessingStatus"
 import { cancelPendingLiveTranscodes } from "@/server/transcode/transcodeCapacity"
 import { errorMessage, fileName } from "@/server/utils/format"
 import { debugLog } from "@/server/utils/debugLog"
@@ -31,6 +35,14 @@ type QueuedWorkStart = {
   kind: WorkKind
   resolvedPath: string
   key: string
+}
+
+type QueuedLibraryFileMoveWork = {
+  id: number
+  move: QueuedInputFileMove
+  startMove: () => Promise<void>
+  resolve: () => void
+  reject: (error: unknown) => void
 }
 type WorkerGlobalState = typeof globalThis & {
   __yamibunkoWorkerRuntime?: WorkerRuntime
@@ -57,9 +69,10 @@ function formatWorkResultEpisode(result: WorkResultEpisode | null) {
 const scanIntervalMs = 5 * 60 * 1000
 const maxActiveWorkByKind: Record<WorkKind, number> = {
   input: 2,
-  "library-sync": 2,
+  "library-sync": 1,
   "library-delete": 1,
 }
+const maxActiveLibraryFileMoveWork = 3
 
 function msUntilNextDailyAniListSync() {
   const now = new Date()
@@ -107,7 +120,11 @@ async function walkFiles(
   const entries = await readdir(directory, { withFileTypes: true })
   const files: string[] = []
 
-  for (const entry of entries) {
+  for (const [index, entry] of entries.entries()) {
+    if (index > 0 && index % 50 === 0) {
+      await yieldToEventLoop()
+    }
+
     const entryPath = path.join(directory, entry.name)
 
     if (entry.isDirectory()) {
@@ -147,6 +164,7 @@ export function startWorkers() {
   )
   const queuedWork = new Set<string>()
   const pendingWorkStarts: QueuedWorkStart[] = []
+  const pendingLibraryFileMoveWork: QueuedLibraryFileMoveWork[] = []
   const activeWork = new Set<Promise<void>>()
   const activeWorkByKind: Record<WorkKind, number> = {
     input: 0,
@@ -158,6 +176,9 @@ export function startWorkers() {
   let dailyAniListTimer: NodeJS.Timeout | undefined
   let dailyAniListSyncRunning = false
   let workStartScheduled = false
+  let libraryFileMoveStartScheduled = false
+  let activeLibraryFileMoveWork = 0
+  let nextLibraryFileMoveId = 1
   const transcodeWaitShutdown = new AbortController()
 
   const inputWatcher = chokidar.watch(config.inputDir, {
@@ -230,6 +251,152 @@ export function startWorkers() {
     })
   }
 
+  function startImmediateBackgroundInputWork(
+    key: string,
+    startWork: () => Promise<void>,
+    deferredInfo: DeferredInputWork
+  ) {
+    const resolvedPath = path.resolve(deferredInfo.filePath)
+    const processingHandle = deferredInfo.processing
+      ? registerMediaImportProcessingItem(deferredInfo.processing)
+      : null
+    const work = new Promise<void>((resolve) => {
+      setImmediate(resolve)
+    }).then(async () => {
+      try {
+        await yieldToEventLoop()
+        processingHandle?.start()
+        console.log(
+          `[Info] [Workers] Started background input work - ${deferredInfo.kind} - ${fileName(resolvedPath)}`
+        )
+        await startWork()
+        console.log(
+          `[Info] [Workers] Completed background input work - ${deferredInfo.kind} - ${fileName(resolvedPath)}`
+        )
+      } catch (error) {
+        console.error(
+          `[Error] [Workers] Background input work failed - startWorkers.ts - ${deferredInfo.kind} - ${resolvedPath} - ${errorMessage(error)}`
+        )
+      } finally {
+        processingHandle?.finish()
+        queuedWork.delete(key)
+        scheduleQueuedWorkStart()
+      }
+    })
+
+    debugWorkers(
+      `Started background input work - ${key} - ${deferredInfo.kind} - Planned ${deferredInfo.planned}`
+    )
+    trackActiveWork(work, `${key}:background-${deferredInfo.kind}`)
+  }
+
+  function formatQueuedFileMoveKind(kind: QueuedInputFileMove["kind"]) {
+    switch (kind) {
+      case "direct-import":
+        return "direct import move"
+      case "transcode-output":
+        return "transcoded output move"
+      case "library-relocation":
+        return "library relocation move"
+    }
+  }
+
+  function startQueuedLibraryFileMove(item: QueuedLibraryFileMoveWork) {
+    activeLibraryFileMoveWork += 1
+
+    const moveLabel = formatQueuedFileMoveKind(item.move.kind)
+    const work = new Promise<void>((resolve) => {
+      setImmediate(resolve)
+    }).then(async () => {
+      try {
+        await yieldToEventLoop()
+        console.log(
+          `[Info] [Workers] Started queued ${moveLabel} - ${fileName(item.move.sourcePath)} -> ${fileName(item.move.destinationPath)}`
+        )
+        await item.startMove()
+        console.log(
+          `[Info] [Workers] Completed queued ${moveLabel} - ${fileName(item.move.destinationPath)}`
+        )
+        item.resolve()
+      } catch (error) {
+        console.error(
+          `[Error] [Workers] Queued ${moveLabel} failed - startWorkers.ts - ${item.move.sourcePath} -> ${item.move.destinationPath} - ${errorMessage(error)}`
+        )
+        item.reject(error)
+      } finally {
+        activeLibraryFileMoveWork = Math.max(activeLibraryFileMoveWork - 1, 0)
+        scheduleLibraryFileMoveStart()
+      }
+    })
+
+    debugWorkers(
+      `Started queued ${moveLabel} #${item.id} - Active ${activeLibraryFileMoveWork}/${maxActiveLibraryFileMoveWork}`
+    )
+    trackActiveWork(work, `library-file-move:${item.id}`)
+  }
+
+  function scheduleLibraryFileMoveStart() {
+    if (libraryFileMoveStartScheduled) {
+      return
+    }
+
+    libraryFileMoveStartScheduled = true
+    setImmediate(() => {
+      libraryFileMoveStartScheduled = false
+
+      while (
+        activeLibraryFileMoveWork < maxActiveLibraryFileMoveWork &&
+        pendingLibraryFileMoveWork.length > 0
+      ) {
+        const item = pendingLibraryFileMoveWork.shift()
+
+        if (!item) {
+          continue
+        }
+
+        startQueuedLibraryFileMove(item)
+      }
+
+      if (
+        activeLibraryFileMoveWork < maxActiveLibraryFileMoveWork &&
+        pendingLibraryFileMoveWork.length > 0
+      ) {
+        scheduleLibraryFileMoveStart()
+      }
+    })
+  }
+
+  const queueLibraryFileMove: QueueInputFileMove = (startMove, move) =>
+    new Promise<void>((resolve, reject) => {
+      const id = nextLibraryFileMoveId
+      nextLibraryFileMoveId += 1
+
+      pendingLibraryFileMoveWork.push({
+        id,
+        move,
+        startMove,
+        resolve,
+        reject,
+      })
+
+      const moveLabel = formatQueuedFileMoveKind(move.kind)
+      console.log(
+        `[Info] [Workers] Queued ${moveLabel} - ${fileName(move.sourcePath)} -> ${fileName(move.destinationPath)} - ${pendingLibraryFileMoveWork.length} waiting, ${activeLibraryFileMoveWork}/${maxActiveLibraryFileMoveWork} active`
+      )
+      debugWorkers(
+        `Queued ${moveLabel} #${id} - Source ${move.sourcePath}, Destination ${move.destinationPath}`
+      )
+      scheduleLibraryFileMoveStart()
+    })
+
+  function startBackgroundInputWork(
+    key: string,
+    startWork: () => Promise<void>,
+    deferredInfo: DeferredInputWork
+  ) {
+    startImmediateBackgroundInputWork(key, startWork, deferredInfo)
+  }
+
   function canStartWork(kind: WorkKind) {
     return activeWorkByKind[kind] < maxActiveWorkByKind[kind]
   }
@@ -288,16 +455,10 @@ export function startWorkers() {
             transcodeWaitSignal: transcodeWaitShutdown.signal,
             deferVideoTranscodes: true,
             deferAudioTranscodes: true,
-            deferDirectMoves: true,
-            onDeferredWork: (deferredWork, deferredInfo) => {
+            queueFileMove: queueLibraryFileMove,
+            onDeferredWork: (startDeferredWork, deferredInfo) => {
               deferredWorkRegistered = true
-              const trackedDeferredWork = deferredWork.finally(() => {
-                queuedWork.delete(key)
-                debugWorkers(
-                  `Deferred input processing completed - ${key} - ${deferredInfo.kind}`
-                )
-              })
-              trackActiveWork(trackedDeferredWork, `${key}:deferred-${deferredInfo.kind}`)
+              startBackgroundInputWork(key, startDeferredWork, deferredInfo)
             },
           })
 
@@ -609,6 +770,13 @@ export function startWorkers() {
     }
     if (cancelled.length > 0) {
       debugWorkers(`Cancelled ${cancelled.length} queued work item(s) before shutdown.`)
+    }
+
+    if (pendingLibraryFileMoveWork.length > 0) {
+      debugWorkers(
+        `Waiting for ${pendingLibraryFileMoveWork.length} queued library file move item(s) during shutdown.`
+      )
+      scheduleLibraryFileMoveStart()
     }
 
     await beginStreamServerShutdown()

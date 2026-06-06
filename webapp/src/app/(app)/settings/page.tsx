@@ -7,8 +7,11 @@ import { requireCurrentUser } from "@/server/auth/session"
 export default async function SettingsPage() {
   const user = await requireCurrentUser()
   const settings = getSafeServerSettings({
-    userName: user?.username ?? "Unknown",
-    isAdmin: user?.isAdmin ?? false,
+    account: {
+      userName: user?.username ?? "Unknown",
+      isAdmin: user?.isAdmin ?? false,
+    },
+    spoilers: user?.spoilerSettings,
   })
 
   return (

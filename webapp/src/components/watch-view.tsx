@@ -5,7 +5,6 @@ import { useRouter } from "next/navigation"
 
 import { AnimePlayer } from "@/components/anime-player"
 import { StreamLimitDialog } from "@/components/stream-limit-dialog"
-import { Badge } from "@/components/ui/badge"
 import { Skeleton } from "@/components/ui/skeleton"
 import { apiGet } from "@/lib/api"
 import { DEFAULT_PLAYER_ASPECT_RATIO, getPreferredPlayerAspectRatio } from "@/lib/player-aspect-ratio"

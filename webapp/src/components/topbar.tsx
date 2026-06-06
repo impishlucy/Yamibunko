@@ -2,12 +2,20 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import Link from "next/link"
-import { Gauge, Info, LogOut, RefreshCw, Settings, Snail, UserRound } from "lucide-react"
+import { usePathname } from "next/navigation"
+import { Gauge, Info, LogOut, PackagePlus, RefreshCw, Settings, Snail, UserRound } from "lucide-react"
 import { SiAnilist } from "@icons-pack/react-simple-icons"
 
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { Button } from "@/components/ui/button"
 import { HoverHint } from "@/components/ui/hover-hint"
+import {
+  importProcessingEventsPath,
+  importProcessingStatusPath,
+  type MediaImportProcessingItem,
+  type MediaImportProcessingState,
+} from "@/lib/import-processing"
+import { clientLibraryRefreshEvent } from "@/lib/library-events"
 import { cn } from "@/lib/utils"
 import type { CurrentUser } from "@/server/auth/session"
 
@@ -79,7 +87,38 @@ function cooldownLabel(seconds: number) {
   return `${minutes}:${remainingSeconds.toString().padStart(2, "0")}`
 }
 
+function parseProcessingStateEvent(event: Event) {
+  const message = event as MessageEvent<string>
+
+  try {
+    return JSON.parse(message.data) as MediaImportProcessingState
+  } catch {
+    return null
+  }
+}
+
+function formatProcessingItemLabel(item: MediaImportProcessingItem) {
+  return item.subtitle
+    ? `Adding Episodes to ${item.animeTitle}: ${item.subtitle}`
+    : `Adding Episodes to ${item.animeTitle}`
+}
+
+function formatProcessingItemMeta(item: MediaImportProcessingItem) {
+  const episode = `S${String(item.seasonNumber).padStart(2, "0")} E${String(item.episodeNumber).padStart(2, "0")}`
+
+  if (item.kind === "direct-move") {
+    return `${episode} · moving`
+  }
+
+  if (item.kind === "audio-transcode") {
+    return `${episode} · audio transcode`
+  }
+
+  return `${episode} · video transcode`
+}
+
 export function Topbar({ user }: { user: CurrentUser }) {
+  const pathname = usePathname()
   const [open, setOpen] = useState(false)
   const [refreshDialogOpen, setRefreshDialogOpen] = useState(false)
   const [refreshState, setRefreshState] = useState<AniListRefreshState | null>(
@@ -88,10 +127,14 @@ export function Topbar({ user }: { user: CurrentUser }) {
   const [refreshing, setRefreshing] = useState(false)
   const [refreshMessage, setRefreshMessage] = useState<string | null>(null)
   const [bandwidthSnapshot, setBandwidthSnapshot] = useState<BandwidthSnapshot | null>(null)
+  const [processingState, setProcessingState] = useState<MediaImportProcessingState | null>(null)
+  const [processingDialogOpen, setProcessingDialogOpen] = useState(false)
   const [bandwidthDialogOpen, setBandwidthDialogOpen] = useState(false)
   const [bandwidthLimitUpdating, setBandwidthLimitUpdating] = useState(false)
   const refreshButtonRef = useRef<HTMLButtonElement | null>(null)
   const refreshDialogRef = useRef<HTMLDivElement | null>(null)
+  const processingButtonRef = useRef<HTMLButtonElement | null>(null)
+  const processingDialogRef = useRef<HTMLDivElement | null>(null)
   const bandwidthButtonRef = useRef<HTMLButtonElement | null>(null)
   const bandwidthDialogRef = useRef<HTMLDivElement | null>(null)
   const profileButtonRef = useRef<HTMLButtonElement | null>(null)
@@ -150,6 +193,12 @@ export function Topbar({ user }: { user: CurrentUser }) {
   const bandwidthLimitButtonLabel = temporaryUploadLimitActive
     ? "Click to remove limit"
     : "Click to apply temporary limit"
+  const processingCount = processingState?.count ?? 0
+  const processingItems = processingState?.items ?? []
+  const processingLabel =
+    processingCount === 1
+      ? "Adding 1 new episode"
+      : `Adding ${processingCount} new episodes`
 
   const loadRefreshState = useCallback(async () => {
     const response = await fetch("/api/anilist/refresh", {
@@ -186,6 +235,24 @@ export function Topbar({ user }: { user: CurrentUser }) {
     }
   }, [user.isAdmin])
 
+  const loadProcessingState = useCallback(async () => {
+    const response = await fetch(importProcessingStatusPath, {
+      cache: "no-store",
+    }).catch(() => null)
+
+    if (!response?.ok) {
+      return
+    }
+
+    const payload = (await response.json().catch(() => null)) as
+      | MediaImportProcessingState
+      | null
+
+    if (payload) {
+      setProcessingState(payload)
+    }
+  }, [])
+
   useEffect(() => {
     const timer = window.setTimeout(() => {
       void loadRefreshState()
@@ -193,6 +260,34 @@ export function Topbar({ user }: { user: CurrentUser }) {
 
     return () => window.clearTimeout(timer)
   }, [loadRefreshState])
+
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void loadProcessingState()
+    }, 0)
+
+    return () => window.clearTimeout(timer)
+  }, [loadProcessingState])
+
+  useEffect(() => {
+    const source = new EventSource(importProcessingEventsPath)
+
+    const onProcessingState = (event: Event) => {
+      const payload = parseProcessingStateEvent(event)
+
+      if (payload) {
+        setProcessingState(payload)
+      }
+    }
+
+    source.addEventListener("processing-state", onProcessingState)
+
+    return () => {
+      source.removeEventListener("processing-state", onProcessingState)
+      source.close()
+    }
+  }, [])
 
   useEffect(() => {
     if (!user.isAdmin) {
@@ -273,6 +368,34 @@ export function Topbar({ user }: { user: CurrentUser }) {
 
     return () => document.removeEventListener("pointerdown", onPointerDown)
   }, [refreshDialogOpen])
+
+  useEffect(() => {
+    if (!processingDialogOpen) {
+      return
+    }
+
+    function onPointerDown(event: PointerEvent) {
+      const target = event.target
+
+      if (!(target instanceof Node)) {
+        return
+      }
+
+      if (processingDialogRef.current?.contains(target)) {
+        return
+      }
+
+      if (processingButtonRef.current?.contains(target)) {
+        return
+      }
+
+      setProcessingDialogOpen(false)
+    }
+
+    document.addEventListener("pointerdown", onPointerDown)
+
+    return () => document.removeEventListener("pointerdown", onPointerDown)
+  }, [processingDialogOpen])
 
   useEffect(() => {
     if (!bandwidthDialogOpen) {
@@ -373,6 +496,14 @@ export function Topbar({ user }: { user: CurrentUser }) {
 
       setRefreshMessage("AniList refresh completed.")
       setRefreshDialogOpen(false)
+
+      if (pathname === "/library" || pathname.startsWith("/anime/")) {
+        window.dispatchEvent(
+          new CustomEvent(clientLibraryRefreshEvent, {
+            detail: { action },
+          })
+        )
+      }
     } finally {
       setRefreshing(false)
     }
@@ -425,6 +556,55 @@ export function Topbar({ user }: { user: CurrentUser }) {
         </Link>
 
         <div className="relative flex items-center gap-2">
+          {processingCount > 0 ? (
+            <div
+              className="relative"
+              onMouseEnter={() => setProcessingDialogOpen(true)}
+              onMouseLeave={() => setProcessingDialogOpen(false)}
+            >
+              <button
+                ref={processingButtonRef}
+                type="button"
+                aria-label={processingLabel}
+                className="inline-flex h-9 items-center gap-1.5 rounded-full border border-cyan-300/30 bg-cyan-500/15 px-3 text-xs font-medium text-cyan-100 shadow-sm transition hover:border-cyan-300/45 hover:bg-cyan-500/20 focus-visible:ring-2 focus-visible:ring-white/30 focus-visible:outline-none"
+                onClick={() => setProcessingDialogOpen((value) => !value)}
+                onFocus={() => setProcessingDialogOpen(true)}
+              >
+                <PackagePlus className="size-4" aria-hidden="true" />
+                <span>{processingLabel}</span>
+              </button>
+
+              {processingDialogOpen ? (
+                <div
+                  ref={processingDialogRef}
+                  className="fixed top-16 right-3 left-3 z-50 max-h-[min(22rem,calc(100vh-5rem))] overflow-y-auto rounded-xl border border-white/10 bg-zinc-950 p-3 shadow-2xl shadow-black/50 sm:absolute sm:top-full sm:right-0 sm:left-auto sm:mt-2 sm:w-[min(24rem,calc(100vw-2rem))]"
+                >
+                  <h2 className="text-sm font-semibold text-zinc-100">
+                    {processingLabel}
+                  </h2>
+                  <div className="mt-2 space-y-2">
+                    {processingItems.map((item) => (
+                      <div
+                        key={item.id}
+                        className="rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2"
+                      >
+                        <p className="text-sm font-medium text-zinc-100">
+                          {formatProcessingItemLabel(item)}
+                        </p>
+                        <p className="mt-1 text-xs text-zinc-400">
+                          {formatProcessingItemMeta(item)}
+                        </p>
+                        <p className="mt-1 truncate text-xs text-zinc-500">
+                          {item.fileName}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
           {user.isAdmin ? (
             <div className="relative">
               <button

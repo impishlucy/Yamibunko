@@ -16,6 +16,7 @@ import {
   upsertAnime,
   upsertEpisode,
 } from "@/server/db/library"
+import { getAnimeTitleSuffix } from "@/lib/anime-title"
 import { createJob, updateJob } from "@/server/db/jobs"
 import { getServerConfig } from "@/server/config"
 import {
@@ -40,6 +41,7 @@ import {
   type ProbeResult,
   waitForStableFile,
 } from "@/server/media/mediaFiles"
+import { emitLibraryChange } from "@/server/media/libraryEvents"
 import { findAnimeMetadata } from "@/server/metadata/anilist"
 import {
   acquireAudioTranscode,
@@ -68,19 +70,51 @@ export type DeferredInputWorkKind =
   | "audio-transcode"
   | "direct-move"
   | "existing-output"
+  | "catalog-only"
+
+export type DeferredInputProcessingInfo = {
+  id: string
+  kind: "direct-move" | "video-transcode" | "audio-transcode"
+  animeTitle: string
+  subtitle?: string | null
+  seasonNumber: number
+  episodeNumber: number
+  fileName: string
+}
 
 export type DeferredInputWork = {
   kind: DeferredInputWorkKind
   filePath: string
   planned: boolean
+  processing?: DeferredInputProcessingInfo
 }
+
+export type QueuedInputFileMoveKind =
+  | "direct-import"
+  | "transcode-output"
+  | "library-relocation"
+
+export type QueuedInputFileMove = {
+  kind: QueuedInputFileMoveKind
+  sourcePath: string
+  destinationPath: string
+  jobId?: string
+}
+
+export type QueueInputFileMove = (
+  startMove: () => Promise<void>,
+  move: QueuedInputFileMove
+) => Promise<void>
 
 export type ProcessInputFileOptions = {
   transcodeWaitSignal?: AbortSignal
   deferVideoTranscodes?: boolean
   deferAudioTranscodes?: boolean
-  deferDirectMoves?: boolean
-  onDeferredWork?: (work: Promise<void>, deferredWork: DeferredInputWork) => void
+  queueFileMove: QueueInputFileMove
+  onDeferredWork?: (
+    startWork: () => Promise<void>,
+    deferredWork: DeferredInputWork
+  ) => void
 }
 
 function debugImport(jobId: string, message: string) {
@@ -90,6 +124,36 @@ function debugImport(jobId: string, message: string) {
 function debugError(jobId: string, message: string, error: unknown) {
   const details = error instanceof Error && error.stack ? error.stack : errorMessage(error)
   console.error(`[Error] [MediaImport:${jobId}] ${message} - ${details}`)
+}
+
+function isSeriesFormat(format?: string | null) {
+  return !format || format === "TV" || format === "TV_SHORT" || format === "ONA"
+}
+
+function seasonLabel(seasonNumber: number) {
+  return `Season ${String(seasonNumber).padStart(2, "0")}`
+}
+
+function getImportProcessingSubtitle(input: {
+  format?: string | null
+  libraryTitle: string
+  mediaTitle: string
+  seasonNumber: number
+}) {
+  const suffix = getAnimeTitleSuffix({
+    libraryTitle: input.libraryTitle,
+    mediaTitle: input.mediaTitle,
+  })
+
+  if (suffix) {
+    return suffix
+  }
+
+  if (isSeriesFormat(input.format) && input.seasonNumber > 1) {
+    return seasonLabel(input.seasonNumber)
+  }
+
+  return null
 }
 
 function normalizeActiveOutputPath(filePath: string) {
@@ -143,6 +207,10 @@ function formatDeferredWorkKind(kind: DeferredInputWorkKind) {
 
   if (kind === "existing-output") {
     return "existing output finalization"
+  }
+
+  if (kind === "catalog-only") {
+    return "catalog-only library registration"
   }
 
   return "direct library move"
@@ -395,6 +463,18 @@ async function uniqueDestinationPath(destination: string) {
 
 function sleep(milliseconds: number) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
+}
+
+function yieldToEventLoop() {
+  return new Promise<void>((resolve) => setImmediate(resolve))
+}
+
+async function runCooperativeSyncStep<T>(work: () => T) {
+  await yieldToEventLoop()
+  const result = work()
+  await yieldToEventLoop()
+
+  return result
 }
 
 function isInsideInputDirectory(inputDir: string, current: string) {
@@ -667,7 +747,7 @@ async function transcodeFile(
 
 export async function processInputFile(
   filePath: string,
-  options: ProcessInputFileOptions = {}
+  options: ProcessInputFileOptions
 ): Promise<ProcessInputFileResult> {
   const jobId = createJob(filePath)
   const config = getServerConfig()
@@ -832,37 +912,42 @@ export async function processInputFile(
       }
     }
 
-    debugImport(jobId, `AniList metadata lookup completed - Anime id ${metadata.id}.`)
+    const inputParsed: NonNullable<ReturnType<typeof parseAnimeFileName>> = parsed
+    const inputMetadata: NonNullable<Awaited<ReturnType<typeof findAnimeMetadata>>> = metadata
+
+    debugImport(jobId, `AniList metadata lookup completed - Anime id ${inputMetadata.id}.`)
     debugImport(jobId, "Saving AniList metadata before media processing.")
-    upsertAnime(metadata)
+    await runCooperativeSyncStep(() => upsertAnime(inputMetadata))
     debugImport(jobId, "AniList metadata saved.")
 
-    const librarySeason = resolveLibrarySeasonNumberForAnime({
-      animeId: metadata.id,
-      parsedSeason: parsed.season,
-      parsedPart: parsed.part,
-    })
+    const librarySeason = await runCooperativeSyncStep(() =>
+      resolveLibrarySeasonNumberForAnime({
+        animeId: inputMetadata.id,
+        parsedSeason: inputParsed.season,
+        parsedPart: inputParsed.part,
+      })
+    )
 
-    if (librarySeason !== parsed.season) {
+    if (librarySeason !== inputParsed.season) {
       console.log(
-        `[Info] [Media] Resolved library season - Parsed Season ${parsed.season}, Library Season ${librarySeason}, Anime id ${metadata.id}`
+        `[Info] [Media] Resolved library season - Parsed Season ${inputParsed.season}, Library Season ${librarySeason}, Anime id ${inputMetadata.id}`
       )
       debugImport(
         jobId,
-        `Library season resolved from parsed season ${parsed.season} to ${librarySeason}.`
+        `Library season resolved from parsed season ${inputParsed.season} to ${librarySeason}.`
       )
     }
 
     console.log(
       `[Info] [Media] Resolved AniList metadata - Found match ${
-        metadata.title.english ??
-        parsed.title
-      } - id ${metadata.id}`
+        inputMetadata.title.english ??
+        inputParsed.title
+      } - id ${inputMetadata.id}`
     )
 
     updateJob(jobId, {
-      animeId: metadata.id,
-      epNr: parsed.episode,
+      animeId: inputMetadata.id,
+      epNr: inputParsed.episode,
       message: "Inspecting media streams.",
     })
 
@@ -930,18 +1015,140 @@ export async function processInputFile(
     const durationSeconds = parseDurationSeconds(probe)
     debugImport(jobId, `Parsed duration - ${durationSeconds}s.`)
 
-    const mediaTitle = metadataTitle(metadata)
-    const libraryTitle = metadata.library?.title
+    const mediaTitle = metadataTitle(inputMetadata)
+    const resolvedLibrary = inputMetadata.library
 
-    if (!libraryTitle) {
-      throw new Error(`AniList media ${metadata.id} did not resolve a library root`)
+    if (!resolvedLibrary?.title) {
+      throw new Error(`AniList media ${inputMetadata.id} did not resolve a library root`)
+    }
+
+    const library = resolvedLibrary
+    const libraryTitle = library.title
+
+    function emitEpisodeAdded() {
+      emitLibraryChange({
+        type: "episode-added",
+        animeId: inputMetadata.id,
+        rootAnimeId: library.primaryAnimeId,
+        librarySlug: library.slug,
+        seasonNumber: librarySeason,
+        episodeNumber: inputParsed.episode,
+      })
+    }
+
+    async function runDeferredImportWork(input: {
+      kind: DeferredInputWorkKind
+      outputPath: string
+      work: () => Promise<ProcessInputFileResult>
+    }) {
+      const label = formatDeferredWorkKind(input.kind)
+
+      try {
+        await runWithActiveInputImportOutput(input.outputPath, async () => {
+          await yieldToEventLoop()
+          return input.work()
+        })
+      } catch (error) {
+        const message = errorMessage(error) || "Unknown media processing error"
+
+        if (
+          isTranscodeWaitCancellation(error) &&
+          options.transcodeWaitSignal?.aborted
+        ) {
+          const shutdownMessage = `Skipped queued ${label} because shutdown started.`
+
+          console.warn(
+            `[Warn] [Media] Queued ${label} cancelled during shutdown - processInputFile.ts - ${filePath}`
+          )
+          debugImport(jobId, shutdownMessage)
+          updateJob(jobId, {
+            status: "skipped",
+            message: shutdownMessage,
+            finishedAt: new Date().toISOString(),
+          })
+          return
+        }
+
+        if (!importEnabled) {
+          const failureMessage = `${message}; input file was left untouched because import processing is disabled.`
+
+          console.error(
+            `[Error] [Media] Deferred ${label} failed - processInputFile.ts - ${filePath} - ${failureMessage}`
+          )
+          debugError(jobId, `Deferred ${label} failed`, error)
+
+          updateJob(jobId, {
+            status: "failed",
+            error: message,
+            message: failureMessage,
+            finishedAt: new Date().toISOString(),
+          })
+          return
+        }
+
+        const failedPath = await tryMoveFailedInputToFailedImports(filePath, {
+          jobId,
+          reason: `Deferred ${label} failed: ${message}`,
+        })
+        const failureMessage = failedPath
+          ? `${message}; input moved to failed imports: ${failedPath}`
+          : message
+
+        console.error(
+          `[Error] [Media] Deferred ${label} failed - processInputFile.ts - ${filePath} - ${failureMessage}`
+        )
+        debugError(jobId, `Deferred ${label} failed`, error)
+
+        updateJob(jobId, {
+          status: "failed",
+          error: message,
+          message: failureMessage,
+          finishedAt: new Date().toISOString(),
+        })
+      }
+    }
+
+    function queueDeferredImportWork(input: {
+      kind: DeferredInputWorkKind
+      outputPath: string
+      planned: boolean
+      message: string
+      work: () => Promise<ProcessInputFileResult>
+      processing?: DeferredInputProcessingInfo
+    }): ProcessInputFileResult {
+      const startDeferredWork = () =>
+        runDeferredImportWork({
+          kind: input.kind,
+          outputPath: input.outputPath,
+          work: input.work,
+        })
+
+      if (options.onDeferredWork) {
+        options.onDeferredWork(startDeferredWork, {
+          kind: input.kind,
+          filePath: input.outputPath,
+          planned: input.planned,
+          processing: input.processing,
+        })
+      } else {
+        void startDeferredWork()
+      }
+
+      return {
+        ok: true,
+        filePath: input.outputPath,
+        planned: input.planned,
+        message: input.message,
+      }
     }
 
     if (!importEnabled) {
-      const catalogExistingEpisode = getStoredEpisode(
-        metadata.id,
-        librarySeason,
-        parsed.episode
+      const catalogExistingEpisode = await runCooperativeSyncStep(() =>
+        getStoredEpisode(
+          inputMetadata.id,
+          librarySeason,
+          inputParsed.episode
+        )
       )
       const resolvedInputPath = path.resolve(filePath)
 
@@ -950,7 +1157,7 @@ export async function processInputFile(
         const existingPathStillExists = await pathExists(existingPath)
 
         if (existingPathStillExists && existingPath !== resolvedInputPath) {
-          const message = `Episode already exists in the library and import processing is disabled; duplicate input was left untouched: ${libraryTitle} S${String(librarySeason).padStart(2, "0")}E${String(parsed.episode).padStart(2, "0")}`
+          const message = `Episode already exists in the library and import processing is disabled; duplicate input was left untouched: ${libraryTitle} S${String(librarySeason).padStart(2, "0")}E${String(inputParsed.episode).padStart(2, "0")}`
 
           updateJob(jobId, {
             status: "skipped",
@@ -970,7 +1177,7 @@ export async function processInputFile(
         }
 
         if (existingPathStillExists && existingPath === resolvedInputPath) {
-          const message = `Input file is already registered in the library: ${libraryTitle} S${String(librarySeason).padStart(2, "0")}E${String(parsed.episode).padStart(2, "0")}`
+          const message = `Input file is already registered in the library: ${libraryTitle} S${String(librarySeason).padStart(2, "0")}E${String(inputParsed.episode).padStart(2, "0")}`
 
           updateJob(jobId, {
             status: "skipped",
@@ -990,61 +1197,90 @@ export async function processInputFile(
         }
       }
 
-      const catalogLegacyEpisode =
-        librarySeason !== parsed.season
-          ? getStoredEpisode(metadata.id, parsed.season, parsed.episode)
-          : null
+      async function finishCatalogOnlyImport() {
+        const catalogLegacyEpisode =
+          librarySeason !== inputParsed.season
+            ? await runCooperativeSyncStep(() =>
+                getStoredEpisode(
+                  inputMetadata.id,
+                  inputParsed.season,
+                  inputParsed.episode
+                )
+              )
+            : null
 
-      if (catalogLegacyEpisode) {
-        deleteEpisodeRecord({
-          animeId: metadata.id,
-          seasonNr: parsed.season,
-          epNr: parsed.episode,
+        if (catalogLegacyEpisode) {
+          await runCooperativeSyncStep(() =>
+            deleteEpisodeRecord({
+              animeId: inputMetadata.id,
+              seasonNr: inputParsed.season,
+              epNr: inputParsed.episode,
+            })
+          )
+          debugImport(jobId, "Legacy parsed-season episode record removed without touching files.")
+        }
+
+        updateJob(jobId, {
+          outputPath: resolvedInputPath,
+          message: "Generating thumbnail.",
         })
-        debugImport(jobId, "Legacy parsed-season episode record removed without touching files.")
+
+        console.log(
+          `[Info] [Media] Generating episode thumbnail - ${fileName(resolvedInputPath)}`
+        )
+
+        const thumbnailPath = await generateEpisodeThumbnail(
+          resolvedInputPath,
+          durationSeconds
+        )
+        debugImport(jobId, `Thumbnail generated - ${thumbnailPath}`)
+
+        await runCooperativeSyncStep(() =>
+          upsertEpisode({
+            animeId: inputMetadata.id,
+            seasonNr: librarySeason,
+            epNr: inputParsed.episode,
+            filePath: resolvedInputPath,
+            thumbnailPath,
+            durationSeconds,
+          })
+        )
+        emitEpisodeAdded()
+
+        const message = "Input file added to the library without moving, deleting, or transcoding."
+
+        updateJob(jobId, {
+          status: "completed",
+          outputPath: resolvedInputPath,
+          message,
+          finishedAt: new Date().toISOString(),
+        })
+
+        debugImport(jobId, `Catalog-only import completed successfully - ${resolvedInputPath}`)
+
+        return {
+          ok: true,
+          filePath: resolvedInputPath,
+          planned: false,
+          message,
+        }
       }
 
       updateJob(jobId, {
-        outputPath: resolvedInputPath,
-        message: "Generating thumbnail.",
+        message: "Cataloging input file in background.",
       })
-
       console.log(
-        `[Info] [Media] Generating episode thumbnail - ${fileName(resolvedInputPath)}`
+        `[Info] [Media] Cataloging input file in background - ${fileName(filePath)}`
       )
+      debugImport(jobId, "Catalog-only import moved to immediate background work.")
 
-      const thumbnailPath = await generateEpisodeThumbnail(
-        resolvedInputPath,
-        durationSeconds
-      )
-      debugImport(jobId, `Thumbnail generated - ${thumbnailPath}`)
-
-      upsertEpisode({
-        animeId: metadata.id,
-        seasonNr: librarySeason,
-        epNr: parsed.episode,
-        filePath: resolvedInputPath,
-        thumbnailPath,
-        durationSeconds,
-      })
-
-      const message = "Input file added to the library without moving, deleting, or transcoding."
-
-      updateJob(jobId, {
-        status: "completed",
+      return queueDeferredImportWork({
+        kind: "catalog-only",
         outputPath: resolvedInputPath,
-        message,
-        finishedAt: new Date().toISOString(),
-      })
-
-      debugImport(jobId, `Catalog-only import completed successfully - ${resolvedInputPath}`)
-
-      return {
-        ok: true,
-        filePath: resolvedInputPath,
         planned: false,
-        message,
-      }
+        message: "Cataloging input file in background.",
+        work: finishCatalogOnlyImport,
+      })
     }
 
     const inputBytesPerMinute = calculateBytesPerMinute(
@@ -1072,14 +1308,14 @@ export async function processInputFile(
     const finalName = formatEpisodeFileName({
       title: safeMediaTitle,
       season: librarySeason,
-      episode: parsed.episode,
+      episode: inputParsed.episode,
       extension,
     })
     const finalPath = path.resolve(
       config.mediaDir,
       safeLibraryTitle,
       ...mediaFolderSegments({
-        format: metadata.format,
+        format: inputMetadata.format,
         season: librarySeason,
         mediaTitle: safeMediaTitle,
       }),
@@ -1093,15 +1329,49 @@ export async function processInputFile(
     )
     debugImport(jobId, `Resolved output path - ${finalPath}`)
     debugImport(jobId, `Resolved temp path - ${tempPath}`)
+
+    const processingInfo = {
+      id: jobId,
+      animeTitle: libraryTitle,
+      subtitle: getImportProcessingSubtitle({
+        format: inputMetadata.format,
+        libraryTitle,
+        mediaTitle,
+        seasonNumber: librarySeason,
+      }),
+      seasonNumber: librarySeason,
+      episodeNumber: inputParsed.episode,
+      fileName: finalName,
+    }
+
+    async function moveLibraryFileThroughQueue(
+      sourcePath: string,
+      destinationPath: string,
+      kind: QueuedInputFileMoveKind
+    ) {
+      const startMove = () => replaceFile(sourcePath, destinationPath, { jobId })
+
+      await options.queueFileMove(startMove, {
+        kind,
+        sourcePath,
+        destinationPath,
+        jobId,
+      })
+    }
+
     debugImport(jobId, "Checking for existing episode/file conflicts.")
-    const existingEpisode = getStoredEpisode(
-      metadata.id,
-      librarySeason,
-      parsed.episode
+    const existingEpisode = await runCooperativeSyncStep(() =>
+      getStoredEpisode(
+        inputMetadata.id,
+        librarySeason,
+        inputParsed.episode
+      )
     )
     const legacySeasonEpisode =
-      librarySeason !== parsed.season
-        ? getStoredEpisode(metadata.id, parsed.season, parsed.episode)
+      librarySeason !== inputParsed.season
+        ? await runCooperativeSyncStep(() =>
+            getStoredEpisode(inputMetadata.id, inputParsed.season, inputParsed.episode)
+          )
         : null
 
     const existingEpisodeFileExists = existingEpisode
@@ -1112,7 +1382,7 @@ export async function processInputFile(
     if (existingEpisodeFileExists && existingEpisode) {
       const existingPath = path.resolve(existingEpisode.filePath)
       const inputPath = path.resolve(filePath)
-      const message = `Episode already exists in the library: ${safeLibraryTitle} S${String(librarySeason).padStart(2, "0")}E${String(parsed.episode).padStart(2, "0")}`
+      const message = `Episode already exists in the library: ${safeLibraryTitle} S${String(librarySeason).padStart(2, "0")}E${String(inputParsed.episode).padStart(2, "0")}`
 
       console.warn(
         `[Warn] [Media] ${message}; cleaning duplicate input if needed - ${filePath}`
@@ -1141,22 +1411,28 @@ export async function processInputFile(
 
     if (legacySeasonEpisode && (await pathExists(legacySeasonEpisode.filePath))) {
       console.warn(
-        `[Warn] [Media] Existing episode was stored under parsed Season ${parsed.season}; moving it to library Season ${librarySeason} - ${legacySeasonEpisode.filePath}`
+        `[Warn] [Media] Existing episode was stored under parsed Season ${inputParsed.season}; moving it to library Season ${librarySeason} - ${legacySeasonEpisode.filePath}`
       )
 
       if (finalPathExists) {
         await unlinkFileWithRetry(legacySeasonEpisode.filePath, { jobId })
       } else {
-        await replaceFile(legacySeasonEpisode.filePath, finalPath, { jobId })
+        await moveLibraryFileThroughQueue(
+          legacySeasonEpisode.filePath,
+          finalPath,
+          "library-relocation"
+        )
         finalPathExists = true
       }
 
       await removeEpisodeThumbnails(legacySeasonEpisode.filePath)
-      deleteEpisodeRecord({
-        animeId: metadata.id,
-        seasonNr: parsed.season,
-        epNr: parsed.episode,
-      })
+      await runCooperativeSyncStep(() =>
+        deleteEpisodeRecord({
+          animeId: inputMetadata.id,
+          seasonNr: inputParsed.season,
+          epNr: inputParsed.episode,
+        })
+      )
       debugImport(jobId, "Legacy parsed-season episode record removed.")
     }
 
@@ -1175,8 +1451,8 @@ export async function processInputFile(
     }
 
     const summary = summarizeProbe(probe)
-    const importAnimeId = metadata.id
-    const importEpisodeNumber = parsed.episode
+    const importAnimeId = inputMetadata.id
+    const importEpisodeNumber = inputParsed.episode
 
     console.log(
       `[Info] [Media] Media stream inspection completed - ${fileName(filePath)} - Video: ${summary.videoCodecs.join(", ") || "unknown"}, Audio: ${summary.audioCodecs.join(", ") || "unknown"}, Duration: ${Math.round(durationSeconds)}s, Size: ${formatMegabytesPerMinute(inputBytesPerMinute)} MB/min`
@@ -1207,14 +1483,17 @@ export async function processInputFile(
       debugImport(jobId, `Thumbnail generated - ${thumbnailPath}`)
 
       debugImport(jobId, "Saving episode row.")
-      upsertEpisode({
-        animeId: importAnimeId,
-        seasonNr: librarySeason,
-        epNr: importEpisodeNumber,
-        filePath: finalPath,
-        thumbnailPath,
-        durationSeconds,
-      })
+      await runCooperativeSyncStep(() =>
+        upsertEpisode({
+          animeId: importAnimeId,
+          seasonNr: librarySeason,
+          epNr: importEpisodeNumber,
+          filePath: finalPath,
+          thumbnailPath,
+          durationSeconds,
+        })
+      )
+      emitEpisodeAdded()
 
       console.log(
         `[Info] [Media] Episode added to database - Anime id ${importAnimeId}, Season ${librarySeason}, Episode ${importEpisodeNumber}`
@@ -1301,7 +1580,12 @@ export async function processInputFile(
       console.log(
         `[Info] [Media] Media transcode completed - ${fileName(filePath)}`
       )
-      await replaceFile(tempPath, finalPath, { jobId })
+      updateJob(jobId, {
+        message: "Waiting for library file move capacity.",
+      })
+      debugImport(jobId, "Queueing transcoded output move into the library.")
+      await moveLibraryFileThroughQueue(tempPath, finalPath, "transcode-output")
+      debugImport(jobId, "Transcoded output move completed.")
       debugImport(jobId, "Removing temporary job directory.")
       await rm(path.dirname(tempPath), { force: true, recursive: true })
       debugImport(jobId, "Temporary job directory removed.")
@@ -1346,7 +1630,7 @@ export async function processInputFile(
         `[Info] [Media] Skipping transcode and moving direct-play file - ${fileName(filePath)}`
       )
 
-      await replaceFile(filePath, finalPath, { jobId })
+      await moveLibraryFileThroughQueue(filePath, finalPath, "direct-import")
 
       if (await pathExists(filePath)) {
         debugImport(jobId, "Source still exists after direct-play move; removing it.")
@@ -1364,100 +1648,22 @@ export async function processInputFile(
       })
     }
 
-    async function runDeferredImportWork(input: {
-      kind: DeferredInputWorkKind
-      work: () => Promise<ProcessInputFileResult>
-    }) {
-      const label = formatDeferredWorkKind(input.kind)
-
-      try {
-        await runWithActiveInputImportOutput(finalPath, input.work)
-      } catch (error) {
-        const message = errorMessage(error) || "Unknown media processing error"
-
-        if (
-          isTranscodeWaitCancellation(error) &&
-          options.transcodeWaitSignal?.aborted
-        ) {
-          const shutdownMessage = `Skipped queued ${label} because shutdown started.`
-
-          console.warn(
-            `[Warn] [Media] Queued ${label} cancelled during shutdown - processInputFile.ts - ${filePath}`
-          )
-          debugImport(jobId, shutdownMessage)
-          updateJob(jobId, {
-            status: "skipped",
-            message: shutdownMessage,
-            finishedAt: new Date().toISOString(),
-          })
-          return
-        }
-
-        const failedPath = await tryMoveFailedInputToFailedImports(filePath, {
-          jobId,
-          reason: `Deferred ${label} failed: ${message}`,
-        })
-        const failureMessage = failedPath
-          ? `${message}; input moved to failed imports: ${failedPath}`
-          : message
-
-        console.error(
-          `[Error] [Media] Deferred ${label} failed - processInputFile.ts - ${filePath} - ${failureMessage}`
-        )
-        debugError(jobId, `Deferred ${label} failed`, error)
-
-        updateJob(jobId, {
-          status: "failed",
-          error: message,
-          message: failureMessage,
-          finishedAt: new Date().toISOString(),
-        })
-      }
-    }
-
-    function queueDeferredImportWork(input: {
-      kind: DeferredInputWorkKind
-      planned: boolean
-      message: string
-      work: () => Promise<ProcessInputFileResult>
-    }): ProcessInputFileResult {
-      const deferredWork = runDeferredImportWork({
-        kind: input.kind,
-        work: input.work,
-      })
-      options.onDeferredWork?.(deferredWork, {
-        kind: input.kind,
-        filePath: finalPath,
-        planned: input.planned,
-      })
-
-      return {
-        ok: true,
-        filePath: finalPath,
-        planned: input.planned,
-        message: input.message,
-      }
-    }
-
     if (useExistingOutput) {
-      if (options.deferDirectMoves) {
-        updateJob(jobId, {
-          message: "Queued existing output finalization.",
-        })
-        console.log(
-          `[Info] [Media] Queued existing output finalization and continuing import scan - ${fileName(filePath)}`
-        )
-        debugImport(jobId, "Existing output finalization deferred so input scanning can continue.")
+      updateJob(jobId, {
+        message: "Finishing existing output import in background.",
+      })
+      console.log(
+        `[Info] [Media] Finishing existing output import in background - ${fileName(filePath)}`
+      )
+      debugImport(jobId, "Existing output finalization moved to immediate background work.")
 
-        return queueDeferredImportWork({
-          kind: "existing-output",
-          planned: false,
-          message: "Queued existing output finalization.",
-          work: finishExistingOutputImport,
-        })
-      }
-
-      return runWithActiveInputImportOutput(finalPath, finishExistingOutputImport)
+      return queueDeferredImportWork({
+        kind: "existing-output",
+        outputPath: finalPath,
+        planned: false,
+        message: "Finishing existing output import in background.",
+        work: finishExistingOutputImport,
+      })
     }
 
     if (needsFfmpegProcessing && convertVideo && options.deferVideoTranscodes) {
@@ -1471,9 +1677,14 @@ export async function processInputFile(
 
       return queueDeferredImportWork({
         kind: "video-transcode",
+        outputPath: finalPath,
         planned: true,
         message: "Queued for video transcode.",
         work: runFfmpegImport,
+        processing: {
+          ...processingInfo,
+          kind: "video-transcode",
+        },
       })
     }
 
@@ -1488,9 +1699,14 @@ export async function processInputFile(
 
       return queueDeferredImportWork({
         kind: "audio-transcode",
+        outputPath: finalPath,
         planned: true,
         message: "Queued for audio transcode.",
         work: runFfmpegImport,
+        processing: {
+          ...processingInfo,
+          kind: "audio-transcode",
+        },
       })
     }
 
@@ -1498,24 +1714,25 @@ export async function processInputFile(
       return runWithActiveInputImportOutput(finalPath, runFfmpegImport)
     }
 
-    if (options.deferDirectMoves) {
-      updateJob(jobId, {
-        message: "Queued direct library move.",
-      })
-      console.log(
-        `[Info] [Media] Queued direct-play move and continuing import scan - ${fileName(filePath)}`
-      )
-      debugImport(jobId, "Direct-play move deferred so input scanning can continue.")
+    updateJob(jobId, {
+      message: "Moving direct-play media file in background.",
+    })
+    console.log(
+      `[Info] [Media] Moving direct-play media file in background - ${fileName(filePath)}`
+    )
+    debugImport(jobId, "Direct-play move moved to immediate background work.")
 
-      return queueDeferredImportWork({
+    return queueDeferredImportWork({
+      kind: "direct-move",
+      outputPath: finalPath,
+      planned: false,
+      message: "Moving direct-play media file in background.",
+      work: runDirectMoveImport,
+      processing: {
+        ...processingInfo,
         kind: "direct-move",
-        planned: false,
-        message: "Queued direct library move.",
-        work: runDirectMoveImport,
-      })
-    }
-
-    return runWithActiveInputImportOutput(finalPath, runDirectMoveImport)
+      },
+    })
   } catch (error) {
     const message = errorMessage(error) || "Unknown media processing error"
 

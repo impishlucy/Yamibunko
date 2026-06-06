@@ -1361,6 +1361,42 @@ export function getEpisodeByPath(filePath: string) {
   return row ? toEpisode(row) : null
 }
 
+export function getLibraryEventTargetForAnime(animeId: string | number) {
+  const id = parsePositiveInt(animeId)
+
+  if (!id) {
+    return null
+  }
+
+  const row = getDb()
+    .query<{
+      anime_id: number
+      library_slug: string | null
+      primary_anime_id: number | null
+    }>(
+      `
+      SELECT
+        a.id AS anime_id,
+        a.library_slug,
+        le.primary_anime_id
+      FROM anime a
+      LEFT JOIN library_entries le ON le.slug = a.library_slug
+      WHERE a.id = ?
+    `
+    )
+    .get(id)
+
+  if (!row?.library_slug) {
+    return null
+  }
+
+  return {
+    animeId: row.anime_id,
+    rootAnimeId: row.primary_anime_id ?? row.anime_id,
+    librarySlug: row.library_slug,
+  }
+}
+
 export function getEpisodeThumbnailPath(
   animeId: string | number,
   seasonNr: string | number,
