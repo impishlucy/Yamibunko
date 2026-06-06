@@ -197,18 +197,18 @@ export function WatchView({
         <h1 className="min-w-0 truncate text-xl font-semibold text-zinc-50">
           {payload.anime.title}
         </h1>
-        <Badge
-          variant="outline"
-          className="border-violet-400/30 bg-violet-400/10 text-violet-100 lg:px-2.5 lg:py-0.5 lg:text-xs"
-        >
+        <h1 className="min-w-0 truncate text-xl font-semibold text-zinc-50">
+          •
+        </h1>
+        <h1 className="min-w-0 truncate text-xl font-semibold text-zinc-50">
           Season {String(payload.episode.seasonNumber).padStart(2, "0")}
-        </Badge>
-        <Badge
-          variant="outline"
-          className="border-violet-400/30 bg-violet-400/10 text-violet-100 lg:px-2.5 lg:py-0.5 lg:text-xs"
-        >
+        </h1>
+        <h1 className="min-w-0 truncate text-xl font-semibold text-zinc-50">
+          -
+        </h1>
+        <h1 className="min-w-0 truncate text-xl font-semibold text-zinc-50">
           Episode {String(payload.episode.episodeNumber).padStart(2, "0")}
-        </Badge>
+        </h1>
       </section>
 
       <div className="yami-player-width mx-auto">

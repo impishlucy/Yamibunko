@@ -77,7 +77,8 @@ export async function GET(request: Request, context: WatchContext) {
     }
   }
 
-  const liveTranscodeEnabled = getServerConfig().transcodeAccel !== "cpu"
+  const config = getServerConfig()
+  const liveTranscodeEnabled = config.transcodeAccel !== "cpu"
   const neighbors = getEpisodeNeighbors({
     animeId: anime.id,
     seasonNr: seasonNumber,
@@ -111,6 +112,7 @@ export async function GET(request: Request, context: WatchContext) {
       castTranscodeUrl: `${castBase}?${commonQuery}&mode=transcode&profile=original&${castTokenQuery}`,
       castDataSaverUrl: `${castBase}?${commonQuery}&mode=transcode&profile=dataSaver&${castTokenQuery}`,
       liveTranscodeEnabled,
+      importEnabled: config.importEnabled,
       subtitleUrl: `${subtitleBase}?${commonQuery}`,
       castSubtitleUrl: `${castSubtitleBase}?${commonQuery}&${castTokenQuery}`,
     },

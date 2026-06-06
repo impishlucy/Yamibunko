@@ -143,7 +143,7 @@ export function startWorkers() {
 
   const config = configResult.config
   debugWorkers(
-    `Worker config loaded - Input ${config.inputDir}, Library ${config.mediaDir}, Temp ${config.tempDir}`
+    `Worker config loaded - Input ${config.inputDir}, Library ${config.mediaDir || "<disabled>"}, Temp ${config.tempDir}, Import enabled ${config.importEnabled}`
   )
   const queuedWork = new Set<string>()
   const pendingWorkStarts: QueuedWorkStart[] = []
@@ -173,15 +173,21 @@ export function startWorkers() {
       pollInterval: 1000,
     },
   })
-  const libraryWatcher = chokidar.watch(config.mediaDir, {
-    ignoreInitial: true,
-    awaitWriteFinish: {
-      stabilityThreshold: 3000,
-      pollInterval: 1000,
-    },
-  })
+  const libraryWatcher = config.importEnabled
+    ? chokidar.watch(config.mediaDir, {
+        ignoreInitial: true,
+        awaitWriteFinish: {
+          stabilityThreshold: 3000,
+          pollInterval: 1000,
+        },
+      })
+    : null
 
-  console.log("[Info] [Workers] Started background file watchers.")
+  console.log(
+    config.importEnabled
+      ? "[Info] [Workers] Started background file watchers."
+      : "[Info] [Workers] Started input library watcher with import processing disabled."
+  )
 
   async function pruneNonMediaOnlyDirectories(
     directory: string,
@@ -437,7 +443,9 @@ export function startWorkers() {
         }
       }
 
-      await pruneNonMediaOnlyDirectories(config.inputDir, config.inputDir)
+      if (config.importEnabled) {
+        await pruneNonMediaOnlyDirectories(config.inputDir, config.inputDir)
+      }
     } catch (error) {
       console.error(
         `[Error] [Workers] Input folder scan failed - startWorkers.ts - ${config.inputDir} - ${errorMessage(error)}`
@@ -447,7 +455,20 @@ export function startWorkers() {
     }
   }
 
+  async function scanKnownDeletedFiles() {
+    for (const filePath of listEpisodeFilePaths()) {
+      if (!(await pathExists(filePath))) {
+        enqueue("library-delete", filePath)
+      }
+    }
+  }
+
   async function scanLibraryDirectory() {
+    if (!config.importEnabled) {
+      await scanKnownDeletedFiles()
+      return
+    }
+
     if (shuttingDown || scanning) {
       return
     }
@@ -472,11 +493,7 @@ export function startWorkers() {
         }
       }
 
-      for (const filePath of listEpisodeFilePaths()) {
-        if (!(await pathExists(filePath))) {
-          enqueue("library-delete", filePath)
-        }
-      }
+      await scanKnownDeletedFiles()
 
       console.log("[Info] [Workers] Library folder scan completed.")
     } catch (error) {
@@ -490,7 +507,12 @@ export function startWorkers() {
 
   async function scanAllDirectories() {
     await scanInputDirectory()
-    await scanLibraryDirectory()
+
+    if (config.importEnabled) {
+      await scanLibraryDirectory()
+    } else {
+      await scanKnownDeletedFiles()
+    }
   }
 
   async function runDailyAniListSync() {
@@ -535,17 +557,24 @@ export function startWorkers() {
     )
   })
 
-  libraryWatcher.on("add", (filePath) => {
+  inputWatcher.on("unlink", (filePath) => {
+    if (!config.importEnabled) {
+      debugWorkers(`Input watcher unlink event with import disabled - ${filePath}`)
+      enqueue("library-delete", filePath)
+    }
+  })
+
+  libraryWatcher?.on("add", (filePath) => {
     debugWorkers(`Library watcher add event - ${filePath}`)
     enqueue("library-sync", filePath)
   })
 
-  libraryWatcher.on("unlink", (filePath) => {
+  libraryWatcher?.on("unlink", (filePath) => {
     debugWorkers(`Library watcher unlink event - ${filePath}`)
     enqueue("library-delete", filePath)
   })
 
-  libraryWatcher.on("error", (error) => {
+  libraryWatcher?.on("error", (error) => {
     console.error(
       `[Error] [Workers] Library watcher failed - startWorkers.ts - ${errorMessage(error)}`
     )
@@ -592,7 +621,10 @@ export function startWorkers() {
     if (dailyAniListTimer) {
       clearTimeout(dailyAniListTimer)
     }
-    await Promise.all([inputWatcher.close(), libraryWatcher.close()])
+    await Promise.all([
+      inputWatcher.close(),
+      ...(libraryWatcher ? [libraryWatcher.close()] : []),
+    ])
 
     while (activeWork.size > 0) {
       await Promise.allSettled([...activeWork])
@@ -602,7 +634,11 @@ export function startWorkers() {
     workerGlobal.__yamibunkoWorkerRuntime = undefined
   }
 
-  const runtime = { activeWork, watchers: [inputWatcher, libraryWatcher], stop }
+  const runtime = {
+    activeWork,
+    watchers: [inputWatcher, ...(libraryWatcher ? [libraryWatcher] : [])],
+    stop,
+  }
   workerGlobal.__yamibunkoWorkerRuntime = runtime
 
   if (!workerGlobal.__yamibunkoSignalHandlersRegistered) {

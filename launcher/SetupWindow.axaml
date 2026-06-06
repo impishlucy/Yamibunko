@@ -3,33 +3,46 @@
         x:Class="Launcher.SetupWindow"
         Title="Yamibunko Server Initialization"
         Icon="avares://Launcher/Assets/icon.ico"
-        Width="500" Height="560"
+        Width="500" Height="620"
         WindowStartupLocation="CenterScreen"
         CanResize="False">
     <Border Padding="20">
         <StackPanel Spacing="15">
             <TextBlock Text="Server Configuration" FontSize="24" FontWeight="Bold" Foreground="#D8B4FE" HorizontalAlignment="Center" Margin="0,0,0,10"/>
 
-            <TextBlock Text="Base URL" Foreground="#A1A1AA"/>
+            <TextBlock Text="Base URL" Foreground="#D4D4D8"/>
             <TextBox Name="BaseUrlBox" PlaceholderText="http://localhost:3000" TextChanged="OnInputChanged"/>
 
-            <TextBlock Text="Input Folder Path" Foreground="#A1A1AA"/>
+            <TextBlock Text="Input Folder Path" Foreground="#D4D4D8"/>
             <Grid ColumnDefinitions="*, Auto">
                 <TextBox Name="InputFolderBox" PlaceholderText="Select input directory..." IsReadOnly="True" Focusable="False" IsHitTestVisible="False" TextChanged="OnInputChanged" VerticalAlignment="Center"/>
                 <Button Grid.Column="1" Content="..." Click="SelectInputFolder_Click" Margin="5,0,0,0" Padding="15,5"/>
             </Grid>
 
-            <TextBlock Text="Output Folder Path" Foreground="#A1A1AA"/>
+            <TextBlock Text="Output Folder Path" Foreground="#D4D4D8"/>
             <Grid ColumnDefinitions="*, Auto">
                 <TextBox Name="OutputFolderBox" PlaceholderText="Select output directory..." IsReadOnly="True" Focusable="False" IsHitTestVisible="False" TextChanged="OnInputChanged" VerticalAlignment="Center"/>
-                <Button Grid.Column="1" Content="..." Click="SelectOutputFolder_Click" Margin="5,0,0,0" Padding="15,5"/>
+                <Button Name="OutputFolderButton" Grid.Column="1" Content="..." Click="SelectOutputFolder_Click" Margin="5,0,0,0" Padding="15,5"/>
             </Grid>
 
-            <TextBlock Text="AniList Client ID (Optional)" Foreground="#A1A1AA"/>
+            <TextBlock Text="AniList Client ID (Optional)" Foreground="#D4D4D8"/>
             <TextBox Name="ClientIdBox" PlaceholderText="Client ID (Numbers only)" TextChanged="OnInputChanged"/>
 
-            <TextBlock Text="AniList Client Secret (Optional)" Foreground="#A1A1AA"/>
+            <TextBlock Text="AniList Client Secret (Optional)" Foreground="#D4D4D8"/>
             <TextBox Name="ClientSecretBox" PlaceholderText="Client Secret" PasswordChar="*" TextChanged="OnInputChanged"/>
+
+            <CheckBox Name="DisableFileProcessingBox" IsChecked="False" Click="OnDisableFileProcessingChanged">
+                <ToolTip.Tip>
+                    <Border Width="310" Padding="4" Background="#18181B" BorderBrush="#7C3AED" BorderThickness="1" CornerRadius="8">
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="Recommended: OFF !" FontSize="14" FontWeight="SemiBold" Foreground="#D8B4FE"/>
+                            <TextBlock FontSize="13" TextWrapping="Wrap" Foreground="#D4D4D8" Text="OFF: Default workflow. Picks up (new) vido files in the input folder, Converts non-HEVC to HEVC, compresses oversized HEVC and puts result in output folder, then deletes the input file."/>
+                            <TextBlock FontSize="13" TextWrapping="Wrap" Foreground="#D4D4D8" Text="ON: Catalog mode for existing large / high-quality libraries. Serves input files in place; no converting, compressing, moving or deleting."/>
+                        </StackPanel>
+                    </Border>
+                </ToolTip.Tip>
+                <TextBlock Text="Disable file processing ⓘ"/>
+            </CheckBox>
 
             <Button Name="SaveButton" Content="Save &amp; Start Server" Click="SaveButton_Click" IsEnabled="False" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Margin="0,20,0,0"/>
         </StackPanel>

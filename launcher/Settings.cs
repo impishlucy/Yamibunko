@@ -9,6 +9,7 @@ public class AppSettings
     public string BaseUrl { get; set; } = "http://localhost:3000";
     public string InputFolderPath { get; set; } = "";
     public string OutputFolderPath { get; set; } = "";
+    public bool ImportEnabled { get; set; } = true;
     public string FfmpegDir { get; set; } = "";
     public string TranscodeAccel { get; set; } = "cpu";
     public string AnilistClientId { get; set; } = "";

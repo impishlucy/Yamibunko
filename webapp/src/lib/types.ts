@@ -76,6 +76,8 @@ export type MediaStreamInfo = {
   id: string
   index: number
   codec?: string
+  profile?: string
+  channels?: number
   language?: string
   label: string
   isDefault: boolean
@@ -99,6 +101,7 @@ export type WatchPayload = {
     castTranscodeUrl: string
     castDataSaverUrl: string
     liveTranscodeEnabled: boolean
+    importEnabled: boolean
     subtitleUrl: string
     castSubtitleUrl: string
   }

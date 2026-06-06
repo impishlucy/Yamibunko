@@ -846,6 +846,7 @@ public class ServerManager
             ["BASE_URL"] = settings.BaseUrl,
             ["ANIME_INPUT_DIR"] = settings.InputFolderPath,
             ["ANIME_MEDIA_DIR"] = settings.OutputFolderPath,
+            ["IMPORT_ENABLED"] = settings.ImportEnabled ? "true" : "false",
             ["FFMPEG_DIR"] = settings.FfmpegDir,
             ["TRANSCODE_ACCEL"] = settings.TranscodeAccel,
             ["ANILIST_CLIENT_ID"] = settings.AnilistClientId,

@@ -36,7 +36,7 @@ import {
   isMediaFile,
   parseDurationSeconds,
   pathExists,
-  thumbnailPathForEpisode,
+  removeEpisodeThumbnails,
   type ProbeResult,
   waitForStableFile,
 } from "@/server/media/mediaFiles"
@@ -45,14 +45,14 @@ import {
   acquireAudioTranscode,
   acquireVideoTranscode,
 } from "@/server/transcode/transcodeCapacity"
-import { getAudioOutputIndexesToMp3 } from "@/server/media/streamMetadata"
+import { getAudioOutputIndexesToAac } from "@/server/media/streamMetadata"
 import { errorMessage, fileName } from "@/server/utils/format"
 import { debugLog } from "@/server/utils/debugLog"
 
 const hardwareMaxHevcBytesPerMinute = 25 * 1024 * 1024
 const cpuMaxHevcBytesPerMinute = 30 * 1024 * 1024
 const targetBytesPerMinute = 22 * 1024 * 1024
-const targetAudioKbps = 256
+const targetAudioKbps = 320
 const failedImportsFolderName = "_failed_imports"
 const activeInputImportOutputs = new Map<string, number>()
 
@@ -171,6 +171,31 @@ function hasHevcVideo(probe: ProbeResult) {
       stream.codec_type === "video" &&
       ["hevc", "h265"].includes((stream.codec_name ?? "").toLowerCase())
   )
+}
+
+
+const mp4SubtitleCodecs = new Set([
+  "ass",
+  "ssa",
+  "subrip",
+  "srt",
+  "webvtt",
+  "mov_text",
+  "text",
+])
+
+function getMp4SubtitleStreamIndexes(probe: ProbeResult) {
+  return (probe.streams ?? [])
+    .filter((stream) => {
+      const codec = (stream.codec_name ?? "").trim().toLowerCase()
+
+      return (
+        stream.codec_type === "subtitle" &&
+        Number.isInteger(stream.index) &&
+        mp4SubtitleCodecs.has(codec)
+      )
+    })
+    .map((stream) => stream.index as number)
 }
 
 function getMaxHevcBytesPerMinute() {
@@ -587,7 +612,8 @@ async function transcodeFile(
   outputPath: string,
   options: {
     convertVideo: boolean
-    audioOutputIndexesToMp3: number[]
+    audioOutputIndexesToAac: number[]
+    subtitleStreamIndexesToMovText: number[]
     videoBitrateKbps: number
     maxVideoBitrateKbps: number
     jobId?: string
@@ -644,6 +670,9 @@ export async function processInputFile(
   options: ProcessInputFileOptions = {}
 ): Promise<ProcessInputFileResult> {
   const jobId = createJob(filePath)
+  const config = getServerConfig()
+  const importEnabled = config.importEnabled
+
   console.log(
     `[Info] [Media] Input file processing started - ${fileName(filePath)}`
   )
@@ -692,15 +721,37 @@ export async function processInputFile(
     const parsed = parseAnimeFileName(filePath)
 
     if (!parsed) {
+      const error = "Unable to extract anime title and episode number"
+
+      if (!importEnabled) {
+        const message = `${error}; input file was left untouched because import processing is disabled.`
+
+        updateJob(jobId, {
+          status: "failed",
+          error,
+          message,
+          finishedAt: new Date().toISOString(),
+        })
+
+        debugImport(jobId, message)
+
+        return {
+          ok: true,
+          filePath,
+          planned: false,
+          message,
+        }
+      }
+
       const failedPath = await moveFailedInputToFailedImports(filePath, {
         jobId,
-        reason: "Unable to extract anime title and episode number",
+        reason: error,
       })
       const message = `Unrecognized media filename was moved to failed imports: ${failedPath}`
 
       updateJob(jobId, {
         status: "failed",
-        error: "Unable to extract anime title and episode number",
+        error,
         message,
         finishedAt: new Date().toISOString(),
       })
@@ -736,15 +787,37 @@ export async function processInputFile(
     )
 
     if (!metadata) {
+      const error = `AniList could not match "${parsed.title}"`
+
+      if (!importEnabled) {
+        const message = `${error}; input file was left untouched because import processing is disabled.`
+
+        updateJob(jobId, {
+          status: "failed",
+          error,
+          message,
+          finishedAt: new Date().toISOString(),
+        })
+
+        debugImport(jobId, message)
+
+        return {
+          ok: true,
+          filePath,
+          planned: false,
+          message,
+        }
+      }
+
       const failedPath = await moveFailedInputToFailedImports(filePath, {
         jobId,
-        reason: `AniList could not match "${parsed.title}"`,
+        reason: error,
       })
       const message = `Unmatched media file was moved to failed imports: ${failedPath}`
 
       updateJob(jobId, {
         status: "failed",
-        error: `AniList could not match "${parsed.title}"`,
+        error,
         message,
         finishedAt: new Date().toISOString(),
       })
@@ -807,15 +880,37 @@ export async function processInputFile(
         throw error
       }
 
+      const errorText = errorMessage(error)
+
+      if (!importEnabled) {
+        const message = `Invalid media file was left untouched because import processing is disabled: ${errorText}`
+
+        updateJob(jobId, {
+          status: "failed",
+          error: errorText,
+          message,
+          finishedAt: new Date().toISOString(),
+        })
+
+        debugImport(jobId, message)
+
+        return {
+          ok: true,
+          filePath,
+          planned: false,
+          message,
+        }
+      }
+
       const failedPath = await moveFailedInputToFailedImports(filePath, {
         jobId,
-        reason: errorMessage(error),
+        reason: errorText,
       })
       const message = `Invalid media file was moved to failed imports: ${failedPath}`
 
       updateJob(jobId, {
         status: "failed",
-        error: errorMessage(error),
+        error: errorText,
         message,
         finishedAt: new Date().toISOString(),
       })
@@ -834,6 +929,124 @@ export async function processInputFile(
 
     const durationSeconds = parseDurationSeconds(probe)
     debugImport(jobId, `Parsed duration - ${durationSeconds}s.`)
+
+    const mediaTitle = metadataTitle(metadata)
+    const libraryTitle = metadata.library?.title
+
+    if (!libraryTitle) {
+      throw new Error(`AniList media ${metadata.id} did not resolve a library root`)
+    }
+
+    if (!importEnabled) {
+      const catalogExistingEpisode = getStoredEpisode(
+        metadata.id,
+        librarySeason,
+        parsed.episode
+      )
+      const resolvedInputPath = path.resolve(filePath)
+
+      if (catalogExistingEpisode) {
+        const existingPath = path.resolve(catalogExistingEpisode.filePath)
+        const existingPathStillExists = await pathExists(existingPath)
+
+        if (existingPathStillExists && existingPath !== resolvedInputPath) {
+          const message = `Episode already exists in the library and import processing is disabled; duplicate input was left untouched: ${libraryTitle} S${String(librarySeason).padStart(2, "0")}E${String(parsed.episode).padStart(2, "0")}`
+
+          updateJob(jobId, {
+            status: "skipped",
+            outputPath: existingPath,
+            message,
+            finishedAt: new Date().toISOString(),
+          })
+
+          debugImport(jobId, `${message}; existing path ${existingPath}`)
+
+          return {
+            ok: true,
+            filePath: existingPath,
+            planned: false,
+            message,
+          }
+        }
+
+        if (existingPathStillExists && existingPath === resolvedInputPath) {
+          const message = `Input file is already registered in the library: ${libraryTitle} S${String(librarySeason).padStart(2, "0")}E${String(parsed.episode).padStart(2, "0")}`
+
+          updateJob(jobId, {
+            status: "skipped",
+            outputPath: resolvedInputPath,
+            message,
+            finishedAt: new Date().toISOString(),
+          })
+
+          debugImport(jobId, message)
+
+          return {
+            ok: true,
+            filePath: resolvedInputPath,
+            planned: false,
+            message,
+          }
+        }
+      }
+
+      const catalogLegacyEpisode =
+        librarySeason !== parsed.season
+          ? getStoredEpisode(metadata.id, parsed.season, parsed.episode)
+          : null
+
+      if (catalogLegacyEpisode) {
+        deleteEpisodeRecord({
+          animeId: metadata.id,
+          seasonNr: parsed.season,
+          epNr: parsed.episode,
+        })
+        debugImport(jobId, "Legacy parsed-season episode record removed without touching files.")
+      }
+
+      updateJob(jobId, {
+        outputPath: resolvedInputPath,
+        message: "Generating thumbnail.",
+      })
+
+      console.log(
+        `[Info] [Media] Generating episode thumbnail - ${fileName(resolvedInputPath)}`
+      )
+
+      const thumbnailPath = await generateEpisodeThumbnail(
+        resolvedInputPath,
+        durationSeconds
+      )
+      debugImport(jobId, `Thumbnail generated - ${thumbnailPath}`)
+
+      upsertEpisode({
+        animeId: metadata.id,
+        seasonNr: librarySeason,
+        epNr: parsed.episode,
+        filePath: resolvedInputPath,
+        thumbnailPath,
+        durationSeconds,
+      })
+
+      const message = "Input file added to the library without moving, deleting, or transcoding."
+
+      updateJob(jobId, {
+        status: "completed",
+        outputPath: resolvedInputPath,
+        message,
+        finishedAt: new Date().toISOString(),
+      })
+
+      debugImport(jobId, `Catalog-only import completed successfully - ${resolvedInputPath}`)
+
+      return {
+        ok: true,
+        filePath: resolvedInputPath,
+        planned: false,
+        message,
+      }
+    }
+
     const inputBytesPerMinute = calculateBytesPerMinute(
       inputStat.size,
       durationSeconds
@@ -842,25 +1055,20 @@ export async function processInputFile(
     const inputHasHevcVideo = hasHevcVideo(probe)
     const convertVideo =
       !inputHasHevcVideo || inputBytesPerMinute > maxHevcBytesPerMinute
-    const audioOutputIndexesToMp3 = getAudioOutputIndexesToMp3(probe)
-    const convertAudioToMp3 = audioOutputIndexesToMp3.length > 0
-    const needsFfmpegProcessing = convertVideo || convertAudioToMp3
+    const audioOutputIndexesToAac = getAudioOutputIndexesToAac(probe)
+    const subtitleStreamIndexesToMovText = getMp4SubtitleStreamIndexes(probe)
+    const convertAudioToAac = audioOutputIndexesToAac.length > 0
+    const needsFfmpegProcessing = convertVideo || convertAudioToAac
     const videoBitrateKbps = calculateVideoBitrateKbps()
-    const mediaTitle = metadataTitle(metadata)
-    const libraryTitle = metadata.library?.title
 
     debugImport(
       jobId,
-      `Processing decision - convertVideo ${convertVideo}, audioTracksToMp3 [${audioOutputIndexesToMp3.join(", ")}], needsFfmpegProcessing ${needsFfmpegProcessing}`
+      `Processing decision - convertVideo ${convertVideo}, audioTracksToAac [${audioOutputIndexesToAac.join(", ")}], subtitleTracksToMovText [${subtitleStreamIndexesToMovText.join(", ")}], needsFfmpegProcessing ${needsFfmpegProcessing}`
     )
-
-    if (!libraryTitle) {
-      throw new Error(`AniList media ${metadata.id} did not resolve a library root`)
-    }
 
     const safeLibraryTitle = safePathSegment(libraryTitle, "Library title")
     const safeMediaTitle = safePathSegment(mediaTitle, "Media title")
-    const extension = needsFfmpegProcessing ? ".mkv" : path.extname(filePath)
+    const extension = needsFfmpegProcessing ? ".mp4" : path.extname(filePath)
     const finalName = formatEpisodeFileName({
       title: safeMediaTitle,
       season: librarySeason,
@@ -868,7 +1076,7 @@ export async function processInputFile(
       extension,
     })
     const finalPath = path.resolve(
-      getServerConfig().mediaDir,
+      config.mediaDir,
       safeLibraryTitle,
       ...mediaFolderSegments({
         format: metadata.format,
@@ -878,7 +1086,7 @@ export async function processInputFile(
       finalName
     )
     const tempPath = path.resolve(
-      getServerConfig().tempDir,
+      config.tempDir,
       "jobs",
       jobId,
       finalName
@@ -943,9 +1151,7 @@ export async function processInputFile(
         finalPathExists = true
       }
 
-      await rm(thumbnailPathForEpisode(legacySeasonEpisode.filePath), {
-        force: true,
-      })
+      await removeEpisodeThumbnails(legacySeasonEpisode.filePath)
       deleteEpisodeRecord({
         animeId: metadata.id,
         seasonNr: parsed.season,
@@ -1071,16 +1277,17 @@ export async function processInputFile(
         updateJob(jobId, {
           message: convertVideo
             ? "Transcoding media file."
-            : "Converting audio tracks.",
+            : "Converting audio tracks to LC-AAC.",
         })
 
         console.log(
-          `[Info] [Media] Starting media transcode - ${fileName(filePath)} - Accel: ${getServerConfig().transcodeAccel}, HW decode: ${convertVideo ? getHardwareInputLabel() : "not needed"}, HEVC: ${convertVideo ? `yes (${inputHasHevcVideo ? `over ${formatMegabytesPerMinute(maxHevcBytesPerMinute)} MB/min` : "source is not HEVC"})` : "copy"}, MP3 audio tracks: ${audioOutputIndexesToMp3.length ? audioOutputIndexesToMp3.join(", ") : "none"}, Target: ${formatMegabytesPerMinute(targetBytesPerMinute)} MB/min, Bitrate: ${videoBitrateKbps}k, Maxrate: ${calculateVideoBitrateKbps(maxHevcBytesPerMinute)}k`
+          `[Info] [Media] Starting media transcode - ${fileName(filePath)} - Accel: ${config.transcodeAccel}, HW decode: ${convertVideo ? getHardwareInputLabel() : "not needed"}, HEVC: ${convertVideo ? `yes (${inputHasHevcVideo ? `over ${formatMegabytesPerMinute(maxHevcBytesPerMinute)} MB/min` : "source is not HEVC"})` : "copy"}, AAC audio tracks: ${audioOutputIndexesToAac.length ? audioOutputIndexesToAac.join(", ") : "none"}, Target: ${formatMegabytesPerMinute(targetBytesPerMinute)} MB/min, Bitrate: ${videoBitrateKbps}k, Maxrate: ${calculateVideoBitrateKbps(maxHevcBytesPerMinute)}k`
         )
 
         await transcodeFile(filePath, tempPath, {
           convertVideo,
-          audioOutputIndexesToMp3,
+          audioOutputIndexesToAac,
+          subtitleStreamIndexesToMovText,
           videoBitrateKbps,
           maxVideoBitrateKbps: calculateVideoBitrateKbps(maxHevcBytesPerMinute),
           jobId,
@@ -1277,7 +1484,7 @@ export async function processInputFile(
       console.log(
         `[Info] [Media] Queued audio transcode and continuing import scan - ${fileName(filePath)}`
       )
-      debugImport(jobId, "Audio-only transcode deferred into the audio-priority transcode queue.")
+      debugImport(jobId, "Audio-only LC-AAC transcode deferred into the audio-priority transcode queue.")
 
       return queueDeferredImportWork({
         kind: "audio-transcode",
@@ -1333,6 +1540,29 @@ export async function processInputFile(
         filePath,
         planned: true,
         message: shutdownMessage,
+      }
+    }
+
+    if (!importEnabled) {
+      const failureMessage = `${message}; input file was left untouched because import processing is disabled.`
+
+      console.error(
+        `[Error] [Media] Input file cataloging failed - processInputFile.ts - ${filePath} - ${failureMessage}`
+      )
+      debugError(jobId, "Input file cataloging failed", error)
+
+      updateJob(jobId, {
+        status: "failed",
+        error: message,
+        message: failureMessage,
+        finishedAt: new Date().toISOString(),
+      })
+
+      return {
+        ok: false,
+        filePath,
+        planned: false,
+        message: failureMessage,
       }
     }
 

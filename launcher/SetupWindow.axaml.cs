@@ -19,11 +19,18 @@ public partial class SetupWindow : Window
     public SetupWindow()
     {
         AvaloniaXamlLoader.Load(this);
+        UpdateFileProcessingState();
         ValidateForm();
     }
 
     private void OnInputChanged(object? sender, TextChangedEventArgs e)
     {
+        ValidateForm();
+    }
+
+    private void OnDisableFileProcessingChanged(object? sender, RoutedEventArgs e)
+    {
+        UpdateFileProcessingState();
         ValidateForm();
     }
 
@@ -55,6 +62,11 @@ public partial class SetupWindow : Window
 
     private async void SelectOutputFolder_Click(object? sender, RoutedEventArgs e)
     {
+        if (IsFileProcessingDisabled())
+        {
+            return;
+        }
+
         var topLevel = TopLevel.GetTopLevel(this);
         if (topLevel == null)
         {
@@ -66,6 +78,11 @@ public partial class SetupWindow : Window
             Title = "Select Output Folder Directory",
             AllowMultiple = false
         });
+
+        if (folders.Count == 0)
+        {
+            return;
+        }
 
         var uri = folders[0].Path;
         if (uri != null && uri.IsAbsoluteUri)
@@ -95,8 +112,9 @@ public partial class SetupWindow : Window
         bool isBaseUrlValid = !string.IsNullOrWhiteSpace(baseUrl) &&
                               BaseUrlRegex.IsMatch(baseUrl);
 
+        bool fileProcessingDisabled = IsFileProcessingDisabled();
         bool isInputValid = Directory.Exists(inputPath);
-        bool isOutputValid = Directory.Exists(outputPath);
+        bool isOutputValid = fileProcessingDisabled || Directory.Exists(outputPath);
         bool isClientIdValid = string.IsNullOrWhiteSpace(clientId) || ClientIdRegex.IsMatch(clientId);
 
         saveButton.IsEnabled = isBaseUrlValid && isInputValid && isOutputValid && isClientIdValid;
@@ -109,6 +127,7 @@ public partial class SetupWindow : Window
             BaseUrl = GetTextBoxValue("BaseUrlBox"),
             InputFolderPath = GetTextBoxValue("InputFolderBox"),
             OutputFolderPath = GetTextBoxValue("OutputFolderBox"),
+            ImportEnabled = !IsFileProcessingDisabled(),
             AnilistClientId = GetTextBoxValue("ClientIdBox"),
             AnilistClientSecret = GetTextBoxValue("ClientSecretBox")
         };
@@ -126,6 +145,33 @@ public partial class SetupWindow : Window
         if (!_isSetupComplete)
         {
             Environment.Exit(0);
+        }
+    }
+
+    private bool IsFileProcessingDisabled()
+    {
+        return this.FindControl<CheckBox>("DisableFileProcessingBox")?.IsChecked == true;
+    }
+
+    private void UpdateFileProcessingState()
+    {
+        var fileProcessingDisabled = IsFileProcessingDisabled();
+        var outputBox = this.FindControl<TextBox>("OutputFolderBox");
+        var outputButton = this.FindControl<Button>("OutputFolderButton");
+
+        if (outputBox != null)
+        {
+            if (fileProcessingDisabled && !string.IsNullOrWhiteSpace(outputBox.Text))
+            {
+                outputBox.Text = string.Empty;
+            }
+
+            outputBox.IsEnabled = !fileProcessingDisabled;
+        }
+
+        if (outputButton != null)
+        {
+            outputButton.IsEnabled = !fileProcessingDisabled;
         }
     }
 

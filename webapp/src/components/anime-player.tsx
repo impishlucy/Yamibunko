@@ -9,9 +9,12 @@ import {
   Pause,
   Play,
   Radio,
+  RefreshCw,
   Settings,
   SkipBack,
   SkipForward,
+  Volume2,
+  VolumeX,
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
@@ -173,27 +176,422 @@ function supportsHevcDecode(video: HTMLVideoElement) {
   return canPlayAny(video, hevcMp4Checks)
 }
 
-function supportsDirectPlayback(video: HTMLVideoElement, fileName: string) {
+function normalizeCodecName(codec: string | undefined) {
+  return codec?.trim().toLowerCase().replace(/[._-]+/g, "") ?? ""
+}
+
+function getMediaContainer(fileName: string, container: string | undefined) {
   const extension = fileName.split(".").at(-1)?.toLowerCase() ?? ""
-  const hevcMatroskaChecks = [
-    'video/x-matroska; codecs="hvc1"',
-    'video/x-matroska; codecs="hev1"',
-    'video/x-matroska; codecs="hevc"',
-  ]
+  const normalizedContainer = container?.trim().toLowerCase() ?? ""
 
   if (extension === "mp4" || extension === "m4v") {
-    return supportsHevcDecode(video)
+    return "mp4"
+  }
+
+  if (extension === "mov") {
+    return "mov"
   }
 
   if (extension === "mkv") {
-    return supportsHevcDecode(video) || canPlayAny(video, hevcMatroskaChecks)
+    return "matroska"
   }
 
   if (extension === "webm") {
-    return canPlayAny(video, ['video/webm; codecs="vp9"', "video/webm"])
+    return "webm"
   }
 
-  return canPlayAny(video, [...hevcMp4Checks, ...hevcMatroskaChecks])
+  if (extension === "avi") {
+    return "avi"
+  }
+
+  if (normalizedContainer.includes("mp4") || normalizedContainer.includes("mov")) {
+    return "mp4"
+  }
+
+  if (normalizedContainer.includes("matroska")) {
+    return "matroska"
+  }
+
+  if (normalizedContainer.includes("webm")) {
+    return "webm"
+  }
+
+  if (normalizedContainer.includes("avi")) {
+    return "avi"
+  }
+
+  return "unknown"
+}
+
+function getDirectMimeTypes(container: string) {
+  if (container === "mp4") {
+    return ["video/mp4"]
+  }
+
+  if (container === "mov") {
+    return ["video/quicktime", "video/mp4"]
+  }
+
+  if (container === "webm") {
+    return ["video/webm"]
+  }
+
+  if (container === "matroska") {
+    return ["video/x-matroska"]
+  }
+
+  if (container === "avi") {
+    return ["video/x-msvideo"]
+  }
+
+  return ["video/mp4", "video/webm", "video/x-matroska"]
+}
+
+function getVideoCodecChecks(codec: string | undefined, mimeType: string) {
+  const normalizedCodec = normalizeCodecName(codec)
+
+  if (!normalizedCodec) {
+    return []
+  }
+
+  if (normalizedCodec === "h264" || normalizedCodec === "avc1") {
+    return ["avc1.640028", "avc1.4D401F", "avc1.42E01E", "avc1"]
+  }
+
+  if (
+    normalizedCodec === "hevc" ||
+    normalizedCodec === "h265" ||
+    normalizedCodec === "hvc1" ||
+    normalizedCodec === "hev1"
+  ) {
+    return mimeType === "video/x-matroska"
+      ? ["hvc1", "hev1", "hevc"]
+      : ["hvc1.1.6.L93.B0", "hev1.1.6.L93.B0", "hvc1", "hev1"]
+  }
+
+  if (normalizedCodec === "vp9" || normalizedCodec === "vp09") {
+    return ["vp09.00.10.08", "vp9"]
+  }
+
+  if (normalizedCodec === "vp8") {
+    return ["vp8"]
+  }
+
+  if (normalizedCodec === "av1" || normalizedCodec === "av01") {
+    return ["av01.0.05M.08", "av01"]
+  }
+
+  return []
+}
+
+function getAacCodecChecks(profile: string | undefined) {
+  const normalizedProfile = profile?.trim().toLowerCase() ?? ""
+
+  if (normalizedProfile.includes("he-aacv2") || normalizedProfile.includes("he-aac v2")) {
+    return ["mp4a.40.29"]
+  }
+
+  if (normalizedProfile.includes("he-aac") || normalizedProfile === "he") {
+    return ["mp4a.40.5"]
+  }
+
+  return ["mp4a.40.2"]
+}
+
+function getAudioCodecChecks(audioStream: MediaStreamInfo | undefined) {
+  const normalizedCodec = normalizeCodecName(audioStream?.codec)
+
+  if (!audioStream || !normalizedCodec) {
+    return []
+  }
+
+  if (normalizedCodec === "aac") {
+    return getAacCodecChecks(audioStream.profile)
+  }
+
+  if (normalizedCodec === "mp3" || normalizedCodec === "mp2" || normalizedCodec === "mp1") {
+    return ["mp4a.40.34", "mp4a.69", "mp4a.6B", "mp3"]
+  }
+
+  if (normalizedCodec === "opus") {
+    return ["opus"]
+  }
+
+  if (normalizedCodec === "vorbis") {
+    return ["vorbis"]
+  }
+
+  if (normalizedCodec === "flac") {
+    return ["flac"]
+  }
+
+  if (normalizedCodec === "ac3") {
+    return ["ac-3"]
+  }
+
+  if (normalizedCodec === "eac3") {
+    return ["ec-3"]
+  }
+
+  return []
+}
+
+function buildDirectPlaybackChecks(input: {
+  fileName: string
+  media: WatchPayload["media"]
+  selectedAudioStream: MediaStreamInfo | undefined
+}) {
+  const container = getMediaContainer(input.fileName, input.media.container)
+  const mimeTypes = getDirectMimeTypes(container)
+  const hasAudio = input.media.audioStreams.length > 0
+  const videoCodec = input.media.videoCodec
+  const audioCodecChecks = getAudioCodecChecks(input.selectedAudioStream)
+  const checks: string[] = []
+
+  if (hasAudio && !audioCodecChecks.length) {
+    return []
+  }
+
+  for (const mimeType of mimeTypes) {
+    const videoCodecChecks = getVideoCodecChecks(videoCodec, mimeType)
+
+    if (!videoCodecChecks.length) {
+      checks.push(mimeType)
+      continue
+    }
+
+    for (const videoCodecCheck of videoCodecChecks) {
+      if (audioCodecChecks.length) {
+        for (const audioCodecCheck of audioCodecChecks) {
+          checks.push(`${mimeType}; codecs="${videoCodecCheck}, ${audioCodecCheck}"`)
+        }
+      } else {
+        checks.push(`${mimeType}; codecs="${videoCodecCheck}"`)
+      }
+    }
+  }
+
+  return checks
+}
+
+function buildDirectVideoPlaybackChecks(input: {
+  fileName: string
+  media: WatchPayload["media"]
+}) {
+  const container = getMediaContainer(input.fileName, input.media.container)
+  const mimeTypes = getDirectMimeTypes(container)
+  const checks: string[] = []
+
+  for (const mimeType of mimeTypes) {
+    const videoCodecChecks = getVideoCodecChecks(input.media.videoCodec, mimeType)
+
+    if (!videoCodecChecks.length) {
+      checks.push(mimeType)
+      continue
+    }
+
+    for (const videoCodecCheck of videoCodecChecks) {
+      checks.push(`${mimeType}; codecs="${videoCodecCheck}"`)
+    }
+  }
+
+  return checks
+}
+
+function getDirectAudioMimeTypes(container: string) {
+  if (container === "webm") {
+    return ["audio/webm", "video/webm"]
+  }
+
+  if (container === "matroska") {
+    return ["video/x-matroska"]
+  }
+
+  return ["audio/mp4", "video/mp4"]
+}
+
+function buildDirectAudioPlaybackChecks(input: {
+  fileName: string
+  media: WatchPayload["media"]
+  selectedAudioStream: MediaStreamInfo | undefined
+}) {
+  if (!input.media.audioStreams.length) {
+    return []
+  }
+
+  const container = getMediaContainer(input.fileName, input.media.container)
+  const audioCodecChecks = getAudioCodecChecks(input.selectedAudioStream)
+
+  if (!audioCodecChecks.length) {
+    return []
+  }
+
+  const mimeTypes = getDirectAudioMimeTypes(container)
+  const checks: string[] = []
+
+  for (const audioCodecCheck of audioCodecChecks) {
+    if (audioCodecCheck === "mp3") {
+      checks.push('audio/mpeg')
+    }
+
+    for (const mimeType of mimeTypes) {
+      checks.push(`${mimeType}; codecs="${audioCodecCheck}"`)
+    }
+  }
+
+  return checks
+}
+
+function isOptimisticDirectVideoCandidate(input: {
+  fileName: string
+  media: WatchPayload["media"]
+}) {
+  const container = getMediaContainer(input.fileName, input.media.container)
+  const videoCodec = normalizeCodecName(input.media.videoCodec)
+
+  if (container !== "mp4" && container !== "mov") {
+    return false
+  }
+
+  return (
+    videoCodec === "h264" ||
+    videoCodec === "avc1" ||
+    videoCodec === "hevc" ||
+    videoCodec === "h265" ||
+    videoCodec === "hvc1" ||
+    videoCodec === "hev1"
+  )
+}
+
+function supportsDirectVideoTrack(input: {
+  video: HTMLVideoElement
+  fileName: string
+  media: WatchPayload["media"]
+}) {
+  const videoCodec = normalizeCodecName(input.media.videoCodec)
+  const isHevcVideo =
+    videoCodec === "hevc" ||
+    videoCodec === "h265" ||
+    videoCodec === "hvc1" ||
+    videoCodec === "hev1"
+
+  if (isHevcVideo && supportsHevcDecode(input.video)) {
+    return true
+  }
+
+  const checks = buildDirectVideoPlaybackChecks(input)
+
+  if (checks.length > 0 && canPlayAny(input.video, checks)) {
+    return true
+  }
+
+  return isOptimisticDirectVideoCandidate(input)
+}
+
+function isOptimisticDirectAudioCandidate(input: {
+  fileName: string
+  media: WatchPayload["media"]
+  selectedAudioStream: MediaStreamInfo | undefined
+}) {
+  if (!input.media.audioStreams.length) {
+    return true
+  }
+
+  const container = getMediaContainer(input.fileName, input.media.container)
+  const audioCodec = normalizeCodecName(input.selectedAudioStream?.codec)
+
+  if (!audioCodec) {
+    return false
+  }
+
+  if (container === "mp4" || container === "mov") {
+    return (
+      audioCodec === "aac" ||
+      audioCodec === "mp3" ||
+      audioCodec === "mp2" ||
+      audioCodec === "mp1" ||
+      audioCodec === "ac3" ||
+      audioCodec === "eac3"
+    )
+  }
+
+  if (container === "webm") {
+    return audioCodec === "opus" || audioCodec === "vorbis"
+  }
+
+  return false
+}
+
+function supportsDirectAudioTrack(input: {
+  video: HTMLVideoElement
+  fileName: string
+  media: WatchPayload["media"]
+  selectedAudioStream: MediaStreamInfo | undefined
+}) {
+  if (!input.media.audioStreams.length) {
+    return true
+  }
+
+  if (!input.selectedAudioStream) {
+    return false
+  }
+
+  const checks = buildDirectAudioPlaybackChecks(input)
+
+  if (checks.length > 0 && canPlayAny(input.video, checks)) {
+    return true
+  }
+
+  return isOptimisticDirectAudioCandidate(input)
+}
+
+function supportsDirectPlayback(input: {
+  video: HTMLVideoElement
+  fileName: string
+  media: WatchPayload["media"]
+  selectedAudioStream: MediaStreamInfo | undefined
+}) {
+  const checks = buildDirectPlaybackChecks(input)
+
+  if (checks.length && canPlayAny(input.video, checks)) {
+    return true
+  }
+
+  return (
+    supportsDirectVideoTrack(input) &&
+    supportsDirectAudioTrack(input)
+  )
+}
+
+function supportsCastDirectPlayback(input: {
+  fileName: string
+  media: WatchPayload["media"]
+  selectedAudioStream: MediaStreamInfo | undefined
+}) {
+  const container = getMediaContainer(input.fileName, input.media.container)
+  const videoCodec = normalizeCodecName(input.media.videoCodec)
+  const audioCodec = normalizeCodecName(input.selectedAudioStream?.codec)
+
+  if (container !== "mp4") {
+    return false
+  }
+
+  if (
+    videoCodec !== "h264" &&
+    videoCodec !== "avc1" &&
+    videoCodec !== "hevc" &&
+    videoCodec !== "h265" &&
+    videoCodec !== "hvc1" &&
+    videoCodec !== "hev1"
+  ) {
+    return false
+  }
+
+  if (!input.media.audioStreams.length) {
+    return true
+  }
+
+  return audioCodec === "aac" || audioCodec === "mp3"
 }
 
 function isPlayerControlTarget(target: EventTarget | null) {
@@ -324,9 +722,26 @@ function withStreamParams(
   return serializeUrl(sourceUrl, url)
 }
 
-function withSubtitleStream(sourceUrl: string, streamId: string) {
+function withSubtitleStream(
+  sourceUrl: string,
+  streamId: string,
+  options: { offsetSeconds?: number | null } = {}
+) {
   const url = new URL(sourceUrl, getUrlBase())
   url.searchParams.set("stream", streamId)
+
+  const offsetSeconds = options.offsetSeconds
+
+  if (
+    typeof offsetSeconds === "number" &&
+    Number.isFinite(offsetSeconds) &&
+    offsetSeconds > 0.25
+  ) {
+    url.searchParams.set("offset", offsetSeconds.toFixed(3))
+  } else {
+    url.searchParams.delete("offset")
+  }
+
   return serializeUrl(sourceUrl, url)
 }
 
@@ -825,10 +1240,13 @@ export function AnimePlayer({
   const videoRef = useRef<HTMLVideoElement>(null)
   const settingsPanelRef = useRef<HTMLDivElement>(null)
   const settingsButtonRef = useRef<HTMLDivElement>(null)
+  const volumeControlRef = useRef<HTMLDivElement>(null)
   const playbackKeyRef = useRef(`${animeId}:${seasonNumber}:${episodeNumber}`)
   const clientStreamIdRef = useRef(clientStreamId ?? createClientStreamId())
   const castSelectionKeyRef = useRef("")
   const lastProgressSavePositionRef = useRef(0)
+  const lastNonZeroVolumeRef = useRef(1)
+  const lastVolumePointerTypeRef = useRef<string | null>(null)
   const completedProgressRef = useRef(false)
   const directFallbackAttemptedRef = useRef(false)
   const currentTimeRef = useRef(0)
@@ -844,6 +1262,7 @@ export function AnimePlayer({
   const isCastLoadingRef = useRef(false)
   const isPlayingRef = useRef(false)
   const castContentIdRef = useRef<string | null>(null)
+  const castSourceStartOffsetRef = useRef(0)
   const castErrorFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const castErrorMessageTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const castFinishedHandledRef = useRef(false)
@@ -907,18 +1326,34 @@ export function AnimePlayer({
   const [controlsVisible, setControlsVisible] = useState(true)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [isPortraitViewport, setIsPortraitViewport] = useState(false)
+  const [isMobilePortraitViewport, setIsMobilePortraitViewport] = useState(false)
+  const [isFullscreen, setIsFullscreen] = useState(false)
   const [isCasting, setIsCasting] = useState(false)
   const [isCastStarting, setIsCastStarting] = useState(false)
   const [castErrorFlash, setCastErrorFlash] = useState(false)
   const [castErrorMessage, setCastErrorMessage] = useState<string | null>(null)
   const [subtitleCues, setSubtitleCues] = useState<SubtitleCue[]>([])
   const [activeSubtitleTexts, setActiveSubtitleTexts] = useState<string[]>([])
+  const [volume, setVolume] = useState(1)
+  const [isMuted, setIsMuted] = useState(false)
+  const [volumeOpen, setVolumeOpen] = useState(false)
 
   const playbackKey = `${animeId}:${seasonNumber}:${episodeNumber}`
   const liveTranscodeEnabled = playback.liveTranscodeEnabled !== false
+  const importProcessingEnabled = playback.importEnabled !== false
+  const automaticDataSaverSwitchingEnabled = !importProcessingEnabled
+  const dataSaverBlockedByDirect = liveTranscodeEnabled && importProcessingEnabled && directPossible
+  const showQualityControl = liveTranscodeEnabled && !dataSaverBlockedByDirect
   const selectedAudioStream = useMemo(
     () => media.audioStreams.find((stream) => stream.id === selectedAudioStreamId),
     [media.audioStreams, selectedAudioStreamId]
+  )
+  const playbackAudioStream = useMemo(
+    () =>
+      selectedAudioStream ??
+      media.audioStreams.find((stream) => stream.id === media.defaultAudioStreamId) ??
+      media.audioStreams[0],
+    [media.audioStreams, media.defaultAudioStreamId, selectedAudioStream]
   )
   const directAudioRemuxActive = shouldUseDirectAudioRemux(
     selectedAudioStreamId,
@@ -983,6 +1418,18 @@ export function AnimePlayer({
 
     return () => window.clearTimeout(timer)
   }, [liveTranscodeEnabled, quality])
+
+  useEffect(() => {
+    if (!dataSaverBlockedByDirect || quality === "original") {
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      setQuality("original")
+    }, 0)
+
+    return () => window.clearTimeout(timer)
+  }, [dataSaverBlockedByDirect, quality])
 
   useEffect(() => {
     const video = videoRef.current
@@ -1179,19 +1626,50 @@ export function AnimePlayer({
   }, [showControls])
 
   useEffect(() => {
-    const mediaQuery = window.matchMedia("(orientation: portrait)")
+    const portraitQuery = window.matchMedia("(orientation: portrait)")
+    const mobilePortraitQuery = window.matchMedia(
+      "(max-width: 767px) and (orientation: portrait)"
+    )
 
     function syncPortraitViewport() {
-      setIsPortraitViewport(mediaQuery.matches)
+      setIsPortraitViewport(portraitQuery.matches)
+      setIsMobilePortraitViewport(mobilePortraitQuery.matches)
     }
 
     syncPortraitViewport()
-    mediaQuery.addEventListener("change", syncPortraitViewport)
+    portraitQuery.addEventListener("change", syncPortraitViewport)
+    mobilePortraitQuery.addEventListener("change", syncPortraitViewport)
 
     return () => {
-      mediaQuery.removeEventListener("change", syncPortraitViewport)
+      portraitQuery.removeEventListener("change", syncPortraitViewport)
+      mobilePortraitQuery.removeEventListener("change", syncPortraitViewport)
     }
   }, [])
+
+  useEffect(() => {
+    function syncFullscreenState() {
+      setIsFullscreen(Boolean(document.fullscreenElement))
+    }
+
+    syncFullscreenState()
+    document.addEventListener("fullscreenchange", syncFullscreenState)
+
+    return () => {
+      document.removeEventListener("fullscreenchange", syncFullscreenState)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!isMobilePortraitViewport || isCasting || isFullscreen) {
+      return
+    }
+
+    const video = videoRef.current
+
+    if (video && !video.paused) {
+      video.pause()
+    }
+  }, [isCasting, isFullscreen, isMobilePortraitViewport])
 
   useEffect(() => {
     if (!settingsOpen) {
@@ -1222,6 +1700,33 @@ export function AnimePlayer({
       document.removeEventListener("pointerdown", handleDocumentPointerDown)
     }
   }, [settingsOpen])
+
+
+  useEffect(() => {
+    if (!volumeOpen) {
+      return
+    }
+
+    function handleDocumentPointerDown(event: PointerEvent) {
+      const target = event.target
+
+      if (!(target instanceof Node)) {
+        return
+      }
+
+      if (volumeControlRef.current?.contains(target)) {
+        return
+      }
+
+      setVolumeOpen(false)
+    }
+
+    document.addEventListener("pointerdown", handleDocumentPointerDown)
+
+    return () => {
+      document.removeEventListener("pointerdown", handleDocumentPointerDown)
+    }
+  }, [volumeOpen])
 
   const saveProgress = useCallback(
     async (
@@ -1542,7 +2047,14 @@ export function AnimePlayer({
       }
 
       const video = videoRef.current
-      const canUseDirect = video ? supportsDirectPlayback(video, fileName) : false
+      const canUseDirect = video
+        ? supportsDirectPlayback({
+            video,
+            fileName,
+            media,
+            selectedAudioStream: playbackAudioStream,
+          })
+        : false
       const waitForPrioritySwitch = pendingPrioritySwitchRef.current
       pendingPrioritySwitchRef.current = false
 
@@ -1589,8 +2101,10 @@ export function AnimePlayer({
     getDirectUrl,
     getTranscodeUrl,
     liveTranscodeEnabled,
+    media,
     playbackKey,
     quality,
+    playbackAudioStream,
   ])
 
   useEffect(() => {
@@ -1737,7 +2251,7 @@ export function AnimePlayer({
 
   const switchQualityFromPriority = useCallback(
     (nextQuality: PlaybackProfile) => {
-      if (!liveTranscodeEnabled) {
+      if (!liveTranscodeEnabled || (dataSaverBlockedByDirect && nextQuality === "dataSaver")) {
         return
       }
 
@@ -1753,7 +2267,7 @@ export function AnimePlayer({
       setQuality(nextQuality)
       showControls(true)
     },
-    [beginMediaWait, liveTranscodeEnabled, showControls]
+    [beginMediaWait, dataSaverBlockedByDirect, liveTranscodeEnabled, showControls]
   )
 
   const markDataSaverProtectionOnServer = useCallback(() => {
@@ -1959,6 +2473,10 @@ export function AnimePlayer({
       }
 
       if (action.type === "forceDataSaver") {
+        if (!automaticDataSaverSwitchingEnabled) {
+          return
+        }
+
         const protectionAlreadyActive = dataSaverProtectionKey === playbackKey
         const protectionEnabled = protectionAlreadyActive || registerForcedDowngrade()
         const message =
@@ -1985,6 +2503,10 @@ export function AnimePlayer({
       }
 
       if (action.type === "restoreOriginal") {
+        if (!automaticDataSaverSwitchingEnabled) {
+          return
+        }
+
         if (dataSaverProtectionKey === playbackKey) {
           markDataSaverProtectionOnServer()
           return
@@ -2016,6 +2538,7 @@ export function AnimePlayer({
       )
     },
     [
+      automaticDataSaverSwitchingEnabled,
       dataSaverProtectionKey,
       handleBandwidthRecheckFinished,
       handleBandwidthRecheckStarted,
@@ -2174,7 +2697,14 @@ export function AnimePlayer({
     }
 
     const video = videoRef.current
-    const canUseDirect = video ? supportsDirectPlayback(video, fileName) : false
+    const canUseDirect = video
+      ? supportsDirectPlayback({
+          video,
+          fileName,
+          media,
+          selectedAudioStream: playbackAudioStream,
+        })
+      : false
 
     if (video) {
       video.muted = false
@@ -2222,6 +2752,11 @@ export function AnimePlayer({
       return
     }
 
+    if (shouldBlockMobilePortraitPlayback) {
+      showControls(true)
+      return
+    }
+
     const video = videoRef.current
 
     if (!video || !sourceUrl) {
@@ -2242,6 +2777,33 @@ export function AnimePlayer({
 
   async function seekTo(seconds: number) {
     if (isCastingRef.current) {
+      const target = clampTime(seconds, duration)
+
+      currentTimeRef.current = target
+      setCurrentTime(target)
+
+      if (statusRef.current === "transcoding" || directAudioRemuxActive) {
+        const video = videoRef.current
+
+        if (!video) {
+          flashCastError(new Error("Google Cast session is missing"))
+          console.error("Google Cast session is missing")
+          return
+        }
+
+        beginMediaWait(statusRef.current === "transcoding")
+
+        try {
+          await startGoogleCastingRef.current(video, isPlayingRef.current, target)
+        } catch (error) {
+          flashCastError(error)
+          console.error(error)
+        }
+
+        showControls()
+        return
+      }
+
       const session = getGoogleCastSession()
 
       if (!session) {
@@ -2251,9 +2813,7 @@ export function AnimePlayer({
       }
 
       try {
-        await seekGoogleCastMedia(session, seconds)
-        currentTimeRef.current = seconds
-        setCurrentTime(seconds)
+        await seekGoogleCastMedia(session, target)
       } catch (error) {
         flashCastError(error)
         console.error(error)
@@ -2376,6 +2936,49 @@ export function AnimePlayer({
     }
   }
 
+  function syncLocalVolumeState(video: HTMLVideoElement) {
+    const nextVolume = Math.min(Math.max(video.volume, 0), 1)
+
+    if (nextVolume > 0) {
+      lastNonZeroVolumeRef.current = nextVolume
+    }
+
+    setVolume(nextVolume)
+    setIsMuted(video.muted || nextVolume === 0)
+  }
+
+  function changeLocalVolume(value: string) {
+    const video = videoRef.current
+    const nextVolume = Math.min(Math.max(Number(value), 0), 1)
+
+    if (!video || !Number.isFinite(nextVolume)) {
+      return
+    }
+
+    video.volume = nextVolume
+    video.muted = nextVolume === 0
+    syncLocalVolumeState(video)
+    showControls(true)
+  }
+
+  function toggleLocalMute() {
+    const video = videoRef.current
+
+    if (!video) {
+      return
+    }
+
+    if (video.muted || video.volume === 0) {
+      video.volume = video.volume === 0 ? lastNonZeroVolumeRef.current : video.volume
+      video.muted = false
+    } else {
+      video.muted = true
+    }
+
+    syncLocalVolumeState(video)
+    showControls(true)
+  }
+
   function requestFullscreen() {
     const target = playerRef.current ?? videoRef.current
 
@@ -2420,13 +3023,15 @@ export function AnimePlayer({
     return new URL(castUrl, window.location.href).toString()
   }
 
-  function getSelectedCastTextTrack() {
+  function getSelectedCastTextTrack(offsetSeconds = 0) {
     if (!selectedSubtitleStream) {
       return undefined
     }
 
     const trackUrl = getCastReceiverUrl(
-      withSubtitleStream(playback.castSubtitleUrl, selectedSubtitleStream.id)
+      withSubtitleStream(playback.castSubtitleUrl, selectedSubtitleStream.id, {
+        offsetSeconds,
+      })
     )
 
     return {
@@ -2490,7 +3095,12 @@ export function AnimePlayer({
       state.durationSeconds,
       duration
     )
-    updateWatchedProgress(state.positionSeconds, state.durationSeconds)
+    const sourcePosition = clampTime(
+      castSourceStartOffsetRef.current + state.positionSeconds,
+      knownDuration
+    )
+
+    updateWatchedProgress(sourcePosition, knownDuration)
 
     if (state.playerState === "PLAYING" || state.playerState === "BUFFERING") {
       resumeLocalAfterCastEndRef.current = true
@@ -2503,7 +3113,7 @@ export function AnimePlayer({
     if (state.playerState === "IDLE") {
       if (state.idleReason === "FINISHED" && !castFinishedHandledRef.current) {
         castFinishedHandledRef.current = true
-        completePlayback(state.positionSeconds, knownDuration)
+        completePlayback(sourcePosition, knownDuration)
         return
       }
 
@@ -2554,13 +3164,16 @@ export function AnimePlayer({
   function activateGoogleCastPlayback(
     session: GoogleCastSessionHandle,
     contentId: string,
-    nextStatus: PlaybackStatusState
+    nextStatus: PlaybackStatusState,
+    sourceStartOffset = 0
   ) {
+    castSourceStartOffsetRef.current = Math.max(sourceStartOffset, 0)
     isCastLoadingRef.current = false
     isCastingRef.current = true
     castSelectionKeyRef.current = castSelectionKey
     setIsCasting(true)
     setStatus(nextStatus)
+    statusRef.current = nextStatus
     endMediaWait()
     suspendLocalVideoForCast()
     attachCastMediaSync(session, contentId)
@@ -2625,25 +3238,44 @@ export function AnimePlayer({
 
     const startTime = startTimeOverride ?? getPlaybackPosition()
     const alreadyCasting = isCastingRef.current || isCastLoadingRef.current
-    const canLocalDirect = supportsDirectPlayback(video, fileName)
-    const directFirst = quality === "original" && canLocalDirect
+    const canLocalDirect = supportsDirectPlayback({
+      video,
+      fileName,
+      media,
+      selectedAudioStream: playbackAudioStream,
+    })
+    const canCastDirect = supportsCastDirectPlayback({
+      fileName,
+      media,
+      selectedAudioStream: playbackAudioStream,
+    })
+    const directFirst = quality === "original" && canCastDirect
+    const directCastUsesOffset = directAudioRemuxActive && startTime > 0.25
+    const directCastStartOffset = directCastUsesOffset ? startTime : 0
+    const directCastRequestTime = directCastUsesOffset ? 0 : startTime
     const directCastUrl = getCastReceiverUrl(
       withStreamParams(playback.castDirectUrl, {
         audioStreamId: selectedAudioStreamId,
+        startTime: directCastUsesOffset ? startTime : null,
         clientId: clientStreamIdRef.current,
       })
     )
     const castTranscodeBaseUrl =
       quality === "dataSaver" ? playback.castDataSaverUrl : playback.castTranscodeUrl
+    const transcodeCastStartOffset = startTime > 0.25 ? startTime : 0
     const transcodeCastUrl = getCastReceiverUrl(
       withStreamParams(castTranscodeBaseUrl, {
         audioStreamId: selectedAudioStreamId,
+        startTime: transcodeCastStartOffset,
         clientId: clientStreamIdRef.current,
       })
     )
-    const textTrack = getSelectedCastTextTrack()
+    const directTextTrack = getSelectedCastTextTrack(directCastStartOffset)
+    const transcodeTextTrack = getSelectedCastTextTrack(transcodeCastStartOffset)
     const localFallbackStatus =
-      directFirst || !liveTranscodeEnabled ? "direct" : "transcoding"
+      quality === "original" && (canLocalDirect || !liveTranscodeEnabled)
+        ? "direct"
+        : "transcoding"
     const localFallbackSource =
       localFallbackStatus === "direct" ? getDirectUrl() : getTranscodeUrl(quality)
 
@@ -2684,12 +3316,17 @@ export function AnimePlayer({
           url: directCastUrl,
           contentType: getCastDirectContentType(fileName, directAudioRemuxActive),
           shouldResume,
-          startTime,
-          textTrack,
+          startTime: directCastRequestTime,
+          textTrack: directTextTrack,
           timeoutMs: 60_000,
         })
         if (result === "loaded") {
-          activateGoogleCastPlayback(session, directCastUrl, "direct")
+          activateGoogleCastPlayback(
+            session,
+            directCastUrl,
+            "direct",
+            directCastStartOffset
+          )
           return true
         }
 
@@ -2726,13 +3363,18 @@ export function AnimePlayer({
         url: transcodeCastUrl,
         contentType: "video/mp4",
         shouldResume,
-        startTime,
-        textTrack,
+        startTime: 0,
+        textTrack: transcodeTextTrack,
         timeoutMs: null,
       })
 
       if (result === "loaded") {
-        activateGoogleCastPlayback(session, transcodeCastUrl, "transcoding")
+        activateGoogleCastPlayback(
+          session,
+          transcodeCastUrl,
+          "transcoding",
+          transcodeCastStartOffset
+        )
         return true
       }
 
@@ -2837,6 +3479,7 @@ export function AnimePlayer({
     video?.pause()
     clearCastMediaSync()
     castContentIdRef.current = null
+    castSourceStartOffsetRef.current = 0
     castFinishedHandledRef.current = false
     castStartPromiseRef.current = null
     setIsCastStarting(false)
@@ -2953,7 +3596,7 @@ export function AnimePlayer({
   }
 
   function changeQuality(nextQuality: PlaybackProfile) {
-    if (!liveTranscodeEnabled) {
+    if (!liveTranscodeEnabled || (dataSaverBlockedByDirect && nextQuality === "dataSaver")) {
       setQuality("original")
       showControls(true)
       return
@@ -3039,12 +3682,19 @@ export function AnimePlayer({
   const canSkipIntro = duration > 90 && currentTime < 90
   const canSkipOutro = duration > 0 && currentTime >= duration * 0.8 && currentTime < duration - 1
   const castSkipLabel = canSkipIntro ? "Skip intro" : canSkipOutro ? "Skip outro" : "Skip intro/outro"
-  const controlsAreVisible = controlsVisible || !isPlaying || isCasting || settingsOpen
+  const shouldBlockMobilePortraitPlayback =
+    isMobilePortraitViewport && !isCasting && !isFullscreen
+  const controlsAreVisible =
+    !shouldBlockMobilePortraitPlayback &&
+    (controlsVisible || !isPlaying || isCasting || settingsOpen)
   const castPreflightError = getCastPreflightError()
   const castButtonLabel = castPreflightError ?? "Google Cast"
   const castButtonDisabled = !sourceUrl || isCastStarting || Boolean(castPreflightError)
   const centerToggleVisible =
-    !isWaitingForMedia && !isCasting && (!isPlaying || controlsAreVisible)
+    !shouldBlockMobilePortraitPlayback &&
+    !isWaitingForMedia &&
+    !isCasting &&
+    (!isPlaying || controlsAreVisible)
   const settingsPanelClass = `fixed left-1/2 z-[100] w-[min(24rem,calc(100vw-1.5rem))] -translate-x-1/2 space-y-3 overflow-y-auto overscroll-contain rounded-xl border border-white/10 bg-zinc-950/95 p-3 text-xs shadow-2xl backdrop-blur lg:p-4 lg:text-sm ${
     isPortraitViewport
       ? "top-[20dvh] max-h-[calc(80dvh-1rem)]"
@@ -3148,12 +3798,28 @@ export function AnimePlayer({
             endMediaWait()
           }}
           onPause={handlePause}
-          onPlay={() => {
+          onPlay={(event) => {
+            if (shouldBlockMobilePortraitPlayback) {
+              event.currentTarget.pause()
+              setIsPlaying(false)
+              endMediaWait()
+              showControls(true)
+              return
+            }
+
             sourceSwitchPauseSuppressionUntilRef.current = 0
             setIsPlaying(true)
             showControls()
           }}
-          onPlaying={() => {
+          onPlaying={(event) => {
+            if (shouldBlockMobilePortraitPlayback) {
+              event.currentTarget.pause()
+              setIsPlaying(false)
+              endMediaWait()
+              showControls(true)
+              return
+            }
+
             sourceSwitchPauseSuppressionUntilRef.current = 0
             setIsPlaying(true)
             endMediaWait()
@@ -3162,7 +3828,25 @@ export function AnimePlayer({
           onWaiting={() => beginMediaWait()}
           onTimeUpdate={handleTimeUpdate}
           onProgress={handleProgress}
+          onVolumeChange={(event) => syncLocalVolumeState(event.currentTarget)}
         />
+
+        {shouldBlockMobilePortraitPlayback ? (
+          <div
+            className="absolute inset-0 z-40 grid place-items-center overflow-hidden bg-zinc-950 text-white"
+            aria-live="polite"
+          >
+            <div className="absolute inset-0 animate-pulse bg-[radial-gradient(circle_at_50%_30%,rgba(168,85,247,0.18),transparent_34%),linear-gradient(180deg,rgba(24,24,27,0.85),rgba(0,0,0,0.98))]" />
+            <div className="relative flex flex-col items-center gap-4 px-6 text-center">
+              <div className="grid size-20 place-items-center rounded-full border border-violet-300/30 bg-white/[0.06] text-violet-200 shadow-2xl sm:size-24">
+                <RefreshCw className="size-10 sm:size-12" />
+              </div>
+              <div className="text-2xl font-semibold tracking-wide text-zinc-100 sm:text-3xl">
+                rotate to play
+              </div>
+            </div>
+          </div>
+        ) : null}
 
         {isCasting ? (
           <div className="absolute inset-0 bg-black text-white">
@@ -3444,35 +4128,35 @@ export function AnimePlayer({
           </div>
         ) : null}
 
-        {settingsOpen ? (
+        {settingsOpen && !shouldBlockMobilePortraitPlayback ? (
           <div
             ref={settingsPanelRef}
             className={settingsPanelClass}
             onClick={(event) => event.stopPropagation()}
           >
-            {liveTranscodeEnabled ? (
-              <>
-                <label className="grid gap-1 text-zinc-300">
-                  <span>Quality</span>
-                  <select
-                    className={settingsSelectClass}
-                    value={quality}
-                    onChange={(event) =>
-                      changeQuality(event.target.value as PlaybackProfile)
-                    }
-                  >
-                    <option value="original">Default</option>
-                    <option value="dataSaver">Data Saver</option>
-                  </select>
-                </label>
+            {showQualityControl ? (
+              <label className="grid gap-1 text-zinc-300">
+                <span>Quality</span>
+                <select
+                  className={settingsSelectClass}
+                  value={quality}
+                  onChange={(event) =>
+                    changeQuality(event.target.value as PlaybackProfile)
+                  }
+                >
+                  <option value="original">Full Quality</option>
+                  <option value="dataSaver">Data Saver</option>
+                </select>
+              </label>
+            ) : null}
 
-                <div className="grid gap-1 text-zinc-300">
-                  <span>Display Method</span>
-                  <div className="rounded-md border border-white/10 bg-zinc-950 px-2 py-1.5 text-zinc-100 lg:px-3 lg:py-2">
-                    {displayMethod}
-                  </div>
+            {liveTranscodeEnabled ? (
+              <div className="grid gap-1 text-zinc-300">
+                <span>Display Method</span>
+                <div className="rounded-md border border-white/10 bg-zinc-950 px-2 py-1.5 text-zinc-100 lg:px-3 lg:py-2">
+                  {displayMethod}
                 </div>
-              </>
+              </div>
             ) : null}
 
             <label className="grid gap-1 text-zinc-300">
@@ -3624,6 +4308,64 @@ export function AnimePlayer({
               />
             </div>
 
+
+            <div
+              ref={volumeControlRef}
+              className="group/volume relative flex shrink-0 items-center rounded-full border border-white/10 bg-zinc-950/60 px-1.5 py-1 text-zinc-200 shadow-lg"
+              onClick={(event) => event.stopPropagation()}
+              onPointerEnter={() => showControls(true)}
+            >
+              <div
+                className={`absolute bottom-full left-1/2 z-30 -translate-x-1/2 rounded-2xl border border-white/10 bg-zinc-950/90 px-3 py-3 text-zinc-200 opacity-0 shadow-2xl backdrop-blur transition group-hover/volume:pointer-events-auto group-hover/volume:opacity-100 ${
+                  volumeOpen ? "pointer-events-auto opacity-100" : "pointer-events-none"
+                }`}
+              >
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={isMuted ? 0 : volume}
+                  onChange={(event) => changeLocalVolume(event.currentTarget.value)}
+                  onPointerDown={(event) => event.stopPropagation()}
+                  onClick={(event) => event.stopPropagation()}
+                  aria-label="Volume"
+                  className="h-28 w-2 accent-violet-500 lg:h-32"
+                  style={{ writingMode: "vertical-lr", direction: "rtl" }}
+                />
+              </div>
+
+              <HoverHint label={isMuted ? "Unmute" : "Mute"}>
+                <button
+                  type="button"
+                  className="grid size-7 place-items-center rounded-full text-zinc-200 transition hover:bg-white/10 hover:text-white lg:size-8"
+                  onPointerDown={(event) => {
+                    lastVolumePointerTypeRef.current = event.pointerType
+                  }}
+                  onClick={(event) => {
+                    event.stopPropagation()
+
+                    if (
+                      lastVolumePointerTypeRef.current === "touch" ||
+                      lastVolumePointerTypeRef.current === "pen"
+                    ) {
+                      setVolumeOpen((open) => !open)
+                      showControls(true)
+                      return
+                    }
+
+                    toggleLocalMute()
+                  }}
+                  aria-label={isMuted ? "Unmute" : "Mute"}
+                >
+                  {isMuted ? (
+                    <VolumeX className="size-4 lg:size-5" />
+                  ) : (
+                    <Volume2 className="size-4 lg:size-5" />
+                  )}
+                </button>
+              </HoverHint>
+            </div>
 
             <div ref={settingsButtonRef} className="relative">
               <HoverHint label="Settings">

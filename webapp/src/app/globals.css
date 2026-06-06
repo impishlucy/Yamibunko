@@ -147,8 +147,8 @@
 
 @media (orientation: landscape) and (max-height: 600px) {
   .yami-player-width {
-    width: 58vw;
-    max-width: 58vw;
+    width: 54vw;
+    max-width: 54vw;
   }
 }
 

@@ -71,15 +71,11 @@ const textSubtitleCodecs = new Set([
   "text",
 ])
 
-const managedAudioCopyCodecs = new Set([
-  "aac",
-  "ac3",
-  "eac3",
-  "mp2",
-  "mp3",
-  "opus",
-  "vorbis",
-])
+function isLcAacProfile(profile: string | undefined | null) {
+  const normalized = profile?.trim().toLowerCase()
+
+  return !normalized || normalized === "lc" || normalized === "aac lc"
+}
 
 function normalizeLanguage(value: string | undefined | null) {
   const normalized = value?.trim().toLowerCase()
@@ -207,31 +203,30 @@ function toBaseStreamInfo(stream: ProbeStream, fallbackIndex: number) {
     id: String(index),
     index,
     codec: stream.codec_name ?? undefined,
+    profile: stream.profile ?? undefined,
+    channels: stream.channels,
     language,
     label,
     isDefault: isDefaultStream(stream),
   }
 }
 
-export function isAudioStreamMp3Target(stream: ProbeStream) {
+export function isAudioStreamAacTranscodeTarget(stream: ProbeStream) {
   const codec = (stream.codec_name ?? "").trim().toLowerCase()
+  const channels = stream.channels
 
-  if (!codec) {
-    return false
-  }
-
-  if (codec.startsWith("pcm_")) {
-    return true
-  }
-
-  return !managedAudioCopyCodecs.has(codec)
+  return (
+    codec !== "aac" ||
+    !isLcAacProfile(stream.profile) ||
+    (typeof channels === "number" && channels > 0 && channels !== 2)
+  )
 }
 
-export function getAudioOutputIndexesToMp3(probe: ProbeResult) {
+export function getAudioOutputIndexesToAac(probe: ProbeResult) {
   return (probe.streams ?? [])
     .filter((stream) => stream.codec_type === "audio")
     .map((stream, outputAudioIndex) => ({ stream, outputAudioIndex }))
-    .filter(({ stream }) => isAudioStreamMp3Target(stream))
+    .filter(({ stream }) => isAudioStreamAacTranscodeTarget(stream))
     .map(({ outputAudioIndex }) => outputAudioIndex)
 }
 

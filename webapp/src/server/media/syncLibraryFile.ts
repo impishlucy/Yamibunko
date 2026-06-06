@@ -1,4 +1,3 @@
-import { rm } from "node:fs/promises"
 import path from "node:path"
 
 import {
@@ -15,7 +14,7 @@ import {
   isMediaFile,
   parseDurationSeconds,
   pathExists,
-  thumbnailPathForEpisode,
+  removeEpisodeThumbnails,
   type ProbeResult,
   waitForStableFile,
 } from "@/server/media/mediaFiles"
@@ -355,9 +354,7 @@ export async function removeLibraryFile(filePath: string) {
     console.log(
       `[Info] [Media] Removed deleted library file from database - Anime id ${episode.animeId}, Season ${episode.seasonNumber}, Episode ${episode.episodeNumber}`
     )
-    await rm(thumbnailPathForEpisode(resolvedPath), { force: true }).catch(
-      () => undefined
-    )
+    await removeEpisodeThumbnails(resolvedPath).catch(() => undefined)
   } else {
     console.log(
       `[Info] [Media] Deleted library file was not present in database - ${fileName(resolvedPath)}`

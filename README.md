@@ -68,9 +68,9 @@ Use the same base URL in the launcher or `.env` file. If you host Yamibunko behi
 
 The webapp can run without the launcher, but you must provide the runtime yourself:
 
-* Node.js 20 or newer, with Node.js 24 recommended for development
-* Bun
-* FFmpeg and FFprobe with HEVC support
+* [Node.js 20 or newer](https://nodejs.org/)
+* [Bun](https://bun.sh/)
+* [FFmpeg and FFprobe with HEVC support](https://github.com/btbn/ffmpeg-builds/)
 * A configured `.env` file
 
 From the `webapp` directory:

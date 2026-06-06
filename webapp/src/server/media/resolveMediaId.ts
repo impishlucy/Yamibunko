@@ -12,6 +12,23 @@ function assertInsideRoot(root: string, candidate: string) {
   )
 }
 
+function getAllowedMediaRoot() {
+  const config = getServerConfig()
+  const root = config.importEnabled ? config.mediaDir : config.inputDir
+
+  return path.resolve(root)
+}
+
+function assertEpisodePathAllowed(candidate: string) {
+  const root = getAllowedMediaRoot()
+
+  if (!assertInsideRoot(root, candidate)) {
+    throw new Error(
+      "Resolved media path escaped the configured media directory"
+    )
+  }
+}
+
 export function resolveEpisodeFile(
   animeId: string,
   seasonNr: string | number,
@@ -23,15 +40,8 @@ export function resolveEpisodeFile(
     return null
   }
 
-  const config = getServerConfig()
-  const root = path.resolve(config.mediaDir)
   const resolved = path.resolve(episode.filePath)
-
-  if (!assertInsideRoot(root, resolved)) {
-    throw new Error(
-      "Resolved media path escaped the configured media directory"
-    )
-  }
+  assertEpisodePathAllowed(resolved)
 
   return resolved
 }
@@ -47,15 +57,8 @@ export function resolveEpisodeMedia(
     return null
   }
 
-  const config = getServerConfig()
-  const root = path.resolve(config.mediaDir)
   const resolved = path.resolve(episode.filePath)
-
-  if (!assertInsideRoot(root, resolved)) {
-    throw new Error(
-      "Resolved media path escaped the configured media directory"
-    )
-  }
+  assertEpisodePathAllowed(resolved)
 
   return {
     file: resolved,

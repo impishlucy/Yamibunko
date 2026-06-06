@@ -8,6 +8,21 @@ import { getServerConfig, type TranscodeAcceleration } from "@/server/config"
 
 let cachedAmdVaapiDevice: string | undefined
 
+const targetAacBitrate = "320k"
+
+export function getLcAacStereoArgs() {
+  return [
+    "-c:a",
+    "aac",
+    "-profile:a",
+    "aac_low",
+    "-b:a",
+    targetAacBitrate,
+    "-ac",
+    "2",
+  ]
+}
+
 export async function ffprobe(file: string) {
   const config = getServerConfig()
   const { stdout } = await execa(
@@ -148,17 +163,64 @@ export function getHardwareInputLabel() {
   return "none"
 }
 
-function getAmdH264EncoderArgs() {
-  return getAmdBackend() === "amf"
-    ? [
-        "-c:v",
-        "h264_amf",
-        "-usage",
-        "lowlatency_high_quality",
-        "-quality",
-        "balanced",
-      ]
-    : ["-c:v", "h264_vaapi"]
+function getLiveH264EncoderArgs(
+  acceleration: TranscodeAcceleration,
+  profile: PlaybackProfile
+) {
+  const dataSaver = profile === "dataSaver"
+
+  if (acceleration === "nvenc") {
+    return [
+      "-c:v",
+      "h264_nvenc",
+      "-preset",
+      dataSaver ? "p1" : "p2",
+      "-tune",
+      dataSaver ? "ll" : "hq",
+      ...(dataSaver
+        ? []
+        : [
+            "-spatial-aq",
+            "1",
+            "-temporal-aq",
+            "1",
+            "-aq-strength",
+            "6",
+            "-rc-lookahead",
+            "16",
+            "-bf",
+            "3",
+            "-b_ref_mode",
+            "middle",
+          ]),
+    ]
+  }
+
+  if (acceleration === "qsv") {
+    return [
+      "-c:v",
+      "h264_qsv",
+      "-preset",
+      dataSaver ? "veryfast" : "faster",
+      "-async_depth",
+      "8",
+    ]
+  }
+
+  if (acceleration === "amd") {
+    return getAmdBackend() === "amf"
+      ? [
+          "-c:v",
+          "h264_amf",
+          "-usage",
+          dataSaver ? "lowlatency" : "lowlatency_high_quality",
+          "-quality",
+          dataSaver ? "speed" : "balanced",
+        ]
+      : ["-c:v", "h264_vaapi"]
+  }
+
+  return ["-c:v", "libx264", "-preset", dataSaver ? "ultrafast" : "superfast"]
 }
 
 function getFileVideoBitrateArgs(input: {
@@ -219,27 +281,7 @@ export function getLiveH264Args(
   options: { audioStreamIndex?: number; sourceBitrateKbps?: number } = {}
 ) {
   const config = getServerConfig()
-  const audioBitrate = profile === "dataSaver" ? "128k" : "192k"
-
-  const encoderArgs =
-    config.transcodeAccel === "nvenc"
-      ? [
-          "-c:v",
-          "h264_nvenc",
-          "-preset",
-          "p4",
-          "-tune",
-          "ll",
-          "-spatial-aq",
-          "1",
-          "-temporal-aq",
-          "1",
-        ]
-      : config.transcodeAccel === "qsv"
-        ? ["-c:v", "h264_qsv", "-preset", "veryfast", "-async_depth", "8"]
-        : config.transcodeAccel === "amd"
-          ? getAmdH264EncoderArgs()
-          : ["-c:v", "libx264", "-preset", "fast"]
+  const encoderArgs = getLiveH264EncoderArgs(config.transcodeAccel, profile)
 
   const qualityArgs = getLiveOriginalQualityArgs(
     config.transcodeAccel,
@@ -273,10 +315,7 @@ export function getLiveH264Args(
     "-keyint_min",
     "48",
     ...getLiveBrowserH264Args(config.transcodeAccel),
-    "-c:a",
-    "aac",
-    "-b:a",
-    audioBitrate,
+    ...getLcAacStereoArgs(),
   ]
 }
 
@@ -312,18 +351,25 @@ function getLiveOriginalQualityArgs(
   }
 
   if (acceleration === "amd") {
-    return [...getAmdLiveQualityArgs(), ...bitrateArgs]
+    return [...getAmdLiveQualityArgs("original"), ...bitrateArgs]
   }
 
   return ["-crf", "20", ...bitrateArgs]
 }
 
-function getAmdLiveQualityArgs() {
+function getAmdLiveQualityArgs(profile: PlaybackProfile) {
+  const dataSaver = profile === "dataSaver"
+
   if (getAmdBackend() === "amf") {
-    return ["-rc", "qvbr", "-qvbr_quality_level", "20"]
+    return [
+      "-rc",
+      "qvbr",
+      "-qvbr_quality_level",
+      dataSaver ? "30" : "20",
+    ]
   }
 
-  return ["-rc_mode", "CQP", "-qp", "23"]
+  return ["-rc_mode", "VBR"]
 }
 
 function getLiveH264FormatArgs(acceleration: TranscodeAcceleration) {
@@ -365,8 +411,12 @@ function getLiveBrowserH264Args(acceleration: TranscodeAcceleration) {
 }
 
 function calculateLiveDataSaverVideoBitrateKbps(sourceBitrateKbps?: number) {
-  const targetTotalKbps = Math.floor((sourceBitrateKbps ?? 4000) / 2)
-  return Math.max(targetTotalKbps - 128, 500)
+  const targetTotalKbps = Math.min(
+    Math.floor((sourceBitrateKbps ?? 4000) * 0.45),
+    3500
+  )
+
+  return Math.max(targetTotalKbps - Number.parseInt(targetAacBitrate, 10), 500)
 }
 
 function getLiveDataSaverBitrateArgs(videoBitrateKbps: number) {
@@ -386,30 +436,43 @@ function getLiveDataSaverArgs(
       ...getLiveH264FormatArgs(acceleration),
       "-rc:v",
       "vbr",
+      "-cq:v",
+      "30",
       ...bitrateArgs,
     ]
   }
 
   if (acceleration === "qsv") {
-    return [...getLiveH264FormatArgs(acceleration), ...bitrateArgs]
+    return [
+      ...getLiveH264FormatArgs(acceleration),
+      "-global_quality:v",
+      "30",
+      ...bitrateArgs,
+    ]
   }
 
   if (acceleration === "amd") {
     return [
       ...getLiveH264FormatArgs(acceleration),
-      ...(getAmdBackend() === "amf" ? ["-rc", "vbr_peak"] : []),
+      ...getAmdLiveQualityArgs("dataSaver"),
       ...bitrateArgs,
     ]
   }
 
-  return [...getLiveH264FormatArgs(acceleration), ...bitrateArgs]
+  return [
+    ...getLiveH264FormatArgs(acceleration),
+    "-crf",
+    "30",
+    ...bitrateArgs,
+  ]
 }
 
 export function getHevcFileArgs(input: {
   videoBitrateKbps: number
   maxVideoBitrateKbps: number
   convertVideo: boolean
-  audioOutputIndexesToMp3: number[]
+  audioOutputIndexesToAac: number[]
+  subtitleStreamIndexesToMovText: number[]
 }) {
   const config = getServerConfig()
   const bitrateArgs = getFileVideoBitrateArgs(input)
@@ -486,33 +549,41 @@ export function getHevcFileArgs(input: {
   const audioArgs = [
     "-c:a",
     "copy",
-    ...input.audioOutputIndexesToMp3.flatMap((outputAudioIndex) => [
+    ...input.audioOutputIndexesToAac.flatMap((outputAudioIndex) => [
       `-c:a:${outputAudioIndex}`,
-      "libmp3lame",
+      "aac",
+      `-profile:a:${outputAudioIndex}`,
+      "aac_low",
       `-b:a:${outputAudioIndex}`,
-      "256k",
+      targetAacBitrate,
+      `-ac:a:${outputAudioIndex}`,
+      "2",
     ]),
   ]
+  const subtitleMapArgs = input.subtitleStreamIndexesToMovText.flatMap(
+    (streamIndex) => ["-map", `0:${streamIndex}`]
+  )
+  const subtitleArgs = input.subtitleStreamIndexesToMovText.length
+    ? ["-c:s", "mov_text"]
+    : []
 
   return [
     "-map",
     "0:V:0",
     "-map",
     "0:a?",
-    "-map",
-    "0:s?",
-    "-map",
-    "0:t?",
+    ...subtitleMapArgs,
     "-map_metadata",
     "0",
     "-map_chapters",
     "0",
     ...videoArgs,
+    "-tag:v",
+    "hvc1",
     ...audioArgs,
-    "-c:s",
-    "copy",
-    "-c:t",
-    "copy",
+    ...subtitleArgs,
     "-dn",
+    "-movflags",
+    "+faststart",
   ]
 }

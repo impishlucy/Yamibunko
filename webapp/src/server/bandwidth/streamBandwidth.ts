@@ -1,5 +1,6 @@
 import type { PlaybackMode, PlaybackProfile } from "@/lib/types"
 import { getMaxUploadKbps } from "@/server/bandwidth/uploadCapacity"
+import { getServerConfig } from "@/server/config"
 
 export type StreamPriorityAction = {
   type:
@@ -555,6 +556,10 @@ function getBandwidthWaitMessage() {
   return "Server upload bandwidth is full. Waiting for a free slot."
 }
 
+function automaticDataSaverSwitchingEnabled() {
+  return !getServerConfig().importEnabled
+}
+
 function rememberForcedDowngrade(input: {
   username: string
   clientId: string | null
@@ -566,6 +571,7 @@ function rememberForcedDowngrade(input: {
   canTranscodeDataSaver: boolean
 }) {
   if (
+    !automaticDataSaverSwitchingEnabled() ||
     !input.clientId ||
     input.originalProfile === "dataSaver" ||
     !input.dataSaverUploadKbps ||
@@ -778,6 +784,10 @@ export function protectCurrentForcedDowngrade(
   username: string,
   clientId: string
 ) {
+  if (!automaticDataSaverSwitchingEnabled()) {
+    return
+  }
+
   const clientKey = getClientActionKey(username, clientId)
   const state = forcedDowngrades.get(clientKey)
 
@@ -809,6 +819,11 @@ function getActiveStreamForClient(clientKey: string) {
 
 function evaluateForcedDowngradeRestores() {
   if (bandwidthRecheckActive) {
+    return
+  }
+
+  if (!automaticDataSaverSwitchingEnabled()) {
+    forcedDowngrades.clear()
     return
   }
 
@@ -871,6 +886,10 @@ function downgradeBlockingStreams(
   requesterClientId: string | null
 ) {
   if (bandwidthRecheckActive) {
+    return
+  }
+
+  if (!automaticDataSaverSwitchingEnabled()) {
     return
   }
 
@@ -1108,6 +1127,9 @@ export async function acquireStreamUpload(input: AcquireStreamUploadInput) {
   }
 
   const contentKey = getContentKey(input)
+  const automaticDataSaverEnabled = automaticDataSaverSwitchingEnabled()
+  const canAutomaticallyUseDataSaver =
+    automaticDataSaverEnabled && input.canTranscodeDataSaver
   const forcedDowngrade = clientKey ? forcedDowngrades.get(clientKey) : null
 
   if (forcedDowngrade && forcedDowngrade.contentKey !== contentKey) {
@@ -1118,6 +1140,7 @@ export async function acquireStreamUpload(input: AcquireStreamUploadInput) {
     forcedDowngrade?.contentKey === contentKey ? forcedDowngrade : null
 
   if (
+    automaticDataSaverEnabled &&
     matchingForcedDowngrade &&
     input.profile !== "dataSaver" &&
     matchingForcedDowngrade.canTranscodeDataSaver &&
@@ -1223,7 +1246,7 @@ export async function acquireStreamUpload(input: AcquireStreamUploadInput) {
 
     if (
       input.profile !== "dataSaver" &&
-      input.canTranscodeDataSaver &&
+      canAutomaticallyUseDataSaver &&
       input.dataSaverUploadKbps &&
       canFitUpload(input.dataSaverUploadKbps, fitOptions)
     ) {

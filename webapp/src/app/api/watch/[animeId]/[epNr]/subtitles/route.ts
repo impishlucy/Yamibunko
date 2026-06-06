@@ -59,6 +59,104 @@ function parseStreamIndex(value: string | null) {
   return Number.isInteger(index) && index >= 0 ? index : null
 }
 
+function parseOffsetSeconds(value: string | null) {
+  if (!value) {
+    return 0
+  }
+
+  const seconds = Number(value)
+
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : 0
+}
+
+function parseWebVttTimestamp(value: string) {
+  const parts = value.trim().replace(",", ".").split(":")
+
+  if (parts.length < 2 || parts.length > 3) {
+    return null
+  }
+
+  const seconds = Number(parts.at(-1))
+  const minutes = Number(parts.at(-2))
+  const hours = parts.length === 3 ? Number(parts[0]) : 0
+
+  if (
+    !Number.isFinite(hours) ||
+    !Number.isFinite(minutes) ||
+    !Number.isFinite(seconds)
+  ) {
+    return null
+  }
+
+  return hours * 3600 + minutes * 60 + seconds
+}
+
+function formatWebVttTimestamp(seconds: number) {
+  const clampedSeconds = Math.max(seconds, 0)
+  const wholeSeconds = Math.floor(clampedSeconds)
+  const milliseconds = Math.round((clampedSeconds - wholeSeconds) * 1000)
+  const normalizedWholeSeconds =
+    milliseconds >= 1000 ? wholeSeconds + 1 : wholeSeconds
+  const normalizedMilliseconds = milliseconds >= 1000 ? 0 : milliseconds
+  const hours = Math.floor(normalizedWholeSeconds / 3600)
+  const minutes = Math.floor((normalizedWholeSeconds % 3600) / 60)
+  const remainingSeconds = normalizedWholeSeconds % 60
+
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}.${String(normalizedMilliseconds).padStart(3, "0")}`
+}
+
+function shiftWebVttTimestamps(value: string, offsetSeconds: number) {
+  if (!Number.isFinite(offsetSeconds) || offsetSeconds <= 0) {
+    return value
+  }
+
+  const blocks = value
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split(/\n{2,}/)
+  const shiftedBlocks: string[] = []
+
+  for (const block of blocks) {
+    const lines = block.split("\n")
+    const timingLineIndex = lines.findIndex((line) => line.includes("-->"))
+
+    if (timingLineIndex === -1) {
+      shiftedBlocks.push(block)
+      continue
+    }
+
+    const timingLine = lines[timingLineIndex]
+    const match = /^(\s*)(\S+)\s+-->\s+(\S+)(.*)$/.exec(timingLine)
+
+    if (!match) {
+      shiftedBlocks.push(block)
+      continue
+    }
+
+    const [, indent, rawStart, rawEnd, settings] = match
+    const start = parseWebVttTimestamp(rawStart)
+    const end = parseWebVttTimestamp(rawEnd)
+
+    if (start === null || end === null) {
+      shiftedBlocks.push(block)
+      continue
+    }
+
+    const shiftedStart = start - offsetSeconds
+    const shiftedEnd = end - offsetSeconds
+
+    if (shiftedEnd <= 0) {
+      continue
+    }
+
+    lines[timingLineIndex] = `${indent}${formatWebVttTimestamp(shiftedStart)} --> ${formatWebVttTimestamp(shiftedEnd)}${settings}`
+    shiftedBlocks.push(lines.join("\n"))
+  }
+
+  return shiftedBlocks.join("\n\n")
+}
+
 function stripSubtitleFormatting(value: string) {
   return value
     .replace(/\{\\[^}]*}/g, "")
@@ -233,6 +331,7 @@ export async function GET(request: Request, context: SubtitleContext) {
   const url = new URL(request.url)
   const seasonNumber = parsePositiveInt(url.searchParams.get("season") ?? "1")
   const streamIndex = parseStreamIndex(url.searchParams.get("stream"))
+  const offsetSeconds = parseOffsetSeconds(url.searchParams.get("offset"))
 
   if (!episodeNumber || !seasonNumber || streamIndex === null) {
     return jsonError("Subtitle stream not found.", 404)
@@ -296,7 +395,7 @@ export async function GET(request: Request, context: SubtitleContext) {
       streamIndex: subtitleStream.index,
     })
 
-    return new Response(body, {
+    return new Response(shiftWebVttTimestamps(body, offsetSeconds), {
       headers: {
         ...subtitleCorsHeaders(),
         "cache-control": "no-store",

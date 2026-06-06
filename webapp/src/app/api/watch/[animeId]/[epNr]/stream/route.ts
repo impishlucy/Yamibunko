@@ -83,6 +83,10 @@ function liveTranscodingEnabled() {
   return getServerConfig().transcodeAccel !== "cpu"
 }
 
+function automaticDataSaverSwitchingEnabled() {
+  return !getServerConfig().importEnabled
+}
+
 function parseOptionalStreamIndex(value: string | null) {
   if (!value) {
     return undefined
@@ -1104,7 +1108,8 @@ export async function GET(request: Request, context: StreamContext) {
       profile,
       estimatedUploadKbps: requestedUploadKbps,
       dataSaverUploadKbps,
-      canTranscodeDataSaver: liveTranscodingEnabled(),
+      canTranscodeDataSaver:
+        liveTranscodingEnabled() && automaticDataSaverSwitchingEnabled(),
       animeId,
       seasonNumber,
       episodeNumber,

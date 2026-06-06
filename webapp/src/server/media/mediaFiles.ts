@@ -1,13 +1,17 @@
 import { constants } from "node:fs"
-import { access, rm, stat } from "node:fs/promises"
+import { createHash } from "node:crypto"
+import { access, mkdir, rm, stat } from "node:fs/promises"
 import path from "node:path"
 
+import { getServerConfig } from "@/server/config"
 import { runFfmpeg } from "@/server/media/ffmpeg"
 
 export type ProbeStream = {
   index?: number
   codec_type?: string
   codec_name?: string
+  codec_long_name?: string
+  profile?: string
   width?: number
   height?: number
   duration?: string
@@ -95,9 +99,68 @@ export async function pathExists(filePath: string) {
   }
 }
 
+function previewFileNameForPath(filePath: string) {
+  const resolvedPath = path.resolve(filePath)
+  const normalizedPath =
+    process.platform === "win32" ? resolvedPath.toLowerCase() : resolvedPath
+  const hash = createHash("sha256").update(normalizedPath).digest("base64url")
+  const baseName = path.basename(filePath, path.extname(filePath))
+  const safeBaseName = baseName
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9._-]+/gi, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 80)
+
+  return `${safeBaseName || "episode"}-${hash}.webp`
+}
+
+export function previewDirectoryPath() {
+  return path.join(getServerConfig().tempDir, "previews")
+}
+
 export function thumbnailPathForEpisode(filePath: string) {
+  return path.join(previewDirectoryPath(), previewFileNameForPath(filePath))
+}
+
+export function legacyThumbnailPathForEpisode(filePath: string) {
   const extension = path.extname(filePath)
   return `${filePath.slice(0, -extension.length)}.jpg`
+}
+
+function isPathInsideDirectory(directoryPath: string, filePath: string) {
+  const relativePath = path.relative(
+    path.resolve(directoryPath),
+    path.resolve(filePath)
+  )
+
+  return (
+    Boolean(relativePath) &&
+    !relativePath.startsWith("..") &&
+    !path.isAbsolute(relativePath)
+  )
+}
+
+function canRemoveLegacyThumbnail(filePath: string) {
+  const config = getServerConfig()
+
+  return Boolean(
+    config.importEnabled &&
+      config.mediaDir &&
+      isPathInsideDirectory(config.mediaDir, filePath)
+  )
+}
+
+export async function removeEpisodeThumbnails(filePath: string) {
+  const removeTasks = [rm(thumbnailPathForEpisode(filePath), { force: true })]
+
+  if (canRemoveLegacyThumbnail(filePath)) {
+    removeTasks.push(
+      rm(legacyThumbnailPathForEpisode(filePath), { force: true })
+    )
+  }
+
+  await Promise.all(removeTasks)
 }
 
 function thumbnailSeekTimes(durationSeconds: number) {
@@ -151,11 +214,13 @@ function thumbnailArgs(filePath: string, thumbnailPath: string, seekTime: number
     "-frames:v",
     "1",
     "-vf",
-    "scale=640:-2:force_original_aspect_ratio=decrease,format=yuvj420p",
-    "-q:v",
-    "3",
-    "-strict",
-    "unofficial",
+    "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p",
+    "-c:v",
+    "libwebp",
+    "-quality",
+    "82",
+    "-compression_level",
+    "4",
     "-y",
     thumbnailPath,
   ]
@@ -166,6 +231,7 @@ export async function generateEpisodeThumbnail(
   durationSeconds: number
 ) {
   const thumbnailPath = thumbnailPathForEpisode(filePath)
+  await mkdir(path.dirname(thumbnailPath), { recursive: true })
   let lastError: unknown = null
 
   for (const seekTime of thumbnailSeekTimes(durationSeconds)) {

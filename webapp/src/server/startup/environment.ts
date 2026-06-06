@@ -3,13 +3,14 @@ import path from "node:path"
 
 import { normalizeBaseUrl } from "@/server/http/baseUrl"
 
-const requiredEnvironmentKeys = [
+const baseRequiredEnvironmentKeys = [
   "FFMPEG_DIR",
   "ANIME_INPUT_DIR",
-  "ANIME_MEDIA_DIR",
   "TRANSCODE_ACCEL",
   "BASE_URL",
 ] as const
+
+const importRequiredEnvironmentKeys = ["ANIME_MEDIA_DIR"] as const
 
 const pathEnvironmentKeys = [
   "FFMPEG_DIR",
@@ -25,15 +26,21 @@ const launcherAliases = new Map<string, string>([
   ["FFMPEG_DIR", "FFMPEG_DIR"],
   ["FFMPEG_BIN_DIR", "FFMPEG_DIR"],
   ["TRANSCODE_ACCEL", "TRANSCODE_ACCEL"],
+  ["IMPORT_ENABLED", "IMPORT_ENABLED"],
   ["ANILIST_CLIENT_ID", "ANILIST_CLIENT_ID"],
   ["ANILIST_CLIENT_SECRET", "ANILIST_CLIENT_SECRET"],
   ["BASE_URL", "BASE_URL"],
   ["APP_BASE_URL", "BASE_URL"],
 ])
 
-const requiredCanonicalKeys = new Set<string>(requiredEnvironmentKeys)
+const requiredCanonicalKeys = new Set<string>([
+  ...baseRequiredEnvironmentKeys,
+  ...importRequiredEnvironmentKeys,
+])
 const loggedEnvironmentKeys = [
-  ...requiredEnvironmentKeys,
+  ...baseRequiredEnvironmentKeys,
+  ...importRequiredEnvironmentKeys,
+  "IMPORT_ENABLED",
   "ANILIST_CLIENT_ID",
   "ANILIST_CLIENT_SECRET",
 ] as const
@@ -145,6 +152,27 @@ function normalizeTranscodeAcceleration() {
   }
 }
 
+function normalizeImportEnabled() {
+  const value = process.env.IMPORT_ENABLED
+
+  if (!value) {
+    process.env.IMPORT_ENABLED = "true"
+    return
+  }
+
+  process.env.IMPORT_ENABLED = cleanValue(value).toLowerCase()
+}
+
+function isImportEnabled() {
+  return process.env.IMPORT_ENABLED !== "false"
+}
+
+function getRequiredEnvironmentKeys() {
+  return isImportEnabled()
+    ? [...baseRequiredEnvironmentKeys, ...importRequiredEnvironmentKeys]
+    : [...baseRequiredEnvironmentKeys]
+}
+
 function hasAnyRequiredEnvironmentValue() {
   for (const [alias, canonical] of launcherAliases) {
     if (requiredCanonicalKeys.has(canonical) && process.env[alias]) {
@@ -253,6 +281,7 @@ export function bootstrapEnvironment() {
   const loadedDotEnv = loadDotEnv(dotEnvPath)
   applyEnvironmentAliases()
   normalizeTranscodeAcceleration()
+  normalizeImportEnabled()
 
   const sources = [
     ...(hadRuntimeEnvironment ? ["process environment"] : []),
@@ -272,7 +301,7 @@ export function bootstrapEnvironment() {
     }
   }
 
-  for (const key of requiredEnvironmentKeys) {
+  for (const key of getRequiredEnvironmentKeys()) {
     if (!process.env[key]) {
       console.error(
         `[Error] [Startup] Required environment variable is missing - environment.ts - ${key}`
@@ -281,6 +310,15 @@ export function bootstrapEnvironment() {
         `CRITICAL INITIALIZATION FAILURE: Environment variable '${key}' is missing. Ensure the launcher is passing parameters or the local .env file contains this variable.`
       )
     }
+  }
+
+  if (!["true", "false"].includes(process.env.IMPORT_ENABLED ?? "")) {
+    console.error(
+      `[Error] [Startup] IMPORT_ENABLED validation failed - environment.ts - ${process.env.IMPORT_ENABLED}`
+    )
+    throw new Error(
+      "CRITICAL STARTUP ERROR: IMPORT_ENABLED must be true or false."
+    )
   }
 
   if (
@@ -313,10 +351,14 @@ export function bootstrapEnvironment() {
     "Input folder",
     resolveRequiredPath("ANIME_INPUT_DIR")
   )
-  assertExistingDirectory(
-    "Media folder",
-    resolveRequiredPath("ANIME_MEDIA_DIR")
-  )
+
+  if (isImportEnabled()) {
+    assertExistingDirectory(
+      "Media folder",
+      resolveRequiredPath("ANIME_MEDIA_DIR")
+    )
+  }
+
   const ffmpegDir = resolveRequiredPath("FFMPEG_DIR")
 
   assertExistingDirectory("FFmpeg binary folder", ffmpegDir)

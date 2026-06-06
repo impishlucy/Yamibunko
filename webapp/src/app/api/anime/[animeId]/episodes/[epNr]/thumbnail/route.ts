@@ -1,11 +1,15 @@
 import { spawn } from "node:child_process"
 import { createReadStream } from "node:fs"
+import path from "node:path"
 import { stat } from "node:fs/promises"
 import { Readable } from "node:stream"
 
 import { requireApiUser } from "@/server/auth/api"
 import { getEpisodeThumbnailPath } from "@/server/db/library"
-import { thumbnailPathForEpisode } from "@/server/media/mediaFiles"
+import {
+  generateEpisodeThumbnail,
+  thumbnailPathForEpisode,
+} from "@/server/media/mediaFiles"
 import { getEpisode } from "@/server/media/libraryStore"
 import { getServerConfig } from "@/server/config"
 
@@ -57,11 +61,15 @@ async function generatePreviewFrame(filePath: string, frameTime: number) {
       "-frames:v",
       "1",
       "-vf",
-      "scale=320:-2:force_original_aspect_ratio=decrease",
+      "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p",
       "-f",
       "image2pipe",
       "-vcodec",
-      "mjpeg",
+      "libwebp",
+      "-quality",
+      "82",
+      "-compression_level",
+      "4",
       "pipe:1",
     ],
     {
@@ -98,6 +106,26 @@ async function generatePreviewFrame(filePath: string, frameTime: number) {
   }
 
   return Buffer.concat(chunks)
+}
+
+function contentTypeForImagePath(filePath: string) {
+  const extension = path.extname(filePath).toLowerCase()
+
+  if (extension === ".webp") {
+    return "image/webp"
+  }
+
+  if (extension === ".png") {
+    return "image/png"
+  }
+
+  return "image/jpeg"
+}
+
+async function existingImageStat(filePath: string) {
+  const fileStat = await stat(/*turbopackIgnore: true*/ filePath)
+
+  return fileStat.isFile() ? fileStat : null
 }
 
 function fallbackThumbnailResponse() {
@@ -140,7 +168,7 @@ export async function GET(request: Request, context: ThumbnailContext) {
     if (previewFrame) {
       return new Response(previewFrame, {
         headers: {
-          "content-type": "image/jpeg",
+          "content-type": "image/webp",
           "content-length": String(previewFrame.length),
           "cache-control": "private, max-age=600",
         },
@@ -148,15 +176,20 @@ export async function GET(request: Request, context: ThumbnailContext) {
     }
   }
 
-  const thumbnailPath =
-    getEpisodeThumbnailPath(animeId, season, epNr) ??
-    thumbnailPathForEpisode(episode.filePath)
+  const storedThumbnailPath = getEpisodeThumbnailPath(animeId, season, epNr)
+  const generatedThumbnailPath = thumbnailPathForEpisode(episode.filePath)
+  const thumbnailCandidates = [
+    storedThumbnailPath,
+    generatedThumbnailPath,
+  ].filter((candidate, index, candidates): candidate is string => {
+    return Boolean(candidate) && candidates.indexOf(candidate) === index
+  })
 
-  try {
-    const fileStat = await stat(/*turbopackIgnore: true*/ thumbnailPath)
+  for (const thumbnailPath of thumbnailCandidates) {
+    const fileStat = await existingImageStat(thumbnailPath).catch(() => null)
 
-    if (!fileStat.isFile()) {
-      return fallbackThumbnailResponse()
+    if (!fileStat) {
+      continue
     }
 
     const fileStream = createReadStream(/*turbopackIgnore: true*/ thumbnailPath)
@@ -165,7 +198,39 @@ export async function GET(request: Request, context: ThumbnailContext) {
       Readable.toWeb(fileStream) as ReadableStream<Uint8Array>,
       {
         headers: {
-          "content-type": "image/jpeg",
+          "content-type": contentTypeForImagePath(thumbnailPath),
+          "content-length": String(fileStat.size),
+          "cache-control": "private, max-age=3600",
+        },
+      }
+    )
+  }
+
+  const regeneratedThumbnailPath = await generateEpisodeThumbnail(
+    episode.filePath,
+    episode.durationSeconds ?? 0
+  ).catch(() => null)
+
+  if (!regeneratedThumbnailPath) {
+    return fallbackThumbnailResponse()
+  }
+
+  try {
+    const fileStat = await existingImageStat(regeneratedThumbnailPath)
+
+    if (!fileStat) {
+      return fallbackThumbnailResponse()
+    }
+
+    const fileStream = createReadStream(
+      /*turbopackIgnore: true*/ regeneratedThumbnailPath
+    )
+
+    return new Response(
+      Readable.toWeb(fileStream) as ReadableStream<Uint8Array>,
+      {
+        headers: {
+          "content-type": contentTypeForImagePath(regeneratedThumbnailPath),
           "content-length": String(fileStat.size),
           "cache-control": "private, max-age=3600",
         },

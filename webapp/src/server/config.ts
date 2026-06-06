@@ -11,11 +11,20 @@ export type TranscodeAcceleration = "nvenc" | "qsv" | "amd" | "cpu"
 const serverConfigSchema = z.object({
   FFMPEG_DIR: z.string().trim().min(1),
   ANIME_INPUT_DIR: z.string().trim().min(1),
-  ANIME_MEDIA_DIR: z.string().trim().min(1),
+  ANIME_MEDIA_DIR: z.string().trim().optional(),
+  IMPORT_ENABLED: z.enum(["true", "false"]).default("true"),
   TRANSCODE_ACCEL: z.enum(["nvenc", "qsv", "amd", "cpu"]),
   ANILIST_CLIENT_ID: z.string().trim().optional(),
   ANILIST_CLIENT_SECRET: z.string().trim().optional(),
   BASE_URL: z.url(),
+}).superRefine((env, context) => {
+  if (env.IMPORT_ENABLED === "true" && !env.ANIME_MEDIA_DIR?.trim()) {
+    context.addIssue({
+      code: "custom",
+      path: ["ANIME_MEDIA_DIR"],
+      message: "Required when IMPORT_ENABLED is true",
+    })
+  }
 })
 
 export type ServerConfig = {
@@ -24,6 +33,7 @@ export type ServerConfig = {
   inputDir: string
   mediaDir: string
   tempDir: string
+  importEnabled: boolean
   transcodeAccel: TranscodeAcceleration
   anilistClientId?: string
   anilistClientSecret?: string
@@ -45,7 +55,7 @@ function executableName(name: "ffmpeg" | "ffprobe") {
   return process.platform === "win32" ? `${name}.exe` : name
 }
 
-function getDefaultTempDir() {
+export function getDefaultTempDir() {
   if (process.platform === "win32") {
     const base =
       process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local")
@@ -69,6 +79,9 @@ function readEnvironment() {
       process.env.ANIME_INPUT_DIR ?? process.env.INPUT_FOLDER_PATH,
     ANIME_MEDIA_DIR:
       process.env.ANIME_MEDIA_DIR ?? process.env.OUTPUT_FOLDER_PATH,
+    IMPORT_ENABLED: process.env.IMPORT_ENABLED
+      ? process.env.IMPORT_ENABLED.trim().toLowerCase()
+      : "true",
     TRANSCODE_ACCEL: process.env.TRANSCODE_ACCEL
       ? process.env.TRANSCODE_ACCEL.trim().toLowerCase()
       : undefined,
@@ -85,8 +98,9 @@ function mapConfig(env: z.infer<typeof serverConfigSchema>): ServerConfig {
     ffmpegPath: path.join(ffmpegDir, executableName("ffmpeg")),
     ffprobePath: path.join(ffmpegDir, executableName("ffprobe")),
     inputDir: cleanPath(env.ANIME_INPUT_DIR),
-    mediaDir: cleanPath(env.ANIME_MEDIA_DIR),
+    mediaDir: env.ANIME_MEDIA_DIR ? cleanPath(env.ANIME_MEDIA_DIR) : "",
     tempDir: getDefaultTempDir(),
+    importEnabled: env.IMPORT_ENABLED === "true",
     transcodeAccel: env.TRANSCODE_ACCEL,
     anilistClientId: env.ANILIST_CLIENT_ID
       ? cleanPath(env.ANILIST_CLIENT_ID)

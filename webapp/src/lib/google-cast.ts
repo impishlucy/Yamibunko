@@ -133,6 +133,13 @@ type ChromeCastApi = {
       contentId: string,
       contentType: string
     ) => GoogleCastMediaInfo
+    Track?: new (trackId: number, type: string) => GoogleCastTextTrack
+    TrackType?: {
+      TEXT: string
+    }
+    TextTrackType?: {
+      SUBTITLES: string
+    }
     LoadRequest: new (mediaInfo: GoogleCastMediaInfo) => GoogleCastLoadRequest
     PauseRequest: new () => GoogleCastMediaCommandRequest
     PlayRequest: new () => GoogleCastMediaCommandRequest
@@ -528,17 +535,26 @@ export function createGoogleCastLoadRequest(input: {
     apis.chromeCast.media.StreamType?.BUFFERED ?? "BUFFERED"
 
   if (input.textTrack) {
-    mediaInfo.tracks = [
-      {
-        language: input.textTrack.language,
-        name: input.textTrack.label,
-        subtype: "SUBTITLES",
-        trackContentId: input.textTrack.url,
-        trackContentType: "text/vtt",
-        trackId: input.textTrack.id,
-        type: "TEXT",
-      },
-    ]
+    const trackType = apis.chromeCast.media.TrackType?.TEXT ?? "TEXT"
+    const subtitleType =
+      apis.chromeCast.media.TextTrackType?.SUBTITLES ?? "SUBTITLES"
+    const textTrack: GoogleCastTextTrack = apis.chromeCast.media.Track
+      ? new apis.chromeCast.media.Track(input.textTrack.id, trackType)
+      : {
+          name: input.textTrack.label,
+          subtype: subtitleType,
+          trackContentId: input.textTrack.url,
+          trackContentType: "text/vtt",
+          trackId: input.textTrack.id,
+          type: trackType,
+        }
+
+    textTrack.language = input.textTrack.language
+    textTrack.name = input.textTrack.label
+    textTrack.subtype = subtitleType
+    textTrack.trackContentId = input.textTrack.url
+    textTrack.trackContentType = "text/vtt"
+    mediaInfo.tracks = [textTrack]
   }
 
   const request = new apis.chromeCast.media.LoadRequest(mediaInfo)
