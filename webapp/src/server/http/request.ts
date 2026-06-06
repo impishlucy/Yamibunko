@@ -31,7 +31,7 @@ function forwardedHeaderPart(headerValue: string | null, key: string) {
   return null
 }
 
-async function getHeaderDerivedOrigin(request?: Request) {
+export async function getHeaderDerivedOrigin(request?: Request) {
   const headerStore = await headers()
   const forwarded = headerStore.get("forwarded")
   const proto =
@@ -47,31 +47,139 @@ async function getHeaderDerivedOrigin(request?: Request) {
   return `${proto}://${host}`
 }
 
+
+function parseIpv4(hostname: string) {
+  const parts = hostname.split(".")
+
+  if (parts.length !== 4) {
+    return null
+  }
+
+  const octets = parts.map((part) => {
+    if (!/^\d{1,3}$/.test(part)) {
+      return null
+    }
+
+    const value = Number(part)
+
+    return Number.isInteger(value) && value >= 0 && value <= 255 ? value : null
+  })
+
+  if (octets.some((octet) => octet === null)) {
+    return null
+  }
+
+  return octets as [number, number, number, number]
+}
+
+function isDeviceLocalHost(hostname: string) {
+  const normalized = hostname.trim().toLowerCase()
+
+  if (normalized === "localhost" || normalized === "::1" || normalized === "[::1]") {
+    return true
+  }
+
+  const octets = parseIpv4(normalized)
+
+  return octets?.[0] === 127 || octets?.[0] === 0
+}
+
+function isPrivateLanIpv4Host(hostname: string) {
+  const octets = parseIpv4(hostname.trim())
+
+  if (!octets) {
+    return false
+  }
+
+  const [first, second] = octets
+
+  return (
+    first === 10 ||
+    (first === 172 && second >= 16 && second <= 31) ||
+    (first === 192 && second === 168)
+  )
+}
+
+function isCastReachableOrigin(origin: string) {
+  try {
+    const url = new URL(origin)
+
+    if (isDeviceLocalHost(url.hostname)) {
+      return false
+    }
+
+    if (url.protocol === "https:") {
+      return true
+    }
+
+    return url.protocol === "http:" && isPrivateLanIpv4Host(url.hostname)
+  } catch {
+    return false
+  }
+}
+
 export async function getRequestOrigin(request?: Request) {
+  if (request) {
+    return getHeaderDerivedOrigin(request)
+  }
+
   const configuredBaseUrl = process.env.BASE_URL ?? process.env.APP_BASE_URL
 
   if (configuredBaseUrl) {
     return new URL(getConfiguredBaseUrl()).origin
   }
 
-  return getHeaderDerivedOrigin(request)
+  return getHeaderDerivedOrigin()
 }
 
-export async function getPublicBaseUrl() {
-  return getConfiguredBaseUrl()
+export async function getPublicBaseUrl(request?: Request) {
+  const configuredBaseUrl = getConfiguredBaseUrl()
+
+  if (!request) {
+    return configuredBaseUrl
+  }
+
+  const requestOrigin = await getHeaderDerivedOrigin(request)
+
+  if (isCastReachableOrigin(requestOrigin)) {
+    const configuredUrl = new URL(configuredBaseUrl)
+
+    if (isDeviceLocalHost(configuredUrl.hostname)) {
+      return requestOrigin
+    }
+  }
+
+  return configuredBaseUrl
+}
+
+function isSecureLocalOrigin(origin: string) {
+  try {
+    const url = new URL(origin)
+
+    if (url.protocol === "https:") {
+      return true
+    }
+
+    if (url.protocol !== "http:") {
+      return false
+    }
+
+    return isDeviceLocalHost(url.hostname) || isPrivateLanIpv4Host(url.hostname)
+  } catch {
+    return false
+  }
 }
 
 export async function isSecureRequest(request?: Request) {
-  const origin = await getRequestOrigin(request)
-  const url = new URL(origin)
+  if (request) {
+    const browserOrigin = getBrowserRequestOrigin(request)
 
-  if (url.protocol === "https:") {
-    return true
+    if (browserOrigin && isSecureLocalOrigin(browserOrigin)) {
+      return true
+    }
   }
 
-  return ["localhost", "127.0.0.1", "::1"].includes(
-    url.hostname
-  )
+  return isSecureLocalOrigin(await getHeaderDerivedOrigin(request))
 }
 
 function sameOrigin(left: string, right: string) {
@@ -88,7 +196,7 @@ function sameOrigin(left: string, right: string) {
   }
 }
 
-function candidateRequestOrigin(request: Request) {
+export function getBrowserRequestOrigin(request: Request) {
   const origin = firstForwardedValue(request.headers.get("origin"))
 
   if (origin) {
@@ -159,7 +267,7 @@ function requestUrlOrigin(request: Request) {
 }
 
 export async function isSameOriginRequest(request: Request) {
-  const candidate = candidateRequestOrigin(request)
+  const candidate = getBrowserRequestOrigin(request)
 
   if (!candidate) {
     return true

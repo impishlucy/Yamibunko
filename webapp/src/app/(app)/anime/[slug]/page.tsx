@@ -6,6 +6,7 @@ import { AnimeVariantSelect } from "@/components/anime-variant-select"
 import { MobileDescription } from "@/components/mobile-description"
 import { EpisodeCard } from "@/components/episode-card"
 import { Badge } from "@/components/ui/badge"
+import { getAnimeTitleSuffix, animeVariantSecondTitle } from "@/lib/anime-title"
 import { getCurrentUser } from "@/server/auth/session"
 import { getEpisodes, getLibraryEntry } from "@/server/media/libraryStore"
 
@@ -22,16 +23,35 @@ function isSeriesFormat(format?: string) {
   return !format || format === "TV" || format === "TV_SHORT" || format === "ONA"
 }
 
+function seasonLabel(seasonNumber?: number) {
+  return `Season ${String(seasonNumber ?? 1).padStart(2, "0")}`
+}
+
 function selectedSubtitle(input: {
   format?: string
+  libraryTitle: string
   title: string
   seasonNumber?: number
 }) {
   if (isSeriesFormat(input.format)) {
-    return `Season ${String(input.seasonNumber ?? 1).padStart(2, "0")}`
+    const suffix = getAnimeTitleSuffix({
+      libraryTitle: input.libraryTitle,
+      mediaTitle: input.title,
+    })
+
+    if (suffix) {
+      return suffix
+    }
+
+    const seasonNumber = input.seasonNumber ?? 1
+
+    return seasonNumber > 1 ? seasonLabel(seasonNumber) : null
   }
 
-  return input.title
+  return animeVariantSecondTitle({
+    libraryTitle: input.libraryTitle,
+    mediaTitle: input.title,
+  })
 }
 
 function episodeCountBadgeClass(localCount: number, anilistCount: number) {
@@ -65,6 +85,12 @@ export default async function AnimePage({
   const user = await getCurrentUser()
   const episodes = getEpisodes(anime.id, user?.username)
   const localEpisodeCount = selectedVariant?.episodeCount ?? episodes.length
+  const subtitle = selectedSubtitle({
+    format: anime.format,
+    libraryTitle: libraryEntry.title,
+    title: anime.title,
+    seasonNumber: selectedVariant?.seasonNumber,
+  })
   const episodesBySeason = new Map<number, typeof episodes>()
 
   for (const episode of episodes) {
@@ -129,13 +155,9 @@ export default async function AnimePage({
             <h1 className="max-w-3xl text-2xl font-semibold text-zinc-50 sm:text-3xl lg:text-4xl">
               {libraryEntry.title}
             </h1>
-            <p className="text-sm font-medium text-violet-200">
-              {selectedSubtitle({
-                format: anime.format,
-                title: anime.title,
-                seasonNumber: selectedVariant?.seasonNumber,
-              })}
-            </p>
+            {subtitle ? (
+              <p className="text-sm font-medium text-violet-200">{subtitle}</p>
+            ) : null}
             {anime.description ? (
               <>
                 <MobileDescription text={anime.description} />
@@ -147,6 +169,7 @@ export default async function AnimePage({
             <AnimeVariantSelect
               variants={libraryEntry.variants}
               selectedId={anime.id}
+              libraryTitle={libraryEntry.title}
             />
             {anime.genres?.length ? (
               <div className="flex flex-wrap gap-2">

@@ -83,16 +83,21 @@ function yieldToEventLoop() {
   return new Promise<void>((resolve) => setImmediate(resolve))
 }
 
-const failedImportsFolderName = "_Failed Imports"
+const failedImportsFolderName = "_failed_imports"
+const failedImportsFolderNames = new Set([failedImportsFolderName])
 
-function isInsideNamedDirectory(root: string, targetPath: string, directoryName: string) {
+function isInsideNamedDirectory(
+  root: string,
+  targetPath: string,
+  directoryNames: Set<string>
+) {
   const relative = path.relative(path.resolve(root), path.resolve(targetPath))
 
   if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
     return false
   }
 
-  return relative.split(path.sep).includes(directoryName)
+  return relative.split(path.sep).some((part) => directoryNames.has(part))
 }
 
 async function walkFiles(
@@ -158,7 +163,11 @@ export function startWorkers() {
   const inputWatcher = chokidar.watch(config.inputDir, {
     ignoreInitial: true,
     ignored: (watchPath) =>
-      isInsideNamedDirectory(config.inputDir, watchPath.toString(), failedImportsFolderName),
+      isInsideNamedDirectory(
+        config.inputDir,
+        watchPath.toString(),
+        failedImportsFolderNames
+      ),
     awaitWriteFinish: {
       stabilityThreshold: 3000,
       pollInterval: 1000,
@@ -370,7 +379,10 @@ export function startWorkers() {
     const resolvedPath = path.resolve(filePath)
     debugWorkers(`Enqueue requested - Kind ${kind}, Path ${resolvedPath}`)
 
-    if (kind === "input" && isInsideNamedDirectory(config.inputDir, resolvedPath, failedImportsFolderName)) {
+    if (
+      kind === "input" &&
+      isInsideNamedDirectory(config.inputDir, resolvedPath, failedImportsFolderNames)
+    ) {
       debugWorkers(`Ignoring failed-import quarantine path - ${resolvedPath}`)
       return
     }
@@ -408,7 +420,7 @@ export function startWorkers() {
 
     try {
       const files = await walkFiles(config.inputDir, {
-        ignoredDirectoryNames: new Set([failedImportsFolderName]),
+        ignoredDirectoryNames: failedImportsFolderNames,
       })
       const mediaFiles = files.filter(isMediaFile)
 

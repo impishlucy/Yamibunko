@@ -115,7 +115,7 @@ export async function POST(request: Request) {
     user.username,
     request.headers.get("user-agent")
   )
-  await setSessionCookie(session.token, session.expires)
+  await setSessionCookie(session.token, session.expires, request)
 
   return Response.json({
     ok: true,

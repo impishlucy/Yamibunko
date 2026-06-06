@@ -3,6 +3,8 @@ import { z } from "zod"
 import { requireApiUser, requireSameOriginRequest } from "@/server/auth/api"
 import { isStrongPassword, maxPasswordLength } from "@/lib/password-policy"
 import { hashPassword } from "@/server/auth/password"
+import { deleteOtherSessionsByUsername } from "@/server/db/sessions"
+import { deleteOtherCastStreamTokensForUser } from "@/server/media/castTokens"
 import { setUserPasswordHash } from "@/server/db/users"
 import { isSecureRequest } from "@/server/http/request"
 
@@ -49,6 +51,8 @@ export async function POST(request: Request) {
 
   const passwordHash = await hashPassword(parsed.data.password)
   setUserPasswordHash(auth.user.username, passwordHash)
+  deleteOtherSessionsByUsername(auth.user.username, auth.sessionTokenHash)
+  deleteOtherCastStreamTokensForUser(auth.user.username, auth.sessionTokenHash)
 
   return Response.json({ ok: true })
 }

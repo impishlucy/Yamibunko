@@ -126,17 +126,16 @@ const libraryMediaFormats = new Set([
   "OVA",
   "ONA",
 ])
-const nonRootLibraryMediaFormats = new Set([
-  "TV_SHORT",
-  "MOVIE",
-  "SPECIAL",
-  "OVA",
-  "ONA",
-])
 const rootRelationPriority = new Map([
   ["PARENT", 0],
   ["PREQUEL", 1],
   ["SEQUEL", 2],
+  ["SIDE_STORY", 3],
+  ["SUMMARY", 4],
+  ["SPIN_OFF", 5],
+  ["ALTERNATIVE", 6],
+  ["COMPILATION", 7],
+  ["CONTAINS", 8],
 ])
 const metadataLookupCacheMs = 10 * 60 * 1000
 
@@ -411,22 +410,58 @@ function isSeriesRootMedia(media: AnimeMetadataInput) {
   return seriesFormats.has(media.format ?? "")
 }
 
-function isNonRootLibraryMedia(media: AnimeMetadataInput) {
-  return nonRootLibraryMediaFormats.has(media.format ?? "")
-}
-
 function titleValuesForRootResolution(metadata: AnimeMetadataInput) {
   return uniqueTitleValues([
     metadata.title.english,
     metadata.title.romaji,
     metadata.title.userPreferred,
     metadata.title.native,
-  ]).map(normalizeComparableTitle)
+  ])
+}
+
+function normalizedTitleValuesForRootResolution(metadata: AnimeMetadataInput) {
+  return titleValuesForRootResolution(metadata).map(normalizeComparableTitle)
+}
+
+function titleRootValuesForRootResolution(metadata: AnimeMetadataInput) {
+  return titleValuesForRootResolution(metadata)
+    .map((title) => normalizeComparableTitle(title.split(/[:：]/)[0] ?? title))
+    .filter((title) => titleTokens(title).length >= 2)
+}
+
+function hasSharedTitleTokenPrefix(title: string, candidateTitle: string) {
+  const titleParts = titleTokens(title)
+  const candidateTitleParts = titleTokens(candidateTitle)
+  let sharedPrefixParts = 0
+
+  for (
+    let index = 0;
+    index < Math.min(titleParts.length, candidateTitleParts.length);
+    index += 1
+  ) {
+    if (titleParts[index] !== candidateTitleParts[index]) {
+      break
+    }
+
+    sharedPrefixParts += 1
+  }
+
+  return sharedPrefixParts >= 2
 }
 
 function hasSharedRootTitle(metadata: AnimeMetadataInput, candidate: AnimeMetadataInput) {
-  const titles = titleValuesForRootResolution(metadata)
-  const candidateTitles = titleValuesForRootResolution(candidate)
+  const titles = normalizedTitleValuesForRootResolution(metadata)
+  const candidateTitles = normalizedTitleValuesForRootResolution(candidate)
+  const titleRoots = titleRootValuesForRootResolution(metadata)
+  const candidateTitleRoots = titleRootValuesForRootResolution(candidate)
+
+  if (
+    titleRoots.some((titleRoot) =>
+      candidateTitleRoots.some((candidateTitleRoot) => titleRoot === candidateTitleRoot)
+    )
+  ) {
+    return true
+  }
 
   return titles.some((title) =>
     candidateTitles.some(
@@ -434,6 +469,7 @@ function hasSharedRootTitle(metadata: AnimeMetadataInput, candidate: AnimeMetada
         title === candidateTitle ||
         title.startsWith(`${candidateTitle} `) ||
         candidateTitle.startsWith(`${title} `) ||
+        hasSharedTitleTokenPrefix(title, candidateTitle) ||
         tokenOverlap(title, candidateTitle) >= 0.65 ||
         tokenOverlap(candidateTitle, title) >= 0.65
     )
@@ -441,13 +477,25 @@ function hasSharedRootTitle(metadata: AnimeMetadataInput, candidate: AnimeMetada
 }
 
 function hasRootTitlePrefix(metadata: AnimeMetadataInput, candidate: AnimeMetadataInput) {
-  const titles = titleValuesForRootResolution(metadata)
-  const candidateTitles = titleValuesForRootResolution(candidate)
+  const titles = normalizedTitleValuesForRootResolution(metadata)
+  const candidateTitles = normalizedTitleValuesForRootResolution(candidate)
+  const titleRoots = titleRootValuesForRootResolution(metadata)
+  const candidateTitleRoots = titleRootValuesForRootResolution(candidate)
 
-  return titles.some((title) =>
-    candidateTitles.some(
-      (candidateTitle) =>
-        title !== candidateTitle && title.startsWith(`${candidateTitle} `)
+  return (
+    titles.some((title) =>
+      candidateTitles.some(
+        (candidateTitle) =>
+          title !== candidateTitle && title.startsWith(`${candidateTitle} `)
+      )
+    ) ||
+    titleRoots.some((titleRoot) =>
+      candidateTitleRoots.some(
+        (candidateTitleRoot) =>
+          titleRoot === candidateTitleRoot ||
+          titleRoot.startsWith(`${candidateTitleRoot} `) ||
+          hasSharedTitleTokenPrefix(titleRoot, candidateTitleRoot)
+      )
     )
   )
 }
@@ -458,121 +506,90 @@ function relationRootPriority(
   return rootRelationPriority.get(relation.relationType) ?? Number.MAX_SAFE_INTEGER
 }
 
+function relationHasValidYearDirection(
+  metadata: AnimeMetadataInput,
+  relation: NonNullable<AnimeMetadataInput["relations"]>[number]
+) {
+  const metadataYear = metadata.seasonYear ?? null
+  const relationYear = relation.media.seasonYear ?? null
+
+  if (metadataYear === null || relationYear === null) {
+    return true
+  }
+
+  if (relation.relationType === "PREQUEL") {
+    return relationYear <= metadataYear
+  }
+
+  if (relation.relationType === "SEQUEL") {
+    return !isSeriesRootMedia(metadata)
+  }
+
+  if (isSeriesRootMedia(metadata) && isSeriesRootMedia(relation.media)) {
+    return relationYear <= metadataYear
+  }
+
+  return true
+}
+
 function relationRootScore(
   metadata: AnimeMetadataInput,
   relation: NonNullable<AnimeMetadataInput["relations"]>[number]
 ) {
-  const relationType = relation.relationType
   const relationPriority = relationRootPriority(relation)
 
   if (
     relationPriority === Number.MAX_SAFE_INTEGER ||
     !isAllowedLibraryMedia(relation.media) ||
-    !hasSharedRootTitle(metadata, relation.media)
+    !relationHasValidYearDirection(metadata, relation)
   ) {
     return null
   }
 
-  const metadataYear = metadata.seasonYear ?? null
   const relationYear = relation.media.seasonYear ?? null
-  const hasYearDirection = metadataYear !== null && relationYear !== null
-  const relationIsOlder = hasYearDirection && relationYear <= metadataYear
-  const metadataIsRootFormat = isSeriesRootMedia(metadata)
   const relationIsRootFormat = isSeriesRootMedia(relation.media)
-  const relationIsNonRootFormat = isNonRootLibraryMedia(relation.media)
   const rootTitlePrefix = hasRootTitlePrefix(metadata, relation.media)
-
-  if (relationType === "SEQUEL" && metadataIsRootFormat) {
-    return null
-  }
-
-  if (
-    relationType === "PREQUEL" &&
-    metadataIsRootFormat &&
-    !relationIsRootFormat
-  ) {
-    return null
-  }
-
-  if (
-    relationType === "PARENT" &&
-    metadataIsRootFormat &&
-    relationIsNonRootFormat
-  ) {
-    return null
-  }
-
-  if (
-    relationType === "PREQUEL" &&
-    hasYearDirection &&
-    !relationIsOlder
-  ) {
-    return null
-  }
-
+  const sharedRootTitle = hasSharedRootTitle(metadata, relation.media)
   let score = relationPriority * 100
 
   if (relationIsRootFormat) {
-    score -= 40
+    score -= 60
   } else {
-    score += 20
+    score += 15
+  }
+
+  if (relation.relationType === "PARENT") {
+    score -= 35
   }
 
   if (rootTitlePrefix) {
-    score -= 20
+    score -= 25
+  } else if (sharedRootTitle) {
+    score -= 10
   }
-
-  if (relationType === "PARENT") {
-    score -= 20
-  } else if (relationType === "PREQUEL") {
-    score += relationIsOlder || !hasYearDirection ? 0 : 25
-  } else if (!relationIsRootFormat) {
-    score += 25
-  }
-
-  const yearSort = relationYear ?? Number.MAX_SAFE_INTEGER
 
   return {
     score,
-    yearSort,
-    relationPriority,
+    yearSort: relationYear ?? Number.MAX_SAFE_INTEGER,
   }
 }
 
-function pickRootCandidates(metadata: AnimeMetadataInput) {
-  const seen = new Set<number>()
-  const candidates = (metadata.relations ?? [])
+function pickBestRootRelation(
+  metadata: AnimeMetadataInput,
+  relationTypes: string[]
+) {
+  const scoredRelations = (metadata.relations ?? [])
+    .filter((relation) => relationTypes.includes(relation.relationType))
     .map((relation) => ({ relation, rootScore: relationRootScore(metadata, relation) }))
     .filter(
       (item): item is {
         relation: NonNullable<AnimeMetadataInput["relations"]>[number]
-        rootScore: { score: number; yearSort: number; relationPriority: number }
+        rootScore: { score: number; yearSort: number }
       } => Boolean(item.rootScore)
     )
-    .filter(({ relation }) => {
-      if (seen.has(relation.media.id)) {
-        return false
-      }
 
-      seen.add(relation.media.id)
-      return true
-    })
-
-  const parentCandidates = candidates.filter(
-    (item) => item.relation.relationType === "PARENT"
-  )
-  const prequelCandidates = candidates.filter(
-    (item) => item.relation.relationType === "PREQUEL"
-  )
-  const primaryCandidates = [...parentCandidates, ...prequelCandidates]
-  const selectedCandidates = primaryCandidates.length > 0
-    ? primaryCandidates
-    : isSeriesRootMedia(metadata)
-      ? []
-      : candidates.filter((item) => item.relation.relationType === "SEQUEL")
-
-  return selectedCandidates
-    .sort((left, right) => {
+  return (
+    scoredRelations.sort((left, right) => {
       const scoreDelta = left.rootScore.score - right.rootScore.score
 
       if (scoreDelta !== 0) {
@@ -584,21 +601,33 @@ function pickRootCandidates(metadata: AnimeMetadataInput) {
       }
 
       return left.relation.media.id - right.relation.media.id
-    })
-    .map((item) => item.relation)
+    })[0]?.relation ?? null
+  )
 }
 
-function pickRootCandidate(
-  metadata: AnimeMetadataInput,
-  skippedMediaIds = new Set<number>()
-) {
-  return (
-    pickRootCandidates(metadata).find(
-      (candidate) =>
-        candidate.media.id !== metadata.id &&
-        !skippedMediaIds.has(candidate.media.id)
-    ) ?? null
-  )
+function pickRootCandidate(metadata: AnimeMetadataInput) {
+  const primaryRelation = pickBestRootRelation(metadata, ["PARENT", "PREQUEL"])
+
+  if (primaryRelation) {
+    return primaryRelation
+  }
+
+  if (!isSeriesRootMedia(metadata)) {
+    const sequelRelation = pickBestRootRelation(metadata, ["SEQUEL"])
+
+    if (sequelRelation) {
+      return sequelRelation
+    }
+  }
+
+  return pickBestRootRelation(metadata, [
+    "SIDE_STORY",
+    "SUMMARY",
+    "SPIN_OFF",
+    "ALTERNATIVE",
+    "COMPILATION",
+    "CONTAINS",
+  ])
 }
 
 async function fetchAnimeMetadataById(id: number) {
@@ -628,43 +657,31 @@ async function resolveLibraryRoot(
   const nextVisited = new Set(visited)
   nextVisited.add(metadata.id)
 
-  const skippedMediaIds = new Set(nextVisited)
-  const fallbackRoots: AnimeMetadataInput[] = []
+  const candidate = pickRootCandidate(metadata)
 
-  while (true) {
-    const candidate = pickRootCandidate(metadata, skippedMediaIds)
-
-    if (!candidate) {
-      break
-    }
-
-    skippedMediaIds.add(candidate.media.id)
-
-    const fullCandidate =
-      (await fetchAnimeMetadataById(candidate.media.id).catch((error) => {
-        console.warn(
-          `[Warn] [Anilist] Related root metadata fetch failed - ${candidate.media.id} - ${errorMessage(error)}`
-        )
-        return null
-      })) ?? candidate.media
-    const root = await resolveLibraryRoot(fullCandidate, nextVisited)
-
-    if (root.id === metadata.id || !isAllowedLibraryMedia(root)) {
-      continue
-    }
-
-    if (isSeriesRootMedia(root)) {
-      return root
-    }
-
-    fallbackRoots.push(root)
+  if (
+    !candidate ||
+    candidate.media.id === metadata.id ||
+    nextVisited.has(candidate.media.id)
+  ) {
+    return metadata
   }
 
-  if (!isSeriesRootMedia(metadata) && fallbackRoots.length > 0) {
-    return fallbackRoots[0]
+  const fullCandidate =
+    (await fetchAnimeMetadataById(candidate.media.id).catch((error) => {
+      console.warn(
+        `[Warn] [Anilist] Related root metadata fetch failed - ${candidate.media.id} - ${errorMessage(error)}`
+      )
+      return null
+    })) ?? candidate.media
+
+  const root = await resolveLibraryRoot(fullCandidate, nextVisited)
+
+  if (root.id === metadata.id || !isAllowedLibraryMedia(root)) {
+    return metadata
   }
 
-  return metadata
+  return isSeriesRootMedia(root) || !isSeriesRootMedia(metadata) ? root : metadata
 }
 
 async function attachLibraryInfo(metadata: AnimeMetadataInput) {

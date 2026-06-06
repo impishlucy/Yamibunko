@@ -9,7 +9,7 @@ import {
 } from "@/server/db/library"
 import { getServerConfig } from "@/server/config"
 import { ffprobe } from "@/server/media/ffmpeg"
-import { parseAnimeFileName, sanitizePathPart } from "@/server/media/filename"
+import { parseAnimeFileName, sanitizeExportPathPart } from "@/server/media/filename"
 import {
   generateEpisodeThumbnail,
   isMediaFile,
@@ -115,7 +115,7 @@ async function runWithTemporaryFileAccessRetry<T>(
 }
 
 function parseSeasonFolder(value: string) {
-  const match = /^season\s*(\d{1,2})$/i.exec(value.trim())
+  const match = /^(?:season\s*|season_)(\d{1,2})$/i.exec(value.trim())
 
   if (!match) {
     return null
@@ -177,7 +177,7 @@ function parseLibraryPath(filePath: string): ParsedLibraryPath | null {
   }
 
   const season = seasonFolder ?? parsedFileName?.season ?? 1
-  const animeTitle = sanitizePathPart(
+  const animeTitle = sanitizeExportPathPart(
     isSpecialFolder ? (parts[2] ?? "") : (parsedFileName?.title ?? "")
   )
   const episode = parseEpisodeNumber(filePath)

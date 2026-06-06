@@ -67,7 +67,8 @@ type GoogleCastSession = {
     type: string,
     listener: (event: GoogleCastMediaSessionEvent) => void
   ): void
-  loadMedia(request: GoogleCastLoadRequest): Promise<unknown>
+  loadMedia(request: GoogleCastLoadRequest): Promise<GoogleCastMediaSession | null | undefined>
+  setVolume?: (volume: number) => Promise<void>
   endSession(stopCasting: boolean): void
   getMediaSession(): GoogleCastMediaSession | null
 }
@@ -151,8 +152,14 @@ type CastWindow = Window &
   }
 
 const defaultMediaReceiverAppId = "CC1AD845"
+export const googleCastUnreachableUrlErrorCode = "CAST_RECEIVER_URL_NOT_REACHABLE"
+export const googleCastMediaUrlMessage =
+  "Google Cast media URLs need HTTPS or an HTTP LAN IPv4 address the TV can reach. Set BASE_URL to your device IPv4 address, for example http://192.168.1.101:3000."
+export const googleCastSenderUrlMessage =
+  "Google Cast sender pages need HTTPS with a valid domain/IP or http://localhost for local use. For localhost, set BASE_URL to your device LAN IPv4 address."
 let castFrameworkPromise: Promise<boolean> | null = null
 let castFrameworkInitialized = false
+const castVolumeInitializedSessions = new WeakSet<object>()
 
 export type GoogleCastMediaLoadResult = "loaded" | "failed" | "timeout"
 
@@ -186,18 +193,180 @@ function getCastApis() {
   }
 }
 
-function isSecureCastSenderOrigin() {
-  if (typeof window === "undefined") {
-    return false
+function parseIpv4(hostname: string) {
+  const parts = hostname.split(".")
+
+  if (parts.length !== 4) {
+    return null
   }
 
-  if (window.isSecureContext) {
+  const octets = parts.map((part) => {
+    if (!/^\d{1,3}$/.test(part)) {
+      return null
+    }
+
+    const value = Number(part)
+
+    return Number.isInteger(value) && value >= 0 && value <= 255 ? value : null
+  })
+
+  if (octets.some((octet) => octet === null)) {
+    return null
+  }
+
+  return octets as [number, number, number, number]
+}
+
+function isDeviceLocalHost(hostname: string) {
+  const normalized = hostname.trim().toLowerCase()
+
+  if (
+    normalized === "localhost" ||
+    normalized === "::1" ||
+    normalized === "[::1]"
+  ) {
     return true
   }
 
-  return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(
-    window.location.hostname
+  const octets = parseIpv4(normalized)
+
+  return octets?.[0] === 127 || normalized === "0.0.0.0"
+}
+
+function isLocalhostName(hostname: string) {
+  return hostname.trim().toLowerCase() === "localhost"
+}
+
+function isIpv6Host(hostname: string) {
+  const normalized = hostname.trim().toLowerCase()
+
+  return normalized.includes(":") || normalized.startsWith("[")
+}
+
+function isValidDomainName(hostname: string) {
+  const normalized = hostname.trim().toLowerCase()
+
+  if (
+    !normalized ||
+    normalized.length > 253 ||
+    normalized === "localhost" ||
+    isIpv6Host(normalized) ||
+    parseIpv4(normalized)
+  ) {
+    return false
+  }
+
+  const labels = normalized.split(".")
+
+  if (labels.length < 2) {
+    return false
+  }
+
+  return labels.every((label) =>
+    /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)
   )
+}
+
+function isAllowedHttpsHost(hostname: string) {
+  if (isDeviceLocalHost(hostname) || isIpv6Host(hostname)) {
+    return false
+  }
+
+  return Boolean(parseIpv4(hostname.trim())) || isValidDomainName(hostname)
+}
+
+export function isPrivateLanIpv4Host(hostname: string) {
+  const octets = parseIpv4(hostname.trim())
+
+  if (!octets) {
+    return false
+  }
+
+  const [first, second] = octets
+
+  return (
+    first === 10 ||
+    (first === 172 && second >= 16 && second <= 31) ||
+    (first === 192 && second === 168)
+  )
+}
+
+export function getGoogleCastReceiverUrlUnavailableReason(value: string) {
+  let url: URL
+
+  try {
+    url = new URL(value)
+  } catch {
+    return googleCastMediaUrlMessage
+  }
+
+  if (url.protocol === "https:") {
+    return isAllowedHttpsHost(url.hostname) ? null : googleCastMediaUrlMessage
+  }
+
+  if (url.protocol !== "http:") {
+    return googleCastMediaUrlMessage
+  }
+
+  if (isIpv6Host(url.hostname)) {
+    return "Google Cast LAN media URLs need IPv4. Set BASE_URL to your device IPv4 address, for example http://192.168.1.101:3000."
+  }
+
+  if (isDeviceLocalHost(url.hostname)) {
+    return googleCastMediaUrlMessage
+  }
+
+  return isPrivateLanIpv4Host(url.hostname) ? null : googleCastMediaUrlMessage
+}
+
+export function isGoogleCastReceiverUrlReachable(value: string) {
+  return getGoogleCastReceiverUrlUnavailableReason(value) === null
+}
+
+export function assertGoogleCastReceiverUrlReachable(value: string) {
+  if (!isGoogleCastReceiverUrlReachable(value)) {
+    throw new Error(googleCastUnreachableUrlErrorCode)
+  }
+}
+
+export function getGoogleCastSenderOriginUnavailableReason(value: string) {
+  let url: URL
+
+  try {
+    url = new URL(value)
+  } catch {
+    return googleCastSenderUrlMessage
+  }
+
+  if (url.protocol === "https:") {
+    return isAllowedHttpsHost(url.hostname) ? null : googleCastSenderUrlMessage
+  }
+
+  if (url.protocol !== "http:") {
+    return googleCastSenderUrlMessage
+  }
+
+  if (isIpv6Host(url.hostname)) {
+    return "Google Cast local sender pages need http://localhost or HTTPS. LAN casting still needs BASE_URL to use an IPv4 address."
+  }
+
+  return isLocalhostName(url.hostname) ? null : googleCastSenderUrlMessage
+}
+
+export function isGoogleCastSenderOriginAllowed(value: string) {
+  return getGoogleCastSenderOriginUnavailableReason(value) === null
+}
+
+export function getGoogleCastCurrentPageSenderUnavailableReason() {
+  if (typeof window === "undefined") {
+    return "Google Cast is only available in a browser."
+  }
+
+  return getGoogleCastSenderOriginUnavailableReason(window.location.href)
+}
+
+function isAllowedCastSenderOrigin() {
+  return getGoogleCastCurrentPageSenderUnavailableReason() === null
 }
 
 function initializeCastFramework() {
@@ -205,7 +374,7 @@ function initializeCastFramework() {
     return true
   }
 
-  if (!isSecureCastSenderOrigin()) {
+  if (!isAllowedCastSenderOrigin()) {
     return false
   }
 
@@ -239,15 +408,10 @@ export function getGoogleCastSession() {
 }
 
 export function getGoogleCastUnavailableReason() {
-  if (typeof window === "undefined") {
-    return "Google Cast is only available in a browser."
-  }
-
-  if (!isSecureCastSenderOrigin()) {
-    return "Google Cast requires HTTPS, or localhost during development. Use https://192.168.1.101 or open the app on localhost."
-  }
-
-  return "Google Cast is not available in this browser."
+  return (
+    getGoogleCastCurrentPageSenderUnavailableReason() ??
+    "Google Cast is not available in this browser."
+  )
 }
 
 export async function ensureGoogleCastFramework() {
@@ -255,7 +419,7 @@ export async function ensureGoogleCastFramework() {
     return false
   }
 
-  if (!isSecureCastSenderOrigin()) {
+  if (!isAllowedCastSenderOrigin()) {
     return false
   }
 
@@ -269,36 +433,59 @@ export async function ensureGoogleCastFramework() {
 
   castFrameworkPromise = new Promise((resolve) => {
     const win = castWindow()
+    let settled = false
+    let checkTimer: number | null = null
+    let timeoutTimer: number | null = null
 
-    if (win.cast?.framework) {
-      resolve(initializeCastFramework())
+    const cleanup = () => {
+      if (checkTimer) {
+        window.clearInterval(checkTimer)
+        checkTimer = null
+      }
+
+      if (timeoutTimer) {
+        window.clearTimeout(timeoutTimer)
+        timeoutTimer = null
+      }
+    }
+
+    const finish = (available: boolean) => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      cleanup()
+      resolve(available ? initializeCastFramework() : false)
+    }
+
+    const checkReady = () => {
+      if (getCastApis()) {
+        finish(true)
+      }
+    }
+
+    if (getCastApis()) {
+      finish(true)
       return
     }
 
     const existingCallback = win.__onGCastApiAvailable
-    const finish = (available: boolean) => {
-      if (available) {
-        resolve(initializeCastFramework())
-        return
-      }
-
-      resolve(false)
-    }
 
     win.__onGCastApiAvailable = (isAvailable: boolean) => {
-      if (isAvailable) {
-        initializeCastFramework()
-      }
       existingCallback?.(isAvailable)
       finish(isAvailable)
     }
+
+    checkTimer = window.setInterval(checkReady, 100)
+    timeoutTimer = window.setTimeout(() => finish(false), 10000)
 
     const existingScript = document.querySelector<HTMLScriptElement>(
       'script[src*="cast_sender.js"]'
     )
 
     if (existingScript) {
-      existingScript.addEventListener("error", () => resolve(false), {
+      existingScript.addEventListener("error", () => finish(false), {
         once: true,
       })
       return
@@ -308,7 +495,7 @@ export async function ensureGoogleCastFramework() {
     script.src =
       "https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"
     script.async = true
-    script.onerror = () => resolve(false)
+    script.onerror = () => finish(false)
     document.head.appendChild(script)
   })
 
@@ -658,6 +845,30 @@ export function isGoogleCastConnectedState(sessionState: string | undefined) {
     (sessionState === framework?.SessionState.SESSION_STARTED ||
       sessionState === framework?.SessionState.SESSION_RESUMED)
   )
+}
+
+
+export async function setGoogleCastReceiverVolumeOnce(
+  session: GoogleCastSession,
+  volume = 1
+) {
+  if (castVolumeInitializedSessions.has(session)) {
+    return
+  }
+
+  if (typeof session.setVolume !== "function") {
+    return
+  }
+
+  const normalizedVolume = Math.min(Math.max(volume, 0), 1)
+  castVolumeInitializedSessions.add(session)
+
+  try {
+    await session.setVolume(normalizedVolume)
+  } catch (error) {
+    castVolumeInitializedSessions.delete(session)
+    throw error
+  }
 }
 
 export async function requestGoogleCastSession() {

@@ -8,10 +8,10 @@ import {
   Maximize2,
   Pause,
   Play,
+  Radio,
   Settings,
   SkipBack,
   SkipForward,
-  Square,
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
@@ -20,12 +20,16 @@ import { getPreferredPlayerAspectRatio } from "@/lib/player-aspect-ratio"
 import {
   addGoogleCastMediaStateListener,
   addGoogleCastSessionStateListener,
+  assertGoogleCastReceiverUrlReachable,
   createGoogleCastLoadRequest,
   ensureGoogleCastFramework,
   getGoogleCastMediaState,
   getGoogleCastContext,
   getGoogleCastSession,
-  getGoogleCastUnavailableReason,
+  getGoogleCastCurrentPageSenderUnavailableReason,
+  getGoogleCastReceiverUrlUnavailableReason,
+  googleCastMediaUrlMessage,
+  googleCastUnreachableUrlErrorCode,
   isGoogleCastConnectedState,
   isGoogleCastEndingState,
   pauseGoogleCastMedia,
@@ -33,6 +37,7 @@ import {
   requestGoogleCastSession,
   safeEndGoogleCastSession,
   seekGoogleCastMedia,
+  setGoogleCastReceiverVolumeOnce,
   waitForGoogleCastMediaLoad,
   type GoogleCastMediaState,
   type GoogleCastSessionHandle,
@@ -218,15 +223,6 @@ function getCastDirectContentType(fileName: string, usesAudioRemux = false) {
   }
 
   return "application/octet-stream"
-}
-
-function isLoopbackHost(hostname: string) {
-  return (
-    hostname === "localhost" ||
-    hostname === "127.0.0.1" ||
-    hostname === "::1" ||
-    hostname === "[::1]"
-  )
 }
 
 function formatTime(seconds: number) {
@@ -785,6 +781,31 @@ function reportCastError(error: unknown) {
   }).catch(() => undefined)
 }
 
+function formatCastErrorMessage(error: unknown) {
+  if (error instanceof Error) {
+    if (error.message === googleCastUnreachableUrlErrorCode) {
+      return googleCastMediaUrlMessage
+    }
+
+    return error.message
+  }
+
+  if (typeof error === "string") {
+    return error
+  }
+
+  return "Google Cast failed to start."
+}
+
+function RadioOffIcon({ className }: { className?: string }) {
+  return (
+    <span className={`relative inline-grid place-items-center ${className ?? ""}`}>
+      <Radio className="size-full" />
+      <span className="absolute h-[2px] w-[115%] rotate-45 rounded-full bg-current" />
+    </span>
+  )
+}
+
 export function AnimePlayer({
   animeId,
   seasonNumber,
@@ -824,11 +845,13 @@ export function AnimePlayer({
   const isPlayingRef = useRef(false)
   const castContentIdRef = useRef<string | null>(null)
   const castErrorFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const castErrorMessageTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const castFinishedHandledRef = useRef(false)
   const castMediaCleanupRef = useRef<(() => void) | null>(null)
   const castProgressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const castStartPromiseRef = useRef<Promise<boolean> | null>(null)
   const localPlaybackBeforeCastRef = useRef<LocalPlaybackSnapshot | null>(null)
+  const resumeLocalAfterCastEndRef = useRef(false)
   const controlsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const hardwareWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const priorityInfoTimerRef = useRef<number | null>(null)
@@ -884,10 +907,10 @@ export function AnimePlayer({
   const [controlsVisible, setControlsVisible] = useState(true)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [isPortraitViewport, setIsPortraitViewport] = useState(false)
-  const [canCast, setCanCast] = useState(false)
   const [isCasting, setIsCasting] = useState(false)
   const [isCastStarting, setIsCastStarting] = useState(false)
   const [castErrorFlash, setCastErrorFlash] = useState(false)
+  const [castErrorMessage, setCastErrorMessage] = useState<string | null>(null)
   const [subtitleCues, setSubtitleCues] = useState<SubtitleCue[]>([])
   const [activeSubtitleTexts, setActiveSubtitleTexts] = useState<string[]>([])
 
@@ -1024,39 +1047,6 @@ export function AnimePlayer({
     return () => window.clearTimeout(timer)
   }, [selectedSubtitleStreamId, subtitleLanguageOptions, supportedSubtitleStreams])
 
-  useEffect(() => {
-    let cancelled = false
-
-    void ensureGoogleCastFramework().then((available) => {
-      if (!cancelled) {
-        setCanCast(available)
-      }
-    })
-
-    return () => {
-      cancelled = true
-    }
-  }, [])
-
-  useEffect(() => {
-    const removeListener = addGoogleCastSessionStateListener((event) => {
-      if (isGoogleCastConnectedState(event.sessionState)) {
-        setCanCast(true)
-      }
-
-      if (
-        isGoogleCastEndingState(event.sessionState) &&
-        (isCastingRef.current || isCastLoadingRef.current)
-      ) {
-        handleCastEndedRef.current()
-      }
-    })
-
-    return () => {
-      removeListener()
-    }
-  }, [])
-
   const clearControlsTimer = useCallback(() => {
     if (controlsTimerRef.current) {
       clearTimeout(controlsTimerRef.current)
@@ -1097,6 +1087,11 @@ export function AnimePlayer({
       clearTimeout(castErrorFlashTimerRef.current)
       castErrorFlashTimerRef.current = null
     }
+
+    if (castErrorMessageTimerRef.current) {
+      clearTimeout(castErrorMessageTimerRef.current)
+      castErrorMessageTimerRef.current = null
+    }
   }, [])
 
   const flashCastError = useCallback(
@@ -1104,10 +1099,16 @@ export function AnimePlayer({
       reportCastError(error)
       clearCastErrorFlashTimer()
       setCastErrorFlash(true)
+      setCastErrorMessage(formatCastErrorMessage(error))
+
       castErrorFlashTimerRef.current = setTimeout(() => {
         setCastErrorFlash(false)
         castErrorFlashTimerRef.current = null
       }, 1800)
+      castErrorMessageTimerRef.current = setTimeout(() => {
+        setCastErrorMessage(null)
+        castErrorMessageTimerRef.current = null
+      }, 8000)
     },
     [clearCastErrorFlashTimer]
   )
@@ -1157,6 +1158,25 @@ export function AnimePlayer({
     },
     [clearControlsTimer]
   )
+
+  useEffect(() => {
+    const removeListener = addGoogleCastSessionStateListener((event) => {
+      if (isGoogleCastConnectedState(event.sessionState)) {
+        showControls(true)
+      }
+
+      if (
+        isGoogleCastEndingState(event.sessionState) &&
+        (isCastingRef.current || isCastLoadingRef.current)
+      ) {
+        handleCastEndedRef.current()
+      }
+    })
+
+    return () => {
+      removeListener()
+    }
+  }, [showControls])
 
   useEffect(() => {
     const mediaQuery = window.matchMedia("(orientation: portrait)")
@@ -2371,26 +2391,33 @@ export function AnimePlayer({
     void target.requestFullscreen().catch(() => undefined)
   }
 
-  function getCastReceiverUrl(castUrl: string) {
-    const configuredUrl = new URL(castUrl, window.location.href)
-    const currentOriginUrl = new URL(
-      `${configuredUrl.pathname}${configuredUrl.search}`,
-      window.location.href
-    )
+  function getCastPreflightError() {
+    const senderReason = getGoogleCastCurrentPageSenderUnavailableReason()
 
-    if (!isLoopbackHost(currentOriginUrl.hostname)) {
-      return currentOriginUrl.toString()
+    if (senderReason) {
+      return senderReason
     }
 
-    return configuredUrl.toString()
+    const castUrls = [
+      playback.castDirectUrl,
+      playback.castTranscodeUrl,
+      playback.castDataSaverUrl,
+      playback.castSubtitleUrl,
+    ]
+
+    for (const castUrl of castUrls) {
+      const reason = getGoogleCastReceiverUrlUnavailableReason(castUrl)
+
+      if (reason) {
+        return reason
+      }
+    }
+
+    return null
   }
 
-  function assertCastReceiverUrlReachable(url: string) {
-    const parsed = new URL(url)
-
-    if (isLoopbackHost(parsed.hostname)) {
-      throw new Error("CAST_RECEIVER_URL_IS_LOCALHOST")
-    }
+  function getCastReceiverUrl(castUrl: string) {
+    return new URL(castUrl, window.location.href).toString()
   }
 
   function getSelectedCastTextTrack() {
@@ -2420,7 +2447,7 @@ export function AnimePlayer({
     timeoutMs?: number | null
   }) {
     if (input.textTrack) {
-      assertCastReceiverUrlReachable(input.textTrack.url)
+      assertGoogleCastReceiverUrlReachable(input.textTrack.url)
     }
 
     const request = createGoogleCastLoadRequest({
@@ -2435,11 +2462,7 @@ export function AnimePlayer({
       throw new Error("Google Cast media request could not be created")
     }
 
-    const loadResult = await input.session.loadMedia(request)
-
-    if (loadResult) {
-      throw new Error(`Google Cast loadMedia failed: ${String(loadResult)}`)
-    }
+    await input.session.loadMedia(request)
 
     return await waitForGoogleCastMediaLoad({
       session: input.session,
@@ -2470,8 +2493,10 @@ export function AnimePlayer({
     updateWatchedProgress(state.positionSeconds, state.durationSeconds)
 
     if (state.playerState === "PLAYING" || state.playerState === "BUFFERING") {
+      resumeLocalAfterCastEndRef.current = true
       setIsPlaying(true)
     } else if (state.playerState === "PAUSED") {
+      resumeLocalAfterCastEndRef.current = false
       setIsPlaying(false)
     }
 
@@ -2554,15 +2579,37 @@ export function AnimePlayer({
     try {
       if (isPlaying) {
         await pauseGoogleCastMedia(session)
+        resumeLocalAfterCastEndRef.current = false
         setIsPlaying(false)
       } else {
         await playGoogleCastMedia(session)
+        resumeLocalAfterCastEndRef.current = true
         setIsPlaying(true)
       }
     } catch (error) {
       flashCastError(error)
       console.error(error)
     }
+  }
+
+  function keepLocalPausedAfterFailedCastStart() {
+    isCastLoadingRef.current = false
+    isCastingRef.current = false
+    resumeLocalAfterCastEndRef.current = false
+    shouldAutoPlaySourceRef.current = false
+    endMediaWait()
+    restoreLocalSource({ preservePosition: true })
+    setIsCasting(false)
+    setIsPlaying(false)
+    isPlayingRef.current = false
+    showControls(true)
+  }
+
+  function pauseLocalPlaybackForCastAttempt(video: HTMLVideoElement) {
+    video.pause()
+    setIsPlaying(false)
+    isPlayingRef.current = false
+    showControls(true)
   }
 
   async function startGoogleCasting(
@@ -2577,7 +2624,6 @@ export function AnimePlayer({
     }
 
     const startTime = startTimeOverride ?? getPlaybackPosition()
-    const session = getGoogleCastSession() ?? (await requestGoogleCastSession())
     const alreadyCasting = isCastingRef.current || isCastLoadingRef.current
     const canLocalDirect = supportsDirectPlayback(video, fileName)
     const directFirst = quality === "original" && canLocalDirect
@@ -2610,18 +2656,29 @@ export function AnimePlayer({
         position: startTime,
         wasMuted: video.muted,
       }
+      resumeLocalAfterCastEndRef.current = shouldResume
       video.muted = true
       video.pause()
       setIsPlaying(false)
+      isPlayingRef.current = false
     }
 
     isCastLoadingRef.current = true
     beginMediaWait(false)
     showControls(true)
 
+    const session = getGoogleCastSession() ?? (await requestGoogleCastSession())
+
+    try {
+      await setGoogleCastReceiverVolumeOnce(session, 1)
+    } catch (error) {
+      reportCastError(error)
+      console.error(error)
+    }
+
     if (directFirst) {
       try {
-        assertCastReceiverUrlReachable(directCastUrl)
+        assertGoogleCastReceiverUrlReachable(directCastUrl)
         const result = await loadGoogleCastMedia({
           session,
           url: directCastUrl,
@@ -2652,20 +2709,18 @@ export function AnimePlayer({
     }
 
     if (!liveTranscodeEnabled) {
-      isCastLoadingRef.current = false
-      endMediaWait()
       safeEndGoogleCastSession(session, true)
-      restoreLocalSource({ preservePosition: true })
       flashCastError(
         new Error("Live transcoding is disabled when TRANSCODE_ACCEL=cpu.")
       )
-      return true
+      keepLocalPausedAfterFailedCastStart()
+      return false
     }
 
     setStatus("transcoding")
     beginMediaWait(true)
     try {
-      assertCastReceiverUrlReachable(transcodeCastUrl)
+      assertGoogleCastReceiverUrlReachable(transcodeCastUrl)
       const result = await loadGoogleCastMedia({
         session,
         url: transcodeCastUrl,
@@ -2678,30 +2733,25 @@ export function AnimePlayer({
 
       if (result === "loaded") {
         activateGoogleCastPlayback(session, transcodeCastUrl, "transcoding")
-      } else {
-        isCastLoadingRef.current = false
-        endMediaWait()
-        safeEndGoogleCastSession(session, true)
-        restoreLocalSource({ preservePosition: true })
-        flashCastError(new Error("Cast receiver could not load the stream."))
-        console.error("Cast receiver could not load the stream.")
+        return true
       }
-    } catch (error) {
-      isCastLoadingRef.current = false
-      endMediaWait()
+
       safeEndGoogleCastSession(session, true)
-      restoreLocalSource({ preservePosition: true })
+      flashCastError(new Error("Cast receiver could not load the stream."))
+      console.error("Cast receiver could not load the stream.")
+      keepLocalPausedAfterFailedCastStart()
+      return false
+    } catch (error) {
+      safeEndGoogleCastSession(session, true)
       flashCastError(
-        error instanceof Error && error.message === "CAST_RECEIVER_URL_IS_LOCALHOST"
-          ? new Error(
-              "Casting needs BASE_URL or the current page URL to be reachable from the TV."
-            )
+        error instanceof Error && error.message === googleCastUnreachableUrlErrorCode
+          ? new Error(googleCastMediaUrlMessage)
           : error
       )
       console.error(error)
+      keepLocalPausedAfterFailedCastStart()
+      return false
     }
-
-    return true
   }
 
   useEffect(() => {
@@ -2742,17 +2792,27 @@ export function AnimePlayer({
       return
     }
 
+    const startTime = getPlaybackPosition()
+    const shouldResume = !video.paused || isPlayingRef.current || startTime <= 0.35
+
+    pauseLocalPlaybackForCastAttempt(video)
+
+    const castPreflightError = getCastPreflightError()
+
+    if (castPreflightError) {
+      flashCastError(new Error(castPreflightError))
+      return
+    }
+
     const googleCastReady =
       Boolean(getGoogleCastContext()) || (await ensureGoogleCastFramework())
 
     if (!googleCastReady) {
-      flashCastError(new Error(getGoogleCastUnavailableReason()))
+      flashCastError(new Error("Google Cast is not available in this browser."))
       return
     }
 
-    showControls(true)
-    const shouldResume = !video.paused || isPlayingRef.current
-    const startPromise = startGoogleCasting(video, shouldResume)
+    const startPromise = startGoogleCasting(video, shouldResume, startTime)
     castStartPromiseRef.current = startPromise
     setIsCastStarting(true)
 
@@ -2760,7 +2820,7 @@ export function AnimePlayer({
       await startPromise
     } catch (error) {
       flashCastError(error)
-      handleCastEnded()
+      keepLocalPausedAfterFailedCastStart()
     } finally {
       if (castStartPromiseRef.current === startPromise) {
         castStartPromiseRef.current = null
@@ -2772,6 +2832,7 @@ export function AnimePlayer({
   function handleCastEnded() {
     const video = videoRef.current
     const castPosition = currentTimeRef.current
+    const shouldResumeLocal = resumeLocalAfterCastEndRef.current
 
     video?.pause()
     clearCastMediaSync()
@@ -2783,6 +2844,7 @@ export function AnimePlayer({
     isCastingRef.current = false
     setIsCasting(false)
     setIsPlaying(false)
+    isPlayingRef.current = false
     endMediaWait()
 
     if (localPlaybackBeforeCastRef.current) {
@@ -2792,6 +2854,8 @@ export function AnimePlayer({
       }
     }
 
+    shouldAutoPlaySourceRef.current = shouldResumeLocal
+    resumeLocalAfterCastEndRef.current = false
     restoreLocalSource({ preservePosition: true })
     showControls(true)
   }
@@ -2974,7 +3038,11 @@ export function AnimePlayer({
       : getPreferredPlayerAspectRatio(media.videoWidth, media.videoHeight)
   const canSkipIntro = duration > 90 && currentTime < 90
   const canSkipOutro = duration > 0 && currentTime >= duration * 0.8 && currentTime < duration - 1
+  const castSkipLabel = canSkipIntro ? "Skip intro" : canSkipOutro ? "Skip outro" : "Skip intro/outro"
   const controlsAreVisible = controlsVisible || !isPlaying || isCasting || settingsOpen
+  const castPreflightError = getCastPreflightError()
+  const castButtonLabel = castPreflightError ?? "Google Cast"
+  const castButtonDisabled = !sourceUrl || isCastStarting || Boolean(castPreflightError)
   const centerToggleVisible =
     !isWaitingForMedia && !isCasting && (!isPlaying || controlsAreVisible)
   const settingsPanelClass = `fixed left-1/2 z-[100] w-[min(24rem,calc(100vw-1.5rem))] -translate-x-1/2 space-y-3 overflow-y-auto overscroll-contain rounded-xl border border-white/10 bg-zinc-950/95 p-3 text-xs shadow-2xl backdrop-blur lg:p-4 lg:text-sm ${
@@ -3097,8 +3165,181 @@ export function AnimePlayer({
         />
 
         {isCasting ? (
-          <div className="absolute inset-0 grid place-items-center bg-black text-sm text-zinc-400">
-            Casting
+          <div className="absolute inset-0 bg-black text-white">
+            <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_18%,rgba(127,29,29,0.2),transparent_36%),linear-gradient(180deg,rgba(24,24,27,0.32),rgba(0,0,0,0.82))]" />
+
+            <div className="relative z-10 flex h-full flex-col items-center px-4 py-4 sm:px-6 lg:px-10 lg:py-8">
+              <div className="flex w-full justify-center">
+                <div className="flex w-full max-w-5xl flex-wrap items-center justify-center gap-3 rounded-3xl border border-white/10 bg-zinc-950/35 p-2 shadow-2xl backdrop-blur-md sm:w-auto sm:p-3">
+                  <HoverHint label="Stop casting">
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      className="h-12 rounded-2xl border border-white/30 bg-zinc-950/70 px-4 text-sm font-medium text-white shadow-xl hover:border-white/45 hover:bg-zinc-900 disabled:opacity-45 lg:h-14 lg:px-5 lg:text-base"
+                      aria-label="Stop casting"
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        stopCasting()
+                      }}
+                    >
+                      <RadioOffIcon className="size-5 lg:size-6" />
+                      <span>Stop casting</span>
+                    </Button>
+                  </HoverHint>
+
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    className="h-12 rounded-2xl border border-white/30 bg-zinc-950/70 px-6 text-sm font-medium text-white shadow-xl hover:border-white/45 hover:bg-zinc-900 disabled:opacity-45 lg:h-14 lg:px-8 lg:text-base"
+                    disabled={!canSkipIntro && !canSkipOutro}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      if (canSkipIntro) {
+                        void seekTo(Math.min(currentTime + 90, duration))
+                        return
+                      }
+                      if (canSkipOutro) {
+                        void seekTo(duration)
+                      }
+                    }}
+                  >
+                    {castSkipLabel}
+                  </Button>
+                </div>
+              </div>
+
+              <div className="flex min-h-0 w-full flex-1 items-center justify-center py-4 lg:py-8">
+                <div className="grid grid-cols-4 items-center gap-2 rounded-[2rem] border border-white/10 bg-zinc-950/35 p-3 shadow-2xl backdrop-blur-md sm:gap-4 sm:p-4 lg:gap-5 lg:p-5">
+                  <HoverHint label="Previous episode">
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="icon"
+                      className="size-14 rounded-2xl border border-white/10 bg-white/[0.06] text-white shadow-xl hover:border-white/20 hover:bg-white/10 disabled:opacity-35 sm:size-16 lg:size-20"
+                      disabled={!previousEpisode}
+                      aria-label="Previous episode"
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        if (previousEpisode && onEpisodeChange) {
+                          onEpisodeChange(previousEpisode, isPlayingRef.current)
+                        }
+                      }}
+                    >
+                      <SkipBack className="size-8 sm:size-9 lg:size-11" />
+                    </Button>
+                  </HoverHint>
+
+                  <HoverHint label={isPlaying ? "Pause" : "Play"}>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="icon"
+                      className="size-14 rounded-2xl border border-white/10 bg-white/[0.06] text-white shadow-xl hover:border-white/20 hover:bg-white/10 disabled:opacity-35 sm:size-16 lg:size-20"
+                      disabled={!isCasting}
+                      aria-label={isPlaying ? "Pause" : "Play"}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        void togglePlay()
+                      }}
+                    >
+                      {isPlaying ? (
+                        <Pause className="size-8 sm:size-9 lg:size-11" />
+                      ) : (
+                        <Play className="ml-1 size-8 sm:size-9 lg:size-11" />
+                      )}
+                    </Button>
+                  </HoverHint>
+
+                  <HoverHint label="Next episode">
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="icon"
+                      className="size-14 rounded-2xl border border-white/10 bg-white/[0.06] text-white shadow-xl hover:border-white/20 hover:bg-white/10 disabled:opacity-35 sm:size-16 lg:size-20"
+                      disabled={!nextEpisode}
+                      aria-label="Next episode"
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        if (nextEpisode && onEpisodeChange) {
+                          onEpisodeChange(nextEpisode, isPlayingRef.current)
+                        }
+                      }}
+                    >
+                      <SkipForward className="size-8 sm:size-9 lg:size-11" />
+                    </Button>
+                  </HoverHint>
+
+                  <div ref={settingsButtonRef}>
+                    <HoverHint label="Settings">
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        size="icon"
+                        className="size-14 rounded-2xl border border-white/10 bg-white/[0.06] text-white shadow-xl hover:border-white/20 hover:bg-white/10 sm:size-16 lg:size-20"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          setSettingsOpen((open) => !open)
+                          showControls(true)
+                        }}
+                        aria-label="Settings"
+                      >
+                        <Settings className="size-8 sm:size-9 lg:size-11" />
+                      </Button>
+                    </HoverHint>
+                  </div>
+                </div>
+              </div>
+
+              <div className="w-full max-w-5xl pb-1 sm:pb-2 lg:pb-4">
+                <div className="relative rounded-3xl border border-white/10 bg-zinc-950/35 px-4 py-4 shadow-2xl backdrop-blur-md sm:px-6 lg:px-8 lg:py-5">
+                  {seekPreviewFrame ? (
+                    <div
+                      className="pointer-events-none absolute bottom-[5.7rem] z-10 w-48 -translate-x-1/2 overflow-hidden rounded-xl border border-white/15 bg-zinc-950 shadow-2xl lg:bottom-[6.5rem] lg:w-64"
+                      style={{ left: `${seekPreviewFrame.leftPercent}%` }}
+                    >
+                      {getSeekPreviewFrameUrl(seekPreviewFrame.time) ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={getSeekPreviewFrameUrl(seekPreviewFrame.time) ?? undefined}
+                          alt=""
+                          className="aspect-video w-full object-cover"
+                        />
+                      ) : null}
+                      <div className="px-2 py-1.5 text-center text-xs font-medium text-zinc-200 tabular-nums lg:text-sm">
+                        {formatTime(seekPreviewFrame.time)}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  <input
+                    type="range"
+                    min={0}
+                    max={duration || 0}
+                    step={0.25}
+                    value={duration ? Math.min(displayedCurrentTime, duration) : 0}
+                    onChange={(event) => updateSeekDragPreview(event.target.value)}
+                    onPointerMove={(event) =>
+                      updateSeekHoverPreview(event.currentTarget, event.clientX)
+                    }
+                    onPointerLeave={() => {
+                      if (seekPreview === null) {
+                        clearSeekPreviewFrame()
+                      }
+                    }}
+                    onPointerUp={(event) => commitSeekInput(event.currentTarget.value)}
+                    onPointerCancel={clearSeekPreviewFrame}
+                    onKeyUp={(event) => commitSeekInput(event.currentTarget.value)}
+                    onBlur={(event) => commitSeekInput(event.currentTarget.value)}
+                    disabled={!duration}
+                    className="h-4 w-full accent-red-600 lg:h-5"
+                    aria-label="Seek cast playback"
+                  />
+                  <div className="mt-3 text-center text-2xl font-semibold tracking-wide text-zinc-100 tabular-nums lg:mt-4 lg:text-4xl">
+                    {formatTime(displayedCurrentTime)} / {formatTime(duration)}
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         ) : null}
 
@@ -3159,7 +3400,7 @@ export function AnimePlayer({
           </button>
         </HoverHint>
 
-        {controlsAreVisible && canSkipIntro ? (
+        {controlsAreVisible && !isCasting && canSkipIntro ? (
           <Button
             type="button"
             variant="secondary"
@@ -3172,7 +3413,7 @@ export function AnimePlayer({
             Skip intro
           </Button>
         ) : null}
-        {controlsAreVisible && !canSkipIntro && canSkipOutro ? (
+        {controlsAreVisible && !isCasting && !canSkipIntro && canSkipOutro ? (
           <Button
             type="button"
             variant="secondary"
@@ -3186,7 +3427,7 @@ export function AnimePlayer({
           </Button>
         ) : null}
 
-        {activeSubtitleTexts.length ? (
+        {activeSubtitleTexts.length && !isCasting ? (
           <div className="pointer-events-none absolute inset-x-4 bottom-[5.25rem] z-10 flex justify-center px-4 text-center text-lg lg:bottom-24 font-semibold leading-snug text-white drop-shadow-[0_2px_5px_rgba(0,0,0,0.95)] sm:text-xl">
             <div className="max-w-[90%] whitespace-pre-line">
               {activeSubtitleTexts.join("\n")}
@@ -3194,6 +3435,14 @@ export function AnimePlayer({
           </div>
         ) : null}
 
+
+        {castErrorMessage ? (
+          <div className="pointer-events-none absolute inset-x-4 bottom-[5.25rem] z-30 flex justify-center lg:bottom-24">
+            <div className="max-w-[min(34rem,calc(100vw-2rem))] rounded-xl border border-red-400/30 bg-red-950/90 px-4 py-3 text-sm font-semibold text-white shadow-2xl backdrop-blur">
+              {castErrorMessage}
+            </div>
+          </div>
+        ) : null}
 
         {settingsOpen ? (
           <div
@@ -3271,7 +3520,8 @@ export function AnimePlayer({
           </div>
         ) : null}
 
-        <div
+        {!isCasting ? (
+          <div
           className={`absolute inset-x-0 bottom-0 bg-zinc-950/40 p-3 backdrop-blur-md lg:p-4 transition-opacity duration-300 ${
             controlsAreVisible ? "opacity-100" : "pointer-events-none opacity-0"
           }`}
@@ -3395,42 +3645,23 @@ export function AnimePlayer({
 
             </div>
 
-            {isCasting ? (
-              <HoverHint label="Stop casting">
-                <Button
-                  type="button"
-                  variant="secondary"
-                  size="icon"
-                  className={`bg-zinc-950/70 ${
-                    castErrorFlash
-                      ? "border-red-500/70 text-red-400 ring-2 ring-red-500/40"
-                      : ""
-                  }`}
-                  aria-label="Stop casting"
-                  onClick={stopCasting}
-                >
-                  <Square className="size-4 lg:size-5" />
-                </Button>
-              </HoverHint>
-            ) : (
-              <HoverHint label={canCast ? "Cast" : getGoogleCastUnavailableReason()}>
-                <Button
-                  type="button"
-                  variant="secondary"
-                  size="icon"
-                  className={`bg-zinc-950/70 ${
-                    castErrorFlash
-                      ? "border-red-500/70 text-red-400 ring-2 ring-red-500/40"
-                      : ""
-                  }`}
-                  aria-label={canCast ? "Cast" : getGoogleCastUnavailableReason()}
-                  disabled={(!sourceUrl && !isCasting) || isCastStarting}
-                  onClick={startCasting}
-                >
-                  <Cast className="size-4 lg:size-5" />
-                </Button>
-              </HoverHint>
-            )}
+            <HoverHint label={castButtonLabel}>
+              <Button
+                type="button"
+                variant="secondary"
+                size="icon"
+                className={`bg-zinc-950/70 ${
+                  castErrorFlash
+                    ? "border-red-500/70 text-red-400 ring-2 ring-red-500/40"
+                    : ""
+                }`}
+                aria-label={castButtonLabel}
+                disabled={castButtonDisabled}
+                onClick={startCasting}
+              >
+                <Cast className="size-4 lg:size-5" />
+              </Button>
+            </HoverHint>
 
             <HoverHint label="Fullscreen">
               <Button
@@ -3446,6 +3677,7 @@ export function AnimePlayer({
             </HoverHint>
           </div>
         </div>
+        ) : null}
       </div>
 
       <p className="sr-only">

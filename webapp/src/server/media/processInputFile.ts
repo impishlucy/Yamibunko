@@ -29,7 +29,7 @@ import {
   formatEpisodeFileName,
   formatSeasonFolderName,
   parseAnimeFileName,
-  sanitizePathPart,
+  sanitizeExportPathPart,
 } from "@/server/media/filename"
 import {
   generateEpisodeThumbnail,
@@ -49,11 +49,11 @@ import { getAudioOutputIndexesToMp3 } from "@/server/media/streamMetadata"
 import { errorMessage, fileName } from "@/server/utils/format"
 import { debugLog } from "@/server/utils/debugLog"
 
-const hardwareMaxHevcBytesPerMinute = 20 * 1024 * 1024
+const hardwareMaxHevcBytesPerMinute = 25 * 1024 * 1024
 const cpuMaxHevcBytesPerMinute = 30 * 1024 * 1024
-const targetBytesPerMinute = 17 * 1024 * 1024
+const targetBytesPerMinute = 22 * 1024 * 1024
 const targetAudioKbps = 256
-const failedImportsFolderName = "_Failed Imports"
+const failedImportsFolderName = "_failed_imports"
 const activeInputImportOutputs = new Map<string, number>()
 
 export type ProcessInputFileResult = {
@@ -179,8 +179,8 @@ function getMaxHevcBytesPerMinute() {
     : hardwareMaxHevcBytesPerMinute
 }
 
-function calculateVideoBitrateKbps() {
-  const totalKbps = Math.floor((targetBytesPerMinute * 8) / 60 / 1000)
+function calculateVideoBitrateKbps(bytesPerMinute = targetBytesPerMinute) {
+  const totalKbps = Math.floor((bytesPerMinute * 8) / 60 / 1000)
   return Math.max(totalKbps - targetAudioKbps, 500)
 }
 
@@ -219,7 +219,7 @@ function metadataTitle(metadata: {
 }
 
 function safePathSegment(value: string, label: string) {
-  const safeValue = sanitizePathPart(value)
+  const safeValue = sanitizeExportPathPart(value)
 
   if (!safeValue) {
     throw new Error(`${label} resolved to an empty path segment`)
@@ -385,12 +385,25 @@ function isInsideFailedImports(inputDir: string, current: string) {
     return false
   }
 
-  return relative.split(path.sep).includes(failedImportsFolderName)
+  return relative
+    .split(path.sep)
+    .some((part) => part === failedImportsFolderName)
 }
 
-async function moveInvalidInputToFailedImports(
+function sanitizeFailedImportRelativePath(relativePath: string) {
+  return relativePath
+    .split(path.sep)
+    .filter(Boolean)
+    .map((part, index, parts) => {
+      const fallback = index === parts.length - 1 ? "failed_file" : "unknown"
+
+      return sanitizeExportPathPart(part) || fallback
+    })
+}
+
+async function moveFailedInputToFailedImports(
   filePath: string,
-  options: { jobId: string }
+  options: { jobId: string; reason: string }
 ) {
   const inputDir = path.resolve(getServerConfig().inputDir)
   const resolvedFilePath = path.resolve(filePath)
@@ -398,7 +411,7 @@ async function moveInvalidInputToFailedImports(
   if (isInsideFailedImports(inputDir, resolvedFilePath)) {
     debugImport(
       options.jobId,
-      `Invalid media is already inside failed imports - ${resolvedFilePath}`
+      `Failed input is already inside failed imports - ${resolvedFilePath}`
     )
     return resolvedFilePath
   }
@@ -407,19 +420,44 @@ async function moveInvalidInputToFailedImports(
     throw new Error(`Refusing to quarantine a file outside the input folder: ${resolvedFilePath}`)
   }
 
-  const relativePath = path.relative(inputDir, resolvedFilePath)
+  const relativePath = sanitizeFailedImportRelativePath(
+    path.relative(inputDir, resolvedFilePath)
+  )
   const destination = await uniqueDestinationPath(
-    path.resolve(inputDir, failedImportsFolderName, relativePath)
+    path.resolve(inputDir, failedImportsFolderName, ...relativePath)
   )
 
   console.warn(
-    `[Warn] [Media] Invalid media file moved to failed imports - ${resolvedFilePath} -> ${destination}`
+    `[Warn] [Media] Failed input moved to failed imports - ${options.reason} - ${resolvedFilePath} -> ${destination}`
   )
-  debugImport(options.jobId, `Moving invalid media to failed imports - ${destination}`)
+  debugImport(options.jobId, `Moving failed input to failed imports - ${destination}`)
   await replaceFile(resolvedFilePath, destination, { jobId: options.jobId })
   await removeNonMediaOnlyInputParents(resolvedFilePath, { jobId: options.jobId })
 
   return destination
+}
+
+async function tryMoveFailedInputToFailedImports(
+  filePath: string,
+  options: { jobId: string; reason: string }
+) {
+  try {
+    if (!(await pathExists(filePath))) {
+      debugImport(
+        options.jobId,
+        `Failed input source is no longer available; nothing to move - ${filePath}`
+      )
+      return null
+    }
+
+    return await moveFailedInputToFailedImports(filePath, options)
+  } catch (error) {
+    console.error(
+      `[Error] [Media] Failed to move input to failed imports - processInputFile.ts - ${filePath} - ${errorMessage(error)}`
+    )
+    debugError(options.jobId, "Failed to move input to failed imports", error)
+    return null
+  }
 }
 
 async function probeInputFileWithRetry(filePath: string, jobId: string) {
@@ -551,6 +589,7 @@ async function transcodeFile(
     convertVideo: boolean
     audioOutputIndexesToMp3: number[]
     videoBitrateKbps: number
+    maxVideoBitrateKbps: number
     jobId?: string
   }
 ) {
@@ -653,7 +692,27 @@ export async function processInputFile(
     const parsed = parseAnimeFileName(filePath)
 
     if (!parsed) {
-      throw new Error("Unable to extract anime title and episode number")
+      const failedPath = await moveFailedInputToFailedImports(filePath, {
+        jobId,
+        reason: "Unable to extract anime title and episode number",
+      })
+      const message = `Unrecognized media filename was moved to failed imports: ${failedPath}`
+
+      updateJob(jobId, {
+        status: "failed",
+        error: "Unable to extract anime title and episode number",
+        message,
+        finishedAt: new Date().toISOString(),
+      })
+
+      debugImport(jobId, message)
+
+      return {
+        ok: true,
+        filePath: failedPath,
+        planned: false,
+        message,
+      }
     }
 
     console.log(
@@ -677,7 +736,27 @@ export async function processInputFile(
     )
 
     if (!metadata) {
-      throw new Error(`AniList could not match "${parsed.title}"`)
+      const failedPath = await moveFailedInputToFailedImports(filePath, {
+        jobId,
+        reason: `AniList could not match "${parsed.title}"`,
+      })
+      const message = `Unmatched media file was moved to failed imports: ${failedPath}`
+
+      updateJob(jobId, {
+        status: "failed",
+        error: `AniList could not match "${parsed.title}"`,
+        message,
+        finishedAt: new Date().toISOString(),
+      })
+
+      debugImport(jobId, message)
+
+      return {
+        ok: true,
+        filePath: failedPath,
+        planned: false,
+        message,
+      }
     }
 
     debugImport(jobId, `AniList metadata lookup completed - Anime id ${metadata.id}.`)
@@ -728,7 +807,10 @@ export async function processInputFile(
         throw error
       }
 
-      const failedPath = await moveInvalidInputToFailedImports(filePath, { jobId })
+      const failedPath = await moveFailedInputToFailedImports(filePath, {
+        jobId,
+        reason: errorMessage(error),
+      })
       const message = `Invalid media file was moved to failed imports: ${failedPath}`
 
       updateJob(jobId, {
@@ -993,13 +1075,14 @@ export async function processInputFile(
         })
 
         console.log(
-          `[Info] [Media] Starting media transcode - ${fileName(filePath)} - Accel: ${getServerConfig().transcodeAccel}, HW decode: ${convertVideo ? getHardwareInputLabel() : "not needed"}, HEVC: ${convertVideo ? `yes (${inputHasHevcVideo ? `over ${formatMegabytesPerMinute(maxHevcBytesPerMinute)} MB/min` : "source is not HEVC"})` : "copy"}, MP3 audio tracks: ${audioOutputIndexesToMp3.length ? audioOutputIndexesToMp3.join(", ") : "none"}, Target: ${formatMegabytesPerMinute(targetBytesPerMinute)} MB/min, Bitrate: ${videoBitrateKbps}k`
+          `[Info] [Media] Starting media transcode - ${fileName(filePath)} - Accel: ${getServerConfig().transcodeAccel}, HW decode: ${convertVideo ? getHardwareInputLabel() : "not needed"}, HEVC: ${convertVideo ? `yes (${inputHasHevcVideo ? `over ${formatMegabytesPerMinute(maxHevcBytesPerMinute)} MB/min` : "source is not HEVC"})` : "copy"}, MP3 audio tracks: ${audioOutputIndexesToMp3.length ? audioOutputIndexesToMp3.join(", ") : "none"}, Target: ${formatMegabytesPerMinute(targetBytesPerMinute)} MB/min, Bitrate: ${videoBitrateKbps}k, Maxrate: ${calculateVideoBitrateKbps(maxHevcBytesPerMinute)}k`
         )
 
         await transcodeFile(filePath, tempPath, {
           convertVideo,
           audioOutputIndexesToMp3,
           videoBitrateKbps,
+          maxVideoBitrateKbps: calculateVideoBitrateKbps(maxHevcBytesPerMinute),
           jobId,
         })
         debugImport(jobId, "Transcode step completed successfully.")
@@ -1103,15 +1186,23 @@ export async function processInputFile(
           return
         }
 
+        const failedPath = await tryMoveFailedInputToFailedImports(filePath, {
+          jobId,
+          reason: `Deferred ${label} failed: ${message}`,
+        })
+        const failureMessage = failedPath
+          ? `${message}; input moved to failed imports: ${failedPath}`
+          : message
+
         console.error(
-          `[Error] [Media] Deferred ${label} failed - processInputFile.ts - ${filePath} - ${message}`
+          `[Error] [Media] Deferred ${label} failed - processInputFile.ts - ${filePath} - ${failureMessage}`
         )
         debugError(jobId, `Deferred ${label} failed`, error)
 
         updateJob(jobId, {
           status: "failed",
           error: message,
-          message,
+          message: failureMessage,
           finishedAt: new Date().toISOString(),
         })
       }
@@ -1245,23 +1336,31 @@ export async function processInputFile(
       }
     }
 
+    const failedPath = await tryMoveFailedInputToFailedImports(filePath, {
+      jobId,
+      reason: message,
+    })
+    const failureMessage = failedPath
+      ? `${message}; input moved to failed imports: ${failedPath}`
+      : message
+
     console.error(
-      `[Error] [Media] Input file processing failed - processInputFile.ts - ${filePath} - ${errorMessage(error)}`
+      `[Error] [Media] Input file processing failed - processInputFile.ts - ${filePath} - ${failureMessage}`
     )
     debugError(jobId, "Input file processing failed", error)
 
     updateJob(jobId, {
       status: "failed",
       error: message,
-      message,
+      message: failureMessage,
       finishedAt: new Date().toISOString(),
     })
 
     return {
       ok: false,
-      filePath,
+      filePath: failedPath ?? filePath,
       planned: false,
-      message,
+      message: failureMessage,
     }
   }
 }

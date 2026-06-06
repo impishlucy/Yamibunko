@@ -49,7 +49,7 @@ function getDefaultTempDir() {
   if (process.platform === "win32") {
     const base =
       process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local")
-    return path.join(base, "Yamibunko", "Cache")
+    return path.join(base, "yamibunko", "cache")
   }
 
   if (process.platform === "linux") {
@@ -57,9 +57,6 @@ function getDefaultTempDir() {
     return path.join(base, "yamibunko")
   }
 
-  if (process.platform === "darwin") {
-    return path.join(os.homedir(), "Library", "Caches", "Yamibunko")
-  }
 
   return path.join(os.tmpdir(), "yamibunko")
 }

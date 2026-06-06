@@ -1,5 +1,7 @@
 import { getDb, nowIso } from "@/server/db/sqlite"
 
+const maxSessionsPerUser = 5
+
 type SessionRow = {
   username: string
   token_hash: string
@@ -39,33 +41,48 @@ export function getSessionByTokenHash(tokenHash: string) {
   return row ? toSession(row) : null
 }
 
-export function replaceUserSession(input: {
+export function createUserSession(input: {
   username: string
   tokenHash: string
   userAgent: string | null
   expiresAt: string
 }) {
   const now = nowIso()
+  const db = getDb()
 
-  getDb().exec("BEGIN IMMEDIATE")
+  db.exec("BEGIN IMMEDIATE")
 
   try {
-    getDb().query("DELETE FROM sessions WHERE username = ?").run(input.username)
-    getDb()
-      .query(
-        "INSERT INTO sessions (username, token_hash, user_agent, created_at, updated_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)"
-      )
-      .run(
-        input.username,
-        input.tokenHash,
-        input.userAgent,
-        now,
-        now,
-        input.expiresAt
-      )
-    getDb().exec("COMMIT")
+    db.query("DELETE FROM sessions WHERE username = ? AND expires_at <= ?").run(
+      input.username,
+      now
+    )
+    db.query(
+      "INSERT INTO sessions (username, token_hash, user_agent, created_at, updated_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)"
+    ).run(
+      input.username,
+      input.tokenHash,
+      input.userAgent,
+      now,
+      now,
+      input.expiresAt
+    )
+    db.query(
+      `
+      DELETE FROM sessions
+      WHERE username = ?
+        AND token_hash NOT IN (
+          SELECT token_hash
+          FROM sessions
+          WHERE username = ?
+          ORDER BY created_at DESC, token_hash DESC
+          LIMIT ?
+        )
+    `
+    ).run(input.username, input.username, maxSessionsPerUser)
+    db.exec("COMMIT")
   } catch (error) {
-    getDb().exec("ROLLBACK")
+    db.exec("ROLLBACK")
     throw error
   }
 }
@@ -80,7 +97,15 @@ export function deleteSessionByTokenHash(tokenHash: string) {
   getDb().query("DELETE FROM sessions WHERE token_hash = ?").run(tokenHash)
 }
 
-
 export function deleteSessionsByUsername(username: string) {
   getDb().query("DELETE FROM sessions WHERE username = ?").run(username)
+}
+
+export function deleteOtherSessionsByUsername(
+  username: string,
+  currentTokenHash: string
+) {
+  getDb()
+    .query("DELETE FROM sessions WHERE username = ? AND token_hash != ?")
+    .run(username, currentTokenHash)
 }

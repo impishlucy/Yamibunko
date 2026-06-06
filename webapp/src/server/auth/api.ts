@@ -1,5 +1,5 @@
 import type { CurrentUser } from "@/server/auth/session"
-import { getCurrentUser } from "@/server/auth/session"
+import { getCurrentUserSession } from "@/server/auth/session"
 import { isSameOriginRequest } from "@/server/http/request"
 import {
   guardApiRequest,
@@ -35,6 +35,7 @@ export async function requireApiUser(request?: Request): Promise<
   | {
       ok: true
       user: CurrentUser
+      sessionTokenHash: string
     }
   | {
       ok: false
@@ -47,13 +48,17 @@ export async function requireApiUser(request?: Request): Promise<
     return { ok: false, response: blocked }
   }
 
-  const user = await getCurrentUser()
+  const session = await getCurrentUserSession()
 
-  if (!user) {
+  if (!session) {
     return { ok: false, response: unauthorized() }
   }
 
-  return { ok: true, user }
+  return {
+    ok: true,
+    user: session.user,
+    sessionTokenHash: session.sessionTokenHash,
+  }
 }
 
 export async function requireAdminApiUser(request?: Request) {

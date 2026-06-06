@@ -18,7 +18,7 @@ type YamibunkoDatabase = DatabaseSync & {
 
 let database: YamibunkoDatabase | undefined
 
-const currentSchemaVersion = 8
+const currentSchemaVersion = 9
 
 function getDatabasePath() {
   return path.join(
@@ -88,8 +88,8 @@ function initializeSchema(db: YamibunkoDatabase) {
     );
 
     CREATE TABLE IF NOT EXISTS sessions (
-      username TEXT PRIMARY KEY COLLATE NOCASE,
-      token_hash TEXT NOT NULL UNIQUE,
+      token_hash TEXT PRIMARY KEY,
+      username TEXT NOT NULL COLLATE NOCASE,
       user_agent TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
@@ -275,7 +275,66 @@ function initializeSchema(db: YamibunkoDatabase) {
       ON anilist_connections(anilist_user_id);
     CREATE INDEX IF NOT EXISTS anilist_media_list_entries_user_idx
       ON anilist_media_list_entries(username, anilist_user_id);
+    CREATE INDEX IF NOT EXISTS sessions_username_idx ON sessions(username);
+    CREATE INDEX IF NOT EXISTS sessions_expires_at_idx ON sessions(expires_at);
   `)
+}
+
+type TableColumnInfo = {
+  name: string
+  pk: number
+}
+
+function hasSessionTokenPrimaryKey(db: YamibunkoDatabase) {
+  return db
+    .query<TableColumnInfo>("PRAGMA table_info(sessions)")
+    .all()
+    .some((column) => column.name === "token_hash" && column.pk > 0)
+}
+
+function migrateSessionsToMultiSessionSchema(db: YamibunkoDatabase) {
+  db.exec("BEGIN IMMEDIATE")
+
+  try {
+    db.exec(`
+      CREATE TABLE sessions_next (
+        token_hash TEXT PRIMARY KEY,
+        username TEXT NOT NULL COLLATE NOCASE,
+        user_agent TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
+      );
+
+      INSERT OR IGNORE INTO sessions_next (
+        token_hash,
+        username,
+        user_agent,
+        created_at,
+        updated_at,
+        expires_at
+      )
+      SELECT
+        token_hash,
+        username,
+        user_agent,
+        created_at,
+        updated_at,
+        expires_at
+      FROM sessions
+      WHERE token_hash IS NOT NULL;
+
+      DROP TABLE sessions;
+      ALTER TABLE sessions_next RENAME TO sessions;
+      CREATE INDEX IF NOT EXISTS sessions_username_idx ON sessions(username);
+      CREATE INDEX IF NOT EXISTS sessions_expires_at_idx ON sessions(expires_at);
+    `)
+    db.exec("COMMIT")
+  } catch (error) {
+    db.exec("ROLLBACK")
+    throw error
+  }
 }
 
 function runSchemaMigrations(db: YamibunkoDatabase) {
@@ -604,6 +663,17 @@ function runSchemaMigrations(db: YamibunkoDatabase) {
         AND is_vip = 0
     `
     ).run(nowIso())
+  }
+
+  if (version < 9) {
+    if (!hasSessionTokenPrimaryKey(db)) {
+      migrateSessionsToMultiSessionSchema(db)
+    } else {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS sessions_username_idx ON sessions(username);
+        CREATE INDEX IF NOT EXISTS sessions_expires_at_idx ON sessions(expires_at);
+      `)
+    }
   }
 
   setUserVersion(db, currentSchemaVersion)

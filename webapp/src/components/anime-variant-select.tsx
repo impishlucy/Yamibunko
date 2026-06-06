@@ -2,26 +2,39 @@
 
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
 
+import { animeVariantSecondTitle } from "@/lib/anime-title"
 import type { AnimeVariant } from "@/lib/types"
 
-function variantLabel(variant: AnimeVariant) {
+function seasonLabel(seasonNumber?: number) {
+  return `Season ${String(seasonNumber ?? 1).padStart(2, "0")}`
+}
+
+function variantLabel(variant: AnimeVariant, libraryTitle: string) {
   if (variant.format === "MOVIE") {
-    return `[Movie] ${variant.title}`
+    return `[Movie] ${animeVariantSecondTitle({
+      libraryTitle,
+      mediaTitle: variant.title,
+    })}`
   }
 
   if (variant.format === "SPECIAL" || variant.format === "OVA") {
-    return `[Special] ${variant.title}`
+    return `[Special] ${animeVariantSecondTitle({
+      libraryTitle,
+      mediaTitle: variant.title,
+    })}`
   }
 
-  return `[Series] Season ${String(variant.seasonNumber ?? 1).padStart(2, "0")}`
+  return `[Series] ${seasonLabel(variant.seasonNumber)}`
 }
 
 export function AnimeVariantSelect({
   variants,
   selectedId,
+  libraryTitle,
 }: {
   variants: AnimeVariant[]
   selectedId: number
+  libraryTitle: string
 }) {
   const router = useRouter()
   const pathname = usePathname()
@@ -45,7 +58,7 @@ export function AnimeVariantSelect({
       >
         {variants.map((variant) => (
           <option key={variant.id} value={variant.id}>
-            {variantLabel(variant)}
+            {variantLabel(variant, libraryTitle)}
           </option>
         ))}
       </select>

@@ -69,29 +69,30 @@ const partNumberPattern = String.raw`(?:\d{1,2}|[ivx]+|first|second|third|fourth
 const partLabelPattern = String.raw`(?:part|pt\.?|cour|p|c)`
 const separatorPattern = String.raw`(?:\s*-\s*|\s+)`
 const optionalSeparatorPattern = String.raw`(?:\s*-\s*|\s*)`
+const episodeVersionSuffixPattern = String.raw`(?:v\d+)?`
 const seasonPartEpisodePatterns = [
   new RegExp(
-    String.raw`^(.+?)${separatorPattern}Season\s*(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${separatorPattern}S\d{1,2}E(\d{1,4})\b`,
+    String.raw`^(.+?)${separatorPattern}Season\s*(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${separatorPattern}S\d{1,2}E(\d{1,4})${episodeVersionSuffixPattern}\b`,
     "i"
   ),
   new RegExp(
-    String.raw`^(.+?)${separatorPattern}S(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${separatorPattern}S\d{1,2}E(\d{1,4})\b`,
+    String.raw`^(.+?)${separatorPattern}S(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${separatorPattern}S\d{1,2}E(\d{1,4})${episodeVersionSuffixPattern}\b`,
     "i"
   ),
   new RegExp(
-    String.raw`^(.+?)${separatorPattern}S(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${optionalSeparatorPattern}E?\s*(\d{1,4})\b`,
+    String.raw`^(.+?)${separatorPattern}S(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${optionalSeparatorPattern}E?\s*(\d{1,4})${episodeVersionSuffixPattern}\b`,
     "i"
   ),
   new RegExp(
-    String.raw`^(.+?)${separatorPattern}S(\d{1,2})${optionalSeparatorPattern}(${partNumberPattern})\s*(?:cour|half)${optionalSeparatorPattern}E?\s*(\d{1,4})\b`,
+    String.raw`^(.+?)${separatorPattern}S(\d{1,2})${optionalSeparatorPattern}(${partNumberPattern})\s*(?:cour|half)${optionalSeparatorPattern}E?\s*(\d{1,4})${episodeVersionSuffixPattern}\b`,
     "i"
   ),
   new RegExp(
-    String.raw`^(.+?)${separatorPattern}Season\s*(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${optionalSeparatorPattern}E?\s*(\d{1,4})\b`,
+    String.raw`^(.+?)${separatorPattern}Season\s*(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${optionalSeparatorPattern}E?\s*(\d{1,4})${episodeVersionSuffixPattern}\b`,
     "i"
   ),
   new RegExp(
-    String.raw`^(.+?)${separatorPattern}Season\s*(\d{1,2})${optionalSeparatorPattern}(${partNumberPattern})\s*(?:cour|half)${optionalSeparatorPattern}E?\s*(\d{1,4})\b`,
+    String.raw`^(.+?)${separatorPattern}Season\s*(\d{1,2})${optionalSeparatorPattern}(${partNumberPattern})\s*(?:cour|half)${optionalSeparatorPattern}E?\s*(\d{1,4})${episodeVersionSuffixPattern}\b`,
     "i"
   ),
 ]
@@ -201,7 +202,7 @@ export function parseAnimeFileName(
     }
   }
 
-  const seasonEpisode = /^(.+?)\s*[-\s]\s*S(\d{1,2})E(\d{1,4})\b/i.exec(
+  const seasonEpisode = /^(.+?)\s*[-\s]\s*S(\d{1,2})E(\d{1,4})(?:v\d+)?\b/i.exec(
     normalized
   )
 
@@ -218,7 +219,7 @@ export function parseAnimeFileName(
     }
   }
 
-  const seasonDashEpisode = /^(.+?)\s+S(\d{1,2})\s*-\s*(\d{1,4})\b/i.exec(
+  const seasonDashEpisode = /^(.+?)\s+S(\d{1,2})\s*-\s*(\d{1,4})(?:v\d+)?\b/i.exec(
     normalized
   )
 
@@ -235,7 +236,7 @@ export function parseAnimeFileName(
     }
   }
 
-  const dashEpisode = /^(.+?)\s*-\s*(\d{1,4})(?:\b|$)/i.exec(normalized)
+  const dashEpisode = /^(.+?)\s*-\s*(\d{1,4})(?:v\d+)?(?:\b|$)/i.exec(normalized)
 
   if (dashEpisode) {
     const episode = toPositiveInteger(dashEpisode[2])
@@ -260,6 +261,74 @@ export function sanitizePathPart(value: string) {
     .slice(0, 120)
 }
 
+const reservedWindowsPathNames = new Set([
+  "CON",
+  "PRN",
+  "AUX",
+  "NUL",
+  "COM1",
+  "COM2",
+  "COM3",
+  "COM4",
+  "COM5",
+  "COM6",
+  "COM7",
+  "COM8",
+  "COM9",
+  "LPT1",
+  "LPT2",
+  "LPT3",
+  "LPT4",
+  "LPT5",
+  "LPT6",
+  "LPT7",
+  "LPT8",
+  "LPT9",
+])
+
+function isAllowedExportPathChar(value: string) {
+  return /^[A-Za-z0-9 .,_\-!&()]$/.test(value)
+}
+
+function isExportPathSeparatorChar(value: string) {
+  return /[\s'’`´]/.test(value)
+}
+
+export function sanitizeExportPathPart(value: string) {
+  let output = ""
+
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index] ?? ""
+
+    if (isAllowedExportPathChar(char)) {
+      output += char
+      continue
+    }
+
+    const nextChar = value[index + 1] ?? ""
+
+    if (isExportPathSeparatorChar(char) || isExportPathSeparatorChar(nextChar)) {
+      continue
+    }
+
+    output += " "
+  }
+
+  output = output
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^[^A-Za-z0-9]+/, "")
+    .replace(/[ .]+$/g, "")
+    .slice(0, 120)
+    .trim()
+
+  if (reservedWindowsPathNames.has(output.toUpperCase())) {
+    return `${output}_`
+  }
+
+  return output
+}
+
 export function formatEpisodeFileName(input: {
   title: string
   season: number
@@ -268,7 +337,7 @@ export function formatEpisodeFileName(input: {
 }) {
   const season = String(input.season).padStart(2, "0")
   const episode = String(input.episode).padStart(2, "0")
-  const safeTitle = sanitizePathPart(input.title) || "Anime"
+  const safeTitle = sanitizeExportPathPart(input.title) || "Anime"
   const extension = input.extension.startsWith(".")
     ? input.extension
     : `.${input.extension}`

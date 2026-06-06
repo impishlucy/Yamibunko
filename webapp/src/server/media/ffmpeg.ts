@@ -161,7 +161,26 @@ function getAmdH264EncoderArgs() {
     : ["-c:v", "h264_vaapi"]
 }
 
-function getAmdHevcEncoderArgs(videoBitrateKbps: number) {
+function getFileVideoBitrateArgs(input: {
+  videoBitrateKbps: number
+  maxVideoBitrateKbps: number
+}) {
+  return [
+    "-b:v",
+    `${input.videoBitrateKbps}k`,
+    "-maxrate",
+    `${input.maxVideoBitrateKbps}k`,
+    "-bufsize",
+    `${input.maxVideoBitrateKbps * 2}k`,
+  ]
+}
+
+function getAmdHevcEncoderArgs(input: {
+  videoBitrateKbps: number
+  maxVideoBitrateKbps: number
+}) {
+  const bitrateArgs = getFileVideoBitrateArgs(input)
+
   return getAmdBackend() === "amf"
     ? [
         "-c:v",
@@ -171,11 +190,28 @@ function getAmdHevcEncoderArgs(videoBitrateKbps: number) {
         "-quality",
         "quality",
         "-rc",
-        "vbr_peak",
-        "-b:v",
-        `${videoBitrateKbps}k`,
+        "hqvbr",
+        "-preanalysis",
+        "true",
+        "-pa_lookahead_buffer_depth",
+        "40",
+        "-pa_paq_mode",
+        "caq",
+        "-pa_taq_mode",
+        "2",
+        "-pa_high_motion_quality_boost_mode",
+        "auto",
+        ...bitrateArgs,
       ]
-    : ["-c:v", "hevc_vaapi", "-b:v", `${videoBitrateKbps}k`]
+    : [
+        "-c:v",
+        "hevc_vaapi",
+        "-rc_mode",
+        "VBR",
+        "-compression_level",
+        "2",
+        ...bitrateArgs,
+      ]
 }
 
 export function getLiveH264Args(
@@ -371,10 +407,12 @@ function getLiveDataSaverArgs(
 
 export function getHevcFileArgs(input: {
   videoBitrateKbps: number
+  maxVideoBitrateKbps: number
   convertVideo: boolean
   audioOutputIndexesToMp3: number[]
 }) {
   const config = getServerConfig()
+  const bitrateArgs = getFileVideoBitrateArgs(input)
 
   const videoArgs = input.convertVideo
     ? config.transcodeAccel === "nvenc"
@@ -382,36 +420,66 @@ export function getHevcFileArgs(input: {
           "-c:v",
           "hevc_nvenc",
           "-preset",
-          "p4",
+          "p5",
           "-tune",
           "hq",
+          "-rc:v",
+          "vbr",
+          "-cq:v",
+          "21",
+          ...bitrateArgs,
+          "-multipass",
+          "fullres",
           "-spatial-aq",
           "1",
           "-temporal-aq",
           "1",
-          "-b:v",
-          `${input.videoBitrateKbps}k`,
+          "-aq-strength",
+          "8",
+          "-rc-lookahead",
+          "32",
+          "-bf",
+          "4",
+          "-b_ref_mode",
+          "middle",
         ]
       : config.transcodeAccel === "qsv"
         ? [
             "-c:v",
             "hevc_qsv",
             "-preset",
-            "veryfast",
+            "slow",
             "-async_depth",
-            "8",
-            "-b:v",
-            `${input.videoBitrateKbps}k`,
+            "6",
+            "-extbrc",
+            "1",
+            "-look_ahead",
+            "1",
+            "-look_ahead_depth",
+            "40",
+            "-adaptive_i",
+            "1",
+            "-adaptive_b",
+            "1",
+            "-mbbrc",
+            "1",
+            "-bf",
+            "4",
+            "-b_strategy",
+            "1",
+            ...bitrateArgs,
           ]
         : config.transcodeAccel === "amd"
-          ? getAmdHevcEncoderArgs(input.videoBitrateKbps)
+          ? getAmdHevcEncoderArgs(input)
           : [
               "-c:v",
               "libx265",
               "-preset",
-              "medium",
-              "-b:v",
-              `${input.videoBitrateKbps}k`,
+              "slow",
+              "-crf",
+              "20",
+              "-x265-params",
+              `vbv-maxrate=${input.maxVideoBitrateKbps}:vbv-bufsize=${input.maxVideoBitrateKbps * 2}:aq-mode=3:psy-rd=2.0:psy-rdoq=1.0`,
             ]
     : ["-c:v", "copy"]
 

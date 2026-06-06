@@ -90,7 +90,7 @@ export async function POST(request: Request) {
   )
 
   await recordAuthSuccess(request, user.username)
-  await setSessionCookie(session.token, session.expires)
+  await setSessionCookie(session.token, session.expires, request)
 
   return Response.json({
     ok: true,

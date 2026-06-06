@@ -29,7 +29,7 @@ export async function POST(request: Request) {
     deleteCastStreamTokensForUser(user.username)
   }
 
-  await clearSessionCookie()
+  await clearSessionCookie(request)
 
   return Response.json({ ok: true })
 }

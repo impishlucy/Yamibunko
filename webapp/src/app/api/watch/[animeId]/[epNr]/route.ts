@@ -87,11 +87,12 @@ export async function GET(request: Request, context: WatchContext) {
   const base = `/api/watch/${encodeURIComponent(animeId)}/${episodeNumber}/stream`
   const subtitleBase = `/api/watch/${encodeURIComponent(animeId)}/${episodeNumber}/subtitles`
   const commonQuery = `season=${seasonNumber}`
-  const publicBaseUrl = await getPublicBaseUrl()
+  const publicBaseUrl = await getPublicBaseUrl(request)
   const castBase = joinBaseUrl(publicBaseUrl, base)
   const castSubtitleBase = joinBaseUrl(publicBaseUrl, subtitleBase)
   const castToken = createCastStreamToken({
     username: auth.user.username,
+    sessionTokenHash: auth.sessionTokenHash,
     animeId,
     seasonNumber,
     episodeNumber,

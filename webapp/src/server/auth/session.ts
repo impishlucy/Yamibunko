@@ -3,13 +3,16 @@ import { createHash, randomBytes } from "node:crypto"
 import { cookies } from "next/headers"
 
 import {
+  createUserSession,
   deleteSessionByTokenHash,
   getSessionByTokenHash,
-  replaceUserSession,
   touchSession,
 } from "@/server/db/sessions"
 import { getUser } from "@/server/db/users"
-import { getRequestOrigin } from "@/server/http/request"
+import {
+  getBrowserRequestOrigin,
+  getHeaderDerivedOrigin,
+} from "@/server/http/request"
 
 export const sessionCookieName = "yamibunko_session"
 
@@ -23,12 +26,25 @@ export type CurrentUser = {
   hasPassword: boolean
 }
 
+export type CurrentUserSession = {
+  user: CurrentUser
+  sessionTokenHash: string
+}
+
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("base64url")
 }
 
-async function shouldUseSecureCookies() {
-  return new URL(await getRequestOrigin()).protocol === "https:"
+async function shouldUseSecureCookies(request?: Request) {
+  if (request) {
+    const browserOrigin = getBrowserRequestOrigin(request)
+
+    if (browserOrigin) {
+      return new URL(browserOrigin).protocol === "https:"
+    }
+  }
+
+  return new URL(await getHeaderDerivedOrigin(request)).protocol === "https:"
 }
 
 export async function createSession(
@@ -38,7 +54,7 @@ export async function createSession(
   const token = randomBytes(32).toString("base64url")
   const expires = new Date(Date.now() + sessionMaxAgeSeconds * 1000)
 
-  replaceUserSession({
+  createUserSession({
     username,
     tokenHash: hashToken(token),
     userAgent,
@@ -48,7 +64,7 @@ export async function createSession(
   return { token, expires }
 }
 
-export async function getCurrentUser(): Promise<CurrentUser | null> {
+export async function getCurrentUserSession(): Promise<CurrentUserSession | null> {
   const cookieStore = await cookies()
   const token = cookieStore.get(sessionCookieName)?.value
 
@@ -78,17 +94,28 @@ export async function getCurrentUser(): Promise<CurrentUser | null> {
   touchSession(tokenHash)
 
   return {
-    username: user.username,
-    name: user.username,
-    isAdmin: user.isAdmin,
-    isVip: user.isVip,
-    hasPassword: Boolean(user.passwordHash),
+    user: {
+      username: user.username,
+      name: user.username,
+      isAdmin: user.isAdmin,
+      isVip: user.isVip,
+      hasPassword: Boolean(user.passwordHash),
+    },
+    sessionTokenHash: tokenHash,
   }
 }
 
-export async function setSessionCookie(token: string, expires: Date) {
+export async function getCurrentUser(): Promise<CurrentUser | null> {
+  return (await getCurrentUserSession())?.user ?? null
+}
+
+export async function setSessionCookie(
+  token: string,
+  expires: Date,
+  request?: Request
+) {
   const cookieStore = await cookies()
-  const secure = await shouldUseSecureCookies()
+  const secure = await shouldUseSecureCookies(request)
 
   cookieStore.set(sessionCookieName, token, {
     httpOnly: true,
@@ -99,9 +126,9 @@ export async function setSessionCookie(token: string, expires: Date) {
   })
 }
 
-export async function clearSessionCookie() {
+export async function clearSessionCookie(request?: Request) {
   const cookieStore = await cookies()
-  const secure = await shouldUseSecureCookies()
+  const secure = await shouldUseSecureCookies(request)
   const token = cookieStore.get(sessionCookieName)?.value
 
   if (token) {

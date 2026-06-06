@@ -1,7 +1,11 @@
 import { randomBytes } from "node:crypto"
 
+import { getSessionByTokenHash } from "@/server/db/sessions"
+import { getUser } from "@/server/db/users"
+
 type CastStreamToken = {
   username: string
+  sessionTokenHash: string
   animeId: string
   seasonNumber: number
   episodeNumber: number
@@ -23,6 +27,7 @@ function cleanupExpiredTokens() {
 
 export function createCastStreamToken(input: {
   username: string
+  sessionTokenHash: string
   animeId: string
   seasonNumber: number
   episodeNumber: number
@@ -58,15 +63,47 @@ export function validateCastStreamToken(input: {
     return null
   }
 
+  const session = getSessionByTokenHash(value.sessionTokenHash)
+
+  if (!session || session.username !== value.username) {
+    tokens.delete(input.token)
+    return null
+  }
+
+  if (Date.parse(session.expiresAt) <= Date.now()) {
+    tokens.delete(input.token)
+    return null
+  }
+
+  const user = getUser(session.username)
+
+  if (!user) {
+    tokens.delete(input.token)
+    return null
+  }
+
   return {
-    username: value.username,
+    username: user.username,
   }
 }
-
 
 export function deleteCastStreamTokensForUser(username: string) {
   for (const [token, value] of tokens) {
     if (value.username === username) {
+      tokens.delete(token)
+    }
+  }
+}
+
+export function deleteOtherCastStreamTokensForUser(
+  username: string,
+  currentSessionTokenHash: string
+) {
+  for (const [token, value] of tokens) {
+    if (
+      value.username === username &&
+      value.sessionTokenHash !== currentSessionTokenHash
+    ) {
       tokens.delete(token)
     }
   }
