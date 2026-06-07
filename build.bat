@@ -1,62 +1,63 @@
 @echo off
-setlocal enabledelayedexpansion
+setlocal
 
 echo ===================================================
 echo Packaging YamiBunko (Win64 ^& Linux64)
 echo ===================================================
 
-:: Set directory variables
 set "BUILD_DIR=Builds"
 set "WIN_DIR=%BUILD_DIR%\yamibunko-win"
 set "LINUX_DIR=%BUILD_DIR%\yamibunko-linux"
 
-:: 1. Clean up old build folder if it exists
 if exist "%BUILD_DIR%" (
     echo Cleaning old build directory...
     rmdir /s /q "%BUILD_DIR%"
+    if errorlevel 1 goto :fail
 )
 
-:: 2. Create the folder structure
 echo Creating build directories...
 mkdir "%WIN_DIR%\webapp"
+if errorlevel 1 goto :fail
 mkdir "%LINUX_DIR%\webapp"
+if errorlevel 1 goto :fail
 
-:: 3. Restore the C# Launcher
 echo.
 echo Restoring C# Launcher packages...
 dotnet restore launcher\Launcher.csproj
+if errorlevel 1 goto :fail
 
-:: 4. Publish for Windows x64 using the pubxml profile
 echo.
 echo Publishing C# Launcher for Win64...
 dotnet publish launcher\Launcher.csproj /p:PublishProfile=Win64.pubxml -o "%WIN_DIR%"
+if errorlevel 1 goto :fail
 
-:: 5. Publish for Linux x64 using the pubxml profile
 echo.
 echo Publishing C# Launcher for Linux64...
 dotnet publish launcher\Launcher.csproj /p:PublishProfile=Linux64.pubxml -o "%LINUX_DIR%"
+if errorlevel 1 goto :fail
 
-:: 6. Copy webapp files using Robocopy
 echo.
 echo Copying Next.js Webapp files to Windows build...
 robocopy webapp "%WIN_DIR%\webapp" /E /XD node_modules .* /XF .* /NJH /NJS /NDL /NC /NS
-
-if %ERRORLEVEL% GEQ 8 (
-    echo [ERROR] Failed copying webapp to Windows build.
-    exit /b %ERRORLEVEL%
-)
+if errorlevel 8 goto :fail
 
 echo Copying Next.js Webapp files to Linux build...
 robocopy webapp "%LINUX_DIR%\webapp" /E /XD node_modules .* /XF .* /NJH /NJS /NDL /NC /NS
-
-if %ERRORLEVEL% GEQ 8 (
-    echo [ERROR] Failed copying webapp to Linux build.
-    exit /b %ERRORLEVEL%
-)
+if errorlevel 8 goto :fail
 
 echo.
 echo ===================================================
-echo Packaging Complete! 
+echo Packaging Complete!
 echo Check the '%BUILD_DIR%' folder for your outputs.
 echo ===================================================
 pause
+exit /b 0
+
+:fail
+set "EXIT_CODE=%ERRORLEVEL%"
+if "%EXIT_CODE%"=="0" set "EXIT_CODE=1"
+echo.
+echo [ERROR] Packaging failed. Aborting.
+echo [ERROR] Exit code: %EXIT_CODE%
+pause
+exit /b %EXIT_CODE%

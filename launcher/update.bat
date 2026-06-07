@@ -17,7 +17,9 @@ $ErrorActionPreference = "Stop"
 $installRoot = [System.IO.Path]::GetFullPath($env:INSTALL_ROOT).TrimEnd("\")
 $webappRoot = [System.IO.Path]::Combine($installRoot, "webapp")
 $pidFile = [System.IO.Path]::Combine($installRoot, "server.pid")
+$latestReleaseApi = "https://api.github.com/repos/impishlucy/Yamibunko/releases/latest"
 $releaseUrl = "https://github.com/impishlucy/Yamibunko/releases/latest/download/yamibunko-win.zip"
+$requestHeaders = @{ "User-Agent" = "Yamibunko-Updater"; "Accept" = "application/vnd.github+json" }
 
 function TextValue($value) {
     if ($null -eq $value) {
@@ -98,10 +100,86 @@ function Get-RunningYamibunkoProcess {
     return $null
 }
 
+function Get-PackageJsonVersion($path) {
+    if (!(Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "Could not read the installed version from webapp\package.json."
+    }
+
+    $packageJson = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    $version = TextValue $packageJson.version
+
+    if ([string]::IsNullOrWhiteSpace($version)) {
+        throw "Could not read the installed version from webapp\package.json."
+    }
+
+    return $version
+}
+
+function Normalize-VersionText($versionText) {
+    $match = [System.Text.RegularExpressions.Regex]::Match((TextValue $versionText), "\d+(?:\.\d+)*")
+    if (!$match.Success) {
+        throw "Version is invalid: $versionText"
+    }
+
+    return $match.Value
+}
+
+function Compare-VersionText($left, $right) {
+    $leftParts = @((Normalize-VersionText $left).Split("."))
+    $rightParts = @((Normalize-VersionText $right).Split("."))
+    $max = [System.Math]::Max($leftParts.Count, $rightParts.Count)
+
+    for ($index = 0; $index -lt $max; $index++) {
+        $leftPart = 0
+        $rightPart = 0
+
+        if ($index -lt $leftParts.Count) {
+            $leftPart = [int]$leftParts[$index]
+        }
+
+        if ($index -lt $rightParts.Count) {
+            $rightPart = [int]$rightParts[$index]
+        }
+
+        if ($leftPart -gt $rightPart) {
+            return 1
+        }
+
+        if ($leftPart -lt $rightPart) {
+            return -1
+        }
+    }
+
+    return 0
+}
+
 $runningProcess = Get-RunningYamibunkoProcess
 if ($null -ne $runningProcess) {
     Write-Host ("Yamibunko is still running (PID " + $runningProcess.ProcessId + "). Close the launcher/server before updating.")
     exit 2
+}
+
+try {
+    $currentVersion = Get-PackageJsonVersion ([System.IO.Path]::Combine($webappRoot, "package.json"))
+
+    Write-Host "Checking latest Yamibunko version..."
+    $latestRelease = Invoke-RestMethod -Uri $latestReleaseApi -Headers $requestHeaders -UseBasicParsing
+    $latestVersion = TextValue $latestRelease.tag_name
+
+    if ([string]::IsNullOrWhiteSpace($latestVersion)) {
+        throw "Could not read the latest GitHub release version."
+    }
+
+    Write-Host ("Installed version: " + $currentVersion)
+    Write-Host ("Latest version: " + $latestVersion)
+
+    if ((Compare-VersionText $latestVersion $currentVersion) -le 0) {
+        Write-Host "Yamibunko is already up to date."
+        exit 0
+    }
+} catch {
+    Write-Host ("Update failed: " + $_.Exception.Message)
+    exit 1
 }
 
 $tempRoot = [System.IO.Path]::Combine(
@@ -115,7 +193,7 @@ try {
     New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
 
     Write-Host "Downloading latest Yamibunko Windows release..."
-    Invoke-WebRequest -Uri $releaseUrl -OutFile $zipPath -UseBasicParsing
+    Invoke-WebRequest -Uri $releaseUrl -OutFile $zipPath -UseBasicParsing -Headers @{ "User-Agent" = "Yamibunko-Updater" }
 
     Write-Host "Extracting release..."
     Expand-Archive -Path $zipPath -DestinationPath $extractRoot -Force

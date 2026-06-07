@@ -24,7 +24,7 @@
                     <NativeMenu>
                         <NativeMenuItem Header="Show Logs" Click="OnShowLogsClicked"/>
                         <NativeMenuItemSeparator/>
-                        <NativeMenuItem x:Name="StopServerTrayMenuItem" Header="Stop Server &amp; Exit" Click="OnExitClicked"/>
+                        <NativeMenuItem Header="Stop Server &amp; Exit" Click="OnExitClicked"/>
                     </NativeMenu>
                 </TrayIcon.Menu>
             </TrayIcon>

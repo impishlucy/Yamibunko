@@ -42,7 +42,7 @@ public partial class App : Application
             desktop.ShutdownRequested += OnShutdownRequested;
             desktop.Exit += (s, e) => ServerManager.StopServer();
 
-            _stopServerTrayMenuItem = StopServerTrayMenuItem;
+            _stopServerTrayMenuItem = FindStopServerTrayMenuItem();
             ServerManager.LogsWindowRequested += ShowLogsWindow;
             ServerManager.ServerStopStateChanged += OnServerStopStateChanged;
             UpdateStopServerControls();
@@ -146,6 +146,35 @@ public partial class App : Application
         }
 
         UpdateStopServerControls();
+    }
+
+
+    private NativeMenuItem? FindStopServerTrayMenuItem()
+    {
+        var trayIcons = TrayIcon.GetIcons(this);
+        if (trayIcons == null)
+        {
+            return null;
+        }
+
+        foreach (var trayIcon in trayIcons)
+        {
+            var menu = trayIcon.Menu;
+            if (menu == null)
+            {
+                continue;
+            }
+
+            foreach (var item in menu.Items)
+            {
+                if (item is NativeMenuItem menuItem && string.Equals(menuItem.Header?.ToString(), "Stop Server & Exit", StringComparison.Ordinal))
+                {
+                    return menuItem;
+                }
+            }
+        }
+
+        return null;
     }
 
     private void UpdateStopServerControls()
