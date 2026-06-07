@@ -289,7 +289,7 @@ public partial class LogWindow : Window
         try
         {
             await _stopServerAsync();
-            SetStopServerState(false, false);
+            SetStopServerState(true, false);
         }
         catch (Exception ex)
         {

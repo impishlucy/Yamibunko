@@ -52,7 +52,7 @@ public class ServerManager
         {
             lock (_shutdownLock)
             {
-                return _stopServerTask == null && _serverProcess != null && !HasProcessExited(_serverProcess);
+                return _stopServerTask == null;
             }
         }
     }
