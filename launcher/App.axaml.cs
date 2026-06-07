@@ -1,6 +1,8 @@
 using Avalonia;
+using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Markup.Xaml;
+using Avalonia.Threading;
 using System;
 using System.Threading.Tasks;
 
@@ -9,7 +11,9 @@ namespace Launcher;
 public partial class App : Application
 {
     public static ServerManager ServerManager { get; } = new();
+
     private LogWindow? _logWindow;
+    private NativeMenuItem? _stopServerTrayMenuItem;
     private bool _shutdownRequested;
     private bool _shutdownCompleted;
 
@@ -38,6 +42,11 @@ public partial class App : Application
             desktop.ShutdownRequested += OnShutdownRequested;
             desktop.Exit += (s, e) => ServerManager.StopServer();
 
+            _stopServerTrayMenuItem = StopServerTrayMenuItem;
+            ServerManager.LogsWindowRequested += ShowLogsWindow;
+            ServerManager.ServerStopStateChanged += OnServerStopStateChanged;
+            UpdateStopServerControls();
+
             ServerManager.CleanupOrphans();
 
             var settings = AppSettings.Load();
@@ -62,19 +71,38 @@ public partial class App : Application
 
     private void OnShowLogsClicked(object? sender, EventArgs e)
     {
+        ShowLogsWindow();
+    }
+
+    private void ShowLogsWindow()
+    {
+        if (!Dispatcher.UIThread.CheckAccess())
+        {
+            Dispatcher.UIThread.Post(ShowLogsWindow);
+            return;
+        }
+
         if (_logWindow == null || !_logWindow.IsVisible)
         {
             _logWindow = new LogWindow(ServerManager.ServerLogs, ServerManager.StopServerAsync);
+            _logWindow.Closed += (_, _) => _logWindow = null;
             _logWindow.Show();
         }
-        else
+
+        UpdateStopServerControls();
+
+        if (_logWindow.WindowState == WindowState.Minimized)
         {
-            _logWindow.Activate();
+            _logWindow.WindowState = WindowState.Normal;
         }
+
+        _logWindow.Activate();
+        _logWindow.Focus();
     }
 
     private async void OnExitClicked(object? sender, EventArgs e)
     {
+        ShowLogsWindow();
         await StopServerAndShutdownAsync();
     }
 
@@ -86,6 +114,7 @@ public partial class App : Application
         }
 
         e.Cancel = true;
+        ShowLogsWindow();
         await StopServerAndShutdownAsync();
     }
 
@@ -93,10 +122,12 @@ public partial class App : Application
     {
         if (_shutdownRequested)
         {
+            ShowLogsWindow();
             return;
         }
 
         _shutdownRequested = true;
+        UpdateStopServerControls();
         await ServerManager.StopServerAsync();
         _shutdownCompleted = true;
 
@@ -104,5 +135,30 @@ public partial class App : Application
         {
             desktop.Shutdown();
         }
+    }
+
+    private void OnServerStopStateChanged()
+    {
+        if (!Dispatcher.UIThread.CheckAccess())
+        {
+            Dispatcher.UIThread.Post(OnServerStopStateChanged);
+            return;
+        }
+
+        UpdateStopServerControls();
+    }
+
+    private void UpdateStopServerControls()
+    {
+        var canStop = ServerManager.CanStopServer && !_shutdownRequested;
+        var isStopping = ServerManager.IsStoppingServer || _shutdownRequested;
+
+        if (_stopServerTrayMenuItem != null)
+        {
+            _stopServerTrayMenuItem.IsEnabled = canStop;
+            _stopServerTrayMenuItem.Header = isStopping ? "Stopping Server..." : "Stop Server & Exit";
+        }
+
+        _logWindow?.SetStopServerState(canStop, isStopping);
     }
 }

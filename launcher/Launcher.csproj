@@ -28,4 +28,9 @@
 		</PackageReference>
 	</ItemGroup>
 
+	<ItemGroup>
+		<None Include="update.bat" CopyToPublishDirectory="Always" />
+		<None Include="update.sh" CopyToPublishDirectory="Always" />
+	</ItemGroup>
+
 </Project>

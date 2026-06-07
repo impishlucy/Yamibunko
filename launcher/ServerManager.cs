@@ -30,9 +30,32 @@ public class ServerManager
     private readonly object _shutdownLock = new();
     private readonly string _pidFile = Path.Combine(AppContext.BaseDirectory, "server.pid");
 
-    private LogWindow? _logWindow;
-
     public ObservableCollection<string> ServerLogs { get; } = new();
+
+    public event Action? LogsWindowRequested;
+    public event Action? ServerStopStateChanged;
+
+    public bool IsStoppingServer
+    {
+        get
+        {
+            lock (_shutdownLock)
+            {
+                return _stopServerTask != null;
+            }
+        }
+    }
+
+    public bool CanStopServer
+    {
+        get
+        {
+            lock (_shutdownLock)
+            {
+                return _stopServerTask == null && _serverProcess != null && !HasProcessExited(_serverProcess);
+            }
+        }
+    }
 
     public void CleanupOrphans()
     {
@@ -99,6 +122,7 @@ public class ServerManager
                 Log("Build complete. Starting WebApp...");
                 _serverProcess = StartBunServer(settings, webappDir);
                 File.WriteAllText(_pidFile, _serverProcess.Id.ToString());
+                NotifyServerStopStateChanged();
 
                 OpenUrl(settings.BaseUrl);
             } else
@@ -158,11 +182,26 @@ public class ServerManager
 
     public Task StopServerAsync()
     {
+        Task stopTask;
+        var createdTask = false;
+
         lock (_shutdownLock)
         {
-            _stopServerTask ??= StopServerCoreAsync(_serverProcess);
-            return _stopServerTask;
+            if (_stopServerTask == null)
+            {
+                _stopServerTask = StopServerCoreAsync(_serverProcess);
+                createdTask = true;
+            }
+
+            stopTask = _stopServerTask;
         }
+
+        if (createdTask)
+        {
+            NotifyServerStopStateChanged();
+        }
+
+        return stopTask;
     }
 
     private async Task StopServerCoreAsync(Process? process)
@@ -199,6 +238,7 @@ public class ServerManager
             process?.Dispose();
             CloseServerJob();
             TryDeleteFile(_pidFile);
+            NotifyServerStopStateChanged();
         }
     }
 
@@ -1065,16 +1105,41 @@ public class ServerManager
         }
     }
 
-    private void ShowLogsWindow()
+    public void ShowLogsWindow()
     {
-        if (_logWindow == null || !_logWindow.IsVisible)
+        try
         {
-            _logWindow = new LogWindow(ServerLogs, StopServerAsync);
-            _logWindow.Show();
+            Avalonia.Threading.Dispatcher.UIThread.Post(() => LogsWindowRequested?.Invoke());
         }
-        else
+        catch
         {
-            _logWindow.Activate();
+        }
+    }
+
+    private void NotifyServerStopStateChanged()
+    {
+        try
+        {
+            Avalonia.Threading.Dispatcher.UIThread.Post(() => ServerStopStateChanged?.Invoke());
+        }
+        catch
+        {
+        }
+    }
+
+    private static bool HasProcessExited(Process process)
+    {
+        try
+        {
+            return process.HasExited;
+        }
+        catch (InvalidOperationException)
+        {
+            return true;
+        }
+        catch (Win32Exception)
+        {
+            return true;
         }
     }
 

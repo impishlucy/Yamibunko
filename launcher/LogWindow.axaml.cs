@@ -257,6 +257,21 @@ public partial class LogWindow : Window
         }
     }
 
+    public void SetStopServerState(bool canStop, bool isStopping)
+    {
+        if (_stopServerButton == null)
+        {
+            return;
+        }
+
+        _stopServerButton.IsEnabled = canStop;
+        _stopServerButton.Content = isStopping
+            ? "Stopping..."
+            : canStop
+                ? "Stop Server"
+                : "Server stopped";
+    }
+
     private void OnScrollToBottomClicked(object? sender, RoutedEventArgs e)
     {
         ScrollToEnd();
@@ -264,23 +279,21 @@ public partial class LogWindow : Window
 
     private async void OnStopServerClicked(object? sender, RoutedEventArgs e)
     {
-        if (_stopServerAsync == null || _stopServerButton == null)
+        if (_stopServerAsync == null)
         {
             return;
         }
 
-        _stopServerButton.IsEnabled = false;
-        _stopServerButton.Content = "Stopping...";
+        SetStopServerState(false, true);
 
         try
         {
             await _stopServerAsync();
-            _stopServerButton.Content = "Server stopped";
+            SetStopServerState(false, false);
         }
         catch (Exception ex)
         {
-            _stopServerButton.Content = "Stop Server";
-            _stopServerButton.IsEnabled = true;
+            SetStopServerState(true, false);
             AppendLogLine($"[{DateTime.Now:HH:mm:ss}] Server stop failed: {ex.Message}");
         }
     }

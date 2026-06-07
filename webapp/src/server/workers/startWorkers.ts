@@ -1,6 +1,5 @@
 import chokidar, { type FSWatcher } from "chokidar"
 import { AsyncLocalStorage } from "node:async_hooks"
-import { writeSync } from "node:fs"
 import { readdir, rm } from "node:fs/promises"
 import path from "node:path"
 
@@ -142,14 +141,6 @@ const workerGlobal = globalThis as WorkerGlobalState
 
 function debugWorkers(message: string) {
   debugLog(`[Debug] [Workers] ${message}`)
-}
-
-function writeImmediateShutdownLine(message: string) {
-  try {
-    writeSync(1, `${message}\n`)
-  } catch {
-    console.log(message)
-  }
 }
 
 function yieldToEventLoop() {
@@ -1320,9 +1311,6 @@ export function startWorkers() {
 
     function handleProcessShutdown(signal: ShutdownSignal, signalExitCode: number) {
       if (processShutdownStarted) {
-        writeImmediateShutdownLine(
-          `[Warn] [Workers] Shutdown signal received (${signal}); graceful shutdown is already running. Please wait for active work to finish.`
-        )
         console.warn(
           "[Warn] [Workers] Graceful shutdown is already running. Waiting for active work to finish."
         )
@@ -1330,16 +1318,14 @@ export function startWorkers() {
       }
 
       processShutdownStarted = true
-      writeImmediateShutdownLine(
-        `\n[Info] [Workers] Shutdown signal received (${signal}); starting graceful shutdown now. Queued work will be cancelled and active work will finish before exit.`
-      )
       process.exitCode = signalExitCode
       installProcessExitGuard()
       keepProcessAliveForShutdown()
-      console.log(`[Info] [Workers] Received ${signal}.`)
-      console.log(
-        `[Info] [Workers] Graceful shutdown started from ${signal}; cancelling queued work and waiting for active work.`
-      )
+      console.log("");
+      console.log(`- - - - - - - - - - - - - - - - - - - - - - - - - - - -`)
+      console.log(`[Info] [Shutdown] Stopping gracefully.`)
+      console.log(`- - - - - - - - - - - - - - - - - - - - - - - - - - - -`)
+      console.log("")
 
       const runtime = workerGlobal.__yamibunkoWorkerRuntime
 
