@@ -31,6 +31,7 @@ import {
   formatEpisodeFileName,
   formatSeasonFolderName,
   parseAnimeFileName,
+  parseAnimeFileNameWithFallbackTitle,
   sanitizeExportPathPart,
 } from "@/server/media/filename"
 import {
@@ -546,8 +547,10 @@ function cleanFolderTitleCandidate(value: string) {
   return value
     .replace(/\[[^\]]*\]|\([^)]*\)/g, " ")
     .replace(/[._]+/g, " ")
+    .replace(/[-–—]\s*[A-Z0-9]{2,}$/g, " ")
     .replace(/\b(?:season|s)\s*\d{1,2}\b/gi, " ")
-    .replace(/\b(?:1080p|720p|2160p|480p|bluray|blu-ray|bdrip|web[- ]?dl|webrip|remux|x264|x265|h264|h265|hevc|avc|aac|flac|opus|dual audio|multi audio)\b/gi, " ")
+    .replace(/\b(?:480p|720p|1080p|2160p|4k|bluray|blu-ray|bdrip|web[- ]?dl|webrip|remux|x264|x265|h264|h265|hevc|avc|aac|flac|opus|ddp?|dts|10\s*bits?|8\s*bits?|dual audio|multi audio)\b/gi, " ")
+    .replace(/[-–—]+/g, " ")
     .replace(/\s+/g, " ")
     .trim()
 }
@@ -576,7 +579,7 @@ function isIgnoredFolderTitleCandidate(value: string) {
   )
 }
 
-function getFolderTitleFallbackCandidates(inputDir: string, filePath: string, parsedTitle: string) {
+function getFolderTitleFallbackCandidates(inputDir: string, filePath: string, parsedTitle?: string) {
   const inputRoot = path.resolve(inputDir)
   const fileDirectory = path.dirname(path.resolve(filePath))
   const relativeDirectory = path.relative(inputRoot, fileDirectory)
@@ -605,13 +608,24 @@ function getFolderTitleFallbackCandidates(inputDir: string, filePath: string, pa
 
   const cleaned = cleanFolderTitleCandidate(parts[candidateIndex])
   const key = cleaned.toLowerCase()
-  const parsedTitleNormalized = parsedTitle.trim().toLowerCase()
+  const parsedTitleNormalized = parsedTitle?.trim().toLowerCase()
 
-  if (key === parsedTitleNormalized) {
+  if (parsedTitleNormalized && key === parsedTitleNormalized) {
     return []
   }
 
   return [cleaned]
+}
+
+function formatDetectedEpisode(input: {
+  animeTitle: string
+  seasonNumber: number
+  episodeNumber: number
+  episodeTitle?: string | null
+}) {
+  const episodeName = input.episodeTitle?.trim()
+
+  return `Anime: ${input.animeTitle}, Season ${input.seasonNumber}, Episode ${input.episodeNumber}${episodeName ? ` (${episodeName})` : ""}`
 }
 
 async function moveFailedInputToFailedImports(
@@ -925,7 +939,29 @@ export async function processInputFile(
     debugImport(jobId, "Input file is stable.")
 
     debugImport(jobId, "Parsing anime filename.")
-    const parsed = parseAnimeFileName(filePath)
+    let parsed = parseAnimeFileName(filePath)
+
+    if (!parsed) {
+      const fallbackTitles = getFolderTitleFallbackCandidates(config.inputDir, filePath)
+
+      for (const fallbackTitle of fallbackTitles) {
+        const fallbackParsed = parseAnimeFileNameWithFallbackTitle(
+          filePath,
+          fallbackTitle
+        )
+
+        if (!fallbackParsed) {
+          continue
+        }
+
+        parsed = fallbackParsed
+        debugImport(
+          jobId,
+          `Parsed input file using folder title fallback - Title ${fallbackParsed.title}, Season ${fallbackParsed.season}${fallbackParsed.part ? `, Part ${fallbackParsed.part}` : ""}, Episode ${fallbackParsed.episode}`
+        )
+        break
+      }
+    }
 
     if (!parsed) {
       const error = "Unable to extract anime title and episode number"
@@ -1192,7 +1228,7 @@ export async function processInputFile(
     const libraryTitle = library.title
 
     console.log(
-      `[Info] [Media] Detected input episode - Anime: ${libraryTitle}, Season ${librarySeason}, Episode ${inputParsed.episode} - ${fileName(filePath)}`
+      `[Info] [Media] Detected input episode - ${formatDetectedEpisode({ animeTitle: libraryTitle, seasonNumber: librarySeason, episodeNumber: inputParsed.episode, episodeTitle: inputParsed.episodeTitle })} - ${fileName(filePath)}`
     )
 
     function emitEpisodeAdded() {
@@ -1289,7 +1325,7 @@ export async function processInputFile(
         })
 
       console.log(
-        `[Info] [File Import] ${input.kind === "catalog-only" ? "Scheduled" : "Added to queue"} - ${label} - Anime: ${libraryTitle}, Season ${librarySeason}, Episode ${inputParsed.episode} - ${fileName(filePath)}`
+        `[Info] [File Import] ${input.kind === "catalog-only" ? "Scheduled" : "Added to queue"} - ${label} - ${formatDetectedEpisode({ animeTitle: libraryTitle, seasonNumber: librarySeason, episodeNumber: inputParsed.episode, episodeTitle: inputParsed.episodeTitle })} - ${fileName(filePath)}`
       )
 
       if (options.onDeferredWork) {
@@ -1413,7 +1449,7 @@ export async function processInputFile(
         emitEpisodeAdded()
 
         console.log(
-          `[Info] [Media] Database import completed - Anime: ${libraryTitle}, Season ${librarySeason}, Episode ${inputParsed.episode} - ${fileName(resolvedInputPath)}`
+          `[Info] [Media] Database import completed - ${formatDetectedEpisode({ animeTitle: libraryTitle, seasonNumber: librarySeason, episodeNumber: inputParsed.episode, episodeTitle: inputParsed.episodeTitle })} - ${fileName(resolvedInputPath)}`
         )
 
         const message = "Input file added to the library without moving, deleting, or transcoding."
@@ -1682,7 +1718,7 @@ export async function processInputFile(
       emitEpisodeAdded()
 
       console.log(
-        `[Info] [Media] Database import completed - Anime: ${libraryTitle}, Season ${librarySeason}, Episode ${importEpisodeNumber} - ${fileName(finalPath)}`
+        `[Info] [Media] Database import completed - ${formatDetectedEpisode({ animeTitle: libraryTitle, seasonNumber: librarySeason, episodeNumber: importEpisodeNumber, episodeTitle: inputParsed.episodeTitle })} - ${fileName(finalPath)}`
       )
       debugImport(jobId, "Episode row saved.")
 

@@ -145,7 +145,7 @@ const inFlightMetadataLookups = new Map<
 >()
 const recentMetadataLookups = new Map<
   string,
-  { metadata: AnimeMetadataInput; createdAt: number }
+  { metadata: AnimeMetadataInput | null; createdAt: number }
 >()
 
 export class AniListMetadataLookupUnavailableError extends Error {
@@ -995,9 +995,7 @@ export async function findAnimeMetadata(
   try {
     const metadata = await lookup
 
-    if (metadata) {
-      recentMetadataLookups.set(key, { metadata, createdAt: Date.now() })
-    }
+    recentMetadataLookups.set(key, { metadata, createdAt: Date.now() })
 
     return metadata
   } finally {

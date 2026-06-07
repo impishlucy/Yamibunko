@@ -11,7 +11,13 @@ export type ParsedAnimeFileName = {
   season: number
   episode: number
   part?: number
+  episodeTitle?: string | null
 }
+
+type ParsedAnimeEpisodeIdentifier = Omit<ParsedAnimeFileName, "title">
+
+const fileInfoPattern = /\b(?:480p|576p|720p|1080p|1440p|2160p|4k|uhd|hdr|hdr10|sdr|bluray|blu[-\s]?ray|bdremux|bdrip|bd|web[-\s]?dl|webdl|webrip|remux|hdtv|dvd|dvdrip|x264|x265|h\.?264|h\.?265|hevc|avc|av1|aac|flac|opus|mp3|ac3|eac3|dd|ddp|dts|truehd|atmos|audio|dual[-\s]*audio|multi[-\s]*audio|multi[-\s]*subs?|dubbed|subbed|subs?|\d{1,2}[-\s]*bits?|hi10p|proper|repack|batch)\b/gi
+const releaseSuffixPattern = /\s*[-–—]\s*[A-Z0-9][A-Z0-9._-]{1,}$/g
 
 function normalizeTitle(value: string) {
   return value
@@ -24,11 +30,35 @@ function normalizeTitle(value: string) {
 }
 
 function cleanTitleSegment(value: string) {
-  return normalizeTitle(value).replace(/(?:\s*-\s*)+$/g, "").trim()
+  let title = normalizeTitle(value)
+    .replace(fileInfoPattern, " ")
+    .replace(releaseSuffixPattern, " ")
+    .replace(/\b(?:v\d+)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+
+  for (;;) {
+    const nextTitle = title
+      .replace(releaseSuffixPattern, " ")
+      .replace(/(?:\s*[-–—]\s*)+$/g, "")
+      .replace(/^[\s:;,.\-–—]+|[\s:;,.\-–—]+$/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+
+    if (nextTitle === title) {
+      return title
+    }
+
+    title = nextTitle
+  }
 }
 
-function cleanSeriesTitleSegment(value: string, season?: number, part?: number) {
+export function cleanAnimeTitleCandidate(
+  value: string,
+  options?: { season?: number; part?: number; removeLooseSeasonMarkers?: boolean }
+) {
   let title = cleanTitleSegment(value)
+  const { season, part, removeLooseSeasonMarkers } = options ?? {}
 
   if (part && part > 1) {
     title = title
@@ -48,7 +78,9 @@ function cleanSeriesTitleSegment(value: string, season?: number, part?: number) 
       )
   }
 
-  if (season) {
+  if (removeLooseSeasonMarkers) {
+    title = title.replace(/\b(?:season|s)\s*\d{1,2}\b/gi, " ")
+  } else if (season) {
     title = title.replace(
       new RegExp(String.raw`\s+(?:season\s*0?${season}|s0?${season})$`, "i"),
       ""
@@ -56,6 +88,23 @@ function cleanSeriesTitleSegment(value: string, season?: number, part?: number) 
   }
 
   return cleanTitleSegment(title)
+}
+
+function cleanSeriesTitleSegment(value: string, season?: number, part?: number) {
+  return cleanAnimeTitleCandidate(value, { season, part })
+}
+
+function cleanEpisodeTitleSegment(value: string | undefined) {
+  if (!value) {
+    return null
+  }
+
+  const title = cleanTitleSegment(value)
+    .replace(/^(?:-|–|—|:)+/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+
+  return title || null
 }
 
 function toPositiveInteger(value: string | undefined) {
@@ -72,19 +121,19 @@ const optionalSeparatorPattern = String.raw`(?:\s*-\s*|\s*)`
 const episodeVersionSuffixPattern = String.raw`(?:v\d+)?`
 const seasonPartEpisodePatterns = [
   new RegExp(
-    String.raw`^(.+?)${separatorPattern}Season\s*(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${separatorPattern}S\d{1,2}E(\d{1,4})${episodeVersionSuffixPattern}\b`,
+    String.raw`^(.+?)${separatorPattern}Season\s*(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${separatorPattern}S\s*\d{1,2}E(\d{1,4})${episodeVersionSuffixPattern}\b`,
     "i"
   ),
   new RegExp(
-    String.raw`^(.+?)${separatorPattern}S(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${separatorPattern}S\d{1,2}E(\d{1,4})${episodeVersionSuffixPattern}\b`,
+    String.raw`^(.+?)${separatorPattern}S\s*(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${separatorPattern}S\s*\d{1,2}E(\d{1,4})${episodeVersionSuffixPattern}\b`,
     "i"
   ),
   new RegExp(
-    String.raw`^(.+?)${separatorPattern}S(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${optionalSeparatorPattern}E?\s*(\d{1,4})${episodeVersionSuffixPattern}\b`,
+    String.raw`^(.+?)${separatorPattern}S\s*(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${optionalSeparatorPattern}E?\s*(\d{1,4})${episodeVersionSuffixPattern}\b`,
     "i"
   ),
   new RegExp(
-    String.raw`^(.+?)${separatorPattern}S(\d{1,2})${optionalSeparatorPattern}(${partNumberPattern})\s*(?:cour|half)${optionalSeparatorPattern}E?\s*(\d{1,4})${episodeVersionSuffixPattern}\b`,
+    String.raw`^(.+?)${separatorPattern}S\s*(\d{1,2})${optionalSeparatorPattern}(${partNumberPattern})\s*(?:cour|half)${optionalSeparatorPattern}E?\s*(\d{1,4})${episodeVersionSuffixPattern}\b`,
     "i"
   ),
   new RegExp(
@@ -93,6 +142,21 @@ const seasonPartEpisodePatterns = [
   ),
   new RegExp(
     String.raw`^(.+?)${separatorPattern}Season\s*(\d{1,2})${optionalSeparatorPattern}(${partNumberPattern})\s*(?:cour|half)${optionalSeparatorPattern}E?\s*(\d{1,4})${episodeVersionSuffixPattern}\b`,
+    "i"
+  ),
+]
+
+const noTitleSeasonPartEpisodePatterns = [
+  new RegExp(
+    String.raw`^Season\s*(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${optionalSeparatorPattern}E?\s*(\d{1,4})${episodeVersionSuffixPattern}(?:\s*[-–—]\s*(.+))?$`,
+    "i"
+  ),
+  new RegExp(
+    String.raw`^S\s*(\d{1,2})${optionalSeparatorPattern}${partLabelPattern}\s*(${partNumberPattern})${optionalSeparatorPattern}E?\s*(\d{1,4})${episodeVersionSuffixPattern}(?:\s*[-–—]\s*(.+))?$`,
+    "i"
+  ),
+  new RegExp(
+    String.raw`^S\s*(\d{1,2})${optionalSeparatorPattern}(${partNumberPattern})\s*(?:cour|half)${optionalSeparatorPattern}E?\s*(\d{1,4})${episodeVersionSuffixPattern}(?:\s*[-–—]\s*(.+))?$`,
     "i"
   ),
 ]
@@ -154,6 +218,199 @@ function parsePartNumber(value: string | undefined) {
   return null
 }
 
+type EpisodeMarkerMatch = {
+  index: number
+  end: number
+  season: number
+  episode: number
+  part?: number
+  suffix: string
+}
+
+const seasonEpisodeMarkerPattern = new RegExp(
+  String.raw`\b(?:Season\s*(\d{1,2})|S\s*(\d{1,2}))\s*[-–—]?\s*(?:(?:${partLabelPattern})\s*(${partNumberPattern})\s*[-–—]?\s*|(${partNumberPattern})\s*(?:cour|half)\s*[-–—]?\s*)?(?:E|EP|Episode)\s*(\d{1,4})${episodeVersionSuffixPattern}\b`,
+  "i"
+)
+
+const seasonDashEpisodeMarkerPattern = /\bS\s*(\d{1,2})\s*[-–—]\s*(\d{1,4})(?:v\d+)?\b/i
+
+function findEpisodeMarker(value: string): EpisodeMarkerMatch | null {
+  const seasonEpisode = seasonEpisodeMarkerPattern.exec(value)
+
+  if (seasonEpisode) {
+    const season = toPositiveInteger(seasonEpisode[1] ?? seasonEpisode[2])
+    const part = parsePartNumber(seasonEpisode[3] ?? seasonEpisode[4])
+    const episode = toPositiveInteger(seasonEpisode[5])
+
+    if (season && episode) {
+      const end = seasonEpisode.index + seasonEpisode[0].length
+
+      return {
+        index: seasonEpisode.index,
+        end,
+        season,
+        episode,
+        part: part ?? undefined,
+        suffix: value.slice(end),
+      }
+    }
+  }
+
+  const seasonDashEpisode = seasonDashEpisodeMarkerPattern.exec(value)
+
+  if (seasonDashEpisode) {
+    const season = toPositiveInteger(seasonDashEpisode[1])
+    const episode = toPositiveInteger(seasonDashEpisode[2])
+
+    if (season && episode) {
+      const end = seasonDashEpisode.index + seasonDashEpisode[0].length
+
+      return {
+        index: seasonDashEpisode.index,
+        end,
+        season,
+        episode,
+        suffix: value.slice(end),
+      }
+    }
+  }
+
+  return null
+}
+
+function getTitleBeforeEpisodeMarker(value: string, marker: EpisodeMarkerMatch) {
+  const titleSegment = value.slice(0, marker.index)
+
+  return cleanSeriesTitleSegment(titleSegment, marker.season, marker.part)
+}
+
+export function parseAnimeEpisodeIdentifier(
+  filePath: string
+): ParsedAnimeEpisodeIdentifier | null {
+  const baseName = path.basename(filePath, path.extname(filePath))
+  const mainName = baseName.split("|")[0] ?? baseName
+  const normalized = normalizeTitle(mainName)
+  const marker = findEpisodeMarker(normalized)
+
+  if (marker) {
+    return {
+      season: marker.season,
+      episode: marker.episode,
+      part: marker.part,
+      episodeTitle: cleanEpisodeTitleSegment(marker.suffix),
+    }
+  }
+
+  for (const pattern of noTitleSeasonPartEpisodePatterns) {
+    const match = pattern.exec(normalized)
+
+    if (!match) {
+      continue
+    }
+
+    const season = toPositiveInteger(match[1])
+    const part = parsePartNumber(match[2])
+    const episode = toPositiveInteger(match[3])
+
+    if (season && part && episode) {
+      return {
+        season,
+        episode,
+        part,
+        episodeTitle: cleanEpisodeTitleSegment(match[4]),
+      }
+    }
+  }
+
+  const noTitleSeasonEpisode = /^S\s*(\d{1,2})\s*(?:E|EP|Episode)\s*(\d{1,4})(?:v\d+)?(?:\s*[-–—]\s*(.+))?$/i.exec(
+    normalized
+  )
+
+  if (noTitleSeasonEpisode) {
+    const season = toPositiveInteger(noTitleSeasonEpisode[1])
+    const episode = toPositiveInteger(noTitleSeasonEpisode[2])
+
+    if (season && episode) {
+      return {
+        season,
+        episode,
+        episodeTitle: cleanEpisodeTitleSegment(noTitleSeasonEpisode[3]),
+      }
+    }
+  }
+
+  const noTitleSeasonDashEpisode = /^S\s*(\d{1,2})\s*[-\s]\s*(\d{1,4})(?:v\d+)?(?:\s*[-–—]\s*(.+))?$/i.exec(
+    normalized
+  )
+
+  if (noTitleSeasonDashEpisode) {
+    const season = toPositiveInteger(noTitleSeasonDashEpisode[1])
+    const episode = toPositiveInteger(noTitleSeasonDashEpisode[2])
+
+    if (season && episode) {
+      return {
+        season,
+        episode,
+        episodeTitle: cleanEpisodeTitleSegment(noTitleSeasonDashEpisode[3]),
+      }
+    }
+  }
+
+  const noTitleNamedEpisode = /^(?:E|EP|Episode)\s*(\d{1,4})(?:v\d+)?(?:\s*[-–—]\s*(.+))?$/i.exec(
+    normalized
+  )
+
+  if (noTitleNamedEpisode) {
+    const episode = toPositiveInteger(noTitleNamedEpisode[1])
+
+    if (episode) {
+      return {
+        season: 1,
+        episode,
+        episodeTitle: cleanEpisodeTitleSegment(noTitleNamedEpisode[2]),
+      }
+    }
+  }
+
+  const noTitleDashEpisode = /^(\d{1,3})(?:v\d+)?\s*[-–—]\s*(.+)$/i.exec(
+    normalized
+  )
+
+  if (noTitleDashEpisode) {
+    const episode = toPositiveInteger(noTitleDashEpisode[1])
+
+    if (episode) {
+      return {
+        season: 1,
+        episode,
+        episodeTitle: cleanEpisodeTitleSegment(noTitleDashEpisode[2]),
+      }
+    }
+  }
+
+  return null
+}
+
+export function parseAnimeFileNameWithFallbackTitle(
+  filePath: string,
+  title: string
+): ParsedAnimeFileName | null {
+  const episode = parseAnimeEpisodeIdentifier(filePath)
+  const cleanedTitle = cleanSeriesTitleSegment(title, episode?.season, episode?.part)
+
+  if (!episode || !cleanedTitle) {
+    return null
+  }
+
+  return {
+    title: cleanedTitle,
+    season: episode.season,
+    episode: episode.episode,
+    part: episode.part,
+    episodeTitle: episode.episodeTitle,
+  }
+}
+
 export function parseAnimeFileName(
   filePath: string
 ): ParsedAnimeFileName | null {
@@ -181,6 +438,22 @@ export function parseAnimeFileName(
     }
   }
 
+  const marker = findEpisodeMarker(normalized)
+
+  if (marker) {
+    const title = getTitleBeforeEpisodeMarker(normalized, marker)
+
+    if (title) {
+      return {
+        title,
+        season: marker.season,
+        episode: marker.episode,
+        part: marker.part,
+        episodeTitle: cleanEpisodeTitleSegment(marker.suffix),
+      }
+    }
+  }
+
   for (const pattern of seasonPartEpisodePatterns) {
     const seasonPartEpisode = pattern.exec(normalized)
 
@@ -192,9 +465,11 @@ export function parseAnimeFileName(
     const part = parsePartNumber(seasonPartEpisode[3])
     const episode = toPositiveInteger(seasonPartEpisode[4])
 
-    if (season && part && episode) {
+    const title = cleanSeriesTitleSegment(seasonPartEpisode[1] ?? "", season ?? undefined, part ?? undefined)
+
+    if (season && part && episode && title) {
       return {
-        title: cleanSeriesTitleSegment(seasonPartEpisode[1] ?? "", season, part),
+        title,
         season,
         episode,
         part,
@@ -202,7 +477,7 @@ export function parseAnimeFileName(
     }
   }
 
-  const seasonEpisode = /^(.+?)\s*[-\s]\s*S(\d{1,2})E(\d{1,4})(?:v\d+)?\b/i.exec(
+  const seasonEpisode = /^(.+?)\s*[-\s]\s*S\s*(\d{1,2})\s*(?:E|EP|Episode)\s*(\d{1,4})(?:v\d+)?\b/i.exec(
     normalized
   )
 
@@ -210,16 +485,18 @@ export function parseAnimeFileName(
     const season = toPositiveInteger(seasonEpisode[2])
     const episode = toPositiveInteger(seasonEpisode[3])
 
-    if (season && episode) {
+    const title = cleanSeriesTitleSegment(seasonEpisode[1] ?? "", season ?? undefined)
+
+    if (season && episode && title) {
       return {
-        title: cleanSeriesTitleSegment(seasonEpisode[1] ?? "", season),
+        title,
         season,
         episode,
       }
     }
   }
 
-  const seasonDashEpisode = /^(.+?)\s+S(\d{1,2})\s*-\s*(\d{1,4})(?:v\d+)?\b/i.exec(
+  const seasonDashEpisode = /^(.+?)\s+S\s*(\d{1,2})\s*-\s*(\d{1,4})(?:v\d+)?\b/i.exec(
     normalized
   )
 
@@ -227,9 +504,11 @@ export function parseAnimeFileName(
     const season = toPositiveInteger(seasonDashEpisode[2])
     const episode = toPositiveInteger(seasonDashEpisode[3])
 
-    if (season && episode) {
+    const title = cleanSeriesTitleSegment(seasonDashEpisode[1] ?? "", season ?? undefined)
+
+    if (season && episode && title) {
       return {
-        title: cleanSeriesTitleSegment(seasonDashEpisode[1] ?? "", season),
+        title,
         season,
         episode,
       }
@@ -241,9 +520,11 @@ export function parseAnimeFileName(
   if (dashEpisode) {
     const episode = toPositiveInteger(dashEpisode[2])
 
-    if (episode) {
+    const title = cleanSeriesTitleSegment(dashEpisode[1] ?? "", 1)
+
+    if (episode && title) {
       return {
-        title: normalizeTitle(dashEpisode[1] ?? ""),
+        title,
         season: 1,
         episode,
       }

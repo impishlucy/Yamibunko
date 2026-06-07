@@ -6,11 +6,14 @@ import { debugLog } from "@/server/utils/debugLog"
 
 const clients = new Map<string, Anilist>()
 const operationTimeoutMs = 30_000
+const maxOperationsPerMinute = 30
+const minOperationStartIntervalMs = Math.ceil(60_000 / maxOperationsPerMinute)
 
 let queue = Promise.resolve()
 let queuedOperations = 0
 let activeOperation = false
 let pausedUntil = 0
+let nextOperationStartAt = 0
 let shuttingDown = false
 let shutdownReason = "AniList operation was cancelled because shutdown started"
 
@@ -105,6 +108,22 @@ async function waitForPause() {
   }
 }
 
+async function waitForQueueRateLimitSlot() {
+  for (;;) {
+    throwIfAniListShutdownStarted()
+
+    const now = Date.now()
+    const waitMs = nextOperationStartAt - now
+
+    if (waitMs <= 0) {
+      nextOperationStartAt = now + minOperationStartIntervalMs
+      return
+    }
+
+    await sleep(Math.min(waitMs, 1000))
+  }
+}
+
 async function runWithTimeout<T>(
   operation: (signal: AbortSignal) => Promise<T>,
   operationLabel: string
@@ -170,11 +189,13 @@ export function getAniListClient(accessToken?: string) {
 }
 
 export function getAniListRateLimitState() {
+  const now = Date.now()
+
   return {
-    limit: null as number | null,
+    limit: maxOperationsPerMinute,
     remaining: null as number | null,
     resetAt: null as number | null,
-    pausedUntil: pausedUntil > Date.now() ? pausedUntil : null,
+    pausedUntil: Math.max(pausedUntil, nextOperationStartAt) > now ? Math.max(pausedUntil, nextOperationStartAt) : null,
     queued: queuedOperations,
     active: activeOperation,
   }
@@ -207,6 +228,7 @@ export function queueAniListOperation<T>(
 
     try {
       await waitForPause()
+      await waitForQueueRateLimitSlot()
       throwIfAniListShutdownStarted()
 
       const result = await runWithTimeout(operation, operationLabel)
@@ -231,7 +253,7 @@ export function queueAniListOperation<T>(
       }
 
       console.error(
-        `[Error] [Anilist] AniList operation failed - ${operationLabel} - Reason: ${getAniListFailureReason(error)}`
+        `[Error] [Anilist] AniList operation failed - ${operationLabel} - Reason: ${getAniListFailureReason(error)} - Detail: ${errorMessage(error)} - transport.ts`
       )
       throw error
     } finally {

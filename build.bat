@@ -10,6 +10,8 @@ set "OBJ_DIR=launcher\obj"
 set "BIN_DIR=launcher\bin"
 set "WIN_DIR=%BUILD_DIR%\yamibunko-win"
 set "LINUX_DIR=%BUILD_DIR%\yamibunko-linux"
+set "WEBAPP_EXCLUDED_DIRS=node_modules .next .idea .*"
+set "WEBAPP_EXCLUDED_FILES=.env"
 
 if exist "%BUILD_DIR%" (
     echo Cleaning old Build directory...
@@ -49,11 +51,11 @@ if errorlevel 1 goto :fail
 
 echo.
 echo Copying Next.js Webapp files to Windows build...
-robocopy webapp "%WIN_DIR%\webapp" /E /XD node_modules .* /XF .* /NJH /NJS /NDL /NC /NS
+robocopy webapp "%WIN_DIR%\webapp" /E /XD %WEBAPP_EXCLUDED_DIRS% /XF %WEBAPP_EXCLUDED_FILES% /NJH /NJS /NDL /NC /NS
 if errorlevel 8 goto :fail
 
 echo Copying Next.js Webapp files to Linux build...
-robocopy webapp "%LINUX_DIR%\webapp" /E /XD node_modules .* /XF .* /NJH /NJS /NDL /NC /NS
+robocopy webapp "%LINUX_DIR%\webapp" /E /XD %WEBAPP_EXCLUDED_DIRS% /XF %WEBAPP_EXCLUDED_FILES% /NJH /NJS /NDL /NC /NS
 if errorlevel 8 goto :fail
 
 echo.
