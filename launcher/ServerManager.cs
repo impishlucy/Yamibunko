@@ -29,7 +29,10 @@ public class ServerManager
     private Task? _stopServerTask;
     private IntPtr _serverJobHandle = IntPtr.Zero;
     private readonly object _shutdownLock = new();
+    private readonly object _logCleanupLock = new();
     private readonly string _pidFile = Path.Combine(AppContext.BaseDirectory, "server.pid");
+    private Timer? _dailyLogCleanupTimer;
+    private TimeSpan _dailyLogCleanupTime;
 
     public ObservableCollection<string> ServerLogs { get; } = new();
 
@@ -99,6 +102,64 @@ public class ServerManager
         finally
         {
             TryDeleteFile(_pidFile);
+        }
+    }
+
+    public void StartDailyLogCleanup(TimeSpan cleanupTime)
+    {
+        lock (_logCleanupLock)
+        {
+            _dailyLogCleanupTime = cleanupTime;
+            _dailyLogCleanupTimer?.Dispose();
+            _dailyLogCleanupTimer = new Timer(OnDailyLogCleanupTimerElapsed);
+            ScheduleNextDailyLogCleanup();
+        }
+    }
+
+    public void StopDailyLogCleanup()
+    {
+        lock (_logCleanupLock)
+        {
+            _dailyLogCleanupTimer?.Dispose();
+            _dailyLogCleanupTimer = null;
+        }
+    }
+
+    private void OnDailyLogCleanupTimerElapsed(object? state)
+    {
+        ClearLogs();
+
+        lock (_logCleanupLock)
+        {
+            if (_dailyLogCleanupTimer != null)
+            {
+                ScheduleNextDailyLogCleanup();
+            }
+        }
+    }
+
+    private void ScheduleNextDailyLogCleanup()
+    {
+        var now = DateTime.Now;
+        var nextRun = now.Date.Add(_dailyLogCleanupTime);
+
+        if (nextRun <= now)
+        {
+            nextRun = nextRun.AddDays(1);
+        }
+
+        var dueTime = nextRun - now;
+        _dailyLogCleanupTimer?.Change(dueTime, Timeout.InfiniteTimeSpan);
+    }
+
+    private void ClearLogs()
+    {
+        try
+        {
+            Avalonia.Threading.Dispatcher.UIThread.Post(ServerLogs.Clear);
+        }
+        catch
+        {
         }
     }
 

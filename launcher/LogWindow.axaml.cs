@@ -5,6 +5,7 @@ using Avalonia.Threading;
 using Avalonia.Interactivity;
 using System;
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
 using System.Diagnostics;
 using System.Text;
 using System.Threading.Tasks;
@@ -46,6 +47,12 @@ public partial class LogWindow : Window
 
         logs.CollectionChanged += (_, e) =>
         {
+            if (e.Action == NotifyCollectionChangedAction.Reset)
+            {
+                Dispatcher.UIThread.Post(ClearDisplayedLogs);
+                return;
+            }
+
             if (e.NewItems == null)
             {
                 return;
@@ -128,6 +135,27 @@ public partial class LogWindow : Window
         }
 
         ScrollToEnd();
+    }
+
+    private void ClearDisplayedLogs()
+    {
+        _logText.Clear();
+
+        if (_logTextBox != null)
+        {
+            _logTextBox.Text = string.Empty;
+            _logTextBox.CaretIndex = 0;
+        }
+
+        if (_logScrollViewer != null)
+        {
+            _logScrollViewer.Offset = new Vector(0, 0);
+        }
+
+        _autoScrollToBottom = true;
+        _pendingAutoScrollToBottom = false;
+        SetScrollToBottomButtonVisible(false);
+        UpdateLastScrollMetrics();
     }
 
     private void AppendLogLine(string line, bool scrollToEnd = true)

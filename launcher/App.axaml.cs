@@ -41,12 +41,19 @@ public partial class App : Application
         {
             desktop.ShutdownMode = Avalonia.Controls.ShutdownMode.OnExplicitShutdown;
             desktop.ShutdownRequested += OnShutdownRequested;
-            desktop.Exit += (s, e) => ServerManager.StopServer();
+            desktop.Exit += (s, e) =>
+            {
+                ServerManager.StopDailyLogCleanup();
+                ServerManager.StopServer();
+                SingleInstanceManager.Shutdown();
+            };
 
             _openInBrowserTrayMenuItem = FindTrayMenuItem("Open in Browser");
             _stopServerTrayMenuItem = FindTrayMenuItem("Stop Server & Exit");
             ServerManager.LogsWindowRequested += ShowLogsWindow;
             ServerManager.ServerStopStateChanged += OnServerStopStateChanged;
+            ServerManager.StartDailyLogCleanup(new TimeSpan(3, 0, 0));
+            SingleInstanceManager.StartListening(ShowLogsWindow);
             UpdateStopServerControls();
 
             ServerManager.CleanupOrphans();
