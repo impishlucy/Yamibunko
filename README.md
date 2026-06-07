@@ -16,20 +16,21 @@ Yamibunko is a all in one local anime library and file processor, with a desktop
 
 ## Features
 
-Yamibunko is built around a local anime library workflow:
+### General
 
-* Custom player designed for animes, with the usual controls, skip intro/outro buttons and Google casting.
+* Custom player designed for animes, with the usual controls, skip intro button and Google casting.
 * Responsive layouts for all pages, on desktop, tablets, and phones.
 * Direct-File play and transcoding are possible.
-* Data Saver mode for when you're have a data cap.
-* Import conversion for smaller, more consistent files, using HEVC conversion and audio cleanup when needed.
-* Per-series library grouping, no more searching the library, its all grouped together.
+* Per-series library grouping, no more searching, its all grouped together.
 * AniList integration for metadata, tracking, watching progress and watching status.
-* Desktop launcher that prepares the runtime, starts the webapp, and keeps setup easier for normal installs.
+* Desktop launcher that prepares the runtime, starts the webapp, and keeps setup easier to use.
 * Bandwidth-aware streaming, uses a server limit and helps avoid overloading the host connection.
 * One active stream per user, with confirmation when switching playback to another episode or device.
 * VIP priority streaming so selected users can get better access when the server is under load.
 
+### File Processing
+* If enabled it can convert input files for smaller, more consistent files, using HEVC conversion when needed.
+* If disabled it only servers your existing files and does not edit them.
 
 ## Install
 
@@ -82,17 +83,20 @@ The webapp can run without the launcher, but you must provide the runtime yourse
 * [Node.js 20 or newer](https://nodejs.org/)
 * [Bun](https://bun.sh/)
 * [FFmpeg and FFprobe with HEVC support](https://github.com/btbn/ffmpeg-builds/)
-* A configured `.env` file
 
+#### Steps
+
+1. Edit the .env files and fill all fields. <br/>
+ - Supported `TRANSCODE_ACCEL` values in env are nvenc, qsv, amd, or cpu.
+ - Nvidia GPU = nvenc, AMD GPU = amd, Intel GPU & CPU with Quicksync = qsv.
+
+2. Start the app:
 From the `webapp` directory:
-
 ```bash
 bun install
 bun run build
 bun run start
 ```
-
-Supported `TRANSCODE_ACCEL` values in env are `nvenc`, `qsv`, and `cpu`.
 
 ### Manual Webapp Update
 
