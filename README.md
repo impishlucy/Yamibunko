@@ -53,6 +53,14 @@ The only required things are an 64bit OS and .NET 10.
 The launcher prepares the local runtime, downloads whats needed and starts the webapp.
 If the web UI does not open automatically, check the launcher log window.
 
+### Update (with Launcher) [Only available with V3 and newer.]
+1. Stop any Yamibunko instance running and wait for shutdown.
+2. Open the Folder of your Yamibunko Install.
+3. Execute the Updater script and wait for it to complete.
+4. Start the Launcher and ur done.
+
+- - - - - -
+
 ### AniList Setup
 
 AniList features require an AniList API client. Configure the client redirect URL to match the Yamibunko callback URL:
@@ -62,7 +70,10 @@ http://localhost:3000/api/anilist/oauth/callback
 https://your-domain.example/api/anilist/oauth/callback
 ```
 
-Use the same base URL in the launcher or `.env` file. If you host Yamibunko behind a path prefix, the callback path is appended behind that base URL.
+Use the same base URL in the launcher or `.env` file.<br/>
+If you host Yamibunko behind a path prefix, the callback path is appended behind that base URL.
+
+- - - - - -
 
 ### Manual Webapp Install
 
@@ -82,6 +93,15 @@ bun run start
 ```
 
 Supported `TRANSCODE_ACCEL` values in env are `nvenc`, `qsv`, and `cpu`.
+
+### Manual Webapp Update
+
+0. Download the new version zip and unpack it.
+1. Stop the currently running Instance.
+2. Paste the webapp contents over the one in your instance folder.
+3. Delete the .next folder inside your instance folder.
+4. Run `bun run build` before starting it.
+5. Start it.
 
 ## Disclaimer
 
