@@ -6,7 +6,7 @@
   
 # Yamibunko
 
-Yamibunko is a local anime library server with a desktop launcher and a web UI. It processes your own media files, organizes them into a library, enriches entries with metadata, and plays them through the browser.
+Yamibunko is a local anime library server with a desktop launcher and a web UI. <br/> It processes your own media files, organizes them into a library, enriches entries with metadata, and plays them through the browser.
 
 <img width="48%" alt="library" src="https://github.com/user-attachments/assets/fe05f186-7b1e-42e2-b154-da7c737952bb" />
 <img width="48%" alt="overview" src="https://github.com/user-attachments/assets/97a719da-e392-4089-82be-fc1d983a979b" />
@@ -50,10 +50,10 @@ The only required things are an 64bit OS and .NET 10.
    * AniList API client ID and secret if you want AniList tracking.
 6. Save the setup and wait for the launcher to start the web UI.
 
-The launcher prepares the local runtime, downloads whats needed and starts the webapp.
+The launcher prepares the local runtime, downloads whats needed and starts the webapp.<br/>
 If the web UI does not open automatically, check the launcher log window.
 
-### Update (with Launcher) [Only available with V3 and newer.]
+### Update (with Launcher)
 1. Stop any Yamibunko instance running and wait for shutdown.
 2. Open the Folder of your Yamibunko Install.
 3. Execute the Updater script and wait for it to complete.
