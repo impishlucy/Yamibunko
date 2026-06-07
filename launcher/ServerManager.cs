@@ -25,6 +25,7 @@ public class ServerManager
     private static readonly TimeSpan HardwareDetectionTimeout = TimeSpan.FromSeconds(8);
 
     private Process? _serverProcess;
+    private Process? _activeManagedProcess;
     private Task? _stopServerTask;
     private IntPtr _serverJobHandle = IntPtr.Zero;
     private readonly object _shutdownLock = new();
@@ -53,6 +54,17 @@ public class ServerManager
             lock (_shutdownLock)
             {
                 return _stopServerTask == null;
+            }
+        }
+    }
+
+    public bool CanOpenInBrowser
+    {
+        get
+        {
+            lock (_shutdownLock)
+            {
+                return _stopServerTask == null && _serverProcess != null && !HasProcessExited(_serverProcess);
             }
         }
     }
@@ -116,6 +128,7 @@ public class ServerManager
 
                 Log("- - - - - - - - - - - - - - - - - - - -");
                 Log("Starting WebApp building process...");
+                DeleteNextBuildDirectory(webappDir);
                 await RunBunCommandAsync(settings, webappDir, "run", "build");
 
                 Log("- - - - - - - - - - - - - - - - - - - -");
@@ -123,8 +136,6 @@ public class ServerManager
                 _serverProcess = StartBunServer(settings, webappDir);
                 File.WriteAllText(_pidFile, _serverProcess.Id.ToString());
                 NotifyServerStopStateChanged();
-
-                OpenUrl(settings.BaseUrl);
             } else
             {
                 ShowLogsWindow();
@@ -134,6 +145,7 @@ public class ServerManager
         catch (Exception ex)
         {
             Log($"[CRITICAL ERROR] {ex.Message}");
+            ShowLogsWindow();
         }
     }
 
@@ -189,7 +201,8 @@ public class ServerManager
         {
             if (_stopServerTask == null)
             {
-                _stopServerTask = StopServerCoreAsync(_serverProcess);
+                var processToStop = _activeManagedProcess ?? _serverProcess;
+                _stopServerTask = StopServerCoreAsync(processToStop);
                 createdTask = true;
             }
 
@@ -206,11 +219,14 @@ public class ServerManager
 
     private async Task StopServerCoreAsync(Process? process)
     {
+        var disposeStoppedProcess = false;
+
         try
         {
             if (process != null)
             {
-                await StopProcessTreeAsync(process);
+                var isServerProcess = IsServerProcess(process);
+                await StopProcessTreeAsync(process, isServerProcess);
             }
             else
             {
@@ -230,12 +246,22 @@ public class ServerManager
                 if (ReferenceEquals(_serverProcess, process))
                 {
                     _serverProcess = null;
+                    disposeStoppedProcess = true;
+                }
+
+                if (ReferenceEquals(_activeManagedProcess, process))
+                {
+                    _activeManagedProcess = null;
                 }
 
                 _stopServerTask = null;
             }
 
-            process?.Dispose();
+            if (disposeStoppedProcess)
+            {
+                process?.Dispose();
+            }
+
             CloseServerJob();
             TryDeleteFile(_pidFile);
             NotifyServerStopStateChanged();
@@ -489,6 +515,27 @@ public class ServerManager
         });
     }
 
+    private void DeleteNextBuildDirectory(string webappDir)
+    {
+        var nextDir = Path.Combine(webappDir, ".next");
+        if (!Directory.Exists(nextDir))
+        {
+            return;
+        }
+
+        Log("Cleaning old WebApp build output...");
+
+        try
+        {
+            Directory.Delete(nextDir, true);
+        }
+        catch (Exception ex)
+        {
+            ShowLogsWindow();
+            throw new IOException($"Could not delete old WebApp build output: {ex.Message}", ex);
+        }
+    }
+
     private Process StartBunServer(AppSettings settings, string workingDirectory)
     {
         return StartBackgroundProcess(settings.BunPath, new[] { "run", "start" }, new CommandOptions
@@ -512,7 +559,7 @@ public class ServerManager
     {
         try
         {
-            return await RunProcessAsync(fileName, arguments, options);
+            return await RunProcessAsync(fileName, arguments, WithoutProcessErrorWindow(options));
         }
         catch (Win32Exception)
         {
@@ -539,22 +586,42 @@ public class ServerManager
         process.OutputDataReceived += (_, e) => AppendProcessLine(output, e.Data, options.LogOutput);
         process.ErrorDataReceived += (_, e) => AppendProcessLine(error, e.Data, options.LogErrors);
 
-        if (!process.Start())
+        try
         {
-            ShowLogsWindow();
-            throw new InvalidOperationException($"Failed to start command: {fileName}");
+            if (!process.Start())
+            {
+                throw new InvalidOperationException($"Failed to start command: {fileName}");
+            }
+        }
+        catch
+        {
+            ShowProcessErrorWindow(options);
+            throw;
         }
 
+        MarkActiveProcess(process);
         AssignProcessToServerJob(process);
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
 
-        await WaitForExitAsync(process, options.Timeout ?? DefaultCommandTimeout);
+        try
+        {
+            await WaitForExitAsync(process, options.Timeout ?? DefaultCommandTimeout);
+        }
+        catch
+        {
+            ShowProcessErrorWindow(options);
+            throw;
+        }
+        finally
+        {
+            ClearActiveProcess(process);
+        }
 
         var result = new CommandResult(process.ExitCode, output.ToString(), error.ToString());
         if (options.ThrowOnError && result.ExitCode != 0)
         {
-            ShowLogsWindow();
+            ShowProcessErrorWindow(options);
             throw new InvalidOperationException($"Command failed ({fileName}) with exit code {result.ExitCode}: {result.Error.Trim()}");
         }
 
@@ -568,14 +635,32 @@ public class ServerManager
         process.OutputDataReceived += (_, e) => AppendProcessLine(null, e.Data, true);
         process.ErrorDataReceived += (_, e) => AppendProcessLine(null, e.Data, true);
         process.EnableRaisingEvents = true;
-        process.Exited += (_, _) => Log($"Server process exited with code {process.ExitCode}.");
-
-        if (!process.Start())
+        process.Exited += (_, _) =>
         {
-            ShowLogsWindow();
-            throw new InvalidOperationException($"Failed to start command: {fileName}");
+            ClearActiveProcess(process);
+            var exitCode = process.ExitCode;
+            Log($"Server process exited with code {exitCode}.");
+
+            if (exitCode != 0 && !IsStoppingServer)
+            {
+                ShowLogsWindow();
+            }
+        };
+
+        try
+        {
+            if (!process.Start())
+            {
+                throw new InvalidOperationException($"Failed to start command: {fileName}");
+            }
+        }
+        catch
+        {
+            ShowProcessErrorWindow(options);
+            throw;
         }
 
+        MarkActiveProcess(process);
         AssignProcessToServerJob(process);
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
@@ -583,7 +668,68 @@ public class ServerManager
         return process;
     }
 
-    private async Task StopProcessTreeAsync(Process process)
+    private void MarkActiveProcess(Process process)
+    {
+        lock (_shutdownLock)
+        {
+            _activeManagedProcess = process;
+        }
+
+        NotifyServerStopStateChanged();
+    }
+
+    private void ClearActiveProcess(Process process)
+    {
+        var cleared = false;
+
+        lock (_shutdownLock)
+        {
+            if (ReferenceEquals(_activeManagedProcess, process))
+            {
+                _activeManagedProcess = null;
+                cleared = true;
+            }
+        }
+
+        if (cleared)
+        {
+            NotifyServerStopStateChanged();
+        }
+    }
+
+    private bool IsServerProcess(Process process)
+    {
+        lock (_shutdownLock)
+        {
+            return ReferenceEquals(_serverProcess, process);
+        }
+    }
+
+    private static CommandOptions WithoutProcessErrorWindow(CommandOptions? options)
+    {
+        options ??= new CommandOptions();
+
+        return new CommandOptions
+        {
+            WorkingDirectory = options.WorkingDirectory,
+            Environment = options.Environment,
+            Timeout = options.Timeout,
+            LogOutput = options.LogOutput,
+            LogErrors = options.LogErrors,
+            ThrowOnError = options.ThrowOnError,
+            ShowLogsOnError = false
+        };
+    }
+
+    private void ShowProcessErrorWindow(CommandOptions options)
+    {
+        if (options.ShowLogsOnError)
+        {
+            ShowLogsWindow();
+        }
+    }
+
+    private async Task StopProcessTreeAsync(Process process, bool waitForServerShutdown)
     {
         try
         {
@@ -595,11 +741,20 @@ public class ServerManager
 
             Log("Requesting graceful shutdown...");
             await RequestGracefulShutdownAsync(process);
-            Log("Waiting for the server to finish active work...");
 
-            await process.WaitForExitAsync();
-            process.WaitForExit();
-            Log("Server process stopped gracefully.");
+            if (waitForServerShutdown)
+            {
+                Log("Waiting for the server to finish active work...");
+                await process.WaitForExitAsync();
+                process.WaitForExit();
+                Log("Server process stopped gracefully.");
+            }
+            else
+            {
+                Log("Waiting for the active startup command to stop...");
+                await WaitForExitOrKillAsync(process, TimeSpan.FromSeconds(10));
+                Log("Startup command stopped.");
+            }
         }
         catch (InvalidOperationException)
         {
@@ -796,6 +951,23 @@ public class ServerManager
         {
             TryKill(process);
             throw new TimeoutException($"Command timed out after {timeout.TotalSeconds:N0} seconds.");
+        }
+    }
+
+    private static async Task WaitForExitOrKillAsync(Process process, TimeSpan timeout)
+    {
+        using var cancellation = new CancellationTokenSource(timeout);
+
+        try
+        {
+            await process.WaitForExitAsync(cancellation.Token);
+            process.WaitForExit();
+        }
+        catch (OperationCanceledException)
+        {
+            TryKill(process);
+            await process.WaitForExitAsync();
+            process.WaitForExit();
         }
     }
 
@@ -1151,6 +1323,7 @@ public class ServerManager
         public bool LogOutput { get; init; }
         public bool LogErrors { get; init; } = true;
         public bool ThrowOnError { get; init; } = true;
+        public bool ShowLogsOnError { get; init; } = true;
     }
 
     private sealed record CommandResult(int ExitCode, string Output, string Error);

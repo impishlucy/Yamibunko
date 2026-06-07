@@ -14,10 +14,26 @@ let pausedUntil = 0
 let shuttingDown = false
 let shutdownReason = "AniList operation was cancelled because shutdown started"
 
+type AniListOperationOptions = {
+  label?: string
+}
+
 export class AniListOperationShutdownError extends Error {
   constructor(message = shutdownReason) {
     super(message)
     this.name = "AniListOperationShutdownError"
+  }
+}
+
+export class AniListOperationTimeoutError extends Error {
+  constructor(
+    readonly operationLabel: string,
+    readonly timeoutMs: number
+  ) {
+    super(
+      `${operationLabel} timed out after ${timeoutMs}ms (reason: AniList or the wrapper did not return a response before Yamibunko's timeout)`
+    )
+    this.name = "AniListOperationTimeoutError"
   }
 }
 
@@ -29,6 +45,50 @@ function throwIfAniListShutdownStarted() {
   if (shuttingDown) {
     throw new AniListOperationShutdownError()
   }
+}
+
+function getOperationLabel(options?: AniListOperationOptions) {
+  return options?.label?.trim() || "AniList wrapper operation"
+}
+
+function describeRateLimitRetry(error: unknown) {
+  if (!isRateLimitError(error)) {
+    return null
+  }
+
+  const retryAfterMs = error.retryAfterMs ?? null
+
+  if (typeof retryAfterMs !== "number" || retryAfterMs <= 0) {
+    return "AniList rate limit was reached"
+  }
+
+  return `AniList rate limit was reached; retry allowed in ${Math.ceil(retryAfterMs / 1000)}s`
+}
+
+function getAniListFailureReason(error: unknown) {
+  if (error instanceof AniListOperationTimeoutError) {
+    return "Timeout while waiting for AniList or the wrapper to return a response"
+  }
+
+  const rateLimitReason = describeRateLimitRetry(error)
+
+  if (rateLimitReason) {
+    return rateLimitReason
+  }
+
+  if (error instanceof DOMException && error.name === "AbortError") {
+    return "Request was aborted by Yamibunko after the operation timeout"
+  }
+
+  if (error instanceof TypeError) {
+    return "Network or transport request failed"
+  }
+
+  if (error instanceof Error && error.name) {
+    return error.name
+  }
+
+  return "Unknown AniList wrapper failure"
 }
 
 async function waitForPause() {
@@ -45,19 +105,20 @@ async function waitForPause() {
   }
 }
 
-async function runWithTimeout<T>(operation: () => Promise<T>) {
+async function runWithTimeout<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  operationLabel: string
+) {
+  const abortController = new AbortController()
   let timeout: NodeJS.Timeout | undefined
 
   try {
     return await Promise.race<T>([
-      operation(),
+      operation(abortController.signal),
       new Promise<T>((_, reject) => {
         timeout = setTimeout(() => {
-          reject(
-            new Error(
-              `AniList operation timed out after ${operationTimeoutMs}ms`
-            )
-          )
+          abortController.abort()
+          reject(new AniListOperationTimeoutError(operationLabel, operationTimeoutMs))
         }, operationTimeoutMs)
         timeout.unref?.()
       }),
@@ -119,14 +180,18 @@ export function getAniListRateLimitState() {
   }
 }
 
-export function queueAniListOperation<T>(operation: () => Promise<T>) {
+export function queueAniListOperation<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  options?: AniListOperationOptions
+) {
   if (shuttingDown) {
     return Promise.reject<T>(new AniListOperationShutdownError())
   }
 
+  const operationLabel = getOperationLabel(options)
   queuedOperations += 1
   debugLog(
-    `[Debug] [Anilist] Queued AniList operation - Queue depth ${queuedOperations}`
+    `[Debug] [Anilist] Queued AniList operation - ${operationLabel} - Queue depth ${queuedOperations}`
   )
 
   const run = queue.then(async () => {
@@ -137,22 +202,22 @@ export function queueAniListOperation<T>(operation: () => Promise<T>) {
     activeOperation = true
 
     debugLog(
-      `[Debug] [Anilist] Starting AniList operation - Remaining queue ${queuedOperations}`
+      `[Debug] [Anilist] Starting AniList operation - ${operationLabel} - Remaining queue ${queuedOperations}`
     )
 
     try {
       await waitForPause()
       throwIfAniListShutdownStarted()
 
-      const result = await runWithTimeout(operation)
+      const result = await runWithTimeout(operation, operationLabel)
       debugLog(
-        `[Debug] [Anilist] AniList operation completed - ${Date.now() - startedAt}ms`
+        `[Debug] [Anilist] AniList operation completed - ${operationLabel} - ${Date.now() - startedAt}ms`
       )
       return result
     } catch (error) {
       if (isAniListOperationShutdownError(error)) {
         debugLog(
-          `[Debug] [Anilist] AniList operation skipped during shutdown - Remaining queue ${queuedOperations}`
+          `[Debug] [Anilist] AniList operation skipped during shutdown - ${operationLabel} - Remaining queue ${queuedOperations}`
         )
         throw error
       }
@@ -166,7 +231,7 @@ export function queueAniListOperation<T>(operation: () => Promise<T>) {
       }
 
       console.error(
-        `[Error] [Anilist] AniList wrapper operation failed - transport.ts - ${errorMessage(error)}`
+        `[Error] [Anilist] AniList operation failed - ${operationLabel} - Reason: ${getAniListFailureReason(error)}`
       )
       throw error
     } finally {
@@ -181,4 +246,3 @@ export function queueAniListOperation<T>(operation: () => Promise<T>) {
 
   return run
 }
-

@@ -213,10 +213,6 @@ try {
         Copy-Item -LiteralPath $_.FullName -Destination $installRoot -Recurse -Force
     }
 
-    $nextDir = [System.IO.Path]::Combine($webappRoot, ".next")
-    if (Test-Path -LiteralPath $nextDir) {
-        Remove-Item -LiteralPath $nextDir -Recurse -Force
-    }
 
     Write-Host "Update done."
     exit 0

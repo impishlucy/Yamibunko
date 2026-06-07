@@ -642,11 +642,13 @@ function pickRootCandidate(metadata: AnimeMetadataInput) {
 }
 
 async function fetchAnimeMetadataById(id: number) {
-  const animeResult = await queueAniListOperation(() =>
-    getAniListClient().graphql.request<
-      { Media: AniListMediaNode | null },
-      { id: number }
-    >(AnimeWithStreamingEpisodesDocument, { id })
+  const animeResult = await queueAniListOperation(
+    () =>
+      getAniListClient().graphql.request<
+        { Media: AniListMediaNode | null },
+        { id: number }
+      >(AnimeWithStreamingEpisodesDocument, { id }),
+    { label: `Fetch AniList metadata by id ${id}` }
   )
   const media = animeResult.Media
 
@@ -1044,8 +1046,9 @@ async function findAnimeMetadataUncached(
     } | null = null
 
     try {
-      result = await queueAniListOperation(() =>
-        getAniListClient().anime.getAnimeBySearch(candidate, 1, 10)
+      result = await queueAniListOperation(
+        () => getAniListClient().anime.getAnimeBySearch(candidate, 1, 10),
+        { label: `Search AniList metadata for "${candidate}"` }
       )
     } catch (error) {
       const message = errorMessage(error)

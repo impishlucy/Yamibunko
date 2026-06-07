@@ -13,5 +13,5 @@ export default async function LoginPage() {
     redirect("/library")
   }
 
-  return <AuthForm mode={hasAnyUsers() ? "login" : "admin-registration"} />
+  return <AuthForm mode={hasAnyUsers() ? "login" : "registration"} />
 }

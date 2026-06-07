@@ -519,10 +519,6 @@ export function registerImportTranscodeCapacity(
       ? 0.5
       : 0.12
 
-  console.log(
-    `[Info] [Transcode] Import ${kind} work registered for live capacity - ${label}`
-  )
-
   return createLease(label, transcodeKind, cost)
 }
 

@@ -76,9 +76,6 @@ function shouldSkipActiveInputOutput(filePath: string) {
     return false
   }
 
-  console.log(
-    `[Info] [Media] Skipped library sync for active input output - ${fileName(filePath)}`
-  )
   debugLibrarySync(`Skipped active input output - ${filePath}`)
   return true
 }
@@ -211,23 +208,13 @@ export async function syncLibraryFile(filePath: string) {
   const resolvedPath = path.resolve(filePath)
   debugLibrarySync(`Sync requested - ${resolvedPath}`)
 
-  console.log(
-    `[Info] [Media] Library file sync started - ${fileName(resolvedPath)}`
-  )
-
   debugLibrarySync(`Checking media file extension - ${resolvedPath}`)
   if (!isMediaFile(resolvedPath)) {
-    console.log(
-      `[Info] [Media] Skipped non-media library file - ${fileName(resolvedPath)}`
-    )
     return null
   }
 
   debugLibrarySync(`Checking library path exists - ${resolvedPath}`)
   if (!(await pathExists(resolvedPath))) {
-    console.log(
-      `[Info] [Media] Library file no longer exists, removing DB entry - ${resolvedPath}`
-    )
     return removeLibraryFile(resolvedPath)
   }
 
@@ -254,9 +241,6 @@ export async function syncLibraryFile(filePath: string) {
   )
 
   if (existingEpisode) {
-    console.log(
-      `[Info] [Media] Library file already exists in database - Anime id ${existingEpisode.animeId}, Season ${existingEpisode.seasonNumber}, Episode ${existingEpisode.episodeNumber}`
-    )
     return {
       animeId: existingEpisode.animeId,
       seasonNr: existingEpisode.seasonNumber,
@@ -276,7 +260,7 @@ export async function syncLibraryFile(filePath: string) {
   }
 
   console.log(
-    `[Info] [Media] Recognized library file - Title: ${parsed.animeTitle}, Season: ${parsed.season}${parsed.part ? `, Part: ${parsed.part}` : ""}, Episode: ${parsed.episode}`
+    `[Info] [Media] Detected library episode - Anime: ${parsed.animeTitle}, Season ${parsed.season}, Episode ${parsed.episode} - ${fileName(resolvedPath)}`
   )
 
   debugLibrarySync("Starting AniList metadata lookup for library file.")
@@ -296,10 +280,6 @@ export async function syncLibraryFile(filePath: string) {
   await runCooperativeSyncStep(() => upsertAnime(metadata))
   debugLibrarySync("AniList metadata saved for library file.")
   const animeId = metadata.id
-  console.log(
-    `[Info] [Media] Created anime from AniList metadata - ${parsed.animeTitle} - id ${animeId}`
-  )
-
   if (shouldSkipActiveInputOutput(resolvedPath)) {
     return null
   }
@@ -322,10 +302,6 @@ export async function syncLibraryFile(filePath: string) {
   if (shouldSkipActiveInputOutput(resolvedPath)) {
     return null
   }
-
-  console.log(
-    `[Info] [Media] Generating thumbnail for library file - ${fileName(resolvedPath)}`
-  )
 
   const thumbnailPath = await runWithTemporaryFileAccessRetry(
     "thumbnail generation",
@@ -363,7 +339,7 @@ export async function syncLibraryFile(filePath: string) {
   }
 
   console.log(
-    `[Info] [Media] Library episode added to database - Anime id ${animeId}, Season ${parsed.season}, Episode ${parsed.episode}`
+    `[Info] [Media] Library database import completed - Anime: ${parsed.animeTitle}, Season ${parsed.season}, Episode ${parsed.episode} - ${fileName(resolvedPath)}`
   )
   debugLibrarySync("Library file sync completed.")
 

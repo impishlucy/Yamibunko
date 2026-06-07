@@ -16,13 +16,18 @@ public partial class LogWindow : Window
     private const double BottomScrollThreshold = 6;
 
     private readonly StringBuilder _logText = new();
-    private Func<Task>? _stopServerAsync;
+    private Func<Task>? _stopServerAndExitAsync;
+    private Action? _openInBrowser;
     private TextBox? _logTextBox;
     private ScrollViewer? _logScrollViewer;
     private Button? _scrollToBottomButton;
+    private Button? _openInBrowserButton;
     private Button? _stopServerButton;
     private bool _autoScrollToBottom = true;
     private bool _isProgrammaticScroll;
+    private bool _pendingAutoScrollToBottom;
+    private double _lastScrollOffsetY;
+    private double _lastScrollExtentHeight;
 
     public LogWindow()
     {
@@ -30,12 +35,13 @@ public partial class LogWindow : Window
         InitializeControls();
     }
 
-    public LogWindow(ObservableCollection<string> logs, Func<Task> stopServerAsync)
+    public LogWindow(ObservableCollection<string> logs, Func<Task> stopServerAndExitAsync, Action openInBrowser)
     {
         AvaloniaXamlLoader.Load(this);
         InitializeControls();
 
-        _stopServerAsync = stopServerAsync;
+        _stopServerAndExitAsync = stopServerAndExitAsync;
+        _openInBrowser = openInBrowser;
         PopulateInitialLogs(logs);
 
         logs.CollectionChanged += (_, e) =>
@@ -63,11 +69,17 @@ public partial class LogWindow : Window
         _logTextBox = this.FindControl<TextBox>("LogTextBox");
         _logScrollViewer = this.FindControl<ScrollViewer>("LogScrollViewer");
         _scrollToBottomButton = this.FindControl<Button>("ScrollToBottomButton");
+        _openInBrowserButton = this.FindControl<Button>("OpenInBrowserButton");
         _stopServerButton = this.FindControl<Button>("StopServerButton");
 
         if (_scrollToBottomButton != null)
         {
             _scrollToBottomButton.Click += OnScrollToBottomClicked;
+        }
+
+        if (_openInBrowserButton != null)
+        {
+            _openInBrowserButton.Click += OnOpenInBrowserClicked;
         }
 
         if (_stopServerButton != null)
@@ -95,6 +107,11 @@ public partial class LogWindow : Window
         if (_scrollToBottomButton == null)
         {
             Debug.WriteLine("ScrollToBottomButton not found in XAML.");
+        }
+
+        if (_openInBrowserButton == null)
+        {
+            Debug.WriteLine("OpenInBrowserButton not found in XAML.");
         }
 
         if (_stopServerButton == null)
@@ -156,12 +173,31 @@ public partial class LogWindow : Window
 
     private void OnLogScrollChanged(object? sender, ScrollChangedEventArgs e)
     {
-        if (_isProgrammaticScroll)
+        if (_logScrollViewer == null)
         {
             return;
         }
 
+        if (_isProgrammaticScroll || _pendingAutoScrollToBottom)
+        {
+            UpdateLastScrollMetrics();
+            return;
+        }
+
+        var offsetY = _logScrollViewer.Offset.Y;
+        var extentHeight = _logScrollViewer.Extent.Height;
+        var extentChanged = Math.Abs(extentHeight - _lastScrollExtentHeight) > 0.5;
+        var offsetChanged = Math.Abs(offsetY - _lastScrollOffsetY) > 0.5;
+
+        if (_autoScrollToBottom && extentChanged && !offsetChanged)
+        {
+            UpdateLastScrollMetrics();
+            ScrollToEnd();
+            return;
+        }
+
         UpdateScrollToBottomState();
+        UpdateLastScrollMetrics();
     }
 
     private void UpdateScrollToBottomState()
@@ -194,12 +230,18 @@ public partial class LogWindow : Window
         }
 
         _autoScrollToBottom = true;
+        _pendingAutoScrollToBottom = true;
         SetScrollToBottomButtonVisible(false);
+        QueueScrollToEnd(2);
+    }
 
+    private void QueueScrollToEnd(int remainingPasses)
+    {
         Dispatcher.UIThread.Post(() =>
         {
             if (_logTextBox == null || _logScrollViewer == null)
             {
+                _pendingAutoScrollToBottom = false;
                 return;
             }
 
@@ -208,15 +250,25 @@ public partial class LogWindow : Window
             try
             {
                 var maxOffsetY = Math.Max(0, _logScrollViewer.Extent.Height - _logScrollViewer.Viewport.Height);
-                _logScrollViewer.Offset = new Vector(_logScrollViewer.Offset.X, maxOffsetY);
+                _logScrollViewer.Offset = new Vector(0, maxOffsetY);
                 _logTextBox.CaretIndex = _logTextBox.Text?.Length ?? 0;
+                UpdateLastScrollMetrics();
             }
             finally
             {
                 _isProgrammaticScroll = false;
             }
 
-            UpdateScrollToBottomState();
+            if (remainingPasses > 0)
+            {
+                QueueScrollToEnd(remainingPasses - 1);
+                return;
+            }
+
+            _pendingAutoScrollToBottom = false;
+            _autoScrollToBottom = true;
+            SetScrollToBottomButtonVisible(false);
+            UpdateLastScrollMetrics();
         }, DispatcherPriority.Background);
     }
 
@@ -238,15 +290,26 @@ public partial class LogWindow : Window
 
             try
             {
-                var maxOffsetX = Math.Max(0, _logScrollViewer.Extent.Width - _logScrollViewer.Viewport.Width);
                 var maxOffsetY = Math.Max(0, _logScrollViewer.Extent.Height - _logScrollViewer.Viewport.Height);
-                _logScrollViewer.Offset = new Vector(Math.Min(offset.X, maxOffsetX), Math.Min(offset.Y, maxOffsetY));
+                _logScrollViewer.Offset = new Vector(0, Math.Min(offset.Y, maxOffsetY));
+                UpdateLastScrollMetrics();
             }
             finally
             {
                 _isProgrammaticScroll = false;
             }
         }, DispatcherPriority.Background);
+    }
+
+    private void UpdateLastScrollMetrics()
+    {
+        if (_logScrollViewer == null)
+        {
+            return;
+        }
+
+        _lastScrollOffsetY = _logScrollViewer.Offset.Y;
+        _lastScrollExtentHeight = _logScrollViewer.Extent.Height;
     }
 
     private void SetScrollToBottomButtonVisible(bool isVisible)
@@ -268,8 +331,16 @@ public partial class LogWindow : Window
         _stopServerButton.Content = isStopping
             ? "Stopping..."
             : canStop
-                ? "Stop Server"
+                ? "Stop Server & Exit"
                 : "Server stopped";
+    }
+
+    public void SetOpenInBrowserState(bool canOpen)
+    {
+        if (_openInBrowserButton != null)
+        {
+            _openInBrowserButton.IsEnabled = canOpen;
+        }
     }
 
     private void OnScrollToBottomClicked(object? sender, RoutedEventArgs e)
@@ -277,18 +348,24 @@ public partial class LogWindow : Window
         ScrollToEnd();
     }
 
+    private void OnOpenInBrowserClicked(object? sender, RoutedEventArgs e)
+    {
+        _openInBrowser?.Invoke();
+    }
+
     private async void OnStopServerClicked(object? sender, RoutedEventArgs e)
     {
-        if (_stopServerAsync == null)
+        if (_stopServerAndExitAsync == null)
         {
             return;
         }
 
         SetStopServerState(false, true);
+        SetOpenInBrowserState(false);
 
         try
         {
-            await _stopServerAsync();
+            await _stopServerAndExitAsync();
             SetStopServerState(true, false);
         }
         catch (Exception ex)

@@ -22,6 +22,7 @@ import { isMediaFile, pathExists } from "@/server/media/mediaFiles"
 import {
   isInputImportOutputActive,
   processInputFile,
+  type DeferredInputProcessingInfo,
   type DeferredInputWork,
   type QueueInputFileMove,
   type QueuedInputFileMove,
@@ -94,6 +95,12 @@ function formatWorkResultEpisode(result: WorkResultEpisode | null) {
 }
 
 function formatShutdownActiveWorkLabel(label: string) {
+  const importActionPrefix = "import-file-action:"
+
+  if (label.startsWith(importActionPrefix)) {
+    return label.slice(importActionPrefix.length)
+  }
+
   for (const kind of ["input", "library-sync", "library-delete"] as const) {
     const prefix = `${kind}:`
 
@@ -114,6 +121,36 @@ function formatShutdownActiveWorkLabel(label: string) {
   }
 
   return label
+}
+
+function formatImportFileActionKind(kind: ImportFileActionKind) {
+  switch (kind) {
+    case "video-transcode":
+      return "video transcode"
+    case "audio-transcode":
+      return "audio transcode"
+    case "container-remux":
+      return "MP4 remux"
+    case "direct-move":
+    case "direct-import":
+      return "direct import move"
+    case "existing-output":
+      return "existing output finalization"
+    case "catalog-only":
+      return "database cataloging"
+    case "transcode-output":
+      return "processed output move"
+    case "library-relocation":
+      return "library relocation"
+  }
+}
+
+function formatQueuedImportFileActionLabel(item: QueuedImportFileActionWork) {
+  return `${formatImportFileActionKind(item.kind)} - ${item.label}`
+}
+
+function formatProcessingInfoLabel(processing: DeferredInputProcessingInfo) {
+  return `${processing.animeTitle} - Season ${processing.seasonNumber}, Episode ${processing.episodeNumber} - ${processing.fileName}`
 }
 
 const scanIntervalMs = 5 * 60 * 1000
@@ -262,8 +299,8 @@ export function startWorkers() {
 
   console.log(
     config.importEnabled
-      ? "[Info] [Workers] Started background file watchers."
-      : "[Info] [Workers] Started input library watcher with import processing disabled."
+      ? "[Info] [File Import] Watching input and library folders."
+      : "[Info] [File Import] Watching input folder with import processing disabled."
   )
 
   async function pruneNonMediaOnlyDirectories(
@@ -343,11 +380,11 @@ export function startWorkers() {
         started = true
         processingHandle?.start()
         console.log(
-          `[Info] [Workers] Started background input work - ${deferredInfo.kind} - ${fileName(resolvedPath)}`
+          `[Info] [File Import] Running ${formatImportFileActionKind(deferredInfo.kind)} - ${fileName(resolvedPath)}`
         )
         await startWork()
         console.log(
-          `[Info] [Workers] Completed background input work - ${deferredInfo.kind} - ${fileName(resolvedPath)}`
+          `[Info] [File Import] Finished ${formatImportFileActionKind(deferredInfo.kind)} - ${fileName(resolvedPath)}`
         )
       } catch (error) {
         console.error(
@@ -449,11 +486,11 @@ export function startWorkers() {
         }
 
         console.log(
-          `[Info] [Workers] Started queued import file action - ${item.label}`
+          `[Info] [File Import] Running ${formatQueuedImportFileActionLabel(item)}`
         )
         await importFileActionContext.run({ id: item.id }, item.run)
         console.log(
-          `[Info] [Workers] Finished queued import file action - ${item.label}`
+          `[Info] [File Import] Finished ${formatQueuedImportFileActionLabel(item)}`
         )
       } catch (error) {
         console.error(
@@ -469,7 +506,7 @@ export function startWorkers() {
     debugWorkers(
       `Started queued import file action #${item.id} - ${item.label} - Active ${activeImportFileActionWork}/${maxActiveImportFileActionWork}`
     )
-    trackActiveWork(work, `import-file-action:${item.id}`)
+    trackActiveWork(work, `import-file-action:${formatQueuedImportFileActionLabel(item)}`)
   }
 
   function scheduleImportFileActionStart() {
@@ -530,9 +567,6 @@ export function startWorkers() {
     })
     nextImportFileActionSequence += 1
 
-    console.log(
-      `[Info] [Workers] Queued import file action - ${input.label} - ${pendingImportFileActionWork.length} waiting, ${activeImportFileActionWork}/${maxActiveImportFileActionWork} active`
-    )
     debugWorkers(
       `Queued import file action #${id} - Kind ${input.kind}, Priority ${input.priority}, Label ${input.label}`
     )
@@ -550,7 +584,9 @@ export function startWorkers() {
     const processingHandle = deferredInfo.processing
       ? registerMediaImportProcessingItem(deferredInfo.processing)
       : null
-    const label = `${deferredInfo.kind} - ${fileName(resolvedPath)}`
+    const label = deferredInfo.processing
+      ? formatProcessingInfoLabel(deferredInfo.processing)
+      : fileName(resolvedPath)
 
     queueImportFileAction({
       kind: deferredInfo.kind,
@@ -569,13 +605,7 @@ export function startWorkers() {
 
           started = true
           processingHandle?.start()
-          console.log(
-            `[Info] [Workers] Started background input work - ${deferredInfo.kind} - ${fileName(resolvedPath)}`
-          )
           await startWork()
-          console.log(
-            `[Info] [Workers] Completed background input work - ${deferredInfo.kind} - ${fileName(resolvedPath)}`
-          )
         } catch (error) {
           console.error(
             `[Error] [Workers] Background input work failed - startWorkers.ts - ${deferredInfo.kind} - ${resolvedPath} - ${errorMessage(error)}`
@@ -613,8 +643,8 @@ export function startWorkers() {
     const moveLabel = formatQueuedFileMoveKind(move.kind)
 
     if (importFileActionContext.getStore()) {
-      console.log(
-        `[Info] [Workers] Running ${moveLabel} inside active import file action - ${fileName(move.sourcePath)} -> ${fileName(move.destinationPath)}`
+      debugWorkers(
+        `Running ${moveLabel} inside active import file action - ${move.sourcePath} -> ${move.destinationPath}`
       )
       await startMove()
       return
@@ -627,17 +657,11 @@ export function startWorkers() {
     return new Promise<void>((resolve, reject) => {
       queueImportFileAction({
         kind: move.kind,
-        label: `${moveLabel} - ${fileName(move.sourcePath)} -> ${fileName(move.destinationPath)}`,
+        label: `${fileName(move.sourcePath)} -> ${fileName(move.destinationPath)}`,
         priority: getMoveWorkPriority(move.kind),
         run: async () => {
           try {
-            console.log(
-              `[Info] [Workers] Started queued ${moveLabel} - ${fileName(move.sourcePath)} -> ${fileName(move.destinationPath)}`
-            )
             await startMove()
-            console.log(
-              `[Info] [Workers] Completed queued ${moveLabel} - ${fileName(move.destinationPath)}`
-            )
             resolve()
           } catch (error) {
             console.error(
@@ -670,9 +694,6 @@ export function startWorkers() {
       })
     }
 
-    console.log(
-      `[Info] [Workers] Cancelled queued background input work during shutdown - ${deferredInfo.kind} - ${fileName(deferredInfo.filePath)}`
-    )
     debugWorkers(
       `Cancelled deferred input work registered after shutdown started - ${key} - ${deferredInfo.kind}`
     )
@@ -745,10 +766,6 @@ export function startWorkers() {
     let deferredWorkRegistered = false
     const work = (async () => {
       try {
-        console.log(
-          `[Info] [Workers] Started file work - ${fileName(resolvedPath)}`
-        )
-
         if (kind === "input") {
           const result = await processInputFile(resolvedPath, {
             shutdownSignal: shutdownAbortController.signal,
@@ -780,9 +797,6 @@ export function startWorkers() {
           )
         }
 
-        console.log(
-          `[Info] [Workers] Completed file work - ${fileName(resolvedPath)}`
-        )
       } catch (error) {
         console.error(
           `[Error] [Workers] Background file processing failed - startWorkers.ts - ${kind} - ${resolvedPath} - ${errorMessage(error)}`
@@ -878,7 +892,7 @@ export function startWorkers() {
     pendingWorkStarts.push({ kind, resolvedPath, key })
 
     if (options.log !== false) {
-      console.log(`[Info] [Workers] Queued file work - ${fileName(resolvedPath)}`)
+      debugWorkers(`Queued new file work - ${kind} - ${resolvedPath}`)
     }
 
     scheduleQueuedWorkStart()
@@ -891,7 +905,6 @@ export function startWorkers() {
     }
 
     scanning = true
-    console.log("[Info] [Workers] Scanning input folder.")
 
     try {
       const files = await walkFiles(config.inputDir, {
@@ -902,7 +915,6 @@ export function startWorkers() {
       debugWorkers(
         `Input folder scan found ${files.length} files, ${mediaFiles.length} media files.`
       )
-      console.log("[Info] [Workers] Input folder scan completed.")
 
       let queuedInputFiles = 0
 
@@ -918,7 +930,7 @@ export function startWorkers() {
 
       if (queuedInputFiles > 0) {
         console.log(
-          `[Info] [Workers] Queued ${queuedInputFiles} input media file(s) from scan.`
+          `[Info] [File Import] Found ${queuedInputFiles} input media file(s) to inspect from scan.`
         )
       }
 
@@ -953,7 +965,6 @@ export function startWorkers() {
     }
 
     scanning = true
-    console.log("[Info] [Workers] Scanning library folder.")
 
     try {
       const files = await walkFiles(config.mediaDir)
@@ -962,7 +973,6 @@ export function startWorkers() {
       debugWorkers(
         `Library folder scan found ${files.length} files, ${mediaFiles.length} media files.`
       )
-      console.log("[Info] [Workers] Library folder scan found media files.")
 
       let queuedLibraryFiles = 0
 
@@ -978,13 +988,12 @@ export function startWorkers() {
 
       if (queuedLibraryFiles > 0) {
         console.log(
-          `[Info] [Workers] Queued ${queuedLibraryFiles} library media file(s) from scan.`
+          `[Info] [File Import] Found ${queuedLibraryFiles} library media file(s) to sync from scan.`
         )
       }
 
       await scanKnownDeletedFiles()
 
-      console.log("[Info] [Workers] Library folder scan completed.")
     } catch (error) {
       console.error(
         `[Error] [Workers] Library folder scan failed - startWorkers.ts - ${config.mediaDir} - ${errorMessage(error)}`
@@ -1108,11 +1117,10 @@ export function startWorkers() {
     }
 
     if (cancelled.length > 0) {
-      console.log(
-        `[Info] [Workers] Cancelled ${cancelled.length} queued file work item(s) before shutdown.`
-      )
       debugWorkers(`Cancelled ${cancelled.length} queued work item(s) before shutdown.`)
     }
+
+    return cancelled.length
   }
 
   function cancelQueuedImportFileActionsForShutdown() {
@@ -1124,48 +1132,57 @@ export function startWorkers() {
     }
 
     if (cancelled.length > 0) {
-      console.log(
-        `[Info] [Workers] Cancelled ${cancelled.length} queued import file action(s) before shutdown.`
-      )
       debugWorkers(
         `Cancelled ${cancelled.length} queued import file action(s) before shutdown.`
       )
     }
+
+    return cancelled.length
+  }
+
+  function getActiveShutdownWorkSummary() {
+    const workerWork = [...activeWork]
+    const hasAniListWork = hasActiveAniListRefreshes()
+    const formattedLabels = workerWork.map((work) =>
+      formatShutdownActiveWorkLabel(activeWorkLabels.get(work) ?? "unknown")
+    )
+    const visibleLabels = formattedLabels.slice(0, 5)
+    const hiddenLabelCount = formattedLabels.length - visibleLabels.length
+
+    return {
+      workerWork,
+      hasAniListWork,
+      formattedLabels,
+      activeLabel: visibleLabels.length
+        ? `${visibleLabels.join("; ")}${hiddenLabelCount > 0 ? `; +${hiddenLabelCount} more` : ""}`
+        : "none",
+    }
   }
 
   async function waitForActiveShutdownWork() {
+    let loggedWaitSummary = false
+
     for (;;) {
-      const workerWork = [...activeWork]
-      const hasAniListWork = hasActiveAniListRefreshes()
+      const { workerWork, hasAniListWork, formattedLabels, activeLabel } =
+        getActiveShutdownWorkSummary()
 
       if (workerWork.length === 0 && !hasAniListWork) {
         return
       }
 
-      const formattedLabels = workerWork.map((work) =>
-        formatShutdownActiveWorkLabel(activeWorkLabels.get(work) ?? "unknown")
-      )
-      const visibleLabels = formattedLabels.slice(0, 5)
-      const hiddenLabelCount = formattedLabels.length - visibleLabels.length
-      const labelSuffix = visibleLabels.length
-        ? ` Active: ${visibleLabels.join("; ")}${hiddenLabelCount > 0 ? `; +${hiddenLabelCount} more` : ""}.`
-        : ""
+      if (!loggedWaitSummary) {
+        console.log(
+          `[Info] [Shutdown] Waiting for active work to finish - ${workerWork.length} worker task(s), AniList ${hasAniListWork ? "active" : "idle"}. Active: ${activeLabel}.`
+        )
+        debugWorkers(
+          `Waiting for active shutdown work - Workers ${workerWork.length}, AniList ${hasAniListWork ? "active" : "idle"}, Active ${formattedLabels.join("; ") || "none"}.`
+        )
+        loggedWaitSummary = true
+      }
 
-      console.log(
-        `[Info] [Workers] Shutdown still waiting - ${workerWork.length} worker task(s), AniList ${hasAniListWork ? "active" : "idle"}.${labelSuffix}`
-      )
-      debugWorkers(
-        `Waiting for active shutdown work - Workers ${workerWork.length}, AniList ${hasAniListWork ? "active" : "idle"}, Active ${formattedLabels.join("; ") || "none"}.`
-      )
-
-      await Promise.race([
-        Promise.allSettled([
-          ...workerWork,
-          ...(hasAniListWork ? [waitForActiveAniListRefreshes()] : []),
-        ]),
-        new Promise<void>((resolve) => {
-          setTimeout(resolve, 15_000)
-        }),
+      await Promise.allSettled([
+        ...workerWork,
+        ...(hasAniListWork ? [waitForActiveAniListRefreshes()] : []),
       ])
     }
   }
@@ -1173,7 +1190,7 @@ export function startWorkers() {
   async function stopInternal() {
     shuttingDown = true
     shutdownAbortController.abort()
-    console.log("[Info] [Workers] Stopping background workers.")
+    console.log("[Info] [Shutdown] Stopping background workers.")
 
     clearInterval(scanTimer)
 
@@ -1183,8 +1200,12 @@ export function startWorkers() {
     }
 
     debugWorkers("Shutdown started; new work is blocked and queued work will be cancelled.")
-    cancelQueuedFileWorkForShutdown()
-    cancelQueuedImportFileActionsForShutdown()
+    const cancelledFileWork = cancelQueuedFileWorkForShutdown()
+    const cancelledImportActions = cancelQueuedImportFileActionsForShutdown()
+
+    console.log(
+      `[Info] [Shutdown] Cleared queued work - ${cancelledFileWork} file task(s), ${cancelledImportActions} import action(s).`
+    )
 
     cancelPendingLiveTranscodes(
       "Server is shutting down. Live transcode request was cancelled"
@@ -1201,7 +1222,7 @@ export function startWorkers() {
 
     await waitForActiveShutdownWork()
 
-    console.log("[Info] [Workers] Background workers stopped.")
+    console.log("[Info] [Shutdown] Background workers stopped.")
     workerGlobal.__yamibunkoWorkerRuntime = undefined
   }
 
@@ -1321,11 +1342,7 @@ export function startWorkers() {
       process.exitCode = signalExitCode
       installProcessExitGuard()
       keepProcessAliveForShutdown()
-      console.log("");
-      console.log(`- - - - - - - - - - - - - - - - - - - - - - - - - - - -`)
-      console.log(`[Info] [Shutdown] Stopping gracefully.`)
-      console.log(`- - - - - - - - - - - - - - - - - - - - - - - - - - - -`)
-      console.log("")
+      console.log("[Info] [Shutdown] Stopping gracefully.")
 
       const runtime = workerGlobal.__yamibunkoWorkerRuntime
 
@@ -1339,7 +1356,7 @@ export function startWorkers() {
         .stop()
         .then(() => {
           releaseShutdownKeepAlive()
-          console.log("[Info] [Workers] Graceful shutdown completed. Exiting process.")
+          console.log("[Info] [Shutdown] Graceful shutdown completed. Exiting process.")
           exitAfterShutdown(0)
         })
         .catch((error) => {

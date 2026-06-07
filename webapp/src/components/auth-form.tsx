@@ -1,15 +1,57 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
+import { BadgeInfo } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { HoverHint } from "@/components/ui/hover-hint"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { isStrongPassword } from "@/lib/password-policy"
 
 type AuthFormProps = {
-  mode: "admin-registration" | "login"
+  mode: "registration" | "login"
+}
+
+const passwordRequirements = [
+  "At least 12 characters",
+  "One lowercase letter from a-z",
+  "One uppercase letter from A-Z",
+  "One number from 0-9",
+  "One special character, such as ! @ # $ % ^ & *",
+]
+
+function PasswordRequirementsHint() {
+  return (
+    <HoverHint
+      align="end"
+      side="top"
+      label={
+        <span className="block text-left">
+          <span className="block font-medium text-zinc-100">
+            Password needs:
+          </span>
+          <span className="mt-1 block space-y-0.5">
+            {passwordRequirements.map((requirement) => (
+              <span key={requirement} className="block">
+                • {requirement}
+              </span>
+            ))}
+          </span>
+        </span>
+      }
+    >
+      <span
+        aria-label="Password requirements"
+        className="inline-flex size-5 cursor-help items-center justify-center rounded-full text-zinc-400 transition-colors hover:text-zinc-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60"
+        role="button"
+        tabIndex={0}
+      >
+        <BadgeInfo className="size-4" aria-hidden="true" />
+      </span>
+    </HoverHint>
+  )
 }
 
 export function AuthForm({ mode }: AuthFormProps) {
@@ -24,9 +66,9 @@ export function AuthForm({ mode }: AuthFormProps) {
   const pendingPasswordSetup =
     mode === "login" && pendingPasswordSetupUsername === normalizedUsername
   const title =
-    mode === "admin-registration" || pendingPasswordSetup ? "Register" : "Login"
+    mode === "registration" || pendingPasswordSetup ? "Register" : "Login"
   const endpoint =
-    mode === "admin-registration" ? "/api/auth/register" : "/api/auth/login"
+    mode === "registration" ? "/api/auth/register" : "/api/auth/login"
   const canSubmit = useMemo(
     () => username.trim().length >= 3 && isStrongPassword(password),
     [password, username]
@@ -122,16 +164,19 @@ export function AuthForm({ mode }: AuthFormProps) {
             />
           </div>
           <div className="space-y-1.5">
-            <Label htmlFor="password" className="text-zinc-400">
-              Password
-            </Label>
+            <div className="flex items-center justify-between gap-2">
+              <Label htmlFor="password" className="text-zinc-400">
+                Password
+              </Label>
+              {mode === "registration" ? <PasswordRequirementsHint /> : null}
+            </div>
             <Input
               id="password"
               value={password}
               onChange={(event) => setPassword(event.target.value)}
               type="password"
               autoComplete={
-                mode === "admin-registration" || pendingPasswordSetup
+                mode === "registration" || pendingPasswordSetup
                   ? "new-password"
                   : "current-password"
               }

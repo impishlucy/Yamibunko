@@ -13,6 +13,7 @@ public partial class App : Application
     public static ServerManager ServerManager { get; } = new();
 
     private LogWindow? _logWindow;
+    private NativeMenuItem? _openInBrowserTrayMenuItem;
     private NativeMenuItem? _stopServerTrayMenuItem;
     private bool _shutdownRequested;
     private bool _shutdownCompleted;
@@ -42,7 +43,8 @@ public partial class App : Application
             desktop.ShutdownRequested += OnShutdownRequested;
             desktop.Exit += (s, e) => ServerManager.StopServer();
 
-            _stopServerTrayMenuItem = FindStopServerTrayMenuItem();
+            _openInBrowserTrayMenuItem = FindTrayMenuItem("Open in Browser");
+            _stopServerTrayMenuItem = FindTrayMenuItem("Stop Server & Exit");
             ServerManager.LogsWindowRequested += ShowLogsWindow;
             ServerManager.ServerStopStateChanged += OnServerStopStateChanged;
             UpdateStopServerControls();
@@ -84,7 +86,7 @@ public partial class App : Application
 
         if (_logWindow == null || !_logWindow.IsVisible)
         {
-            _logWindow = new LogWindow(ServerManager.ServerLogs, ServerManager.StopServerAsync);
+            _logWindow = new LogWindow(ServerManager.ServerLogs, StopServerAndShutdownAsync, OpenInBrowser);
             _logWindow.Closed += (_, _) => _logWindow = null;
             _logWindow.Show();
         }
@@ -100,9 +102,30 @@ public partial class App : Application
         _logWindow.Focus();
     }
 
+    private void OnOpenBrowserClicked(object? sender, EventArgs e)
+    {
+        OpenInBrowser();
+    }
+
+    private void OpenInBrowser()
+    {
+        if (_shutdownRequested || !ServerManager.CanOpenInBrowser)
+        {
+            return;
+        }
+
+        var settings = AppSettings.Load();
+        if (settings == null || string.IsNullOrWhiteSpace(settings.BaseUrl))
+        {
+            ShowLogsWindow();
+            return;
+        }
+
+        ServerManager.OpenUrl(settings.BaseUrl);
+    }
+
     private async void OnExitClicked(object? sender, EventArgs e)
     {
-        ShowLogsWindow();
         await StopServerAndShutdownAsync();
     }
 
@@ -114,7 +137,6 @@ public partial class App : Application
         }
 
         e.Cancel = true;
-        ShowLogsWindow();
         await StopServerAndShutdownAsync();
     }
 
@@ -127,7 +149,9 @@ public partial class App : Application
         }
 
         _shutdownRequested = true;
+        DisableOpenInBrowserControls();
         UpdateStopServerControls();
+        ShowLogsWindow();
         await ServerManager.StopServerAsync();
         _shutdownCompleted = true;
 
@@ -148,8 +172,18 @@ public partial class App : Application
         UpdateStopServerControls();
     }
 
+    private void DisableOpenInBrowserControls()
+    {
+        if (_openInBrowserTrayMenuItem != null)
+        {
+            _openInBrowserTrayMenuItem.IsEnabled = false;
+        }
 
-    private NativeMenuItem? FindStopServerTrayMenuItem()
+        _logWindow?.SetOpenInBrowserState(false);
+    }
+
+
+    private NativeMenuItem? FindTrayMenuItem(string header)
     {
         var trayIcons = TrayIcon.GetIcons(this);
         if (trayIcons == null)
@@ -167,7 +201,7 @@ public partial class App : Application
 
             foreach (var item in menu.Items)
             {
-                if (item is NativeMenuItem menuItem && string.Equals(menuItem.Header?.ToString(), "Stop Server & Exit", StringComparison.Ordinal))
+                if (item is NativeMenuItem menuItem && string.Equals(menuItem.Header?.ToString(), header, StringComparison.Ordinal))
                 {
                     return menuItem;
                 }
@@ -181,6 +215,12 @@ public partial class App : Application
     {
         var canStop = ServerManager.CanStopServer && !_shutdownRequested;
         var isStopping = ServerManager.IsStoppingServer || _shutdownRequested;
+        var canOpenInBrowser = ServerManager.CanOpenInBrowser && !_shutdownRequested;
+
+        if (_openInBrowserTrayMenuItem != null)
+        {
+            _openInBrowserTrayMenuItem.IsEnabled = canOpenInBrowser;
+        }
 
         if (_stopServerTrayMenuItem != null)
         {
@@ -189,5 +229,6 @@ public partial class App : Application
         }
 
         _logWindow?.SetStopServerState(canStop, isStopping);
+        _logWindow?.SetOpenInBrowserState(canOpenInBrowser);
     }
 }

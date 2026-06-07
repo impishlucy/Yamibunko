@@ -125,7 +125,7 @@ export async function exchangeAniListAuthorizationCode(
   const redirectUri = await getAniListRedirectUri(request)
   console.log("[Info] [Anilist] Exchanging OAuth authorization code.")
 
-  const response = await queueAniListOperation(() =>
+  const response = await queueAniListOperation((signal) =>
     fetch("https://anilist.co/api/v2/oauth/token", {
       method: "POST",
       headers: {
@@ -139,7 +139,9 @@ export async function exchangeAniListAuthorizationCode(
         redirect_uri: redirectUri,
         code,
       }),
-    })
+      signal,
+    }),
+    { label: "Exchange AniList OAuth authorization code" }
   )
 
   if (!response.ok) {
@@ -188,8 +190,9 @@ function decodeAniListUserIdFromToken(accessToken: string) {
 
 export async function getAniListViewer(accessToken: string) {
   const userId = decodeAniListUserIdFromToken(accessToken)
-  const result = await queueAniListOperation(() =>
-    getAniListClient(accessToken).user.getUserInfo(userId)
+  const result = await queueAniListOperation(
+    () => getAniListClient(accessToken).user.getUserInfo(userId),
+    { label: `Load AniList viewer ${userId}` }
   )
   const viewer = result.User as AniListViewer | null
 
@@ -320,8 +323,9 @@ async function readUserInfo(input: {
   accessToken: string
   aniListUserId: number
 }) {
-  const result = await queueAniListOperation(() =>
-    getAniListClient(input.accessToken).user.getUserInfo(input.aniListUserId)
+  const result = await queueAniListOperation(
+    () => getAniListClient(input.accessToken).user.getUserInfo(input.aniListUserId),
+    { label: `Read AniList user info ${input.aniListUserId}` }
   )
 
   return result.User as AniListViewer | null
@@ -331,11 +335,13 @@ async function readUserAnimeList(input: {
   accessToken: string
   aniListUserId: number
 }) {
-  const result = await queueAniListOperation(() =>
-    getAniListClient(input.accessToken).media.getMediaList(
-      input.aniListUserId,
-      "ANIME"
-    )
+  const result = await queueAniListOperation(
+    () =>
+      getAniListClient(input.accessToken).media.getMediaList(
+        input.aniListUserId,
+        "ANIME"
+      ),
+    { label: `Read AniList anime list ${input.aniListUserId}` }
   )
 
   return flattenListEntries(result as AniListListCollection)
@@ -485,8 +491,9 @@ export async function saveAniListProgress(input: {
     score: current?.score ?? undefined,
   }
 
-  const saved = await queueAniListOperation(() =>
-    getAniListClient(accessToken).mediaList.saveEntry(saveInput)
+  const saved = await queueAniListOperation(
+    () => getAniListClient(accessToken).mediaList.saveEntry(saveInput),
+    { label: `Save AniList progress for anime ${input.animeId}` }
   )
   const rawSavedEntry = (saved.SaveMediaListEntry ?? null) as AniListListEntry | null
   const savedEntry = rawSavedEntry ?? null
@@ -546,8 +553,9 @@ export async function markAniListWatchingStarted(input: {
     saveInput.repeat = repeat
   }
 
-  const saved = await queueAniListOperation(() =>
-    getAniListClient(accessToken).mediaList.saveEntry(saveInput)
+  const saved = await queueAniListOperation(
+    () => getAniListClient(accessToken).mediaList.saveEntry(saveInput),
+    { label: `Mark AniList watching for anime ${input.animeId}` }
   )
   const rawSavedEntry = (saved.SaveMediaListEntry ?? null) as AniListListEntry | null
   const savedEntry = rawSavedEntry ?? null
@@ -593,8 +601,9 @@ export async function saveAniListRating(input: {
     score,
   }
 
-  const saved = await queueAniListOperation(() =>
-    getAniListClient(accessToken).mediaList.saveEntry(saveInput)
+  const saved = await queueAniListOperation(
+    () => getAniListClient(accessToken).mediaList.saveEntry(saveInput),
+    { label: `Save AniList rating for anime ${input.animeId}` }
   )
   const rawSavedEntry = (saved.SaveMediaListEntry ?? null) as AniListListEntry | null
   const savedEntry = rawSavedEntry ?? null

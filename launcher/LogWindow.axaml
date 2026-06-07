@@ -12,7 +12,7 @@
                     BorderThickness="1">
                 <ScrollViewer x:Name="LogScrollViewer"
                               VerticalScrollBarVisibility="Auto"
-                              HorizontalScrollBarVisibility="Auto">
+                              HorizontalScrollBarVisibility="Disabled">
                     <TextBox x:Name="LogTextBox"
                              Background="Transparent"
                              Foreground="#E4E4E7"
@@ -22,7 +22,7 @@
                              FontSize="13"
                              AcceptsReturn="True"
                              IsReadOnly="True"
-                             TextWrapping="NoWrap" />
+                             TextWrapping="Wrap" />
                 </ScrollViewer>
             </Border>
 
@@ -54,8 +54,11 @@
         </Grid>
 
         <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+            <Button x:Name="OpenInBrowserButton" MinWidth="120" Padding="14,8" IsEnabled="False">
+                Open in Browser
+            </Button>
             <Button x:Name="StopServerButton" MinWidth="120" Padding="14,8">
-                Stop Server
+                Stop Server &amp; Exit
             </Button>
         </StackPanel>
     </Grid>

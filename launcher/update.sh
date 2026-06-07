@@ -276,9 +276,6 @@ fi
 printf "Updating files...\n"
 cp -a "$source_dir"/. "$install_dir"/ || fail "Could not copy the updated files."
 
-if [ -d "$webapp_dir/.next" ]; then
-  rm -rf "$webapp_dir/.next" || fail "Could not delete webapp/.next."
-fi
 
 printf "Update done.\n"
 wait_before_exit

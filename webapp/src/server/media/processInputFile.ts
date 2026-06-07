@@ -23,7 +23,6 @@ import {
   ffprobe,
   getFileSubtitleInputArgs,
   getHardwareInputArgs,
-  getHardwareInputLabel,
   getHevcFileArgs,
   runFfmpeg,
   type Mp4SubtitleOutputStream,
@@ -227,7 +226,7 @@ function formatDeferredWorkKind(kind: DeferredInputWorkKind) {
     return "catalog-only library registration"
   }
 
-  return "direct library move"
+  return "direct import move"
 }
 
 function isTranscodeWaitCancellation(error: unknown) {
@@ -349,9 +348,6 @@ function calculateBytesPerMinute(
   return fileSizeBytes / durationMinutes
 }
 
-function formatMegabytesPerMinute(bytesPerMinute: number) {
-  return (bytesPerMinute / 1024 / 1024).toFixed(1)
-}
 
 function metadataTitle(metadata: {
   id: number
@@ -399,30 +395,6 @@ function mediaFolderSegments(input: {
   }
 
   return [formatSeasonFolderName(input.season)]
-}
-
-function summarizeProbe(probe: ProbeResult) {
-  const streams = probe.streams ?? []
-
-  return {
-    videoCodecs: [
-      ...new Set(
-        streams
-          .filter((stream) => stream.codec_type === "video")
-          .map((stream) => stream.codec_name ?? "unknown")
-      ),
-    ],
-    audioCodecs: [
-      ...new Set(
-        streams
-          .filter((stream) => stream.codec_type === "audio")
-          .map((stream) => stream.codec_name ?? "unknown")
-      ),
-    ],
-    subtitleStreams: streams.filter(
-      (stream) => stream.codec_type === "subtitle"
-    ).length,
-  }
 }
 
 async function replaceFile(
@@ -917,9 +889,6 @@ export async function processInputFile(
   const config = getServerConfig()
   const importEnabled = config.importEnabled
 
-  console.log(
-    `[Info] [Media] Input file processing started - ${fileName(filePath)}`
-  )
   debugImport(jobId, `Created media-processing job for ${filePath}`)
 
   try {
@@ -932,9 +901,6 @@ export async function processInputFile(
 
     debugImport(jobId, `Checking media file extension - ${filePath}`)
     if (!isMediaFile(filePath)) {
-      console.log(
-        `[Info] [Media] Skipped non-media input file - ${fileName(filePath)}`
-      )
       updateJob(jobId, {
         status: "skipped",
         message: "Skipped non-media file.",
@@ -955,9 +921,6 @@ export async function processInputFile(
     }
     debugImport(jobId, "Input path exists.")
 
-    console.log(
-      `[Info] [Media] Waiting for input file to become stable - ${fileName(filePath)}`
-    )
     await waitForStableFile(filePath)
     debugImport(jobId, "Input file is stable.")
 
@@ -1010,9 +973,6 @@ export async function processInputFile(
       }
     }
 
-    console.log(
-      `[Info] [Media] Recognized input file - Title: ${parsed.title}, Season: ${parsed.season}${parsed.part ? `, Part: ${parsed.part}` : ""}, Episode: ${parsed.episode}`
-    )
     debugImport(
       jobId,
       `Parsed input file - Title ${parsed.title}, Season ${parsed.season}${parsed.part ? `, Part ${parsed.part}` : ""}, Episode ${parsed.episode}`
@@ -1066,9 +1026,6 @@ export async function processInputFile(
 
           metadata = fallbackMetadata
           resolvedParsed = { ...parsed, title: fallbackTitle }
-          console.log(
-            `[Info] [Media] Folder title fallback matched AniList metadata - ${fallbackTitle} - ${fileName(filePath)}`
-          )
           debugImport(jobId, `Folder title fallback matched - ${fallbackTitle}.`)
           break
         }
@@ -1148,21 +1105,11 @@ export async function processInputFile(
     )
 
     if (librarySeason !== inputParsed.season) {
-      console.log(
-        `[Info] [Media] Resolved library season - Parsed Season ${inputParsed.season}, Library Season ${librarySeason}, Anime id ${inputMetadata.id}`
-      )
       debugImport(
         jobId,
         `Library season resolved from parsed season ${inputParsed.season} to ${librarySeason}.`
       )
     }
-
-    console.log(
-      `[Info] [Media] Resolved AniList metadata - Found match ${
-        inputMetadata.title.english ??
-        inputParsed.title
-      } - id ${inputMetadata.id}`
-    )
 
     updateJob(jobId, {
       animeId: inputMetadata.id,
@@ -1243,6 +1190,10 @@ export async function processInputFile(
 
     const library = resolvedLibrary
     const libraryTitle = library.title
+
+    console.log(
+      `[Info] [Media] Detected input episode - Anime: ${libraryTitle}, Season ${librarySeason}, Episode ${inputParsed.episode} - ${fileName(filePath)}`
+    )
 
     function emitEpisodeAdded() {
       emitLibraryChange({
@@ -1329,12 +1280,17 @@ export async function processInputFile(
       work: () => Promise<ProcessInputFileResult>
       processing?: DeferredInputProcessingInfo
     }): ProcessInputFileResult {
+      const label = formatDeferredWorkKind(input.kind)
       const startDeferredWork = () =>
         runDeferredImportWork({
           kind: input.kind,
           outputPath: input.outputPath,
           work: input.work,
         })
+
+      console.log(
+        `[Info] [File Import] ${input.kind === "catalog-only" ? "Scheduled" : "Added to queue"} - ${label} - Anime: ${libraryTitle}, Season ${librarySeason}, Episode ${inputParsed.episode} - ${fileName(filePath)}`
+      )
 
       if (options.onDeferredWork) {
         options.onDeferredWork(startDeferredWork, {
@@ -1438,10 +1394,6 @@ export async function processInputFile(
           message: "Generating thumbnail.",
         })
 
-        console.log(
-          `[Info] [Media] Generating episode thumbnail - ${fileName(resolvedInputPath)}`
-        )
-
         const thumbnailPath = await generateEpisodeThumbnail(
           resolvedInputPath,
           durationSeconds
@@ -1459,6 +1411,10 @@ export async function processInputFile(
           })
         )
         emitEpisodeAdded()
+
+        console.log(
+          `[Info] [Media] Database import completed - Anime: ${libraryTitle}, Season ${librarySeason}, Episode ${inputParsed.episode} - ${fileName(resolvedInputPath)}`
+        )
 
         const message = "Input file added to the library without moving, deleting, or transcoding."
 
@@ -1482,9 +1438,6 @@ export async function processInputFile(
       updateJob(jobId, {
         message: "Cataloging input file in background.",
       })
-      console.log(
-        `[Info] [Media] Cataloging input file in background - ${fileName(filePath)}`
-      )
       debugImport(jobId, "Catalog-only import moved to immediate background work.")
 
       return queueDeferredImportWork({
@@ -1692,14 +1645,8 @@ export async function processInputFile(
     } else {
       debugImport(jobId, "No existing episode/file conflict found.")
     }
-
-    const summary = summarizeProbe(probe)
     const importAnimeId = inputMetadata.id
     const importEpisodeNumber = inputParsed.episode
-
-    console.log(
-      `[Info] [Media] Media stream inspection completed - ${fileName(filePath)} - Video: ${summary.videoCodecs.join(", ") || "unknown"}, Audio: ${summary.audioCodecs.join(", ") || "unknown"}, Duration: ${Math.round(durationSeconds)}s, Size: ${formatMegabytesPerMinute(inputBytesPerMinute)} MB/min`
-    )
 
     async function finalizeImport(input: {
       planned: boolean
@@ -1709,10 +1656,6 @@ export async function processInputFile(
         outputPath: finalPath,
         message: "Generating thumbnail.",
       })
-
-      console.log(
-        `[Info] [Media] Generating episode thumbnail - ${fileName(finalPath)}`
-      )
 
       debugImport(jobId, `Checking output file before thumbnail - ${finalPath}`)
       if (!(await pathExists(finalPath))) {
@@ -1739,7 +1682,7 @@ export async function processInputFile(
       emitEpisodeAdded()
 
       console.log(
-        `[Info] [Media] Episode added to database - Anime id ${importAnimeId}, Season ${librarySeason}, Episode ${importEpisodeNumber}`
+        `[Info] [Media] Database import completed - Anime: ${libraryTitle}, Season ${librarySeason}, Episode ${importEpisodeNumber} - ${fileName(finalPath)}`
       )
       debugImport(jobId, "Episode row saved.")
 
@@ -1761,14 +1704,6 @@ export async function processInputFile(
     }
 
     async function runFfmpegProcessing() {
-      const processingLabel = convertVideo
-        ? videoTranscodeReason === "shrink"
-          ? "shrinking video transcode"
-          : "full video transcode"
-        : convertAudioToAac
-          ? "audio transcode"
-          : "MP4 remux"
-
       updateJob(jobId, {
         message: convertVideo
           ? videoTranscodeReason === "shrink"
@@ -1778,10 +1713,6 @@ export async function processInputFile(
             ? "Converting audio tracks to LC-AAC."
             : "Remuxing media file to MP4.",
       })
-
-      console.log(
-        `[Info] [Media] Starting ${processingLabel} - ${fileName(filePath)} - Accel: ${config.transcodeAccel}, HW decode: ${convertVideo ? getHardwareInputLabel() : "not needed"}, HEVC: ${inputHasHevcVideo ? "yes" : "no"}, Size: ${formatMegabytesPerMinute(inputBytesPerMinute)} MB/min, AAC audio tracks: ${audioOutputIndexesToAac.length ? audioOutputIndexesToAac.join(", ") : "none"}, MP4 remux: ${requiresMp4ContainerRemux ? "yes" : "no"}, Target: ${formatMegabytesPerMinute(targetBytesPerMinute)} MB/min, Bitrate: ${videoBitrateKbps}k, Maxrate: ${calculateVideoBitrateKbps(maxHevcBytesPerMinute)}k`
-      )
 
       await transcodeFile(filePath, tempPath, {
         convertVideo,
@@ -1793,9 +1724,6 @@ export async function processInputFile(
       })
       debugImport(jobId, "FFmpeg processing step completed successfully.")
 
-      console.log(
-        `[Info] [Media] Media processing completed - ${fileName(filePath)}`
-      )
       updateJob(jobId, {
         message: "Moving processed output into the library.",
       })
@@ -1842,10 +1770,6 @@ export async function processInputFile(
         message: "Moving direct-import media file.",
       })
 
-      console.log(
-        `[Info] [Media] Skipping processing and moving direct-import file - ${fileName(filePath)}`
-      )
-
       await moveLibraryFileThroughQueue(filePath, finalPath, "direct-import")
 
       if (await pathExists(filePath)) {
@@ -1868,9 +1792,6 @@ export async function processInputFile(
       updateJob(jobId, {
         message: "Finishing existing output import in background.",
       })
-      console.log(
-        `[Info] [Media] Finishing existing output import in background - ${fileName(filePath)}`
-      )
       debugImport(jobId, "Existing output finalization moved to immediate background work.")
 
       return queueDeferredImportWork({
@@ -1890,9 +1811,6 @@ export async function processInputFile(
       updateJob(jobId, {
         message: videoQueueMessage,
       })
-      console.log(
-        `[Info] [Media] ${videoQueueMessage.replace(/\.$/, "")} and continuing import scan - ${fileName(filePath)}`
-      )
       debugImport(jobId, "Video transcode queued in the shared file-edit queue so other import inspections can continue.")
 
       return queueDeferredImportWork({
@@ -1916,9 +1834,6 @@ export async function processInputFile(
       updateJob(jobId, {
         message: queueMessage,
       })
-      console.log(
-        `[Info] [Media] ${convertAudioToAac ? "Queued audio transcode" : "Queued MP4 remux"} and continuing import scan - ${fileName(filePath)}`
-      )
       debugImport(
         jobId,
         convertAudioToAac
@@ -1946,9 +1861,6 @@ export async function processInputFile(
     updateJob(jobId, {
       message: "Moving direct-import media file in background.",
     })
-    console.log(
-      `[Info] [Media] Moving direct-import media file in background - ${fileName(filePath)}`
-    )
     debugImport(jobId, "Direct-import move queued for file-edit processing.")
 
     return queueDeferredImportWork({

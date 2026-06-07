@@ -23,6 +23,7 @@
                 <TrayIcon.Menu>
                     <NativeMenu>
                         <NativeMenuItem Header="Show Logs" Click="OnShowLogsClicked"/>
+                        <NativeMenuItem Header="Open in Browser" Click="OnOpenBrowserClicked" IsEnabled="False"/>
                         <NativeMenuItemSeparator/>
                         <NativeMenuItem Header="Stop Server &amp; Exit" Click="OnExitClicked"/>
                     </NativeMenu>
