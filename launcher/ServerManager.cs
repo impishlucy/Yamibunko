@@ -25,6 +25,7 @@ public class ServerManager
     private static readonly TimeSpan HardwareDetectionTimeout = TimeSpan.FromSeconds(8);
 
     private Process? _serverProcess;
+    private Task? _stopServerTask;
     private IntPtr _serverJobHandle = IntPtr.Zero;
     private readonly object _shutdownLock = new();
     private readonly string _pidFile = Path.Combine(AppContext.BaseDirectory, "server.pid");
@@ -152,37 +153,52 @@ public class ServerManager
 
     public void StopServer()
     {
+        StopServerAsync().GetAwaiter().GetResult();
+    }
+
+    public Task StopServerAsync()
+    {
         lock (_shutdownLock)
         {
-            var process = _serverProcess;
-            _serverProcess = null;
+            _stopServerTask ??= StopServerCoreAsync(_serverProcess);
+            return _stopServerTask;
+        }
+    }
 
-            try
+    private async Task StopServerCoreAsync(Process? process)
+    {
+        try
+        {
+            if (process != null)
             {
-                if (process != null)
+                await StopProcessTreeAsync(process);
+            }
+            else
+            {
+                CloseServerJob();
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Failed to stop server: {ex.Message}");
+            Log($"Server shutdown failed: {ex.Message}");
+            ShowLogsWindow();
+        }
+        finally
+        {
+            lock (_shutdownLock)
+            {
+                if (ReferenceEquals(_serverProcess, process))
                 {
-                    try
-                    {
-                        StopProcessTree(process);
-                    }
-                    finally
-                    {
-                        CloseServerJob();
-                        process.Dispose();
-                    }
-                }
-                else
-                {
-                    CloseServerJob();
+                    _serverProcess = null;
                 }
 
-                TryDeleteFile(_pidFile);
+                _stopServerTask = null;
             }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Failed to stop server: {ex.Message}");
-                ShowLogsWindow();
-            }
+
+            process?.Dispose();
+            CloseServerJob();
+            TryDeleteFile(_pidFile);
         }
     }
 
@@ -527,68 +543,100 @@ public class ServerManager
         return process;
     }
 
-    private async void StopProcessTree(Process process)
+    private async Task StopProcessTreeAsync(Process process)
     {
         try
         {
             if (process.HasExited)
             {
+                Log("Server process already stopped.");
                 return;
             }
 
             Log("Requesting graceful shutdown...");
+            await RequestGracefulShutdownAsync(process);
+            Log("Waiting for the server to finish active work...");
 
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            {
-                using var taskKill = Process.Start(new ProcessStartInfo
-                {
-                    FileName = "taskkill",
-                    Arguments = $"/PID {process.Id} /T",
-                    CreateNoWindow = true,
-                    UseShellExecute = false
-                });
-#pragma warning disable CS8602 // Dereference of a possibly null reference.
-                await taskKill?.WaitForExitAsync();
-#pragma warning restore CS8602 // Dereference of a possibly null reference.
-            }
-            else
-            {
-                using var killProcess = Process.Start(new ProcessStartInfo
-                {
-                    FileName = "kill",
-                    Arguments = $"-SIGINT {process.Id}",
-                    CreateNoWindow = true,
-                    UseShellExecute = false
-                });
-#pragma warning disable CS8602 // Dereference of a possibly null reference.
-                await killProcess?.WaitForExitAsync();
-#pragma warning restore CS8602 // Dereference of a possibly null reference.
-            }
-
-            if (process.WaitForExit(30000))
-            {
-                Log("Server process stopped gracefully.");
-                return;
-            }
-
-            Log("Process did not exit gracefully, forcing hard kill...");
-            process.Kill(true);
-
-            if (process.WaitForExit(5000))
-            {
-                Log("Server process force stopped.");
-                return;
-            }
-
-            Log("Server process did not exit after hard kill request.");
+            await process.WaitForExitAsync();
+            process.WaitForExit();
+            Log("Server process stopped gracefully.");
         }
         catch (InvalidOperationException)
         {
-            // The process already exited before we could interact with it
+            Log("Server process already stopped.");
         }
         catch (Exception ex)
         {
             Log($"Server process stop failed: {ex.Message}");
+        }
+    }
+
+    private async Task RequestGracefulShutdownAsync(Process process)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            if (TrySendWindowsCtrlC(process))
+            {
+                return;
+            }
+
+            await RunSignalCommandAsync("taskkill", $"/PID {process.Id} /T");
+            return;
+        }
+
+        await RunSignalCommandAsync("kill", $"-SIGINT {process.Id}");
+    }
+
+    private async Task RunSignalCommandAsync(string fileName, string arguments)
+    {
+        using var signalProcess = Process.Start(new ProcessStartInfo
+        {
+            FileName = fileName,
+            Arguments = arguments,
+            CreateNoWindow = true,
+            UseShellExecute = false
+        });
+
+        if (signalProcess != null)
+        {
+            await signalProcess.WaitForExitAsync();
+        }
+    }
+
+    private bool TrySendWindowsCtrlC(Process process)
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return false;
+        }
+
+        try
+        {
+            if (!AttachConsole((uint)process.Id))
+            {
+                return false;
+            }
+
+            SetConsoleCtrlHandler(null, true);
+            var sent = GenerateConsoleCtrlEvent(CtrlCEvent, 0);
+            Thread.Sleep(250);
+            FreeConsole();
+            SetConsoleCtrlHandler(null, false);
+
+            return sent;
+        }
+        catch
+        {
+            try
+            {
+                FreeConsole();
+                SetConsoleCtrlHandler(null, false);
+            }
+            catch
+            {
+            }
+
+            return false;
         }
     }
 
@@ -1102,6 +1150,22 @@ public class ServerManager
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr handle);
+
+    private const uint CtrlCEvent = 0;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AttachConsole(uint processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool FreeConsole();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GenerateConsoleCtrlEvent(uint ctrlEvent, uint processGroupId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetConsoleCtrlHandler(ConsoleCtrlDelegate? handlerRoutine, bool add);
+
+    private delegate bool ConsoleCtrlDelegate(uint ctrlType);
 
     public static void OpenUrl(string url)
     {

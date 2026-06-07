@@ -145,8 +145,19 @@ const inFlightMetadataLookups = new Map<
 >()
 const recentMetadataLookups = new Map<
   string,
-  { metadata: AnimeMetadataInput | null; createdAt: number }
+  { metadata: AnimeMetadataInput; createdAt: number }
 >()
+
+export class AniListMetadataLookupUnavailableError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "AniListMetadataLookupUnavailableError"
+  }
+}
+
+export function isAniListMetadataLookupUnavailableError(error: unknown) {
+  return error instanceof AniListMetadataLookupUnavailableError
+}
 
 function normalizeMetadataLookupTitle(title: string) {
   return title.trim().replace(/\s+/g, " ").toLowerCase()
@@ -981,7 +992,11 @@ export async function findAnimeMetadata(
 
   try {
     const metadata = await lookup
-    recentMetadataLookups.set(key, { metadata, createdAt: Date.now() })
+
+    if (metadata) {
+      recentMetadataLookups.set(key, { metadata, createdAt: Date.now() })
+    }
+
     return metadata
   } finally {
     inFlightMetadataLookups.delete(key)
@@ -1017,17 +1032,29 @@ async function findAnimeMetadataUncached(
     return attachLibraryInfo(cached)
   }
 
+  const lookupErrors: string[] = []
+
   for (const candidate of getSearchCandidates(title, season, part)) {
     console.log(`[Info] [Anilist] Searching anime metadata - ${candidate}`)
 
-    const result = await queueAniListOperation(() =>
-      getAniListClient().anime.getAnimeBySearch(candidate, 1, 10)
-    ).catch((error) => {
-      console.warn(
-        `[Warn] [Anilist] Anime metadata search failed - ${candidate} - ${errorMessage(error)}`
+    let result: {
+      Page?: {
+        media?: Array<AniListMediaNode | null> | null
+      } | null
+    } | null = null
+
+    try {
+      result = await queueAniListOperation(() =>
+        getAniListClient().anime.getAnimeBySearch(candidate, 1, 10)
       )
-      return null
-    })
+    } catch (error) {
+      const message = errorMessage(error)
+      lookupErrors.push(`${candidate}: ${message}`)
+      console.warn(
+        `[Warn] [Anilist] Anime metadata search failed - ${candidate} - ${message}`
+      )
+      continue
+    }
 
     if (!result) {
       continue
@@ -1100,6 +1127,12 @@ async function findAnimeMetadataUncached(
         return attachLibraryInfo(metadata)
       }
     }
+  }
+
+  if (lookupErrors.length > 0) {
+    throw new AniListMetadataLookupUnavailableError(
+      `AniList metadata lookup was incomplete for "${title}": ${lookupErrors.join("; ")}`
+    )
   }
 
   if (part && part > 1) {

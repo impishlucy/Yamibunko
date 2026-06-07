@@ -2,7 +2,11 @@ import chokidar, { type FSWatcher } from "chokidar"
 import { readdir, rm } from "node:fs/promises"
 import path from "node:path"
 
-import { runFullAniListRefresh } from "@/server/anilist/sync"
+import {
+  hasActiveAniListRefreshes,
+  runFullAniListRefresh,
+  waitForActiveAniListRefreshes,
+} from "@/server/anilist/sync"
 import {
   checkForYamibunkoUpdate,
   getCurrentAppVersion,
@@ -179,6 +183,7 @@ export function startWorkers() {
     "library-delete": 0,
   }
   let shuttingDown = false
+  let stopPromise: Promise<void> | null = null
   let scanning = false
   let dailyAniListTimer: NodeJS.Timeout | undefined
   let dailyAniListSyncRunning = false
@@ -252,10 +257,16 @@ export function startWorkers() {
 
   function trackActiveWork(work: Promise<void>, key: string) {
     activeWork.add(work)
-    void work.finally(() => {
-      activeWork.delete(work)
-      debugWorkers(`Work removed from active set - ${key}`)
-    })
+    void work.then(
+      () => {
+        activeWork.delete(work)
+        debugWorkers(`Work removed from active set - ${key}`)
+      },
+      () => {
+        activeWork.delete(work)
+        debugWorkers(`Work removed from active set - ${key}`)
+      }
+    )
   }
 
   function startImmediateBackgroundInputWork(
@@ -270,8 +281,19 @@ export function startWorkers() {
     const work = new Promise<void>((resolve) => {
       setImmediate(resolve)
     }).then(async () => {
+      let started = false
+
       try {
         await yieldToEventLoop()
+
+        if (shuttingDown) {
+          debugWorkers(
+            `Cancelled deferred background input work before start during shutdown - ${key} - ${deferredInfo.kind}`
+          )
+          return
+        }
+
+        started = true
         processingHandle?.start()
         console.log(
           `[Info] [Workers] Started background input work - ${deferredInfo.kind} - ${fileName(resolvedPath)}`
@@ -285,14 +307,17 @@ export function startWorkers() {
           `[Error] [Workers] Background input work failed - startWorkers.ts - ${deferredInfo.kind} - ${resolvedPath} - ${errorMessage(error)}`
         )
       } finally {
-        processingHandle?.finish()
+        if (started) {
+          processingHandle?.finish()
+        }
+
         queuedWork.delete(key)
         scheduleQueuedWorkStart()
       }
     })
 
     debugWorkers(
-      `Started background input work - ${key} - ${deferredInfo.kind} - Planned ${deferredInfo.planned}`
+      `Scheduled background input work - ${key} - ${deferredInfo.kind} - Planned ${deferredInfo.planned}`
     )
     trackActiveWork(work, `${key}:background-${deferredInfo.kind}`)
   }
@@ -683,6 +708,11 @@ export function startWorkers() {
     }
   }
 
+  function startTrackedDirectoryScan(reason: string) {
+    const work = scanAllDirectories()
+    trackActiveWork(work, `directory-scan:${reason}`)
+  }
+
   async function runDailyAniListSync(
     reason = "daily maintenance",
     includeUpdateCheck = true
@@ -758,72 +788,99 @@ export function startWorkers() {
   })
 
   const scanTimer = setInterval(() => {
-    void scanAllDirectories()
+    startTrackedDirectoryScan("interval")
   }, scanIntervalMs)
   scanTimer.unref?.()
 
   const startupAniListSync = runDailyAniListSync("startup", false)
-  activeWork.add(startupAniListSync)
-  void startupAniListSync.finally(() => {
-    activeWork.delete(startupAniListSync)
-  })
+  trackActiveWork(startupAniListSync, "startup-anilist-sync")
 
   const startupUpdateCheck = checkForYamibunkoUpdate("startup").then(
     () => undefined
   )
-  activeWork.add(startupUpdateCheck)
-  void startupUpdateCheck.finally(() => {
-    activeWork.delete(startupUpdateCheck)
-  })
+  trackActiveWork(startupUpdateCheck, "startup-update-check")
 
   debugWorkers("Starting initial input/library scans.")
-  void scanAllDirectories()
+  startTrackedDirectoryScan("startup")
   scheduleDailyAniListSync()
 
-  async function stop() {
-    if (shuttingDown) {
-      return
-    }
-
-    shuttingDown = true
-    console.log("[Info] [Workers] Stopping background workers.")
-
+  function cancelQueuedFileWorkForShutdown() {
     const cancelled = pendingWorkStarts.splice(0)
+
     for (const item of cancelled) {
       queuedWork.delete(item.key)
     }
+
     if (cancelled.length > 0) {
       debugWorkers(`Cancelled ${cancelled.length} queued work item(s) before shutdown.`)
     }
+  }
+
+  async function waitForActiveShutdownWork() {
+    for (;;) {
+      const workerWork = [...activeWork]
+      const hasAniListWork = hasActiveAniListRefreshes()
+
+      if (workerWork.length === 0 && !hasAniListWork) {
+        return
+      }
+
+      debugWorkers(
+        `Waiting for active shutdown work - Workers ${workerWork.length}, AniList ${hasAniListWork ? "active" : "idle"}.`
+      )
+
+      await Promise.allSettled([
+        ...workerWork,
+        ...(hasAniListWork ? [waitForActiveAniListRefreshes()] : []),
+      ])
+    }
+  }
+
+  async function stopInternal() {
+    shuttingDown = true
+    console.log("[Info] [Workers] Stopping background workers.")
+
+    clearInterval(scanTimer)
+
+    if (dailyAniListTimer) {
+      clearTimeout(dailyAniListTimer)
+      dailyAniListTimer = undefined
+    }
+
+    cancelQueuedFileWorkForShutdown()
 
     if (pendingLibraryFileMoveWork.length > 0) {
       debugWorkers(
-        `Waiting for ${pendingLibraryFileMoveWork.length} queued library file move item(s) during shutdown.`
+        `Keeping ${pendingLibraryFileMoveWork.length} queued library file move item(s) that belong to active work.`
       )
       scheduleLibraryFileMoveStart()
     }
 
-    await beginStreamServerShutdown()
     cancelPendingLiveTranscodes(
       "Server is shutting down. Live transcode request was cancelled"
     )
     transcodeWaitShutdown.abort()
     debugWorkers("Cancelled pending background transcode waits.")
-    clearInterval(scanTimer)
-    if (dailyAniListTimer) {
-      clearTimeout(dailyAniListTimer)
-    }
+
+    await beginStreamServerShutdown()
     await Promise.all([
       inputWatcher.close(),
       ...(libraryWatcher ? [libraryWatcher.close()] : []),
     ])
 
-    while (activeWork.size > 0) {
-      await Promise.allSettled([...activeWork])
-    }
+    await waitForActiveShutdownWork()
 
     console.log("[Info] [Workers] Background workers stopped.")
     workerGlobal.__yamibunkoWorkerRuntime = undefined
+  }
+
+  function stop() {
+    stopPromise ??= stopInternal().catch((error) => {
+      stopPromise = null
+      throw error
+    })
+
+    return stopPromise
   }
 
   const runtime = {

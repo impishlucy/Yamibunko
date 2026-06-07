@@ -42,7 +42,10 @@ import {
   waitForStableFile,
 } from "@/server/media/mediaFiles"
 import { emitLibraryChange } from "@/server/media/libraryEvents"
-import { findAnimeMetadata } from "@/server/metadata/anilist"
+import {
+  findAnimeMetadata,
+  isAniListMetadataLookupUnavailableError,
+} from "@/server/metadata/anilist"
 import {
   acquireAudioTranscode,
   acquireVideoTranscode,
@@ -598,6 +601,33 @@ async function tryMoveFailedInputToFailedImports(
   }
 }
 
+async function finishRetryableInputFailure(
+  filePath: string,
+  options: { jobId: string; error: unknown; context: string }
+): Promise<ProcessInputFileResult> {
+  const message = errorMessage(options.error) || "Unknown media processing error"
+  const retryMessage = `${message}; input file was left in the input folder for retry.`
+
+  console.warn(
+    `[Warn] [Media] ${options.context} - processInputFile.ts - ${filePath} - ${retryMessage}`
+  )
+  debugError(options.jobId, options.context, options.error)
+
+  updateJob(options.jobId, {
+    status: "failed",
+    error: message,
+    message: retryMessage,
+    finishedAt: new Date().toISOString(),
+  })
+
+  return {
+    ok: false,
+    filePath,
+    planned: false,
+    message: retryMessage,
+  }
+}
+
 async function probeInputFileWithRetry(filePath: string, jobId: string) {
   let lastError: unknown
 
@@ -892,12 +922,26 @@ export async function processInputFile(
     })
 
     debugImport(jobId, "Starting AniList metadata lookup.")
-    const metadata = await findAnimeMetadata(
-      parsed.title,
-      parsed.season,
-      parsed.episode,
-      parsed.part
-    )
+    let metadata: Awaited<ReturnType<typeof findAnimeMetadata>>
+
+    try {
+      metadata = await findAnimeMetadata(
+        parsed.title,
+        parsed.season,
+        parsed.episode,
+        parsed.part
+      )
+    } catch (error) {
+      if (isAniListMetadataLookupUnavailableError(error)) {
+        return finishRetryableInputFailure(filePath, {
+          jobId,
+          error,
+          context: "AniList metadata lookup could not complete",
+        })
+      }
+
+      throw error
+    }
 
     if (!metadata) {
       const error = `AniList could not match "${parsed.title}"`
@@ -1119,13 +1163,10 @@ export async function processInputFile(
           return
         }
 
-        const failedPath = await tryMoveFailedInputToFailedImports(filePath, {
-          jobId,
-          reason: `Deferred ${label} failed: ${message}`,
-        })
-        const failureMessage = failedPath
-          ? `${message}; input moved to failed imports: ${failedPath}`
-          : message
+        const inputStillExists = await pathExists(filePath)
+        const failureMessage = inputStillExists
+          ? `${message}; input file was left in the input folder for retry.`
+          : `${message}; input source was already moved or removed before the deferred failure.`
 
         console.error(
           `[Error] [Media] Deferred ${label} failed - processInputFile.ts - ${filePath} - ${failureMessage}`
@@ -1804,6 +1845,14 @@ export async function processInputFile(
         planned: true,
         message: shutdownMessage,
       }
+    }
+
+    if (isAniListMetadataLookupUnavailableError(error)) {
+      return finishRetryableInputFailure(filePath, {
+        jobId,
+        error,
+        context: "AniList metadata lookup could not complete",
+      })
     }
 
     if (!importEnabled) {

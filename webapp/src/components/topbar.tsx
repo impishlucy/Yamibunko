@@ -11,6 +11,7 @@ import {
 import Link from "next/link"
 import { usePathname } from "next/navigation"
 import {
+  Download,
   Gauge,
   Import,
   Info,
@@ -163,6 +164,7 @@ export function Topbar({ user }: { user: CurrentUser }) {
   const refreshDialogRef = useRef<HTMLDivElement | null>(null)
   const processingButtonRef = useRef<HTMLButtonElement | null>(null)
   const processingDialogRef = useRef<HTMLDivElement | null>(null)
+  const processingHoverCloseTimerRef = useRef<number | null>(null)
   const bandwidthButtonRef = useRef<HTMLButtonElement | null>(null)
   const bandwidthDialogRef = useRef<HTMLDivElement | null>(null)
   const profileButtonRef = useRef<HTMLButtonElement | null>(null)
@@ -190,7 +192,7 @@ export function Topbar({ user }: { user: CurrentUser }) {
 
   const refreshButtonClassName = useMemo(() => {
     const base =
-      "h-9 rounded-full border px-3 text-sm transition focus-visible:ring-2 focus-visible:ring-white/30"
+      "h-9 w-9 rounded-full border px-0 text-sm transition focus-visible:ring-2 focus-visible:ring-white/30 sm:w-auto sm:px-3"
 
     if (refreshing) {
       return `${base} border-emerald-300/35 bg-emerald-500/20 text-emerald-100 hover:border-emerald-300/45 hover:bg-emerald-500/25`
@@ -475,6 +477,14 @@ export function Topbar({ user }: { user: CurrentUser }) {
   }, [refreshDialogOpen])
 
   useEffect(() => {
+    return () => {
+      if (processingHoverCloseTimerRef.current !== null) {
+        window.clearTimeout(processingHoverCloseTimerRef.current)
+      }
+    }
+  }, [])
+
+  useEffect(() => {
     if (!processingDialogOpen) {
       return
     }
@@ -663,6 +673,34 @@ export function Topbar({ user }: { user: CurrentUser }) {
     }
   }
 
+  function clearProcessingHoverCloseTimer() {
+    if (processingHoverCloseTimerRef.current === null) {
+      return
+    }
+
+    window.clearTimeout(processingHoverCloseTimerRef.current)
+    processingHoverCloseTimerRef.current = null
+  }
+
+  function openProcessingDialog() {
+    clearProcessingHoverCloseTimer()
+    setProcessingDialogOpen(true)
+  }
+
+  function closeProcessingDialogSoon() {
+    clearProcessingHoverCloseTimer()
+
+    processingHoverCloseTimerRef.current = window.setTimeout(() => {
+      processingHoverCloseTimerRef.current = null
+      setProcessingDialogOpen(false)
+    }, 180)
+  }
+
+  function toggleProcessingDialog() {
+    clearProcessingHoverCloseTimer()
+    setProcessingDialogOpen((value) => !value)
+  }
+
   function onRefreshClick() {
     setOpen(false)
     setRefreshMessage(null)
@@ -677,12 +715,12 @@ export function Topbar({ user }: { user: CurrentUser }) {
   return (
     <header
       className={cn(
-        "yami-topbar sticky top-0 z-30 border-b border-white/10 bg-[#0d0d12]/85 px-4 py-3 backdrop-blur sm:px-6 lg:px-8",
+        "yami-topbar sticky top-0 z-30 border-b border-white/10 bg-[#0d0d12]/85 px-3 py-2.5 backdrop-blur sm:px-6 sm:py-3 lg:px-8",
         isWatchRoute ? "yami-watch-topbar" : null
       )}
     >
-      <div className="relative flex items-center justify-between gap-3">
-        <div className="flex min-w-0 items-center gap-2">
+      <div className="relative flex items-center justify-between gap-2 sm:gap-3">
+        <div className="flex min-w-0 items-center gap-1.5 sm:gap-2">
           <Link
             href="/library"
             prefetch={false}
@@ -692,19 +730,22 @@ export function Topbar({ user }: { user: CurrentUser }) {
           </Link>
 
           {appUpdateAvailable ? (
-            <div className="inline-flex h-7 shrink-0 items-center gap-1 rounded-full border border-amber-300/35 bg-amber-500/15 px-1 py-1 text-xs font-medium text-amber-100 shadow-sm">
+            <div className="inline-flex h-9 shrink-0 items-center gap-1 rounded-full border border-amber-300/35 bg-amber-500/15 px-1 text-xs font-medium text-amber-100 shadow-sm sm:h-7">
               <a
                 href={appUpdateReleaseUrl}
                 target="_blank"
                 rel="noreferrer"
-                className="inline-flex h-5 items-center rounded-full px-2 transition hover:text-amber-50 focus-visible:ring-2 focus-visible:ring-white/30 focus-visible:outline-none"
+                aria-label="Update is available"
+                title="Update is available"
+                className="inline-flex size-7 items-center justify-center rounded-full transition hover:text-amber-50 focus-visible:ring-2 focus-visible:ring-white/30 focus-visible:outline-none sm:h-5 sm:w-auto sm:px-2"
               >
-                Update is available
+                <Download className="size-4 sm:hidden" aria-hidden="true" />
+                <span className="hidden sm:inline">Update is available</span>
               </a>
               <button
                 type="button"
                 aria-label="Hide update badge until another update is available"
-                className="inline-flex size-5 items-center justify-center rounded-full border border-amber-200/20 bg-amber-950/45 text-amber-100/80 transition hover:border-amber-200/35 hover:bg-amber-900/60 hover:text-amber-50 focus-visible:ring-2 focus-visible:ring-white/30 focus-visible:outline-none"
+                className="inline-flex size-7 items-center justify-center rounded-full border border-amber-200/20 bg-amber-950/45 text-amber-100/80 transition hover:border-amber-200/35 hover:bg-amber-900/60 hover:text-amber-50 focus-visible:ring-2 focus-visible:ring-white/30 focus-visible:outline-none sm:size-5"
                 onClick={(event) => void dismissAppUpdate(event)}
               >
                 <X className="size-3.5" aria-hidden="true" />
@@ -713,20 +754,20 @@ export function Topbar({ user }: { user: CurrentUser }) {
           ) : null}
         </div>
 
-        <div className="relative flex items-center gap-2">
+        <div className="relative flex min-w-0 items-center gap-1.5 sm:gap-2">
           {processingCount > 0 ? (
             <div
               className="relative"
-              onMouseEnter={() => setProcessingDialogOpen(true)}
-              onMouseLeave={() => setProcessingDialogOpen(false)}
+              onMouseEnter={openProcessingDialog}
+              onMouseLeave={closeProcessingDialogSoon}
             >
               <button
                 ref={processingButtonRef}
                 type="button"
                 aria-label={processingLabel}
                 className="inline-flex size-9 items-center justify-center rounded-full border border-cyan-300/30 bg-cyan-500/15 text-cyan-100 shadow-sm transition hover:border-cyan-300/45 hover:bg-cyan-500/20 focus-visible:ring-2 focus-visible:ring-white/30 focus-visible:outline-none"
-                onClick={() => setProcessingDialogOpen((value) => !value)}
-                onFocus={() => setProcessingDialogOpen(true)}
+                onClick={toggleProcessingDialog}
+                onFocus={openProcessingDialog}
               >
                 <Import className="size-4" aria-hidden="true" />
               </button>
@@ -735,6 +776,8 @@ export function Topbar({ user }: { user: CurrentUser }) {
                 <div
                   ref={processingDialogRef}
                   className="fixed top-16 right-3 left-3 z-50 max-h-[min(22rem,calc(100vh-5rem))] overflow-y-auto rounded-xl border border-white/10 bg-zinc-950 p-3 shadow-2xl shadow-black/50 sm:absolute sm:top-full sm:right-0 sm:left-auto sm:mt-2 sm:w-[min(24rem,calc(100vw-2rem))]"
+                  onMouseEnter={openProcessingDialog}
+                  onMouseLeave={closeProcessingDialogSoon}
                 >
                   <h2 className="text-sm font-semibold text-zinc-100">
                     {processingLabel}
@@ -769,13 +812,13 @@ export function Topbar({ user }: { user: CurrentUser }) {
                 type="button"
                 aria-label={`Current / Max Upload: ${bandwidthLabel}`}
                 className={cn(
-                  "inline-flex h-9 items-center gap-1.5 rounded-full border px-3 text-xs font-medium tabular-nums shadow-sm transition hover:border-white/25 focus-visible:ring-2 focus-visible:ring-white/30 focus-visible:outline-none",
+                  "inline-flex size-9 items-center justify-center gap-1.5 rounded-full border px-0 text-xs font-medium tabular-nums shadow-sm transition hover:border-white/25 focus-visible:ring-2 focus-visible:ring-white/30 focus-visible:outline-none sm:h-9 sm:w-auto sm:px-3",
                   bandwidthUsageClassName
                 )}
                 onClick={() => setBandwidthDialogOpen((value) => !value)}
               >
                 <BandwidthIcon className="size-4" aria-hidden="true" />
-                <span>{bandwidthLabel}</span>
+                <span className="hidden sm:inline">{bandwidthLabel}</span>
               </button>
 
               {bandwidthDialogOpen ? (
@@ -815,7 +858,7 @@ export function Topbar({ user }: { user: CurrentUser }) {
                 className={refreshButtonClassName}
               >
                 <span className="flex items-center gap-1.5">
-                  <SiAnilist className="size-4" />
+                  <SiAnilist className="hidden size-4 sm:block" />
                   <RefreshCw className={refreshIconClassName} />
                 </span>
               </Button>
@@ -826,7 +869,7 @@ export function Topbar({ user }: { user: CurrentUser }) {
             ref={profileButtonRef}
             type="button"
             variant="ghost"
-            className="h-9 gap-2 rounded-lg px-2"
+            className="h-9 gap-2 rounded-lg px-1.5 sm:px-2"
             aria-expanded={open}
             onClick={() => setOpen((value) => !value)}
           >

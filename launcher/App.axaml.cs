@@ -2,6 +2,7 @@ using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Markup.Xaml;
 using System;
+using System.Threading.Tasks;
 
 namespace Launcher;
 
@@ -9,6 +10,8 @@ public partial class App : Application
 {
     public static ServerManager ServerManager { get; } = new();
     private LogWindow? _logWindow;
+    private bool _shutdownRequested;
+    private bool _shutdownCompleted;
 
     public override void Initialize()
     {
@@ -20,7 +23,11 @@ public partial class App : Application
         AppDomain.CurrentDomain.ProcessExit += (s, e) => ServerManager.StopServer();
         AppDomain.CurrentDomain.DomainUnload += (s, e) => ServerManager.StopServer();
         AppDomain.CurrentDomain.UnhandledException += (s, e) => ServerManager.StopServer();
-        Console.CancelKeyPress += (s, e) => ServerManager.StopServer();
+        Console.CancelKeyPress += (s, e) =>
+        {
+            e.Cancel = true;
+            ServerManager.StopServer();
+        };
     }
 
     public override void OnFrameworkInitializationCompleted()
@@ -28,7 +35,7 @@ public partial class App : Application
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
             desktop.ShutdownMode = Avalonia.Controls.ShutdownMode.OnExplicitShutdown;
-            desktop.ShutdownRequested += (s, e) => ServerManager.StopServer();
+            desktop.ShutdownRequested += OnShutdownRequested;
             desktop.Exit += (s, e) => ServerManager.StopServer();
 
             ServerManager.CleanupOrphans();
@@ -66,9 +73,33 @@ public partial class App : Application
         }
     }
 
-    private void OnExitClicked(object? sender, EventArgs e)
+    private async void OnExitClicked(object? sender, EventArgs e)
     {
-        ServerManager.StopServer();
+        await StopServerAndShutdownAsync();
+    }
+
+    private async void OnShutdownRequested(object? sender, ShutdownRequestedEventArgs e)
+    {
+        if (_shutdownCompleted)
+        {
+            return;
+        }
+
+        e.Cancel = true;
+        await StopServerAndShutdownAsync();
+    }
+
+    private async Task StopServerAndShutdownAsync()
+    {
+        if (_shutdownRequested)
+        {
+            return;
+        }
+
+        _shutdownRequested = true;
+        await ServerManager.StopServerAsync();
+        _shutdownCompleted = true;
+
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
             desktop.Shutdown();

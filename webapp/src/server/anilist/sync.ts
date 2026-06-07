@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto"
+
 import { syncAniListLibraryProgress } from "@/server/anilist/client"
 import { listAniListConnections } from "@/server/db/anilistConnections"
 import { refreshCachedAniListMetadata } from "@/server/metadata/anilist"
@@ -12,8 +14,35 @@ let fullRefreshPromise: Promise<{
   }>
 }> | null = null
 
+const activeAniListRefreshes = new Map<string, Promise<unknown>>()
+
+function trackAniListRefresh<T>(label: string, refresh: Promise<T>) {
+  const id = `${label}:${randomUUID()}`
+  activeAniListRefreshes.set(id, refresh)
+
+  void refresh.then(
+    () => activeAniListRefreshes.delete(id),
+    () => activeAniListRefreshes.delete(id)
+  )
+
+  return refresh
+}
+
+export function hasActiveAniListRefreshes() {
+  return activeAniListRefreshes.size > 0
+}
+
+export async function waitForActiveAniListRefreshes() {
+  while (activeAniListRefreshes.size > 0) {
+    await Promise.allSettled([...activeAniListRefreshes.values()])
+  }
+}
+
 export async function refreshAniListTrackingData(username: string) {
-  return syncAniListLibraryProgress(username)
+  return trackAniListRefresh(
+    `user:${username}`,
+    syncAniListLibraryProgress(username)
+  )
 }
 
 export async function runFullAniListRefresh() {
@@ -21,7 +50,7 @@ export async function runFullAniListRefresh() {
     return fullRefreshPromise
   }
 
-  fullRefreshPromise = (async () => {
+  const refresh = (async () => {
     const metadata = await refreshCachedAniListMetadata()
     const users: Array<{
       username: string
@@ -31,7 +60,7 @@ export async function runFullAniListRefresh() {
 
     for (const connection of listAniListConnections()) {
       try {
-        await syncAniListLibraryProgress(connection.username)
+        await refreshAniListTrackingData(connection.username)
         users.push({ username: connection.username, synced: true })
       } catch (error) {
         const message = errorMessage(error)
@@ -43,7 +72,9 @@ export async function runFullAniListRefresh() {
     }
 
     return { metadata, users }
-  })().finally(() => {
+  })()
+
+  fullRefreshPromise = trackAniListRefresh("full", refresh).finally(() => {
     fullRefreshPromise = null
   })
 
