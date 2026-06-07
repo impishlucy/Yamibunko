@@ -1300,9 +1300,22 @@ export function startWorkers() {
     function exitAfterShutdown(exitCode: number) {
       restoreConsoleInputMode()
       workerGlobal.__yamibunkoProcessExitAllowed = true
+      process.exitCode = exitCode
+
       const originalProcessExit =
         workerGlobal.__yamibunkoOriginalProcessExit ?? process.exit
-      originalProcessExit(exitCode)
+      const forceExit = (process as NodeJS.Process & {
+        reallyExit?: (code?: number) => never
+      }).reallyExit
+
+      setImmediate(() => {
+        if (typeof forceExit === "function") {
+          forceExit.call(process, exitCode)
+          return
+        }
+
+        originalProcessExit(exitCode)
+      })
     }
 
     function handleProcessShutdown(signal: ShutdownSignal, signalExitCode: number) {
@@ -1356,6 +1369,7 @@ export function startWorkers() {
       | ((chunk: Buffer | string) => void)
       | null = null
     let consoleRawModeEnabled = false
+    let consoleInputResumed = false
 
     function restoreConsoleInputMode() {
       if (consoleInputDataHandler) {
@@ -1363,15 +1377,22 @@ export function startWorkers() {
         consoleInputDataHandler = null
       }
 
-      if (!consoleRawModeEnabled) {
-        return
+      if (consoleRawModeEnabled) {
+        consoleRawModeEnabled = false
+
+        try {
+          process.stdin.setRawMode(false)
+        } catch {
+        }
       }
 
-      consoleRawModeEnabled = false
+      if (consoleInputResumed) {
+        consoleInputResumed = false
 
-      try {
-        process.stdin.setRawMode(false)
-      } catch {
+        try {
+          process.stdin.pause()
+        } catch {
+        }
       }
     }
 
@@ -1403,6 +1424,7 @@ export function startWorkers() {
         process.stdin.setRawMode(true)
         consoleRawModeEnabled = true
         process.stdin.resume()
+        consoleInputResumed = true
         process.stdin.on("data", consoleInputDataHandler)
         process.once("exit", restoreConsoleInputMode)
         debugWorkers("Registered interactive Ctrl+C shutdown input handler.")
