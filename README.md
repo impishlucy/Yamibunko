@@ -6,7 +6,7 @@
   
 # Yamibunko
 
-Yamibunko is a local anime library server with a desktop launcher and a web UI. It processes your own media files, organizes them into a library, enriches entries with metadata, and plays them through the browser.
+Yamibunko is a all in one local anime library and file processor, with a desktop launcher and a web UI. <br/> It can optimize your files, organizes them and can play them back through the WebUI.
 
 <img width="48%" alt="library" src="https://github.com/user-attachments/assets/fe05f186-7b1e-42e2-b154-da7c737952bb" />
 <img width="48%" alt="overview" src="https://github.com/user-attachments/assets/97a719da-e392-4089-82be-fc1d983a979b" />
@@ -16,20 +16,21 @@ Yamibunko is a local anime library server with a desktop launcher and a web UI. 
 
 ## Features
 
-Yamibunko is built around a local anime library workflow:
+### General
 
-* Custom player designed for animes, with the usual controls, skip intro/outro buttons and Google casting.
+* Custom player designed for animes, with the usual controls, skip intro button and Google casting.
 * Responsive layouts for all pages, on desktop, tablets, and phones.
 * Direct-File play and transcoding are possible.
-* Data Saver mode for when you're have a data cap.
-* Import conversion for smaller, more consistent files, using HEVC conversion and audio cleanup when needed.
-* Per-series library grouping, no more searching the library, its all grouped together.
+* Per-series library grouping, no more searching, its all grouped together.
 * AniList integration for metadata, tracking, watching progress and watching status.
-* Desktop launcher that prepares the runtime, starts the webapp, and keeps setup easier for normal installs.
+* Desktop launcher that prepares the runtime, starts the webapp, and keeps setup easier to use.
 * Bandwidth-aware streaming, uses a server limit and helps avoid overloading the host connection.
 * One active stream per user, with confirmation when switching playback to another episode or device.
 * VIP priority streaming so selected users can get better access when the server is under load.
 
+### File Processing
+* If enabled it can convert input files for smaller, more consistent files, using HEVC conversion when needed.
+* If disabled it only servers your existing files and does not edit them.
 
 ## Install
 
@@ -50,8 +51,16 @@ The only required things are an 64bit OS and .NET 10.
    * AniList API client ID and secret if you want AniList tracking.
 6. Save the setup and wait for the launcher to start the web UI.
 
-The launcher prepares the local runtime, downloads whats needed and starts the webapp.
+The launcher prepares the local runtime, downloads whats needed and starts the webapp.<br/>
 If the web UI does not open automatically, check the launcher log window.
+
+### Update (with Launcher)
+1. Stop any Yamibunko instance running and wait for shutdown.
+2. Open the Folder of your Yamibunko Install.
+3. Execute the Updater script and wait for it to complete.
+4. Start the Launcher and ur done.
+
+- - - - - -
 
 ### AniList Setup
 
@@ -62,7 +71,10 @@ http://localhost:3000/api/anilist/oauth/callback
 https://your-domain.example/api/anilist/oauth/callback
 ```
 
-Use the same base URL in the launcher or `.env` file. If you host Yamibunko behind a path prefix, the callback path is appended behind that base URL.
+Use the same base URL in the launcher or `.env` file.<br/>
+If you host Yamibunko behind a path prefix, the callback path is appended behind that base URL.
+
+- - - - - -
 
 ### Manual Webapp Install
 
@@ -71,17 +83,29 @@ The webapp can run without the launcher, but you must provide the runtime yourse
 * [Node.js 20 or newer](https://nodejs.org/)
 * [Bun](https://bun.sh/)
 * [FFmpeg and FFprobe with HEVC support](https://github.com/btbn/ffmpeg-builds/)
-* A configured `.env` file
 
+#### Steps
+
+1. Edit the .env files and fill all fields. <br/>
+ - Supported `TRANSCODE_ACCEL` values in env are nvenc, qsv, amd, or cpu.
+ - Nvidia GPU = nvenc, AMD GPU = amd, Intel GPU & CPU with Quicksync = qsv.
+
+2. Start the app:
 From the `webapp` directory:
-
 ```bash
 bun install
 bun run build
 bun run start
 ```
 
-Supported `TRANSCODE_ACCEL` values in env are `nvenc`, `qsv`, and `cpu`.
+### Manual Webapp Update
+
+0. Download the new version zip and unpack it.
+1. Stop the currently running Instance.
+2. Paste the webapp contents over the one in your instance folder.
+3. Delete the .next folder inside your instance folder.
+4. Run `bun run build` before starting it.
+5. Start it.
 
 ## Disclaimer
 
