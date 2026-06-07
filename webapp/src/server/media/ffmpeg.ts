@@ -10,6 +10,11 @@ let cachedAmdVaapiDevice: string | undefined
 
 const targetAacBitrate = "320k"
 
+export type Mp4SubtitleOutputStream = {
+  streamIndex: number
+  codec: "copy" | "mov_text"
+}
+
 export function getLcAacStereoArgs() {
   return [
     "-c:a",
@@ -467,12 +472,20 @@ function getLiveDataSaverArgs(
   ]
 }
 
+export function getFileSubtitleInputArgs(input: {
+  subtitleStreams: Mp4SubtitleOutputStream[]
+}) {
+  return input.subtitleStreams.some((stream) => stream.codec === "mov_text")
+    ? ["-fix_sub_duration"]
+    : []
+}
+
 export function getHevcFileArgs(input: {
   videoBitrateKbps: number
   maxVideoBitrateKbps: number
   convertVideo: boolean
   audioOutputIndexesToAac: number[]
-  subtitleStreamIndexesToMovText: number[]
+  subtitleStreams: Mp4SubtitleOutputStream[]
 }) {
   const config = getServerConfig()
   const bitrateArgs = getFileVideoBitrateArgs(input)
@@ -560,12 +573,16 @@ export function getHevcFileArgs(input: {
       "2",
     ]),
   ]
-  const subtitleMapArgs = input.subtitleStreamIndexesToMovText.flatMap(
-    (streamIndex) => ["-map", `0:${streamIndex}`]
-  )
-  const subtitleArgs = input.subtitleStreamIndexesToMovText.length
-    ? ["-c:s", "mov_text"]
-    : []
+  const subtitleMapArgs = input.subtitleStreams.flatMap((stream) => [
+    "-map",
+    `0:${stream.streamIndex}`,
+  ])
+  const subtitleArgs = input.subtitleStreams.length
+    ? input.subtitleStreams.flatMap((stream, outputSubtitleIndex) => [
+        `-c:s:${outputSubtitleIndex}`,
+        stream.codec,
+      ])
+    : ["-sn"]
 
   return [
     "-map",
@@ -583,6 +600,10 @@ export function getHevcFileArgs(input: {
     ...audioArgs,
     ...subtitleArgs,
     "-dn",
+    "-max_interleave_delta",
+    "1000000",
+    "-flush_packets",
+    "1",
     "-movflags",
     "+faststart",
     "-f",

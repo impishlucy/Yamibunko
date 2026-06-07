@@ -21,10 +21,12 @@ import { createJob, updateJob } from "@/server/db/jobs"
 import { getServerConfig } from "@/server/config"
 import {
   ffprobe,
+  getFileSubtitleInputArgs,
   getHardwareInputArgs,
   getHardwareInputLabel,
   getHevcFileArgs,
   runFfmpeg,
+  type Mp4SubtitleOutputStream,
 } from "@/server/media/ffmpeg"
 import {
   formatEpisodeFileName,
@@ -46,10 +48,6 @@ import {
   findAnimeMetadata,
   isAniListMetadataLookupUnavailableError,
 } from "@/server/metadata/anilist"
-import {
-  acquireAudioTranscode,
-  acquireVideoTranscode,
-} from "@/server/transcode/transcodeCapacity"
 import { getAudioOutputIndexesToAac } from "@/server/media/streamMetadata"
 import { errorMessage, fileName } from "@/server/utils/format"
 import { debugLog } from "@/server/utils/debugLog"
@@ -60,6 +58,14 @@ const targetBytesPerMinute = 22 * 1024 * 1024
 const targetAudioKbps = 320
 const failedImportsFolderName = "_failed_imports"
 const activeInputImportOutputs = new Map<string, number>()
+
+type ImportFileEditKind =
+  | "direct-move"
+  | "audio-transcode"
+  | "container-remux"
+  | "video-transcode"
+
+type VideoTranscodeReason = "none" | "shrink" | "full"
 
 export type ProcessInputFileResult = {
   ok: boolean
@@ -111,7 +117,7 @@ export type QueueInputFileMove = (
 ) => Promise<void>
 
 export type ProcessInputFileOptions = {
-  transcodeWaitSignal?: AbortSignal
+  shutdownSignal?: AbortSignal
   deferVideoTranscodes?: boolean
   deferAudioTranscodes?: boolean
   queueFileMove: QueueInputFileMove
@@ -228,6 +234,20 @@ function isTranscodeWaitCancellation(error: unknown) {
   return errorMessage(error) === "Transcode request was cancelled"
 }
 
+function isShutdownCancellation(error: unknown, signal?: AbortSignal) {
+  if (!signal?.aborted) {
+    return false
+  }
+
+  const message = errorMessage(error).toLowerCase()
+
+  return (
+    isTranscodeWaitCancellation(error) ||
+    message.includes("shutdown started") ||
+    message.includes("was cancelled")
+  )
+}
+
 function isInvalidMediaProbeError(error: unknown) {
   const message = errorMessage(error).toLowerCase()
 
@@ -278,28 +298,36 @@ function usesMp4OutputContainer(filePath: string, probe: ProbeResult) {
   )
 }
 
-const mp4SubtitleCodecs = new Set([
+const mp4CopyableSubtitleCodecs = new Set(["mov_text"])
+const mp4ConvertibleTextSubtitleCodecs = new Set([
   "ass",
   "ssa",
   "subrip",
   "srt",
-  "webvtt",
-  "mov_text",
   "text",
+  "webvtt",
 ])
 
-function getMp4SubtitleStreamIndexes(probe: ProbeResult) {
+function getMp4SubtitleOutputStreams(probe: ProbeResult): Mp4SubtitleOutputStream[] {
   return (probe.streams ?? [])
-    .filter((stream) => {
+    .map((stream) => {
       const codec = (stream.codec_name ?? "").trim().toLowerCase()
 
-      return (
-        stream.codec_type === "subtitle" &&
-        Number.isInteger(stream.index) &&
-        mp4SubtitleCodecs.has(codec)
-      )
+      if (stream.codec_type !== "subtitle" || !Number.isInteger(stream.index)) {
+        return null
+      }
+
+      if (mp4CopyableSubtitleCodecs.has(codec)) {
+        return { streamIndex: stream.index as number, codec: "copy" as const }
+      }
+
+      if (mp4ConvertibleTextSubtitleCodecs.has(codec)) {
+        return { streamIndex: stream.index as number, codec: "mov_text" as const }
+      }
+
+      return null
     })
-    .map((stream) => stream.index as number)
+    .filter((stream): stream is Mp4SubtitleOutputStream => stream !== null)
 }
 
 function getMaxHevcBytesPerMinute() {
@@ -542,6 +570,78 @@ function sanitizeFailedImportRelativePath(relativePath: string) {
     })
 }
 
+function cleanFolderTitleCandidate(value: string) {
+  return value
+    .replace(/\[[^\]]*\]|\([^)]*\)/g, " ")
+    .replace(/[._]+/g, " ")
+    .replace(/\b(?:season|s)\s*\d{1,2}\b/gi, " ")
+    .replace(/\b(?:1080p|720p|2160p|480p|bluray|blu-ray|bdrip|web[- ]?dl|webrip|remux|x264|x265|h264|h265|hevc|avc|aac|flac|opus|dual audio|multi audio)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function isIgnoredFolderTitleCandidate(value: string) {
+  const normalized = value.trim().toLowerCase()
+
+  return (
+    !normalized ||
+    normalized === failedImportsFolderName ||
+    normalized === "season" ||
+    normalized === "seasons" ||
+    normalized === "special" ||
+    normalized === "specials" ||
+    normalized === "ova" ||
+    normalized === "ovas" ||
+    normalized === "movie" ||
+    normalized === "movies" ||
+    normalized === "extra" ||
+    normalized === "extras" ||
+    normalized === "episode" ||
+    normalized === "episodes" ||
+    normalized === "done" ||
+    /^s\d{1,2}$/i.test(normalized) ||
+    /^season\s*\d{1,2}$/i.test(normalized)
+  )
+}
+
+function getFolderTitleFallbackCandidates(inputDir: string, filePath: string, parsedTitle: string) {
+  const inputRoot = path.resolve(inputDir)
+  const fileDirectory = path.dirname(path.resolve(filePath))
+  const relativeDirectory = path.relative(inputRoot, fileDirectory)
+
+  if (!relativeDirectory || relativeDirectory.startsWith("..") || path.isAbsolute(relativeDirectory)) {
+    return []
+  }
+
+  const parts = relativeDirectory.split(path.sep).filter(Boolean)
+  let candidateIndex = parts.length - 1
+
+  while (candidateIndex >= 0) {
+    const part = parts[candidateIndex]
+    const cleaned = cleanFolderTitleCandidate(part)
+
+    if (cleaned.length >= 2 && !isIgnoredFolderTitleCandidate(cleaned)) {
+      break
+    }
+
+    candidateIndex -= 1
+  }
+
+  if (candidateIndex < 0) {
+    return []
+  }
+
+  const cleaned = cleanFolderTitleCandidate(parts[candidateIndex])
+  const key = cleaned.toLowerCase()
+  const parsedTitleNormalized = parsedTitle.trim().toLowerCase()
+
+  if (key === parsedTitleNormalized) {
+    return []
+  }
+
+  return [cleaned]
+}
+
 async function moveFailedInputToFailedImports(
   filePath: string,
   options: { jobId: string; reason: string }
@@ -756,7 +856,7 @@ async function transcodeFile(
   options: {
     convertVideo: boolean
     audioOutputIndexesToAac: number[]
-    subtitleStreamIndexesToMovText: number[]
+    subtitleStreams: Mp4SubtitleOutputStream[]
     videoBitrateKbps: number
     maxVideoBitrateKbps: number
     jobId?: string
@@ -771,6 +871,7 @@ async function transcodeFile(
     ...(options.convertVideo
       ? getHardwareInputArgs({ keepFramesOnDevice: true })
       : []),
+    ...getFileSubtitleInputArgs(options),
     "-i",
     inputPath,
     ...getHevcFileArgs(options),
@@ -923,6 +1024,7 @@ export async function processInputFile(
 
     debugImport(jobId, "Starting AniList metadata lookup.")
     let metadata: Awaited<ReturnType<typeof findAnimeMetadata>>
+    let resolvedParsed = parsed
 
     try {
       metadata = await findAnimeMetadata(
@@ -931,6 +1033,46 @@ export async function processInputFile(
         parsed.episode,
         parsed.part
       )
+
+      if (!metadata) {
+        const fallbackTitles = getFolderTitleFallbackCandidates(
+          config.inputDir,
+          filePath,
+          parsed.title
+        )
+
+        for (const fallbackTitle of fallbackTitles) {
+          console.warn(
+            `[Warn] [Media] AniList could not match filename title "${parsed.title}"; trying folder title "${fallbackTitle}" - ${fileName(filePath)}`
+          )
+          debugImport(
+            jobId,
+            `Trying folder title fallback - Filename title ${parsed.title}, Folder title ${fallbackTitle}`
+          )
+          updateJob(jobId, {
+            message: `Fetching AniList metadata using folder title: ${fallbackTitle}.`,
+          })
+
+          const fallbackMetadata = await findAnimeMetadata(
+            fallbackTitle,
+            parsed.season,
+            parsed.episode,
+            parsed.part
+          )
+
+          if (!fallbackMetadata) {
+            continue
+          }
+
+          metadata = fallbackMetadata
+          resolvedParsed = { ...parsed, title: fallbackTitle }
+          console.log(
+            `[Info] [Media] Folder title fallback matched AniList metadata - ${fallbackTitle} - ${fileName(filePath)}`
+          )
+          debugImport(jobId, `Folder title fallback matched - ${fallbackTitle}.`)
+          break
+        }
+      }
     } catch (error) {
       if (isAniListMetadataLookupUnavailableError(error)) {
         return finishRetryableInputFailure(filePath, {
@@ -989,7 +1131,7 @@ export async function processInputFile(
       }
     }
 
-    const inputParsed: NonNullable<ReturnType<typeof parseAnimeFileName>> = parsed
+    const inputParsed: NonNullable<ReturnType<typeof parseAnimeFileName>> = resolvedParsed
     const inputMetadata: NonNullable<Awaited<ReturnType<typeof findAnimeMetadata>>> = metadata
 
     debugImport(jobId, `AniList metadata lookup completed - Anime id ${inputMetadata.id}.`)
@@ -1128,10 +1270,7 @@ export async function processInputFile(
       } catch (error) {
         const message = errorMessage(error) || "Unknown media processing error"
 
-        if (
-          isTranscodeWaitCancellation(error) &&
-          options.transcodeWaitSignal?.aborted
-        ) {
+        if (isShutdownCancellation(error, options.shutdownSignal)) {
           const shutdownMessage = `Skipped queued ${label} because shutdown started.`
 
           console.warn(
@@ -1363,19 +1502,47 @@ export async function processInputFile(
     )
     const maxHevcBytesPerMinute = getMaxHevcBytesPerMinute()
     const inputHasHevcVideo = hasHevcVideo(probe)
-    const convertVideo =
-      !inputHasHevcVideo || inputBytesPerMinute > maxHevcBytesPerMinute
     const audioOutputIndexesToAac = getAudioOutputIndexesToAac(probe)
-    const subtitleStreamIndexesToMovText = getMp4SubtitleStreamIndexes(probe)
+    const subtitleStreams = getMp4SubtitleOutputStreams(probe)
     const convertAudioToAac = audioOutputIndexesToAac.length > 0
-    const requiresMp4ContainerRemux = !usesMp4OutputContainer(filePath, probe)
-    const needsFfmpegProcessing =
-      convertVideo || convertAudioToAac || requiresMp4ContainerRemux
+    const inputUsesMp4Container = inputHasHevcVideo
+      ? usesMp4OutputContainer(filePath, probe)
+      : false
+    const requiresVideoShrink = inputHasHevcVideo
+      ? inputBytesPerMinute > maxHevcBytesPerMinute
+      : false
+    const requiresMp4ContainerRemux = inputHasHevcVideo
+      ? !inputUsesMp4Container
+      : false
+    const requiredSingleStepEdits = inputHasHevcVideo
+      ? [requiresVideoShrink, requiresMp4ContainerRemux, convertAudioToAac].filter(
+          Boolean
+        ).length
+      : 0
+    const videoTranscodeReason: VideoTranscodeReason = !inputHasHevcVideo
+      ? "full"
+      : requiredSingleStepEdits > 1
+        ? "full"
+        : requiresVideoShrink
+          ? "shrink"
+          : "none"
+    const convertVideo = videoTranscodeReason !== "none"
+    const importFileEditKind: ImportFileEditKind = convertVideo
+      ? "video-transcode"
+      : convertAudioToAac
+        ? "audio-transcode"
+        : requiresMp4ContainerRemux
+          ? "container-remux"
+          : "direct-move"
+    const needsFfmpegProcessing = importFileEditKind !== "direct-move"
     const videoBitrateKbps = calculateVideoBitrateKbps()
+    const skippedDetailedEditChecks = !inputHasHevcVideo
 
     debugImport(
       jobId,
-      `Processing decision - convertVideo ${convertVideo}, audioTracksToAac [${audioOutputIndexesToAac.join(", ")}], subtitleTracksToMovText [${subtitleStreamIndexesToMovText.join(", ")}], mp4ContainerRemux ${requiresMp4ContainerRemux}, needsFfmpegProcessing ${needsFfmpegProcessing}`
+      skippedDetailedEditChecks
+        ? `Processing decision - hevc false, action ${importFileEditKind}, videoTranscodeReason ${videoTranscodeReason}, needsFfmpegProcessing ${needsFfmpegProcessing}; skipped shrink/remux/audio-decision checks because full processing is required. Audio tracks to AAC for output [${audioOutputIndexesToAac.join(", ")}], subtitleTracks [${subtitleStreams.map((stream) => `${stream.streamIndex}:${stream.codec}`).join(", ")}]`
+        : `Processing decision - hevc ${inputHasHevcVideo}, belowMaxSize ${!requiresVideoShrink}, mp4Container ${inputUsesMp4Container}, audioTracksToAac [${audioOutputIndexesToAac.join(", ")}], subtitleTracks [${subtitleStreams.map((stream) => `${stream.streamIndex}:${stream.codec}`).join(", ")}], requiredEdits ${requiredSingleStepEdits}, action ${importFileEditKind}, videoTranscodeReason ${videoTranscodeReason}, needsFfmpegProcessing ${needsFfmpegProcessing}`
     )
 
     const safeLibraryTitle = safePathSegment(libraryTitle, "Library title")
@@ -1594,72 +1761,43 @@ export async function processInputFile(
     }
 
     async function runFfmpegProcessing() {
-      const lease = convertVideo
-        ? await (async () => {
-            updateJob(jobId, {
-              message: "Waiting for video transcode capacity.",
-            })
+      const processingLabel = convertVideo
+        ? videoTranscodeReason === "shrink"
+          ? "shrinking video transcode"
+          : "full video transcode"
+        : convertAudioToAac
+          ? "audio transcode"
+          : "MP4 remux"
 
-            console.log(
-              `[Info] [Media] Waiting for background transcode capacity - ${fileName(filePath)}`
-            )
-            debugImport(jobId, "Waiting for video transcode lease.")
-
-            const lease = await acquireVideoTranscode(
-              `video:${jobId}`,
-              options.transcodeWaitSignal
-            )
-            debugImport(jobId, `Video transcode lease acquired - ${lease.id}`)
-            return lease
-          })()
-        : await (async () => {
-            updateJob(jobId, {
-              message: "Waiting for audio transcode capacity.",
-            })
-            console.log(
-              `[Info] [Media] Waiting for audio transcode capacity - ${fileName(filePath)}`
-            )
-            debugImport(jobId, "Waiting for audio transcode lease.")
-            const lease = await acquireAudioTranscode(
-              `audio:${jobId}`,
-              options.transcodeWaitSignal
-            )
-            debugImport(jobId, `Audio transcode lease acquired - ${lease.id}`)
-            return lease
-          })()
-
-      try {
-        updateJob(jobId, {
-          message: convertVideo
-            ? "Transcoding media file."
-            : convertAudioToAac
-              ? "Converting audio tracks to LC-AAC."
-              : "Remuxing media file to MP4.",
-        })
-
-        console.log(
-          `[Info] [Media] Starting media transcode - ${fileName(filePath)} - Accel: ${config.transcodeAccel}, HW decode: ${convertVideo ? getHardwareInputLabel() : "not needed"}, HEVC: ${convertVideo ? `yes (${inputHasHevcVideo ? `over ${formatMegabytesPerMinute(maxHevcBytesPerMinute)} MB/min` : "source is not HEVC"})` : "copy"}, AAC audio tracks: ${audioOutputIndexesToAac.length ? audioOutputIndexesToAac.join(", ") : "none"}, MP4 remux: ${requiresMp4ContainerRemux ? "yes" : "no"}, Target: ${formatMegabytesPerMinute(targetBytesPerMinute)} MB/min, Bitrate: ${videoBitrateKbps}k, Maxrate: ${calculateVideoBitrateKbps(maxHevcBytesPerMinute)}k`
-        )
-
-        await transcodeFile(filePath, tempPath, {
-          convertVideo,
-          audioOutputIndexesToAac,
-          subtitleStreamIndexesToMovText,
-          videoBitrateKbps,
-          maxVideoBitrateKbps: calculateVideoBitrateKbps(maxHevcBytesPerMinute),
-          jobId,
-        })
-        debugImport(jobId, "Transcode step completed successfully.")
-      } finally {
-        lease.release()
-        debugImport(jobId, "Transcode lease released.")
-      }
+      updateJob(jobId, {
+        message: convertVideo
+          ? videoTranscodeReason === "shrink"
+            ? "Shrinking media file."
+            : "Transcoding media file."
+          : convertAudioToAac
+            ? "Converting audio tracks to LC-AAC."
+            : "Remuxing media file to MP4.",
+      })
 
       console.log(
-        `[Info] [Media] Media transcode completed - ${fileName(filePath)}`
+        `[Info] [Media] Starting ${processingLabel} - ${fileName(filePath)} - Accel: ${config.transcodeAccel}, HW decode: ${convertVideo ? getHardwareInputLabel() : "not needed"}, HEVC: ${inputHasHevcVideo ? "yes" : "no"}, Size: ${formatMegabytesPerMinute(inputBytesPerMinute)} MB/min, AAC audio tracks: ${audioOutputIndexesToAac.length ? audioOutputIndexesToAac.join(", ") : "none"}, MP4 remux: ${requiresMp4ContainerRemux ? "yes" : "no"}, Target: ${formatMegabytesPerMinute(targetBytesPerMinute)} MB/min, Bitrate: ${videoBitrateKbps}k, Maxrate: ${calculateVideoBitrateKbps(maxHevcBytesPerMinute)}k`
+      )
+
+      await transcodeFile(filePath, tempPath, {
+        convertVideo,
+        audioOutputIndexesToAac,
+        subtitleStreams,
+        videoBitrateKbps,
+        maxVideoBitrateKbps: calculateVideoBitrateKbps(maxHevcBytesPerMinute),
+        jobId,
+      })
+      debugImport(jobId, "FFmpeg processing step completed successfully.")
+
+      console.log(
+        `[Info] [Media] Media processing completed - ${fileName(filePath)}`
       )
       updateJob(jobId, {
-        message: "Waiting for library file move capacity.",
+        message: "Moving processed output into the library.",
       })
       debugImport(jobId, "Queueing transcoded output move into the library.")
       await moveLibraryFileThroughQueue(tempPath, finalPath, "transcode-output")
@@ -1701,21 +1839,21 @@ export async function processInputFile(
 
     async function runDirectMoveImport() {
       updateJob(jobId, {
-        message: "Moving direct-play media file.",
+        message: "Moving direct-import media file.",
       })
 
       console.log(
-        `[Info] [Media] Skipping transcode and moving direct-play file - ${fileName(filePath)}`
+        `[Info] [Media] Skipping processing and moving direct-import file - ${fileName(filePath)}`
       )
 
       await moveLibraryFileThroughQueue(filePath, finalPath, "direct-import")
 
       if (await pathExists(filePath)) {
-        debugImport(jobId, "Source still exists after direct-play move; removing it.")
+        debugImport(jobId, "Source still exists after direct-import move; removing it.")
         await unlinkFileWithRetry(filePath, { jobId })
       }
 
-      debugImport(jobId, "Direct-play file move completed.")
+      debugImport(jobId, "Direct-import file move completed.")
       debugImport(jobId, "Cleaning input parent folders.")
       await removeNonMediaOnlyInputParents(filePath, { jobId })
       debugImport(jobId, "Input parent cleanup completed.")
@@ -1745,19 +1883,23 @@ export async function processInputFile(
     }
 
     if (needsFfmpegProcessing && convertVideo && options.deferVideoTranscodes) {
+      const videoQueueMessage = videoTranscodeReason === "shrink"
+        ? "Queued for shrinking video transcode."
+        : "Queued for full video transcode."
+
       updateJob(jobId, {
-        message: "Queued for video transcode.",
+        message: videoQueueMessage,
       })
       console.log(
-        `[Info] [Media] Queued video transcode and continuing import scan - ${fileName(filePath)}`
+        `[Info] [Media] ${videoQueueMessage.replace(/\.$/, "")} and continuing import scan - ${fileName(filePath)}`
       )
-      debugImport(jobId, "Video transcode deferred so other import inspections can continue.")
+      debugImport(jobId, "Video transcode queued in the shared file-edit queue so other import inspections can continue.")
 
       return queueDeferredImportWork({
         kind: "video-transcode",
         outputPath: finalPath,
         planned: true,
-        message: "Queued for video transcode.",
+        message: videoQueueMessage,
         work: runFfmpegImport,
         processing: {
           ...processingInfo,
@@ -1780,8 +1922,8 @@ export async function processInputFile(
       debugImport(
         jobId,
         convertAudioToAac
-          ? "Audio-only LC-AAC transcode deferred into the audio-priority transcode queue."
-          : "Container remux deferred into the audio-priority transcode queue."
+          ? "Audio-only LC-AAC transcode queued in the shared file-edit queue."
+          : "Container remux queued in the shared file-edit queue."
       )
 
       return queueDeferredImportWork({
@@ -1802,18 +1944,18 @@ export async function processInputFile(
     }
 
     updateJob(jobId, {
-      message: "Moving direct-play media file in background.",
+      message: "Moving direct-import media file in background.",
     })
     console.log(
-      `[Info] [Media] Moving direct-play media file in background - ${fileName(filePath)}`
+      `[Info] [Media] Moving direct-import media file in background - ${fileName(filePath)}`
     )
-    debugImport(jobId, "Direct-play move moved to immediate background work.")
+    debugImport(jobId, "Direct-import move queued for file-edit processing.")
 
     return queueDeferredImportWork({
       kind: "direct-move",
       outputPath: finalPath,
       planned: false,
-      message: "Moving direct-play media file in background.",
+      message: "Moving direct-import media file in background.",
       work: runDirectMoveImport,
       processing: {
         ...processingInfo,
@@ -1823,11 +1965,8 @@ export async function processInputFile(
   } catch (error) {
     const message = errorMessage(error) || "Unknown media processing error"
 
-    if (
-      isTranscodeWaitCancellation(error) &&
-      options.transcodeWaitSignal?.aborted
-    ) {
-      const shutdownMessage = "Skipped queued transcode because shutdown started."
+    if (isShutdownCancellation(error, options.shutdownSignal)) {
+      const shutdownMessage = "Skipped queued import file action because shutdown started."
 
       console.warn(
         `[Warn] [Media] Input file processing cancelled during shutdown - processInputFile.ts - ${filePath}`

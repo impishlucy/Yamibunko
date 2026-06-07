@@ -1069,7 +1069,7 @@ public class ServerManager
     {
         if (_logWindow == null || !_logWindow.IsVisible)
         {
-            _logWindow = new LogWindow(ServerLogs);
+            _logWindow = new LogWindow(ServerLogs, StopServerAsync);
             _logWindow.Show();
         }
         else

@@ -22,7 +22,8 @@ type CpuSample = {
   total: number
 }
 
-type TranscodeKind = "live" | "audio" | "background" | "video"
+type TranscodeKind = "live" | "import-video" | "import-remux"
+export type ImportTranscodeCapacityKind = "video" | "remux"
 
 type PendingTranscodeRequest = {
   id: string
@@ -309,35 +310,19 @@ function getTranscodeCost(
   kind: TranscodeKind,
   profile?: PlaybackProfile
 ) {
+  if (kind === "import-video") {
+    return 0.5
+  }
+
+  if (kind === "import-remux") {
+    return acceleration === "cpu" ? 0.18 : 0.12
+  }
+
   if (acceleration === "cpu") {
-    if (kind === "live") {
-      return 0.35
-    }
-
-    if (kind === "audio") {
-      return 0.12
-    }
-
-    return 0.65
+    return 0.35
   }
 
-  if (kind === "live") {
-    return profile === "dataSaver" ? 0.14 : 0.16
-  }
-
-  if (kind === "audio") {
-    return 0.08
-  }
-
-  if (kind === "background") {
-    return 0.25
-  }
-
-  if (kind === "video") {
-    return 0.38
-  }
-
-  return 0.38
+  return profile === "dataSaver" ? 0.14 : 0.16
 }
 
 function getActiveCost() {
@@ -347,20 +332,10 @@ function getActiveCost() {
   )
 }
 
-function getTranscodePriority(kind: TranscodeKind) {
-  if (kind === "live") {
-    return 0
-  }
-
-  if (kind === "audio") {
-    return 1
-  }
-
-  if (kind === "background") {
-    return 2
-  }
-
-  return 3
+function getActiveLiveCount() {
+  return [...activeTranscodes.values()].filter(
+    (transcode) => transcode.kind === "live"
+  ).length
 }
 
 function scheduleQueueDrain() {
@@ -388,7 +363,7 @@ async function getCanFitTranscode(
   const acceleration = result.config.transcodeAccel
 
   if (acceleration === "cpu") {
-    return kind !== "live" && activeTranscodes.size === 0
+    return false
   }
 
   const snapshot = await getHardwarePressureSnapshot(acceleration)
@@ -411,12 +386,9 @@ function removePendingRequest(id: string) {
 export function cancelPendingLiveTranscodes(
   reason = "Live transcode request was cancelled"
 ) {
-  const pendingLiveRequests = pendingTranscodes.filter(
-    (request) => request.kind === "live"
-  )
+  const pendingLiveRequests = pendingTranscodes.splice(0)
 
   for (const request of pendingLiveRequests) {
-    removePendingRequest(request.id)
     request.reject(new Error(reason))
   }
 
@@ -534,14 +506,30 @@ function createLease(
   }
 }
 
+export function registerImportTranscodeCapacity(
+  label: string,
+  kind: ImportTranscodeCapacityKind
+): LiveTranscodeLease {
+  const result = getServerConfigResult()
+  const transcodeKind: TranscodeKind =
+    kind === "video" ? "import-video" : "import-remux"
+  const cost = result.ok
+    ? getTranscodeCost(result.config.transcodeAccel, transcodeKind)
+    : kind === "video"
+      ? 0.5
+      : 0.12
+
+  console.log(
+    `[Info] [Transcode] Import ${kind} work registered for live capacity - ${label}`
+  )
+
+  return createLease(label, transcodeKind, cost)
+}
+
 export async function getLiveTranscodeStatus(): Promise<TranscodeStatus> {
   const available = await getDynamicLiveCapacity()
-  const active = [...activeTranscodes.values()].filter(
-    (transcode) => transcode.kind === "live"
-  ).length
-  const queued = pendingTranscodes.filter(
-    (request) => request.kind === "live"
-  ).length
+  const active = getActiveLiveCount()
+  const queued = pendingTranscodes.length
 
   return {
     max: active + available,
@@ -566,7 +554,7 @@ function acquireQueuedTranscode(input: {
       label: input.label,
       kind: input.kind,
       profile: input.profile,
-      priority: getTranscodePriority(input.kind) - (input.isVip ? 1 : 0),
+      priority: input.isVip ? -1 : 0,
       sequence: pendingSequence++,
       signal: input.signal,
       resolve,
@@ -614,28 +602,5 @@ export function acquireLiveTranscode(
     profile,
     signal,
     isVip: options?.isVip,
-  })
-}
-
-export function acquireAudioTranscode(label: string, signal?: AbortSignal) {
-  return acquireQueuedTranscode({
-    label,
-    kind: "audio",
-    signal,
-  })
-}
-
-export function acquireOtherTranscode(label: string) {
-  return acquireQueuedTranscode({
-    label,
-    kind: "background",
-  })
-}
-
-export function acquireVideoTranscode(label: string, signal?: AbortSignal) {
-  return acquireQueuedTranscode({
-    label,
-    kind: "video",
-    signal,
   })
 }

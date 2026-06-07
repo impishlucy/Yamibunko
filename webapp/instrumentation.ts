@@ -9,10 +9,17 @@ export async function register() {
     const { startScheduledUploadCapacityRechecks } = await import(
       "./src/server/bandwidth/uploadCapacityRechecks"
     )
+    const { startParentProcessMonitor } = await import(
+      "./src/server/startup/parentProcessMonitor"
+    )
 
     bootstrapEnvironment()
     await startUploadCapacityMeasurement("startup")
     startScheduledUploadCapacityRechecks()
-    startWorkers()
+    const workerRuntime = startWorkers()
+
+    startParentProcessMonitor(async () => {
+      await workerRuntime?.stop()
+    })
   }
 }

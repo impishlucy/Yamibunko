@@ -64,7 +64,7 @@ public partial class App : Application
     {
         if (_logWindow == null || !_logWindow.IsVisible)
         {
-            _logWindow = new LogWindow(ServerManager.ServerLogs);
+            _logWindow = new LogWindow(ServerManager.ServerLogs, ServerManager.StopServerAsync);
             _logWindow.Show();
         }
         else

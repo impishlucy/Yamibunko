@@ -2,15 +2,61 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         x:Class="Launcher.LogWindow"
         Title="Server Logs"
-        Width="700" Height="400"
+        Width="900" Height="560"
+        MinWidth="640" MinHeight="360"
         WindowStartupLocation="CenterScreen">
-    <Grid>
-        <ListBox x:Name="LogList" Name="LogList" Background="#111111" Foreground="#E4E4E7" Padding="10" FontFamily="Consolas">
-            <ListBox.Styles>
-                <Style Selector="ListBoxItem">
-                    <Setter Property="Padding" Value="2"/>
-                </Style>
-            </ListBox.Styles>
-        </ListBox>
+    <Grid RowDefinitions="*,Auto" Margin="12" RowSpacing="10">
+        <Grid Grid.Row="0">
+            <Border Background="#111111"
+                    BorderBrush="#3F3F46"
+                    BorderThickness="1">
+                <ScrollViewer x:Name="LogScrollViewer"
+                              VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Auto">
+                    <TextBox x:Name="LogTextBox"
+                             Background="Transparent"
+                             Foreground="#E4E4E7"
+                             BorderThickness="0"
+                             Padding="10"
+                             FontFamily="Consolas"
+                             FontSize="13"
+                             AcceptsReturn="True"
+                             IsReadOnly="True"
+                             TextWrapping="NoWrap" />
+                </ScrollViewer>
+            </Border>
+
+            <Button x:Name="ScrollToBottomButton"
+                    Width="44"
+                    Height="44"
+                    Padding="0"
+                    Background="Transparent"
+                    BorderThickness="0"
+                    HorizontalAlignment="Right"
+                    VerticalAlignment="Bottom"
+                    Margin="0,0,24,24"
+                    IsVisible="False">
+                <Border Width="40"
+                        Height="40"
+                        CornerRadius="20"
+                        Background="#CC27272A"
+                        BorderBrush="#52525B"
+                        BorderThickness="1">
+                    <TextBlock Text="↓"
+                               Foreground="#F4F4F5"
+                               FontSize="22"
+                               FontWeight="SemiBold"
+                               HorizontalAlignment="Center"
+                               VerticalAlignment="Center"
+                               Margin="0,-3,0,0" />
+                </Border>
+            </Button>
+        </Grid>
+
+        <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+            <Button x:Name="StopServerButton" MinWidth="120" Padding="14,8">
+                Stop Server
+            </Button>
+        </StackPanel>
     </Grid>
 </Window>

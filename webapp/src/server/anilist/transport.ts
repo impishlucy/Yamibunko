@@ -11,16 +11,37 @@ let queue = Promise.resolve()
 let queuedOperations = 0
 let activeOperation = false
 let pausedUntil = 0
+let shuttingDown = false
+let shutdownReason = "AniList operation was cancelled because shutdown started"
+
+export class AniListOperationShutdownError extends Error {
+  constructor(message = shutdownReason) {
+    super(message)
+    this.name = "AniListOperationShutdownError"
+  }
+}
 
 function sleep(milliseconds: number) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
 
-async function waitForPause() {
-  const waitMs = pausedUntil - Date.now()
+function throwIfAniListShutdownStarted() {
+  if (shuttingDown) {
+    throw new AniListOperationShutdownError()
+  }
+}
 
-  if (waitMs > 0) {
-    await sleep(waitMs)
+async function waitForPause() {
+  for (;;) {
+    throwIfAniListShutdownStarted()
+
+    const waitMs = pausedUntil - Date.now()
+
+    if (waitMs <= 0) {
+      return
+    }
+
+    await sleep(Math.min(waitMs, 1000))
   }
 }
 
@@ -48,6 +69,32 @@ async function runWithTimeout<T>(operation: () => Promise<T>) {
   }
 }
 
+export function beginAniListOperationShutdown(
+  reason = "AniList operation was cancelled because shutdown started"
+) {
+  shutdownReason = reason
+
+  if (shuttingDown) {
+    return
+  }
+
+  shuttingDown = true
+
+  if (queuedOperations > 0 || activeOperation) {
+    console.log(
+      `[Info] [Anilist] Shutdown requested; cancelling queued AniList operation(s) and waiting for the active lookup to finish - queued ${queuedOperations}, active ${activeOperation ? "yes" : "no"}.`
+    )
+  }
+}
+
+export function isAniListOperationShutdownActive() {
+  return shuttingDown
+}
+
+export function isAniListOperationShutdownError(error: unknown) {
+  return error instanceof AniListOperationShutdownError
+}
+
 export function getAniListClient(accessToken?: string) {
   const key = accessToken ?? ""
   const existing = clients.get(key)
@@ -73,6 +120,10 @@ export function getAniListRateLimitState() {
 }
 
 export function queueAniListOperation<T>(operation: () => Promise<T>) {
+  if (shuttingDown) {
+    return Promise.reject<T>(new AniListOperationShutdownError())
+  }
+
   queuedOperations += 1
   debugLog(
     `[Debug] [Anilist] Queued AniList operation - Queue depth ${queuedOperations}`
@@ -81,21 +132,31 @@ export function queueAniListOperation<T>(operation: () => Promise<T>) {
   const run = queue.then(async () => {
     const startedAt = Date.now()
     queuedOperations = Math.max(queuedOperations - 1, 0)
+
+    throwIfAniListShutdownStarted()
     activeOperation = true
 
     debugLog(
       `[Debug] [Anilist] Starting AniList operation - Remaining queue ${queuedOperations}`
     )
 
-    await waitForPause()
-
     try {
+      await waitForPause()
+      throwIfAniListShutdownStarted()
+
       const result = await runWithTimeout(operation)
       debugLog(
         `[Debug] [Anilist] AniList operation completed - ${Date.now() - startedAt}ms`
       )
       return result
     } catch (error) {
+      if (isAniListOperationShutdownError(error)) {
+        debugLog(
+          `[Debug] [Anilist] AniList operation skipped during shutdown - Remaining queue ${queuedOperations}`
+        )
+        throw error
+      }
+
       const retryAfter = isRateLimitError(error)
         ? (error.retryAfterMs ?? 60_000)
         : null
@@ -120,3 +181,4 @@ export function queueAniListOperation<T>(operation: () => Promise<T>) {
 
   return run
 }
+
