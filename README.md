@@ -45,7 +45,7 @@ The only required things are an 64bit OS and .NET 10.
 4. Start the launcher from the extracted folder.
 5. Fill in the setup fields:
 
-   * Base URL, usually `http://localhost:3000` or the website url of the app.
+   * Base URL, usually ur Devices lan IP `http://192.168.178.10:3000` or the website url (if using a reverse proxy).
    * Input folder for new files.
    * Output folder for processed files.
    * AniList API client ID and secret if you want AniList tracking.
