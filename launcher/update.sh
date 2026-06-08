@@ -4,7 +4,6 @@ set -u
 
 install_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 webapp_dir="$install_dir/webapp"
-pid_file="$install_dir/server.pid"
 latest_release_api="https://api.github.com/repos/impishlucy/Yamibunko/releases/latest"
 release_url="https://github.com/impishlucy/Yamibunko/releases/latest/download/yamibunko-linux.zip"
 temp_dir=""
@@ -26,16 +25,6 @@ fail() {
   exit 1
 }
 
-is_process_alive() {
-  local pid="$1"
-
-  if [ -z "$pid" ]; then
-    return 1
-  fi
-
-  kill -0 "$pid" 2>/dev/null
-}
-
 read_process_command() {
   local pid="$1"
 
@@ -51,24 +40,16 @@ read_process_name() {
   local pid="$1"
 
   if [ -r "/proc/$pid/comm" ]; then
-    cat "/proc/$pid/comm"
+    head -n 1 "/proc/$pid/comm"
     return
   fi
 
-  ps -p "$pid" -o comm= 2>/dev/null || true
-}
-
-read_process_cwd() {
-  local pid="$1"
-
-  if [ -L "/proc/$pid/cwd" ]; then
-    readlink "/proc/$pid/cwd" 2>/dev/null || true
-  fi
+  ps -p "$pid" -o comm= 2>/dev/null | head -n 1 || true
 }
 
 is_yamibunko_process() {
   local pid="$1"
-  local name command cwd lower_name lower_command
+  local name command lower_name lower_command
 
   if [ "$pid" = "$$" ]; then
     return 1
@@ -76,31 +57,17 @@ is_yamibunko_process() {
 
   name="$(read_process_name "$pid")"
   command="$(read_process_command "$pid")"
-  cwd="$(read_process_cwd "$pid")"
   lower_name="$(printf "%s" "$name" | tr '[:upper:]' '[:lower:]')"
   lower_command="$(printf "%s" "$command" | tr '[:upper:]' '[:lower:]')"
 
-  if [ "$lower_name" = "launcher" ] || [ "$lower_name" = "launcher.exe" ]; then
-    case "$cwd" in
-      "$install_dir"|"$install_dir"/*) return 0 ;;
-    esac
-
-    case "$command" in
-      *"$install_dir"*) return 0 ;;
-    esac
+  if [ "$lower_name" = "yamibunko" ]; then
+    return 0
   fi
 
   case "$lower_name" in
-    bun|bun.exe|node|node.exe|next|next.exe)
-      case "$cwd" in
-        "$webapp_dir"|"$webapp_dir"/*) return 0 ;;
-      esac
-
-      case "$command" in
-        *"$webapp_dir"*) return 0 ;;
-      esac
-
-      if printf "%s" "$lower_command" | grep -q "yamibunko" && printf "%s" "$lower_command" | grep -Eq "(next|bun|node|run start)"; then
+    bun|node)
+      if printf "%s" "$lower_command" | grep -q "yamibunk" && \
+        printf "%s" "$lower_command" | grep -Eq '(^|[[:space:]])run[[:space:]]+start($|[[:space:]]|:)'; then
         return 0
       fi
       ;;
@@ -110,22 +77,19 @@ is_yamibunko_process() {
 }
 
 find_running_yamibunko_process() {
-  local pid
-
-  if [ -f "$pid_file" ]; then
-    pid="$(tr -cd '0-9' < "$pid_file")"
-    if is_process_alive "$pid" && is_yamibunko_process "$pid"; then
-      printf "%s" "$pid"
-      return 0
-    fi
-  fi
+  local pid process_name
 
   for process_dir in /proc/[0-9]*; do
     [ -d "$process_dir" ] || continue
     pid="${process_dir##*/}"
 
     if is_yamibunko_process "$pid"; then
-      printf "%s" "$pid"
+      process_name="$(read_process_name "$pid")"
+      if [ -z "$process_name" ]; then
+        process_name="unknown"
+      fi
+
+      printf "%s\t%s" "$process_name" "$pid"
       return 0
     fi
   done
@@ -201,8 +165,11 @@ download_to_stdout() {
   fi
 }
 
-if running_pid="$(find_running_yamibunko_process)"; then
-  fail "Yamibunko is still running (PID $running_pid). Close the launcher/server before updating."
+if running_process="$(find_running_yamibunko_process)"; then
+  IFS="$(printf '	')" read -r running_name running_pid <<EOF
+$running_process
+EOF
+  fail "Yamibunko is still running ($running_name, PID $running_pid). Close the launcher/server before updating."
 fi
 
 if ! command -v unzip >/dev/null 2>&1; then

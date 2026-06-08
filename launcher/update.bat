@@ -17,7 +17,6 @@ $ProgressPreference = "SilentlyContinue"
 
 $installRoot = [System.IO.Path]::GetFullPath($env:INSTALL_ROOT).TrimEnd("\")
 $webappRoot = [System.IO.Path]::Combine($installRoot, "webapp")
-$pidFile = [System.IO.Path]::Combine($installRoot, "server.pid")
 $latestReleaseApi = "https://api.github.com/repos/impishlucy/Yamibunko/releases/latest"
 $releaseUrl = "https://github.com/impishlucy/Yamibunko/releases/latest/download/yamibunko-win.zip"
 $requestHeaders = @{ "User-Agent" = "Yamibunko-Updater"; "Accept" = "application/vnd.github+json" }
@@ -30,20 +29,31 @@ function TextValue($value) {
     return [string]$value
 }
 
-function IsUnderRoot($path, $root) {
-    if ([string]::IsNullOrWhiteSpace($path)) {
+function Normalize-CommandLine($value) {
+    return [System.Text.RegularExpressions.Regex]::Replace((TextValue $value), "\s+", " ").Trim()
+}
+
+function Is-NodeOrBunProcessName($name) {
+    $lowerName = (TextValue $name).ToLowerInvariant()
+    return @("bun.exe", "bun", "node.exe", "node") -contains $lowerName
+}
+
+function Has-YamibunkoStartCommand($process) {
+    if (!(Is-NodeOrBunProcessName $process.Name)) {
         return $false
     }
 
-    try {
-        $fullPath = [System.IO.Path]::GetFullPath($path).TrimEnd("\")
-        $fullRoot = [System.IO.Path]::GetFullPath($root).TrimEnd("\")
+    $commandLine = Normalize-CommandLine $process.CommandLine
+    $lowerCommandLine = $commandLine.ToLowerInvariant()
 
-        return $fullPath.Equals($fullRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
-            $fullPath.StartsWith($fullRoot + "\", [System.StringComparison]::OrdinalIgnoreCase)
-    } catch {
+    if (!$lowerCommandLine.Contains("yamibunk")) {
         return $false
     }
+
+    return [System.Text.RegularExpressions.Regex]::IsMatch(
+        $lowerCommandLine,
+        '(^|[\s"''])run\s+start($|[\s"'':])'
+    )
 }
 
 function Is-YamibunkoProcess($process) {
@@ -52,45 +62,16 @@ function Is-YamibunkoProcess($process) {
     }
 
     $name = TextValue $process.Name
-    $commandLine = TextValue $process.CommandLine
-    $executablePath = TextValue $process.ExecutablePath
     $lowerName = $name.ToLowerInvariant()
-    $lowerCommandLine = $commandLine.ToLowerInvariant()
 
-    if ($lowerName -eq "launcher.exe" -and (IsUnderRoot $executablePath $installRoot)) {
+    if ($lowerName -eq "yamibunko.exe" -or $lowerName -eq "yamibunko") {
         return $true
     }
 
-    if (@("bun.exe", "node.exe", "next.exe") -contains $lowerName) {
-        if ($commandLine.IndexOf($webappRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-            return $true
-        }
-
-        $hasYamibunkoMarker = $lowerCommandLine.Contains("yamibunko")
-        $hasServerMarker = $lowerCommandLine.Contains("next") -or
-            $lowerCommandLine.Contains("bun") -or
-            $lowerCommandLine.Contains("node") -or
-            $lowerCommandLine.Contains("run start")
-
-        if ($hasYamibunkoMarker -and $hasServerMarker) {
-            return $true
-        }
-    }
-
-    return $false
+    return Has-YamibunkoStartCommand $process
 }
 
 function Get-RunningYamibunkoProcess {
-    if (Test-Path -LiteralPath $pidFile) {
-        $rawPid = (Get-Content -LiteralPath $pidFile -Raw).Trim()
-        if ($rawPid -match "^\d+$") {
-            $pidProcess = Get-CimInstance Win32_Process -Filter ("ProcessId = " + $rawPid) -ErrorAction SilentlyContinue
-            if (Is-YamibunkoProcess $pidProcess) {
-                return $pidProcess
-            }
-        }
-    }
-
     $processes = Get-CimInstance Win32_Process
     foreach ($process in $processes) {
         if (Is-YamibunkoProcess $process) {
@@ -235,7 +216,7 @@ function Copy-ReleaseFiles($sourcePath, $destinationPath) {
 
 $runningProcess = Get-RunningYamibunkoProcess
 if ($null -ne $runningProcess) {
-    Write-Host ("Yamibunko is still running (PID " + $runningProcess.ProcessId + "). Close the launcher/server before updating.")
+    Write-Host ("Yamibunko is still running (" + (TextValue $runningProcess.Name) + ", PID " + $runningProcess.ProcessId + "). Close the launcher/server before updating.")
     exit 2
 }
 
