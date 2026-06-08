@@ -64,7 +64,8 @@ If the web UI does not open automatically, check the launcher log window.
 
 ### AniList Setup
 
-AniList features require an [AniList API client](https://anilist.co/settings/developer). Configure the client redirect URL to match the Yamibunko callback URL:
+AniList user features require an [AniList API client](https://anilist.co/settings/developer).<br/>
+Configure the client redirect URL to match the Yamibunko callback URL:
 
 ```text
 Examples:
