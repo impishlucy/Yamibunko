@@ -1,6 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import type { ComponentPropsWithoutRef, CSSProperties } from "react"
 import { createPortal } from "react-dom"
 import {
   Cast,
@@ -96,6 +97,77 @@ type SeekPreviewFrame = {
   leftPercent: number
 }
 
+type BufferedSeekBarProps = Omit<
+  ComponentPropsWithoutRef<"input">,
+  "className" | "max" | "min" | "step" | "type"
+> & {
+  durationSeconds: number
+  currentTimeSeconds: number
+  bufferedSeconds: number
+  trackClassName: string
+  trackHeight: string
+  inputClassName?: string
+}
+
+type SeekRangeStyle = CSSProperties & {
+  "--yamibunko-seek-track-height"?: string
+}
+
+function getProgressPercent(value: number, durationSeconds: number) {
+  if (!durationSeconds || durationSeconds <= 0) {
+    return 0
+  }
+
+  return Math.min(Math.max((value / durationSeconds) * 100, 0), 100)
+}
+
+function BufferedSeekBar({
+  durationSeconds,
+  currentTimeSeconds,
+  bufferedSeconds,
+  trackClassName,
+  trackHeight,
+  inputClassName = "",
+  style,
+  ...inputProps
+}: BufferedSeekBarProps) {
+  const playedPercent = getProgressPercent(currentTimeSeconds, durationSeconds)
+  const bufferedPercent = getProgressPercent(
+    Math.max(bufferedSeconds, currentTimeSeconds),
+    durationSeconds
+  )
+  const visibleBufferedPercent = Math.max(bufferedPercent, playedPercent)
+  const inputStyle: SeekRangeStyle = {
+    ...style,
+    "--yamibunko-seek-track-height": trackHeight,
+  }
+
+  return (
+    <div className={`relative ${trackClassName}`}>
+      <div className="pointer-events-none absolute inset-0 overflow-hidden rounded-full bg-zinc-950/95">
+        <div
+          className="absolute inset-y-0 left-0 rounded-full bg-zinc-300/75"
+          style={{ width: `${visibleBufferedPercent}%` }}
+        />
+        <div
+          className="absolute inset-y-0 left-0 rounded-full bg-red-600"
+          style={{ width: `${playedPercent}%` }}
+        />
+      </div>
+      <input
+        {...inputProps}
+        type="range"
+        min={0}
+        max={durationSeconds || 0}
+        step={0.25}
+        style={inputStyle}
+        className={`yamibunko-seek-range absolute -inset-y-3 left-0 z-10 h-[calc(100%+1.5rem)] w-full bg-transparent ${inputClassName}`}
+      />
+    </div>
+  )
+}
+
+
 type StreamPriorityAction = {
   type:
     | "forceDataSaver"
@@ -186,6 +258,17 @@ type SubtitleCue = {
   text: string
 }
 
+type CastClockSnapshot = {
+  durationSeconds?: number
+  playerState?: string
+  positionSeconds: number
+}
+
+type PreloadRangeProbe = {
+  contentLength: number
+  rangeable: boolean
+}
+
 const hevcMp4Checks = [
   'video/mp4; codecs="hvc1.1.6.L93.B0"',
   'video/mp4; codecs="hev1.1.6.L93.B0"',
@@ -195,6 +278,19 @@ const hevcMp4Checks = [
 
 const mediaErrorDecodeCode = 3
 const mediaErrorSourceNotSupportedCode = 4
+const introSkipVisibleSeconds = 4 * 60
+const introSkipSeekSeconds = 90
+const preloadRampInitialRatio = 0.4
+const preloadRampMaxAheadSeconds = 10 * 60
+const preloadRampMaxSeconds = 60
+const preloadRampTickMs = 250
+const preloadRangeProbeTimeoutMs = 4_000
+const preloadRangeWarmupMinChunkBytes = 96 * 1024 * 1024
+const preloadRangeWarmupMaxChunkBytes = 1024 * 1024 * 1024
+const preloadRangeWarmupMinimumMissingSeconds = 0.5
+const castClockTickMs = 1_000
+const serverCastStatusPollMs = 1_000
+const maxServerCastStatusFailures = 8
 
 const iosExternalCastAppName = "Web Video Caster"
 const iosExternalCastAppStoreUrl =
@@ -1108,6 +1204,47 @@ function getBufferedEnd(video: HTMLVideoElement) {
   return end
 }
 
+function parseContentRangeTotal(value: string | null) {
+  const total = value?.match(/\/(\d+)$/)?.[1]
+
+  if (!total) {
+    return undefined
+  }
+
+  const size = Number(total)
+
+  return Number.isFinite(size) && size > 0 ? size : undefined
+}
+
+async function drainResponseBody(
+  response: Response,
+  onBytesRead?: (byteLength: number) => void
+) {
+  if (!response.body) {
+    const body = await response.arrayBuffer()
+    onBytesRead?.(body.byteLength)
+    return
+  }
+
+  const reader = response.body.getReader()
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+
+      if (done) {
+        return
+      }
+
+      if (value) {
+        onBytesRead?.(value.byteLength)
+      }
+    }
+  } finally {
+    reader.releaseLock()
+  }
+}
+
 function parseWebVttTimestamp(value: string) {
   const parts = value.trim().replace(",", ".").split(":")
 
@@ -1594,6 +1731,7 @@ export function AnimePlayer({
   const serverCastProgressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const serverCastStatusGraceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const serverCastStatusGraceActiveRef = useRef(false)
+  const serverCastStatusFailureCountRef = useRef(0)
   const nativeRemoteFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const isCastLoadingRef = useRef(false)
   const isPlayingRef = useRef(false)
@@ -1604,6 +1742,18 @@ export function AnimePlayer({
   const castFinishedHandledRef = useRef(false)
   const castMediaCleanupRef = useRef<(() => void) | null>(null)
   const castProgressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const castClockTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const castClockRef = useRef<CastClockSnapshot | null>(null)
+  const castClockElapsedSecondsRef = useRef(0)
+  const preloadRampTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const preloadRampElapsedSecondsRef = useRef(0)
+  const preloadRangeAbortRef = useRef<AbortController | null>(null)
+  const preloadRangeProbeRef = useRef<PreloadRangeProbe | null>(null)
+  const preloadRangeProbePromiseRef = useRef<Promise<PreloadRangeProbe | null> | null>(null)
+  const preloadRangeProbeSourceRef = useRef<string | null>(null)
+  const preloadRangeFetchingRef = useRef(false)
+  const preloadRangeRequestedByteEndRef = useRef(-1)
+  const preloadRangeWarmedUntilRef = useRef(0)
   const castStartPromiseRef = useRef<Promise<boolean> | null>(null)
   const localPlaybackBeforeCastRef = useRef<LocalPlaybackSnapshot | null>(null)
   const resumeLocalAfterCastEndRef = useRef(false)
@@ -1644,6 +1794,11 @@ export function AnimePlayer({
   >(() => undefined)
   const handlePlayRequestFailureRef = useRef<(error: unknown) => boolean>(() => false)
   const handleCastEndedRef = useRef<() => void>(() => undefined)
+  const emitCastClockProgressRef = useRef<() => void>(() => undefined)
+  const loadServerCastStatusRef = useRef<() => Promise<void>>(async () => undefined)
+  const handleServerCastStatusErrorRef = useRef<(error: unknown) => void>(() => undefined)
+  const syncCastMediaStateRef = useRef<(state: GoogleCastMediaState) => void>(() => undefined)
+  const applyLocalPreloadRampRef = useRef<(video: HTMLVideoElement) => void>(() => undefined)
   const [quality, setQuality] = useState<PlaybackProfile>("original")
   const [detectedPlayerAspectRatio, setDetectedPlayerAspectRatio] = useState<{
     playbackKey: string
@@ -1667,6 +1822,7 @@ export function AnimePlayer({
   const [seekPreview, setSeekPreview] = useState<number | null>(null)
   const [seekPreviewFrame, setSeekPreviewFrame] = useState<SeekPreviewFrame | null>(null)
   const [duration, setDuration] = useState(getStableDuration(durationSeconds))
+  const [bufferedTime, setBufferedTime] = useState(0)
   const [controlsVisible, setControlsVisible] = useState(true)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [isPortraitViewport, setIsPortraitViewport] = useState(false)
@@ -1917,7 +2073,382 @@ export function AnimePlayer({
     [clearCastErrorFlashTimer]
   )
 
+
+  function clearCastClock() {
+    if (castClockTimerRef.current) {
+      clearInterval(castClockTimerRef.current)
+      castClockTimerRef.current = null
+    }
+
+    castClockRef.current = null
+    castClockElapsedSecondsRef.current = 0
+  }
+
+  function estimateCastClockPosition() {
+    const snapshot = castClockRef.current
+
+    if (!snapshot) {
+      return currentTimeRef.current
+    }
+
+    const elapsedSeconds =
+      snapshot.playerState === "PLAYING" || snapshot.playerState === "BUFFERING"
+        ? castClockElapsedSecondsRef.current
+        : 0
+
+    return clampTime(
+      castSourceStartOffsetRef.current + snapshot.positionSeconds + elapsedSeconds,
+      getStableDuration(durationSeconds, snapshot.durationSeconds, duration)
+    )
+  }
+
+  function emitCastClockProgress() {
+    const snapshot = castClockRef.current
+
+    if (!snapshot) {
+      return
+    }
+
+    const knownDuration = getStableDuration(
+      durationSeconds,
+      snapshot.durationSeconds,
+      duration
+    )
+
+    updateWatchedProgress(estimateCastClockPosition(), knownDuration)
+  }
+
+  function startCastClock() {
+    if (castClockTimerRef.current) {
+      return
+    }
+
+    castClockTimerRef.current = setInterval(() => {
+      const snapshot = castClockRef.current
+
+      if (snapshot?.playerState === "PLAYING" || snapshot?.playerState === "BUFFERING") {
+        castClockElapsedSecondsRef.current += castClockTickMs / 1000
+      }
+
+      emitCastClockProgressRef.current()
+    }, castClockTickMs)
+  }
+
+  function syncCastClock(state: GoogleCastMediaState) {
+    castClockRef.current = {
+      durationSeconds: state.durationSeconds,
+      playerState: state.playerState,
+      positionSeconds: Math.max(state.positionSeconds, 0),
+    }
+    castClockElapsedSecondsRef.current = 0
+
+    startCastClock()
+  }
+
+  function clearPreloadRamp() {
+    if (preloadRampTimerRef.current) {
+      clearInterval(preloadRampTimerRef.current)
+      preloadRampTimerRef.current = null
+    }
+
+    preloadRangeAbortRef.current?.abort()
+    preloadRangeAbortRef.current = null
+    preloadRangeProbeRef.current = null
+    preloadRangeProbePromiseRef.current = null
+    preloadRangeProbeSourceRef.current = null
+    preloadRangeFetchingRef.current = false
+    preloadRangeRequestedByteEndRef.current = -1
+    preloadRangeWarmedUntilRef.current = Math.max(currentTimeRef.current, 0)
+  }
+
+  function getPreloadRampRatio() {
+    const elapsedSeconds = Math.max(preloadRampElapsedSecondsRef.current, 0)
+    const rampProgress = Math.min(
+      elapsedSeconds / Math.max(preloadRampMaxSeconds, 1),
+      1
+    )
+
+    return preloadRampInitialRatio + (1 - preloadRampInitialRatio) * rampProgress
+  }
+
+  function getPreloadAheadTargetSeconds() {
+    return Math.round(preloadRampMaxAheadSeconds * getPreloadRampRatio())
+  }
+
+  function getPreloadWarmupChunkBytes() {
+    return Math.round(
+      preloadRangeWarmupMinChunkBytes +
+        (preloadRangeWarmupMaxChunkBytes - preloadRangeWarmupMinChunkBytes) *
+          getPreloadRampRatio()
+    )
+  }
+
+  function resetPreloadRangeProbe(sourceUrl: string | null) {
+    preloadRangeAbortRef.current?.abort()
+    preloadRangeAbortRef.current = null
+    preloadRangeProbeRef.current = null
+    preloadRangeProbePromiseRef.current = null
+    preloadRangeProbeSourceRef.current = sourceUrl
+    preloadRangeFetchingRef.current = false
+    preloadRangeRequestedByteEndRef.current = -1
+    preloadRangeWarmedUntilRef.current = Math.max(currentTimeRef.current, 0)
+  }
+
+  function getPreloadRangeProbe(sourceUrl: string) {
+    if (preloadRangeProbeSourceRef.current !== sourceUrl) {
+      resetPreloadRangeProbe(sourceUrl)
+    }
+
+    if (preloadRangeProbeRef.current) {
+      return Promise.resolve(preloadRangeProbeRef.current)
+    }
+
+    if (preloadRangeProbePromiseRef.current) {
+      return preloadRangeProbePromiseRef.current
+    }
+
+    const controller = new AbortController()
+    const timeout = window.setTimeout(() => controller.abort(), preloadRangeProbeTimeoutMs)
+
+    preloadRangeProbePromiseRef.current = fetch(sourceUrl, {
+      headers: {
+        Range: "bytes=0-0",
+      },
+      credentials: "same-origin",
+      cache: "force-cache",
+      signal: controller.signal,
+    })
+      .then(async (response) => {
+        await response.body?.cancel().catch(() => undefined)
+
+        if (response.status === 206) {
+          const rangedContentLength = parseContentRangeTotal(
+            response.headers.get("content-range")
+          )
+
+          if (rangedContentLength) {
+            return {
+              contentLength: rangedContentLength,
+              rangeable: true,
+            } satisfies PreloadRangeProbe
+          }
+        }
+
+        const contentLength = Number(response.headers.get("content-length"))
+        const acceptRanges = response.headers.get("accept-ranges")?.toLowerCase() ?? ""
+
+        if (!response.ok || !Number.isFinite(contentLength) || contentLength <= 0) {
+          return null
+        }
+
+        return {
+          contentLength,
+          rangeable: acceptRanges.includes("bytes"),
+        } satisfies PreloadRangeProbe
+      })
+      .catch(() => null)
+      .finally(() => {
+        window.clearTimeout(timeout)
+      })
+      .then((probe) => {
+        if (preloadRangeProbeSourceRef.current === sourceUrl) {
+          preloadRangeProbeRef.current = probe
+          preloadRangeProbePromiseRef.current = null
+        }
+
+        return probe
+      })
+
+    return preloadRangeProbePromiseRef.current
+  }
+
+  function warmLocalDirectBuffer(video: HTMLVideoElement, targetAheadSeconds: number) {
+    const sourceUrl = sourceUrlRef.current
+
+    if (
+      !sourceUrl ||
+      statusRef.current !== "direct" ||
+      localDirectAudioRemuxActive ||
+      preloadRangeFetchingRef.current
+    ) {
+      return
+    }
+
+    void getPreloadRangeProbe(sourceUrl).then((probe) => {
+      if (
+        !probe?.rangeable ||
+        sourceUrlRef.current !== sourceUrl ||
+        statusRef.current !== "direct" ||
+        localDirectAudioRemuxActive ||
+        isAnyCastingRef() ||
+        preloadRangeFetchingRef.current
+      ) {
+        return
+      }
+
+      const knownDuration = getStableDuration(durationSeconds, video.duration, duration)
+
+      if (!knownDuration || knownDuration <= 0) {
+        return
+      }
+
+      const currentSeconds = Math.max(video.currentTime, currentTimeRef.current, 0)
+      const bufferedEndSeconds = Math.max(
+        getBufferedEnd(video),
+        preloadRangeWarmedUntilRef.current - activeSourceStartRef.current,
+        currentSeconds
+      )
+      const targetSeconds = Math.min(currentSeconds + targetAheadSeconds, knownDuration)
+      const missingSeconds = targetSeconds - bufferedEndSeconds
+
+      if (missingSeconds < preloadRangeWarmupMinimumMissingSeconds) {
+        return
+      }
+
+      const bytesPerSecond = probe.contentLength / knownDuration
+      const bufferedByteEnd = Math.max(
+        Math.floor(bufferedEndSeconds * bytesPerSecond),
+        0
+      )
+      const targetByteEnd = Math.min(
+        Math.max(Math.floor(targetSeconds * bytesPerSecond), 0),
+        probe.contentLength - 1
+      )
+      const byteStart = Math.max(
+        bufferedByteEnd,
+        preloadRangeRequestedByteEndRef.current + 1,
+        0
+      )
+
+      if (byteStart >= targetByteEnd) {
+        return
+      }
+
+      const byteEnd = Math.min(
+        targetByteEnd,
+        byteStart + getPreloadWarmupChunkBytes() - 1,
+        probe.contentLength - 1
+      )
+      const controller = new AbortController()
+
+      preloadRangeAbortRef.current?.abort()
+      preloadRangeAbortRef.current = controller
+      preloadRangeFetchingRef.current = true
+      preloadRangeRequestedByteEndRef.current = byteEnd
+
+      void fetch(sourceUrl, {
+        headers: {
+          Range: `bytes=${byteStart}-${byteEnd}`,
+        },
+        credentials: "same-origin",
+        cache: "force-cache",
+        signal: controller.signal,
+      })
+        .then(async (response) => {
+          if (response.status !== 206) {
+            preloadRangeProbeRef.current = {
+              ...probe,
+              rangeable: false,
+            }
+            return
+          }
+
+          const requestedByteLength = byteEnd - byteStart + 1
+          const visualUpdateStepBytes = 4 * 1024 * 1024
+          let loadedByteLength = 0
+          let lastVisualByteLength = 0
+          const updateWarmupDisplay = (force = false) => {
+            if (
+              !force &&
+              loadedByteLength - lastVisualByteLength < visualUpdateStepBytes
+            ) {
+              return
+            }
+
+            lastVisualByteLength = loadedByteLength
+
+            const loadedByteEndExclusive = Math.min(
+              byteStart + loadedByteLength,
+              byteEnd + 1
+            )
+            const warmedUntilSeconds =
+              activeSourceStartRef.current +
+              Math.min(loadedByteEndExclusive / bytesPerSecond, knownDuration)
+
+            preloadRangeWarmedUntilRef.current = Math.max(
+              preloadRangeWarmedUntilRef.current,
+              warmedUntilSeconds
+            )
+            setBufferedTime((previousBufferedTime) =>
+              Math.abs(previousBufferedTime - preloadRangeWarmedUntilRef.current) >= 0.25
+                ? preloadRangeWarmedUntilRef.current
+                : previousBufferedTime
+            )
+          }
+
+          await drainResponseBody(response, (byteLength) => {
+            loadedByteLength = Math.min(
+              loadedByteLength + byteLength,
+              requestedByteLength
+            )
+            updateWarmupDisplay()
+          })
+
+          loadedByteLength = requestedByteLength
+          updateWarmupDisplay(true)
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          if (preloadRangeAbortRef.current === controller) {
+            preloadRangeAbortRef.current = null
+          }
+
+          preloadRangeFetchingRef.current = false
+
+          const activeVideo = videoRef.current
+
+          if (
+            activeVideo &&
+            sourceUrlRef.current === sourceUrl &&
+            !isAnyCastingRef()
+          ) {
+            applyLocalPreloadRampRef.current(activeVideo)
+          }
+        })
+    })
+  }
+
+  function applyLocalPreloadRamp(video: HTMLVideoElement) {
+    video.preload = "auto"
+
+    if (!sourceUrlRef.current || isAnyCastingRef()) {
+      return
+    }
+
+    const targetAheadSeconds = getPreloadAheadTargetSeconds()
+    const bufferedAhead = Math.max(getBufferedEnd(video) - video.currentTime, 0)
+
+    if (bufferedAhead >= targetAheadSeconds) {
+      return
+    }
+
+    warmLocalDirectBuffer(video, targetAheadSeconds)
+  }
+
+  function isAnyCastingRef() {
+    return isCastingRef.current || isServerCastingRef.current || isNativeRemoteCastingRef.current
+  }
+
+  useEffect(() => {
+    emitCastClockProgressRef.current = emitCastClockProgress
+    loadServerCastStatusRef.current = loadServerCastStatus
+    handleServerCastStatusErrorRef.current = handleServerCastStatusError
+    syncCastMediaStateRef.current = syncCastMediaState
+    applyLocalPreloadRampRef.current = applyLocalPreloadRamp
+  })
+
   const clearCastMediaSync = useCallback(() => {
+    clearCastClock()
     castMediaCleanupRef.current?.()
     castMediaCleanupRef.current = null
 
@@ -1946,6 +2477,8 @@ export function AnimePlayer({
   }, [clearServerCastStatusGrace])
 
   const clearServerCastMediaSync = useCallback(() => {
+    clearCastClock()
+
     if (serverCastProgressTimerRef.current) {
       clearInterval(serverCastProgressTimerRef.current)
       serverCastProgressTimerRef.current = null
@@ -2055,6 +2588,10 @@ export function AnimePlayer({
         isGoogleCastEndingState(event.sessionState) &&
         (isCastingRef.current || isCastLoadingRef.current)
       ) {
+        if (document.visibilityState === "hidden") {
+          return
+        }
+
         handleCastEndedRef.current()
       }
     })
@@ -2063,6 +2600,47 @@ export function AnimePlayer({
       removeListener()
     }
   }, [showControls])
+
+  useEffect(() => {
+    function resyncActiveCast() {
+      if (!isAnyCastingRef()) {
+        return
+      }
+
+      emitCastClockProgressRef.current()
+
+      if (isServerCastingRef.current) {
+        void loadServerCastStatusRef.current().catch(handleServerCastStatusErrorRef.current)
+        return
+      }
+
+      const session = getGoogleCastSession()
+
+      if (session) {
+        const state = getGoogleCastMediaState(session)
+
+        if (state) {
+          syncCastMediaStateRef.current(state)
+        }
+      }
+    }
+
+    function handleVisibilityChange() {
+      if (document.visibilityState === "visible") {
+        resyncActiveCast()
+      }
+    }
+
+    document.addEventListener("visibilitychange", handleVisibilityChange)
+    window.addEventListener("focus", resyncActiveCast)
+    window.addEventListener("pageshow", resyncActiveCast)
+
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange)
+      window.removeEventListener("focus", resyncActiveCast)
+      window.removeEventListener("pageshow", resyncActiveCast)
+    }
+  }, [])
 
   useEffect(() => {
     const portraitQuery = window.matchMedia("(orientation: portrait)")
@@ -2129,6 +2707,37 @@ export function AnimePlayer({
       video.pause()
     }
   }, [isCasting, isFullscreen, isMobilePortraitViewport, isNativeRemoteCasting])
+
+  useEffect(() => {
+    const video = videoRef.current
+
+    clearPreloadRamp()
+
+    if (!video || !sourceUrl || isCasting || isServerCasting || isNativeRemoteCasting) {
+      return
+    }
+
+    preloadRampElapsedSecondsRef.current = 0
+    applyLocalPreloadRampRef.current(video)
+    preloadRampTimerRef.current = setInterval(() => {
+      const activeVideo = videoRef.current
+
+      preloadRampElapsedSecondsRef.current += preloadRampTickMs / 1000
+
+      if (activeVideo) {
+        applyLocalPreloadRampRef.current(activeVideo)
+      }
+    }, preloadRampTickMs)
+
+    return clearPreloadRamp
+  }, [
+    isCasting,
+    isNativeRemoteCasting,
+    isServerCasting,
+    localDirectAudioRemuxActive,
+    sourceUrl,
+    status,
+  ])
 
   useEffect(() => {
     if (!settingsOpen) {
@@ -2276,6 +2885,7 @@ export function AnimePlayer({
       clearCastMediaSync()
       clearServerCastMediaSync()
       clearServerCastStatusGrace()
+      clearPreloadRamp()
       clearSeekPreviewFrameTimer()
       clearSubtitleAnimationFrame()
     },
@@ -2312,6 +2922,36 @@ export function AnimePlayer({
   const getPlaybackPosition = useCallback(() => {
     return getPlaybackClockPosition(videoRef.current)
   }, [getPlaybackClockPosition])
+
+  const syncBufferedTime = useCallback(
+    (video: HTMLVideoElement | null) => {
+      if (!video) {
+        return
+      }
+
+      const sourceOffset = activeSourceStartRef.current
+      const bufferedEnd = sourceOffset + getBufferedEnd(video)
+      const nextBufferedTime = Math.max(
+        bufferedEnd,
+        preloadRangeWarmedUntilRef.current,
+        currentTimeRef.current,
+        0
+      )
+      const measuredDuration = Number.isFinite(video.duration)
+        ? video.duration + sourceOffset
+        : undefined
+      const knownDuration = getStableDuration(durationSeconds, measuredDuration, duration)
+      const clampedBufferedTime =
+        knownDuration > 0 ? Math.min(nextBufferedTime, knownDuration) : nextBufferedTime
+
+      setBufferedTime((previousBufferedTime) =>
+        Math.abs(previousBufferedTime - clampedBufferedTime) >= 0.25
+          ? clampedBufferedTime
+          : previousBufferedTime
+      )
+    },
+    [duration, durationSeconds]
+  )
 
   const syncSubtitleOverlay = useCallback(
     (seconds = getPlaybackPosition()) => {
@@ -2443,6 +3083,9 @@ export function AnimePlayer({
       shouldAutoPlaySourceRef.current
 
     activeSourceStartRef.current = sourceStartTime
+    streamStatsSampleRef.current = null
+    preloadRangeWarmedUntilRef.current = sourceStartTime
+    setBufferedTime(sourceStartTime)
 
     if (options.preservePosition) {
       currentTimeRef.current = previousPosition
@@ -2507,6 +3150,9 @@ export function AnimePlayer({
     sourceUrlRef.current = null
     activeSourceStartRef.current = 0
     pendingSeekRef.current = null
+    streamStatsSampleRef.current = null
+    preloadRangeWarmedUntilRef.current = 0
+    setBufferedTime(0)
     setSourceUrl(null)
     setStatus("blocked")
     statusRef.current = "blocked"
@@ -2538,6 +3184,8 @@ export function AnimePlayer({
         setSeekPreviewFrame(null)
         setActiveSubtitleTexts([])
         setDuration(getStableDuration(durationSeconds))
+        preloadRangeWarmedUntilRef.current = 0
+        setBufferedTime(0)
         setControlsVisible(!isPlayingRef.current)
         setSettingsOpen(false)
         endMediaWait()
@@ -3854,9 +4502,15 @@ export function AnimePlayer({
     }
 
     if (!state.isAlive) {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden" && isAnyCastingRef()) {
+        return
+      }
+
       handleCastEndedRef.current()
       return
     }
+
+    syncCastClock(state)
 
     const knownDuration = getStableDuration(
       durationSeconds,
@@ -3947,25 +4601,36 @@ export function AnimePlayer({
     }
 
     const payload = (await response.json()) as ServerCastStatusResponse
+    serverCastStatusFailureCountRef.current = 0
     syncServerCastMediaState(payload.state)
+  }
+
+  function handleServerCastStatusError(error: unknown) {
+    serverCastStatusFailureCountRef.current += 1
+
+    if (document.visibilityState === "hidden") {
+      return
+    }
+
+    if (serverCastStatusFailureCountRef.current < maxServerCastStatusFailures) {
+      return
+    }
+
+    flashCastError(error)
+    handleCastEndedRef.current()
   }
 
   function attachServerCastMediaSync(contentId: string) {
     clearServerCastMediaSync()
     castContentIdRef.current = contentId
     castFinishedHandledRef.current = false
+    serverCastStatusFailureCountRef.current = 0
 
     serverCastProgressTimerRef.current = setInterval(() => {
-      void loadServerCastStatus().catch((error) => {
-        flashCastError(error)
-        handleCastEndedRef.current()
-      })
-    }, 1000)
+      void loadServerCastStatus().catch(handleServerCastStatusError)
+    }, serverCastStatusPollMs)
 
-    void loadServerCastStatus().catch((error) => {
-      flashCastError(error)
-      handleCastEndedRef.current()
-    })
+    void loadServerCastStatus().catch(handleServerCastStatusError)
   }
 
   function suspendLocalVideoForCast() {
@@ -4789,10 +5454,14 @@ export function AnimePlayer({
     }
 
     if (serverCastSessionIdRef.current || isServerCastingRef.current || isServerCasting) {
-      void sendServerCastControl({ action: "stop" }).catch((error) => {
-        flashCastError(error)
-        console.error(error)
-      })
+      void sendServerCastControl({ action: "stop" })
+        .catch((error) => {
+          flashCastError(error)
+          console.error(error)
+        })
+        .finally(() => {
+          handleCastEnded()
+        })
       return
     }
 
@@ -4801,6 +5470,10 @@ export function AnimePlayer({
   }
 
   function handleProgress(event: React.SyntheticEvent<HTMLVideoElement>) {
+    const video = event.currentTarget
+
+    syncBufferedTime(video)
+
     const estimatedMbps = streamMbps
 
     if (!estimatedMbps || estimatedMbps <= 0) {
@@ -4808,7 +5481,7 @@ export function AnimePlayer({
       return
     }
 
-    const bufferedEnd = getBufferedEnd(event.currentTarget)
+    const bufferedEnd = getBufferedEnd(video)
     const sampledAt = performance.now()
     const previousSample = streamStatsSampleRef.current
 
@@ -4834,6 +5507,7 @@ export function AnimePlayer({
       ? video.duration + sourceOffset
       : undefined
 
+    syncBufferedTime(video)
     updateWatchedProgress(watchedSeconds, measuredDuration)
   }
 
@@ -4873,6 +5547,10 @@ export function AnimePlayer({
       Number.isFinite(video?.duration) ? video?.duration : undefined,
       duration
     )
+
+    if (knownDuration > 0) {
+      setBufferedTime(knownDuration)
+    }
 
     completePlayback(endedTime, knownDuration)
   }
@@ -5034,11 +5712,13 @@ export function AnimePlayer({
     detectedPlayerAspectRatio?.playbackKey === currentPlaybackKey
       ? detectedPlayerAspectRatio.aspectRatio
       : getPreferredPlayerAspectRatio(media.videoWidth, media.videoHeight)
-  const canSkipIntro = duration > 90 && currentTime < 90
+  const canSkipIntro = duration > introSkipSeekSeconds && currentTime < introSkipVisibleSeconds
   const canSkipOutro = duration > 0 && currentTime >= duration * 0.8 && currentTime < duration - 1
   const castSkipLabel = canSkipIntro ? "Skip intro" : canSkipOutro ? "Skip outro" : "Skip intro/outro"
   const receiverCastActive = isCasting || isServerCasting
   const isAnyCasting = receiverCastActive || isNativeRemoteCasting
+  const usePhonePortraitCastLayout = isPhoneViewport && isPortraitViewport
+  const usePhoneLandscapeCastLayout = isPhoneViewport && !isPortraitViewport
   const shouldShowCastOverlay = isAnyCasting || isCastStarting
   const shouldShowCastLoadingOverlay = isCastStarting && !isAnyCasting
   const canControlActiveCast = receiverCastActive || isNativeRemoteCasting
@@ -5093,6 +5773,76 @@ export function AnimePlayer({
 
   const shouldShowCastErrorPortal = Boolean(castErrorMessage && serverCastOverlayPortalRoot && (shouldUseIosServerCast || serverCastDeviceModalOpen))
 
+  const castOverlayContentClass = usePhonePortraitCastLayout
+    ? "relative z-10 flex h-full flex-col items-center justify-center gap-2 px-3 py-3"
+    : usePhoneLandscapeCastLayout
+      ? "relative z-10 flex h-full flex-col items-center justify-between gap-1.5 px-3 py-2"
+      : "relative z-10 flex h-full flex-col items-center px-3 py-3 sm:px-6 lg:px-10 lg:py-8"
+  const castTopControlsClass = usePhonePortraitCastLayout
+    ? "gap-2 rounded-2xl p-1.5"
+    : usePhoneLandscapeCastLayout
+      ? "gap-2 rounded-2xl p-1.5"
+      : "gap-3 rounded-3xl p-2 sm:p-3"
+  const castActionButtonClass = usePhonePortraitCastLayout
+    ? "h-10 rounded-xl px-3 text-xs"
+    : usePhoneLandscapeCastLayout
+      ? "h-9 rounded-xl px-3 text-xs"
+      : "h-12 rounded-2xl px-4 text-sm lg:h-14 lg:px-5 lg:text-base"
+  const castSkipButtonClass = usePhonePortraitCastLayout
+    ? "h-10 rounded-xl px-3 text-xs"
+    : usePhoneLandscapeCastLayout
+      ? "h-9 rounded-xl px-4 text-xs"
+      : "h-12 rounded-2xl px-6 text-sm lg:h-14 lg:px-8 lg:text-base"
+  const castSmallIconClass = usePhonePortraitCastLayout || usePhoneLandscapeCastLayout
+    ? "size-4"
+    : "size-5 lg:size-6"
+  const castSubtitleClass = usePhonePortraitCastLayout
+    ? "text-[0.68rem] leading-snug"
+    : usePhoneLandscapeCastLayout
+      ? "text-[0.68rem] leading-tight"
+      : "text-xs sm:text-sm"
+  const castControlRowWrapperClass = usePhonePortraitCastLayout
+    ? "py-0"
+    : usePhoneLandscapeCastLayout
+      ? "flex-1 py-1"
+      : "flex-1 py-4 lg:py-8"
+  const castControlPanelClass = usePhonePortraitCastLayout
+    ? "gap-1.5 rounded-2xl p-2"
+    : usePhoneLandscapeCastLayout
+      ? "gap-2 rounded-2xl p-2"
+      : "gap-2 rounded-[2rem] p-3 sm:gap-4 sm:p-4 lg:gap-5 lg:p-5"
+  const castControlButtonClass = usePhonePortraitCastLayout
+    ? "size-11"
+    : usePhoneLandscapeCastLayout
+      ? "size-12"
+      : "size-14 sm:size-16 lg:size-20"
+  const castControlIconClass = usePhonePortraitCastLayout
+    ? "size-6"
+    : usePhoneLandscapeCastLayout
+      ? "size-6"
+      : "size-8 sm:size-9 lg:size-11"
+  const castPlayIconClass = usePhonePortraitCastLayout
+    ? "ml-0.5 size-6"
+    : usePhoneLandscapeCastLayout
+      ? "ml-0.5 size-6"
+      : "ml-1 size-8 sm:size-9 lg:size-11"
+  const castProgressWrapperClass = usePhonePortraitCastLayout
+    ? "w-full max-w-md pb-0"
+    : usePhoneLandscapeCastLayout
+      ? "w-full max-w-3xl pb-0"
+      : "w-full max-w-5xl pb-1 sm:pb-2 lg:pb-4"
+  const castProgressPanelClass = usePhonePortraitCastLayout
+    ? "rounded-2xl px-3 py-2"
+    : usePhoneLandscapeCastLayout
+      ? "rounded-2xl px-3 py-2"
+      : "rounded-3xl px-4 py-4 sm:px-6 lg:px-8 lg:py-5"
+  const castTimeClass = usePhoneLandscapeCastLayout
+    ? "mt-1 text-center text-base font-semibold tracking-wide text-zinc-100 tabular-nums"
+    : "mt-3 text-center text-2xl font-semibold tracking-wide text-zinc-100 tabular-nums lg:mt-4 lg:text-4xl"
+  const castSeekPreviewClass = usePhoneLandscapeCastLayout
+    ? "pointer-events-none absolute bottom-[4.8rem] z-10 w-44 -translate-x-1/2 overflow-hidden rounded-xl border border-white/15 bg-zinc-950 shadow-2xl"
+    : "pointer-events-none absolute bottom-[5.7rem] z-10 w-48 -translate-x-1/2 overflow-hidden rounded-xl border border-white/15 bg-zinc-950 shadow-2xl lg:bottom-[6.5rem] lg:w-64"
+
   return (
     <div className="yami-anime-player space-y-3 lg:space-y-4">
       <div
@@ -5128,7 +5878,8 @@ export function AnimePlayer({
             "x-webkit-airplay": "allow",
             "webkit-playsinline": "true",
           } as Record<string, string | boolean>)}
-          preload={isIosDevice && status === "direct" ? "metadata" : "none"}
+          preload="auto"
+          {...({ fetchPriority: "high" } as Record<string, string>)}
           poster={thumbnailUrl}
           src={webVideoCasterSources ? webVideoCasterSources.directUrl : sourceUrl ?? undefined}
           onDurationChange={(event) => {
@@ -5141,6 +5892,8 @@ export function AnimePlayer({
             if (nextDuration > 0) {
               setDuration(nextDuration)
             }
+
+            syncBufferedTime(event.currentTarget)
           }}
           onLoadedMetadata={(event) => {
             const video = event.currentTarget
@@ -5155,6 +5908,7 @@ export function AnimePlayer({
             })
             applyPendingSeek(video)
             applyDirectAudioTrack(video, selectedAudioStream, media.audioStreams)
+            syncBufferedTime(video)
           }}
           onEnded={handleEnded}
           onError={(event) => {
@@ -5185,10 +5939,12 @@ export function AnimePlayer({
           }}
           onLoadedData={(event) => {
             applyPendingSeek(event.currentTarget)
+            syncBufferedTime(event.currentTarget)
             endMediaWait()
           }}
           onCanPlay={(event) => {
             applyPendingSeek(event.currentTarget)
+            syncBufferedTime(event.currentTarget)
             endMediaWait()
           }}
           onPause={handlePause}
@@ -5496,33 +6252,23 @@ export function AnimePlayer({
                 </Button>
               </div>
             ) : (
-            <div
-              className={`relative z-10 flex h-full flex-col items-center px-3 py-3 sm:px-6 lg:px-10 lg:py-8 ${
-                isPhoneViewport ? "justify-center gap-2" : ""
-              }`}
-            >
+            <div className={castOverlayContentClass}>
               <div className="flex w-full flex-col items-center gap-2 text-center">
                 <div
-                  className={`flex w-full max-w-5xl flex-wrap items-center justify-center border border-white/10 bg-zinc-950/35 shadow-2xl backdrop-blur-md sm:w-auto ${
-                    isPhoneViewport ? "gap-2 rounded-2xl p-1.5" : "gap-3 rounded-3xl p-2 sm:p-3"
-                  }`}
+                  className={`flex w-full max-w-5xl flex-wrap items-center justify-center border border-white/10 bg-zinc-950/35 shadow-2xl backdrop-blur-md sm:w-auto ${castTopControlsClass}`}
                 >
                   <HoverHint label="Stop casting">
                     <Button
                       type="button"
                       variant="secondary"
-                      className={`border border-white/30 bg-zinc-950/70 font-medium text-white shadow-xl hover:border-white/45 hover:bg-zinc-900 disabled:opacity-45 ${
-                        isPhoneViewport
-                          ? "h-10 rounded-xl px-3 text-xs"
-                          : "h-12 rounded-2xl px-4 text-sm lg:h-14 lg:px-5 lg:text-base"
-                      }`}
+                      className={`border border-white/30 bg-zinc-950/70 font-medium text-white shadow-xl hover:border-white/45 hover:bg-zinc-900 disabled:opacity-45 ${castActionButtonClass}`}
                       aria-label="Stop casting"
                       onClick={(event) => {
                         event.stopPropagation()
                         stopCasting()
                       }}
                     >
-                      <RadioOffIcon className={isPhoneViewport ? "size-4" : "size-5 lg:size-6"} />
+                      <RadioOffIcon className={castSmallIconClass} />
                       <span>Stop casting</span>
                     </Button>
                   </HoverHint>
@@ -5530,16 +6276,12 @@ export function AnimePlayer({
                   <Button
                     type="button"
                     variant="secondary"
-                    className={`border border-white/30 bg-zinc-950/70 font-medium text-white shadow-xl hover:border-white/45 hover:bg-zinc-900 disabled:opacity-45 ${
-                      isPhoneViewport
-                        ? "h-10 rounded-xl px-3 text-xs"
-                        : "h-12 rounded-2xl px-6 text-sm lg:h-14 lg:px-8 lg:text-base"
-                    }`}
+                    className={`border border-white/30 bg-zinc-950/70 font-medium text-white shadow-xl hover:border-white/45 hover:bg-zinc-900 disabled:opacity-45 ${castSkipButtonClass}`}
                     disabled={!canSkipIntro && !canSkipOutro}
                     onClick={(event) => {
                       event.stopPropagation()
                       if (canSkipIntro) {
-                        void seekTo(Math.min(currentTime + 90, duration))
+                        void seekTo(Math.min(currentTime + introSkipSeekSeconds, duration))
                         return
                       }
                       if (canSkipOutro) {
@@ -5551,9 +6293,7 @@ export function AnimePlayer({
                   </Button>
                 </div>
                 <div
-                  className={`max-w-md text-zinc-300 ${
-                    isPhoneViewport ? "text-[0.68rem] leading-snug" : "text-xs sm:text-sm"
-                  }`}
+                  className={`max-w-md text-zinc-300 ${castSubtitleClass}`}
                 >
                   {castControlSubtitle}
                 </div>
@@ -5561,16 +6301,10 @@ export function AnimePlayer({
 
 
               <div
-                className={`flex min-h-0 w-full items-center justify-center ${
-                  isPhoneViewport ? "py-0" : "flex-1 py-4 lg:py-8"
-                }`}
+                className={`flex min-h-0 w-full items-center justify-center ${castControlRowWrapperClass}`}
               >
                 <div
-                  className={`grid grid-cols-4 items-center border border-white/10 bg-zinc-950/35 shadow-2xl backdrop-blur-md ${
-                    isPhoneViewport
-                      ? "gap-1.5 rounded-2xl p-2"
-                      : "gap-2 rounded-[2rem] p-3 sm:gap-4 sm:p-4 lg:gap-5 lg:p-5"
-                  }`}
+                  className={`grid grid-cols-4 items-center border border-white/10 bg-zinc-950/35 shadow-2xl backdrop-blur-md ${castControlPanelClass}`}
                 >
                   <HoverHint label="Previous episode">
                     <Button
@@ -5578,7 +6312,7 @@ export function AnimePlayer({
                       variant="secondary"
                       size="icon"
                       className={`rounded-2xl border border-white/10 bg-white/[0.06] text-white shadow-xl hover:border-white/20 hover:bg-white/10 disabled:opacity-35 ${
-                        isPhoneViewport ? "size-11" : "size-14 sm:size-16 lg:size-20"
+                        castControlButtonClass
                       }`}
                       disabled={!previousEpisode}
                       aria-label="Previous episode"
@@ -5589,7 +6323,7 @@ export function AnimePlayer({
                         }
                       }}
                     >
-                      <SkipBack className={isPhoneViewport ? "size-6" : "size-8 sm:size-9 lg:size-11"} />
+                      <SkipBack className={castControlIconClass} />
                     </Button>
                   </HoverHint>
 
@@ -5599,7 +6333,7 @@ export function AnimePlayer({
                       variant="secondary"
                       size="icon"
                       className={`rounded-2xl border border-white/10 bg-white/[0.06] text-white shadow-xl hover:border-white/20 hover:bg-white/10 disabled:opacity-35 ${
-                        isPhoneViewport ? "size-11" : "size-14 sm:size-16 lg:size-20"
+                        castControlButtonClass
                       }`}
                       disabled={!canControlActiveCast}
                       aria-label={isPlaying ? "Pause" : "Play"}
@@ -5609,9 +6343,9 @@ export function AnimePlayer({
                       }}
                     >
                       {isPlaying ? (
-                        <Pause className={isPhoneViewport ? "size-6" : "size-8 sm:size-9 lg:size-11"} />
+                        <Pause className={castControlIconClass} />
                       ) : (
-                        <Play className={isPhoneViewport ? "ml-0.5 size-6" : "ml-1 size-8 sm:size-9 lg:size-11"} />
+                        <Play className={castPlayIconClass} />
                       )}
                     </Button>
                   </HoverHint>
@@ -5622,7 +6356,7 @@ export function AnimePlayer({
                       variant="secondary"
                       size="icon"
                       className={`rounded-2xl border border-white/10 bg-white/[0.06] text-white shadow-xl hover:border-white/20 hover:bg-white/10 disabled:opacity-35 ${
-                        isPhoneViewport ? "size-11" : "size-14 sm:size-16 lg:size-20"
+                        castControlButtonClass
                       }`}
                       disabled={!nextEpisode}
                       aria-label="Next episode"
@@ -5633,7 +6367,7 @@ export function AnimePlayer({
                         }
                       }}
                     >
-                      <SkipForward className={isPhoneViewport ? "size-6" : "size-8 sm:size-9 lg:size-11"} />
+                      <SkipForward className={castControlIconClass} />
                     </Button>
                   </HoverHint>
 
@@ -5644,7 +6378,7 @@ export function AnimePlayer({
                         variant="secondary"
                         size="icon"
                         className={`rounded-2xl border border-white/10 bg-white/[0.06] text-white shadow-xl hover:border-white/20 hover:bg-white/10 ${
-                          isPhoneViewport ? "size-11" : "size-14 sm:size-16 lg:size-20"
+                          castControlButtonClass
                         }`}
                         onClick={(event) => {
                           event.stopPropagation()
@@ -5653,24 +6387,20 @@ export function AnimePlayer({
                         }}
                         aria-label="Settings"
                       >
-                        <Settings className={isPhoneViewport ? "size-6" : "size-8 sm:size-9 lg:size-11"} />
+                        <Settings className={castControlIconClass} />
                       </Button>
                     </HoverHint>
                   </div>
                 </div>
               </div>
 
-              <div className={isPhoneViewport ? "w-full max-w-md pb-0" : "w-full max-w-5xl pb-1 sm:pb-2 lg:pb-4"}>
+              <div className={castProgressWrapperClass}>
                 <div
-                  className={`relative border border-white/10 bg-zinc-950/35 shadow-2xl backdrop-blur-md ${
-                    isPhoneViewport
-                      ? "rounded-2xl px-3 py-2"
-                      : "rounded-3xl px-4 py-4 sm:px-6 lg:px-8 lg:py-5"
-                  }`}
+                  className={`relative border border-white/10 bg-zinc-950/35 shadow-2xl backdrop-blur-md ${castProgressPanelClass}`}
                 >
                   {seekPreviewFrame ? (
                     <div
-                      className="pointer-events-none absolute bottom-[5.7rem] z-10 w-48 -translate-x-1/2 overflow-hidden rounded-xl border border-white/15 bg-zinc-950 shadow-2xl lg:bottom-[6.5rem] lg:w-64"
+                      className={castSeekPreviewClass}
                       style={{ left: `${seekPreviewFrame.leftPercent}%` }}
                     >
                       {getSeekPreviewFrameUrl(seekPreviewFrame.time) ? (
@@ -5687,11 +6417,12 @@ export function AnimePlayer({
                     </div>
                   ) : null}
 
-                  <input
-                    type="range"
-                    min={0}
-                    max={duration || 0}
-                    step={0.25}
+                  <BufferedSeekBar
+                    durationSeconds={duration}
+                    currentTimeSeconds={displayedCurrentTime}
+                    bufferedSeconds={bufferedTime}
+                    trackClassName="h-4 w-full lg:h-5"
+                    trackHeight="1rem"
                     value={duration ? Math.min(displayedCurrentTime, duration) : 0}
                     onChange={(event) => updateSeekDragPreview(event.target.value)}
                     onPointerMove={(event) =>
@@ -5707,11 +6438,10 @@ export function AnimePlayer({
                     onKeyUp={(event) => commitSeekInput(event.currentTarget.value)}
                     onBlur={(event) => commitSeekInput(event.currentTarget.value)}
                     disabled={!duration}
-                    className="h-4 w-full accent-red-600 lg:h-5"
                     aria-label="Seek cast playback"
                   />
-                  {!isPhoneViewport ? (
-                    <div className="mt-3 text-center text-2xl font-semibold tracking-wide text-zinc-100 tabular-nums lg:mt-4 lg:text-4xl">
+                  {!usePhonePortraitCastLayout ? (
+                    <div className={castTimeClass}>
                       {formatTime(displayedCurrentTime)} / {formatTime(duration)}
                     </div>
                   ) : null}
@@ -5786,7 +6516,7 @@ export function AnimePlayer({
             className="absolute right-4 bottom-20 z-20 rounded-lg bg-zinc-950/60"
             onClick={(event) => {
               event.stopPropagation()
-              void seekTo(Math.min(currentTime + 90, duration))
+              void seekTo(Math.min(currentTime + introSkipSeekSeconds, duration))
             }}
           >
             Skip intro
@@ -5984,11 +6714,12 @@ export function AnimePlayer({
                   </div>
                 </div>
               ) : null}
-              <input
-                type="range"
-                min={0}
-                max={duration || 0}
-                step={0.25}
+              <BufferedSeekBar
+                durationSeconds={duration}
+                currentTimeSeconds={displayedCurrentTime}
+                bufferedSeconds={bufferedTime}
+                trackClassName="h-2 w-full lg:h-3"
+                trackHeight="0.5rem"
                 value={duration ? Math.min(displayedCurrentTime, duration) : 0}
                 onChange={(event) => updateSeekDragPreview(event.target.value)}
                 onPointerMove={(event) =>
@@ -6004,7 +6735,7 @@ export function AnimePlayer({
                 onKeyUp={(event) => commitSeekInput(event.currentTarget.value)}
                 onBlur={(event) => commitSeekInput(event.currentTarget.value)}
                 disabled={!duration}
-                className="h-2 w-full accent-red-600 lg:h-3"
+                aria-label="Seek playback"
               />
             </div>
 
@@ -6166,7 +6897,7 @@ export function AnimePlayer({
               <video
                 controls
                 playsInline
-                preload="metadata"
+                preload="auto"
                 poster={thumbnailUrl}
                 src={webVideoCasterSources.directUrl}
                 title={webVideoCasterSources.directFileName}
@@ -6175,6 +6906,9 @@ export function AnimePlayer({
                 data-yamibunko-wvc-label="Direct Play"
                 data-yamibunko-wvc-filename={webVideoCasterSources.directFileName}
                 data-yamibunko-duration-seconds={webVideoCasterSources.durationSeconds ?? undefined}
+                onEnded={handleEnded}
+                onTimeUpdate={handleTimeUpdate}
+                onProgress={handleProgress}
                 className="h-16 w-full rounded-lg bg-black object-cover"
               />
             </div>
@@ -6199,7 +6933,7 @@ export function AnimePlayer({
                 <video
                   controls
                   playsInline
-                  preload="none"
+                  preload="auto"
                   poster={thumbnailUrl}
                   src={webVideoCasterSources.transcodeUrl}
                   title={webVideoCasterSources.transcodeFileName}
@@ -6208,6 +6942,9 @@ export function AnimePlayer({
                   data-yamibunko-wvc-label="Compatibility Transcode"
                   data-yamibunko-wvc-filename={webVideoCasterSources.transcodeFileName}
                   data-yamibunko-duration-seconds={webVideoCasterSources.durationSeconds ?? undefined}
+                  onEnded={handleEnded}
+                  onTimeUpdate={handleTimeUpdate}
+                  onProgress={handleProgress}
                   className="h-16 w-full rounded-lg bg-black object-cover"
                 />
               </div>

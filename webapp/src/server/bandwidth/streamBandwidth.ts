@@ -20,6 +20,7 @@ export type StreamUploadLease = {
   effectiveProfile: PlaybackProfile
   downgraded: boolean
   observeUploadBytes: (bytes: number) => void
+  waitForUploadBytes: (bytes: number, signal?: AbortSignal) => Promise<void>
   setForceClose: (handler: () => void) => void
   release: () => void
 }
@@ -43,6 +44,19 @@ type ActiveStream = {
   seasonNumber: number
   episodeNumber: number
   contentKey: string
+  streamGroupKey: string
+  throttle: StreamThrottleState
+}
+
+type StreamThrottleState = {
+  availableBytes: number
+  updatedAt: number
+}
+
+type ActiveStreamGroup = {
+  streamGroupKey: string
+  streamCount: number
+  minimumUploadKbps: number
 }
 
 type UploadSample = {
@@ -79,6 +93,28 @@ type AcquireStreamUploadInput = {
   signal?: AbortSignal
 }
 
+type StreamAdmissionInput = {
+  username: string
+  clientId: string | null
+  isVip: boolean
+  contentKey: string
+}
+
+type PendingStreamUploadRequest = {
+  id: string
+  username: string
+  clientId: string | null
+  isVip: boolean
+  estimatedUploadKbps: number
+  priority: number
+  sequence: number
+  signal?: AbortSignal
+  admissionInput: StreamAdmissionInput
+  createLease: () => StreamUploadLease
+  resolve: (lease: StreamUploadLease) => void
+  reject: (error: Error) => void
+}
+
 type TemporaryUploadLimitState = {
   active: boolean
   expiresAt: number | null
@@ -103,6 +139,11 @@ const streamBandwidthStore = streamBandwidthGlobal.__yamibunkoStreamBandwidthSto
 const admissionOverageFactor = 1.08
 const restoreOverageFactor = 1.02
 const capacityWaitMs = 1000
+const minimumRegularStreamUploadKbps = 6_000
+const minimumVipStreamUploadKbps = 8_000
+const streamThrottleBucketSeconds = 1
+const streamThrottleMinimumBucketBytes = 256 * 1024
+const streamThrottleWaitMaxMs = 1000
 const uploadObservationWindowMs = 12_000
 const staleObservationMs = 18_000
 const streamEstimateOverheadFactor = 1.06
@@ -118,8 +159,12 @@ const clientActionSubscribers = new Map<
   string,
   Set<(action: StreamPriorityAction) => void>
 >()
-const capacityWaiters = new Set<() => void>()
+const throttleWaiters = new Set<() => void>()
 const bandwidthRecheckWaiters = new Set<() => void>()
+const pendingStreamUploadRequests: PendingStreamUploadRequest[] = []
+let pendingStreamUploadSequence = 0
+let pendingStreamUploadDrainTimer: ReturnType<typeof setTimeout> | null = null
+let drainingPendingStreamUploads = false
 const bandwidthRecheckClients = new Set<string>()
 let bandwidthRecheckActive = false
 let streamServerShutdownActive = false
@@ -174,6 +219,190 @@ function getContentKey(input: {
   episodeNumber: number
 }) {
   return `${input.animeId}:${input.seasonNumber}:${input.episodeNumber}`
+}
+
+function getMinimumStreamUploadKbps(isVip: boolean) {
+  return isVip ? minimumVipStreamUploadKbps : minimumRegularStreamUploadKbps
+}
+
+function getStreamGroupKey(input: {
+  username: string
+  clientId: string | null
+  contentKey: string
+}) {
+  const clientKey = getClientKey(input.username, input.clientId)
+
+  return `${clientKey ?? `user:${input.username}`}:${input.contentKey}`
+}
+
+function getActiveStreamGroups(
+  options: { excludeClientKey?: string | null } = {}
+) {
+  const groups = new Map<string, ActiveStreamGroup>()
+
+  for (const stream of activeStreams.values()) {
+    if (options.excludeClientKey && stream.clientKey === options.excludeClientKey) {
+      continue
+    }
+
+    const existing = groups.get(stream.streamGroupKey)
+    const minimumUploadKbps = getMinimumStreamUploadKbps(stream.isVip)
+
+    if (existing) {
+      existing.streamCount += 1
+      existing.minimumUploadKbps = Math.max(
+        existing.minimumUploadKbps,
+        minimumUploadKbps
+      )
+      continue
+    }
+
+    groups.set(stream.streamGroupKey, {
+      streamGroupKey: stream.streamGroupKey,
+      streamCount: 1,
+      minimumUploadKbps,
+    })
+  }
+
+  return groups
+}
+
+function getProjectedStreamGroups(input: {
+  username: string
+  clientId: string | null
+  isVip: boolean
+  contentKey: string
+}) {
+  const clientKey = getClientKey(input.username, input.clientId)
+  const groups = getActiveStreamGroups({ excludeClientKey: clientKey })
+  const streamGroupKey = getStreamGroupKey(input)
+  const minimumUploadKbps = getMinimumStreamUploadKbps(input.isVip)
+  const existing = groups.get(streamGroupKey)
+
+  if (existing) {
+    existing.streamCount += 1
+    existing.minimumUploadKbps = Math.max(
+      existing.minimumUploadKbps,
+      minimumUploadKbps
+    )
+  } else {
+    groups.set(streamGroupKey, {
+      streamGroupKey,
+      streamCount: 1,
+      minimumUploadKbps,
+    })
+  }
+
+  return groups
+}
+
+function getFairStreamUploadKbps(streamGroupCount: number) {
+  const maxUploadKbps = getEffectiveMaxUploadKbps()
+
+  if (!maxUploadKbps || streamGroupCount <= 0) {
+    return null
+  }
+
+  return Math.max(Math.floor(maxUploadKbps / streamGroupCount), 1)
+}
+
+function getProjectedFairUploadKbps(input: {
+  username: string
+  clientId: string | null
+  isVip: boolean
+  contentKey: string
+}) {
+  const groups = getProjectedStreamGroups(input)
+  const fairUploadKbps = getFairStreamUploadKbps(groups.size)
+
+  return { groups, fairUploadKbps }
+}
+
+function canFitMinimumStreamUpload(input: {
+  username: string
+  clientId: string | null
+  isVip: boolean
+  contentKey: string
+}) {
+  const maxUploadKbps = getEffectiveMaxUploadKbps()
+
+  if (!maxUploadKbps) {
+    return true
+  }
+
+  const { groups, fairUploadKbps } = getProjectedFairUploadKbps(input)
+
+  if (!fairUploadKbps) {
+    return true
+  }
+
+  return [...groups.values()].every(
+    (group) => group.minimumUploadKbps <= fairUploadKbps
+  )
+}
+
+function getFairUploadKbpsForCandidate(input: {
+  username: string
+  clientId: string | null
+  isVip: boolean
+  contentKey: string
+}) {
+  return getProjectedFairUploadKbps(input).fairUploadKbps
+}
+
+function getActiveStreamGroupCount() {
+  return getActiveStreamGroups().size
+}
+
+function getActiveStreamGroupConnectionCount(streamGroupKey: string) {
+  return [...activeStreams.values()].filter(
+    (stream) => stream.streamGroupKey === streamGroupKey
+  ).length
+}
+
+function getActiveStreamThrottleKbps(stream: ActiveStream) {
+  const fairUploadKbps = getFairStreamUploadKbps(getActiveStreamGroupCount())
+
+  if (!fairUploadKbps) {
+    return null
+  }
+
+  const connectionCount = Math.max(
+    getActiveStreamGroupConnectionCount(stream.streamGroupKey),
+    1
+  )
+
+  return Math.max(Math.floor(fairUploadKbps / connectionCount), 1)
+}
+
+function getThrottleBucketCapacityBytes(
+  bytesPerSecond: number,
+  minimumBytes: number
+) {
+  return Math.max(
+    Math.ceil(bytesPerSecond * streamThrottleBucketSeconds),
+    streamThrottleMinimumBucketBytes,
+    minimumBytes
+  )
+}
+
+function refillStreamThrottle(
+  stream: ActiveStream,
+  bytesPerSecond: number,
+  minimumBucketBytes: number,
+  now = Date.now()
+) {
+  const elapsedSeconds = Math.max((now - stream.throttle.updatedAt) / 1000, 0)
+  const bucketCapacityBytes = getThrottleBucketCapacityBytes(
+    bytesPerSecond,
+    minimumBucketBytes
+  )
+
+  stream.throttle.availableBytes = Math.min(
+    bucketCapacityBytes,
+    stream.throttle.availableBytes + elapsedSeconds * bytesPerSecond
+  )
+  stream.throttle.updatedAt = now
 }
 
 export type ActiveStreamConflict = {
@@ -283,17 +512,21 @@ function canFitUpload(
 }
 
 function notifyCapacityWaiters() {
-  for (const waiter of capacityWaiters) {
+  void drainPendingStreamUploadRequests()
+}
+
+function notifyThrottleWaiters() {
+  for (const waiter of throttleWaiters) {
     waiter()
   }
 
-  capacityWaiters.clear()
+  throttleWaiters.clear()
 }
 
-function waitForCapacity(signal?: AbortSignal) {
+function waitForThrottle(milliseconds: number, signal?: AbortSignal) {
   return new Promise<void>((resolve, reject) => {
     let settled = false
-    const timer = setTimeout(finish, capacityWaitMs)
+    const timer = setTimeout(finish, Math.max(Math.ceil(milliseconds), 1))
 
     timer.unref?.()
 
@@ -304,7 +537,7 @@ function waitForCapacity(signal?: AbortSignal) {
 
       settled = true
       clearTimeout(timer)
-      capacityWaiters.delete(finish)
+      throttleWaiters.delete(finish)
       signal?.removeEventListener("abort", abort)
       resolve()
     }
@@ -316,9 +549,9 @@ function waitForCapacity(signal?: AbortSignal) {
 
       settled = true
       clearTimeout(timer)
-      capacityWaiters.delete(finish)
+      throttleWaiters.delete(finish)
       signal?.removeEventListener("abort", abort)
-      reject(new Error("Stream upload reservation was cancelled"))
+      reject(new Error("Stream upload was cancelled"))
     }
 
     if (signal?.aborted) {
@@ -326,8 +559,197 @@ function waitForCapacity(signal?: AbortSignal) {
       return
     }
 
-    capacityWaiters.add(finish)
+    throttleWaiters.add(finish)
     signal?.addEventListener("abort", abort, { once: true })
+  })
+}
+
+async function waitForStreamUploadBytes(
+  id: string,
+  bytes: number,
+  signal?: AbortSignal
+) {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return
+  }
+
+  for (;;) {
+    if (signal?.aborted) {
+      throw new Error("Stream upload was cancelled")
+    }
+
+    const stream = activeStreams.get(id)
+
+    if (!stream) {
+      return
+    }
+
+    const throttleKbps = getActiveStreamThrottleKbps(stream)
+
+    if (!throttleKbps) {
+      return
+    }
+
+    const bytesPerSecond = Math.max((throttleKbps * 1000) / 8, 1)
+    refillStreamThrottle(stream, bytesPerSecond, bytes)
+
+    if (stream.throttle.availableBytes >= bytes) {
+      stream.throttle.availableBytes -= bytes
+      return
+    }
+
+    const missingBytes = bytes - stream.throttle.availableBytes
+    const waitMs = Math.min(
+      Math.max((missingBytes / bytesPerSecond) * 1000, 25),
+      streamThrottleWaitMaxMs
+    )
+
+    await waitForThrottle(waitMs, signal)
+  }
+}
+
+function getPendingStreamUploadPriority(isVip: boolean) {
+  return isVip ? -1 : 0
+}
+
+function hasPendingStreamUploadRequests() {
+  return pendingStreamUploadRequests.length > 0
+}
+
+function removePendingStreamUploadRequest(id: string) {
+  const index = pendingStreamUploadRequests.findIndex(
+    (request) => request.id === id
+  )
+
+  if (index >= 0) {
+    pendingStreamUploadRequests.splice(index, 1)
+  }
+}
+
+function sortPendingStreamUploadRequests() {
+  pendingStreamUploadRequests.sort((left, right) => {
+    if (left.priority !== right.priority) {
+      return left.priority - right.priority
+    }
+
+    return left.sequence - right.sequence
+  })
+}
+
+function schedulePendingStreamUploadDrain() {
+  if (pendingStreamUploadDrainTimer) {
+    return
+  }
+
+  pendingStreamUploadDrainTimer = setTimeout(() => {
+    pendingStreamUploadDrainTimer = null
+    void drainPendingStreamUploadRequests()
+  }, capacityWaitMs)
+  pendingStreamUploadDrainTimer.unref?.()
+}
+
+async function drainPendingStreamUploadRequests() {
+  if (drainingPendingStreamUploads) {
+    return
+  }
+
+  drainingPendingStreamUploads = true
+
+  try {
+    for (;;) {
+      sortPendingStreamUploadRequests()
+      const request = pendingStreamUploadRequests[0]
+
+      if (!request) {
+        return
+      }
+
+      if (request.signal?.aborted) {
+        removePendingStreamUploadRequest(request.id)
+        request.reject(new Error("Stream upload reservation was cancelled"))
+        continue
+      }
+
+      if (streamServerShutdownActive) {
+        removePendingStreamUploadRequest(request.id)
+        request.reject(new Error("Server is shutting down. New streams are disabled"))
+        continue
+      }
+
+      evaluateForcedDowngradeRestores()
+
+      if (request.isVip) {
+        downgradeBlockingStreams(request.estimatedUploadKbps, request.clientId)
+      }
+
+      if (!canFitMinimumStreamUpload(request.admissionInput)) {
+        schedulePendingStreamUploadDrain()
+        return
+      }
+
+      removePendingStreamUploadRequest(request.id)
+
+      try {
+        request.resolve(request.createLease())
+      } catch (error) {
+        request.reject(
+          error instanceof Error
+            ? error
+            : new Error("Stream upload reservation failed")
+        )
+      }
+    }
+  } finally {
+    drainingPendingStreamUploads = false
+  }
+}
+
+function acquireQueuedStreamUpload(input: {
+  username: string
+  clientId: string | null
+  isVip: boolean
+  estimatedUploadKbps: number
+  admissionInput: StreamAdmissionInput
+  createLease: () => StreamUploadLease
+  signal?: AbortSignal
+}) {
+  const id = createId()
+
+  return new Promise<StreamUploadLease>((resolve, reject) => {
+    const request: PendingStreamUploadRequest = {
+      id,
+      username: input.username,
+      clientId: input.clientId,
+      isVip: input.isVip,
+      estimatedUploadKbps: input.estimatedUploadKbps,
+      priority: getPendingStreamUploadPriority(input.isVip),
+      sequence: pendingStreamUploadSequence++,
+      signal: input.signal,
+      admissionInput: input.admissionInput,
+      createLease: input.createLease,
+      resolve,
+      reject,
+    }
+
+    const onAbort = () => {
+      removePendingStreamUploadRequest(id)
+      reject(new Error("Stream upload reservation was cancelled"))
+      void drainPendingStreamUploadRequests()
+    }
+
+    if (input.signal?.aborted) {
+      reject(new Error("Stream upload reservation was cancelled"))
+      return
+    }
+
+    input.signal?.addEventListener("abort", onAbort, { once: true })
+    pendingStreamUploadRequests.push(request)
+
+    void drainPendingStreamUploadRequests().finally(() => {
+      if (!pendingStreamUploadRequests.some((pending) => pending.id === id)) {
+        input.signal?.removeEventListener("abort", onAbort)
+      }
+    })
   })
 }
 
@@ -427,6 +849,7 @@ function closeAllActiveStreams() {
   }
 
   notifyCapacityWaiters()
+  notifyThrottleWaiters()
 }
 
 async function waitForServerShutdownStreamsToDrain() {
@@ -467,6 +890,7 @@ export async function beginStreamServerShutdown() {
 
   publishServerShutdownAction()
   notifyCapacityWaiters()
+  notifyThrottleWaiters()
   notifyBandwidthRecheckWaiters()
 
   if (activeStreamCount > 0) {
@@ -654,6 +1078,8 @@ function closeActiveStream(stream: ActiveStream) {
     stream.forceClose?.()
   } finally {
     activeStreams.delete(stream.id)
+    notifyCapacityWaiters()
+    notifyThrottleWaiters()
   }
 }
 
@@ -701,6 +1127,7 @@ export function closeActiveStreamsForUser(username: string) {
   }
 
   notifyCapacityWaiters()
+  notifyThrottleWaiters()
 }
 
 async function waitForActiveStreamsToDrain() {
@@ -776,6 +1203,7 @@ export async function runUploadCapacityRecheckWithStreamHold(
     bandwidthRecheckClients.clear()
     notifyBandwidthRecheckWaiters()
     notifyCapacityWaiters()
+    notifyThrottleWaiters()
     evaluateForcedDowngradeRestores()
   }
 }
@@ -968,6 +1396,11 @@ function createLease(input: {
   const id = createId()
   const clientKey = getClientKey(input.username, input.clientId)
   const contentKey = getContentKey(input)
+  const streamGroupKey = getStreamGroupKey({
+    username: input.username,
+    clientId: input.clientId,
+    contentKey,
+  })
   let released = false
 
   closeActiveStreamsForClientKey(clientKey, { exceptContentKey: contentKey })
@@ -996,10 +1429,16 @@ function createLease(input: {
     seasonNumber: input.seasonNumber,
     episodeNumber: input.episodeNumber,
     contentKey,
+    streamGroupKey,
     observedUploadKbps: null,
     uploadSamples: [],
+    throttle: {
+      availableBytes: Number.POSITIVE_INFINITY,
+      updatedAt: Date.now(),
+    },
     forceClose: null,
   })
+  notifyThrottleWaiters()
 
   return {
     id,
@@ -1020,6 +1459,13 @@ function createLease(input: {
       const sampledAt = Date.now()
       stream.uploadSamples.push({ bytes, sampledAt })
       getObservedUploadKbps(stream, sampledAt)
+    },
+    waitForUploadBytes(bytes: number, signal?: AbortSignal) {
+      if (released) {
+        return Promise.resolve()
+      }
+
+      return waitForStreamUploadBytes(id, bytes, signal)
     },
     setForceClose(handler: () => void) {
       if (released) {
@@ -1048,6 +1494,7 @@ function createLease(input: {
       activeStreams.delete(id)
       evaluateForcedDowngradeRestores()
       notifyCapacityWaiters()
+      notifyThrottleWaiters()
     },
   }
 }
@@ -1076,6 +1523,9 @@ export function createUnmeteredStreamUploadLease(input: {
     effectiveProfile: input.profile,
     downgraded: false,
     observeUploadBytes() {},
+    waitForUploadBytes() {
+      return Promise.resolve()
+    },
     setForceClose(handler: () => void) {
       if (released) {
         return
@@ -1130,6 +1580,108 @@ export function estimateUploadKbps(input: {
   })
 }
 
+function shouldUseDataSaverForFairUpload(input: {
+  profile: PlaybackProfile
+  estimatedUploadKbps: number
+  dataSaverUploadKbps: number | null
+  canTranscodeDataSaver: boolean
+  admissionInput: {
+    username: string
+    clientId: string | null
+    isVip: boolean
+    contentKey: string
+  }
+}) {
+  if (
+    input.profile === "dataSaver" ||
+    !automaticDataSaverSwitchingEnabled() ||
+    !input.canTranscodeDataSaver ||
+    !input.dataSaverUploadKbps
+  ) {
+    return false
+  }
+
+  const fairUploadKbps = getFairUploadKbpsForCandidate(input.admissionInput)
+
+  return (
+    fairUploadKbps !== null &&
+    input.estimatedUploadKbps > fairUploadKbps &&
+    input.dataSaverUploadKbps <= fairUploadKbps
+  )
+}
+
+function createFairAdmittedLease(input: {
+  clientId: string | null
+  username: string
+  isVip: boolean
+  mode: PlaybackMode
+  profile: PlaybackProfile
+  estimatedUploadKbps: number
+  dataSaverUploadKbps: number | null
+  canTranscodeDataSaver: boolean
+  animeId: string
+  seasonNumber: number
+  episodeNumber: number
+  contentKey: string
+  admissionInput: {
+    username: string
+    clientId: string | null
+    isVip: boolean
+    contentKey: string
+  }
+}) {
+  if (shouldUseDataSaverForFairUpload(input)) {
+    const dataSaverUploadKbps = input.dataSaverUploadKbps!
+
+    rememberForcedDowngrade({
+      username: input.username,
+      clientId: input.clientId,
+      contentKey: input.contentKey,
+      originalMode: input.mode,
+      originalProfile: input.profile,
+      originalUploadKbps: input.estimatedUploadKbps,
+      dataSaverUploadKbps,
+      canTranscodeDataSaver: input.canTranscodeDataSaver,
+    })
+
+    setClientAction(input.username, input.clientId, {
+      type: "forceDataSaver",
+      message: getDataSaverMessage(),
+      createdAt: nowIso(),
+    })
+
+    return createLease({
+      clientId: input.clientId,
+      username: input.username,
+      isVip: input.isVip,
+      mode: "transcode",
+      profile: "dataSaver",
+      estimatedUploadKbps: dataSaverUploadKbps,
+      dataSaverUploadKbps,
+      canTranscodeDataSaver: input.canTranscodeDataSaver,
+      animeId: input.animeId,
+      seasonNumber: input.seasonNumber,
+      episodeNumber: input.episodeNumber,
+      downgraded: true,
+    })
+  }
+
+  return createLease({
+    clientId: input.clientId,
+    username: input.username,
+    isVip: input.isVip,
+    mode: input.mode,
+    profile: input.profile,
+    estimatedUploadKbps: input.estimatedUploadKbps,
+    dataSaverUploadKbps: input.dataSaverUploadKbps,
+    canTranscodeDataSaver: input.canTranscodeDataSaver,
+    animeId: input.animeId,
+    seasonNumber: input.seasonNumber,
+    episodeNumber: input.episodeNumber,
+    downgraded: false,
+  })
+}
+
 export async function acquireStreamUpload(input: AcquireStreamUploadInput) {
   const clientKey = getClientKey(input.username, input.clientId)
 
@@ -1166,9 +1718,13 @@ export async function acquireStreamUpload(input: AcquireStreamUploadInput) {
   }
 
   const contentKey = getContentKey(input)
+  const admissionInput = {
+    username: input.username,
+    clientId: input.clientId,
+    isVip: input.isVip,
+    contentKey,
+  }
   const automaticDataSaverEnabled = automaticDataSaverSwitchingEnabled()
-  const canAutomaticallyUseDataSaver =
-    automaticDataSaverEnabled && input.canTranscodeDataSaver
   const forcedDowngrade = clientKey ? forcedDowngrades.get(clientKey) : null
 
   if (forcedDowngrade && forcedDowngrade.contentKey !== contentKey) {
@@ -1206,10 +1762,6 @@ export async function acquireStreamUpload(input: AcquireStreamUploadInput) {
     })
   }
 
-  const fitOptions = {
-    excludeClientKey: clientKey,
-  }
-
   if (!input.estimatedUploadKbps || input.estimatedUploadKbps <= 0) {
     return createLease({
       clientId: input.clientId,
@@ -1227,113 +1779,70 @@ export async function acquireStreamUpload(input: AcquireStreamUploadInput) {
     })
   }
 
-  for (;;) {
-    if (streamServerShutdownActive) {
-      if (clientKey) {
-        setClientActionByKey(
-          clientKey,
-          streamServerShutdownAction ?? createServerShutdownStartedAction()
-        )
-      }
-
-      throw new Error("Server is shutting down. New streams are disabled")
-    }
-
-    if (input.signal?.aborted) {
-      throw new Error("Stream upload reservation was cancelled")
-    }
-
-    evaluateForcedDowngradeRestores()
-
-    if (canFitUpload(input.estimatedUploadKbps, fitOptions)) {
-      return createLease({
-        clientId: input.clientId,
-        username: input.username,
-        isVip: input.isVip,
-        mode: input.mode,
-        profile: input.profile,
-        estimatedUploadKbps: input.estimatedUploadKbps,
-        dataSaverUploadKbps: input.dataSaverUploadKbps,
-        canTranscodeDataSaver: input.canTranscodeDataSaver,
-        animeId: input.animeId,
-        seasonNumber: input.seasonNumber,
-        episodeNumber: input.episodeNumber,
-        downgraded: false,
-      })
-    }
-
-    if (input.isVip) {
-      downgradeBlockingStreams(input.estimatedUploadKbps, input.clientId)
-
-      if (canFitUpload(input.estimatedUploadKbps, fitOptions)) {
-        return createLease({
-          clientId: input.clientId,
-          username: input.username,
-          isVip: input.isVip,
-          mode: input.mode,
-          profile: input.profile,
-          estimatedUploadKbps: input.estimatedUploadKbps,
-          dataSaverUploadKbps: input.dataSaverUploadKbps,
-          canTranscodeDataSaver: input.canTranscodeDataSaver,
-          animeId: input.animeId,
-          seasonNumber: input.seasonNumber,
-          episodeNumber: input.episodeNumber,
-          downgraded: false,
-        })
-      }
-    }
-
-    if (
-      input.profile !== "dataSaver" &&
-      canAutomaticallyUseDataSaver &&
-      input.dataSaverUploadKbps &&
-      canFitUpload(input.dataSaverUploadKbps, fitOptions)
-    ) {
-      rememberForcedDowngrade({
-        username: input.username,
-        clientId: input.clientId,
-        contentKey: getContentKey(input),
-        originalMode: input.mode,
-        originalProfile: input.profile,
-        originalUploadKbps: input.estimatedUploadKbps,
-        dataSaverUploadKbps: input.dataSaverUploadKbps,
-        canTranscodeDataSaver: input.canTranscodeDataSaver,
-      })
-
-      setClientAction(input.username, input.clientId, {
-        type: "forceDataSaver",
-        message: getDataSaverMessage(),
-        createdAt: nowIso(),
-      })
-
-      return createLease({
-        clientId: input.clientId,
-        username: input.username,
-        isVip: input.isVip,
-        mode: "transcode",
-        profile: "dataSaver",
-        estimatedUploadKbps: input.dataSaverUploadKbps,
-        dataSaverUploadKbps: input.dataSaverUploadKbps,
-        canTranscodeDataSaver: input.canTranscodeDataSaver,
-        animeId: input.animeId,
-        seasonNumber: input.seasonNumber,
-        episodeNumber: input.episodeNumber,
-        downgraded: true,
-      })
-    }
-
-    setClientAction(input.username, input.clientId, {
-      type: "waitingForBandwidth",
-      message: getBandwidthWaitMessage(),
-      createdAt: nowIso(),
+  const createAdmittedLease = () =>
+    createFairAdmittedLease({
+      clientId: input.clientId,
+      username: input.username,
+      isVip: input.isVip,
+      mode: input.mode,
+      profile: input.profile,
+      estimatedUploadKbps: input.estimatedUploadKbps!,
+      dataSaverUploadKbps: input.dataSaverUploadKbps,
+      canTranscodeDataSaver: input.canTranscodeDataSaver,
+      animeId: input.animeId,
+      seasonNumber: input.seasonNumber,
+      episodeNumber: input.episodeNumber,
+      contentKey,
+      admissionInput,
     })
 
-    try {
-      await waitForCapacity(input.signal)
-    } catch (error) {
-      clearClientAction(input.username, input.clientId)
-      throw error
+  if (streamServerShutdownActive) {
+    if (clientKey) {
+      setClientActionByKey(
+        clientKey,
+        streamServerShutdownAction ?? createServerShutdownStartedAction()
+      )
     }
+
+    throw new Error("Server is shutting down. New streams are disabled")
+  }
+
+  if (input.signal?.aborted) {
+    throw new Error("Stream upload reservation was cancelled")
+  }
+
+  evaluateForcedDowngradeRestores()
+
+  if (input.isVip) {
+    downgradeBlockingStreams(input.estimatedUploadKbps, input.clientId)
+  }
+
+  if (
+    !hasPendingStreamUploadRequests() &&
+    canFitMinimumStreamUpload(admissionInput)
+  ) {
+    return createAdmittedLease()
+  }
+
+  setClientAction(input.username, input.clientId, {
+    type: "waitingForBandwidth",
+    message: getBandwidthWaitMessage(),
+    createdAt: nowIso(),
+  })
+
+  try {
+    return await acquireQueuedStreamUpload({
+      username: input.username,
+      clientId: input.clientId,
+      isVip: input.isVip,
+      estimatedUploadKbps: input.estimatedUploadKbps,
+      admissionInput,
+      createLease: createAdmittedLease,
+      signal: input.signal,
+    })
+  } catch (error) {
+    clearClientAction(input.username, input.clientId)
+    throw error
   }
 }
 
@@ -1386,6 +1895,7 @@ export function setTemporaryUploadLimit(active: boolean) {
   }
 
   notifyCapacityWaiters()
+  notifyThrottleWaiters()
   evaluateForcedDowngradeRestores()
 
   return getActiveStreamBandwidthSnapshot()
@@ -1401,6 +1911,8 @@ export function getActiveStreamBandwidthSnapshot() {
   const usedUploadKbps = getUsedUploadKbps({ measured: true })
   const reservedUploadKbps = getUsedUploadKbps()
   const temporaryUploadLimit = getTemporaryUploadLimitState()
+  const activeStreamGroups = getActiveStreamGroups()
+  const fairUploadKbps = getFairStreamUploadKbps(activeStreamGroups.size)
 
   return {
     baseMaxUploadKbps,
@@ -1410,7 +1922,11 @@ export function getActiveStreamBandwidthSnapshot() {
     availableUploadKbps: maxUploadKbps
       ? Math.max(maxUploadKbps - usedUploadKbps, 0)
       : null,
-    activeStreams: activeStreams.size,
+    activeStreams: activeStreamGroups.size,
+    activeStreamConnections: activeStreams.size,
+    fairUploadKbps,
+    minimumRegularStreamUploadKbps,
+    minimumVipStreamUploadKbps,
     temporaryUploadLimit: {
       active: temporaryUploadLimit.active,
       expiresAt: temporaryUploadLimit.expiresAt

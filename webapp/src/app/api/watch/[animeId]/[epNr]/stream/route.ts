@@ -2,12 +2,12 @@ import { spawn } from "node:child_process"
 import { createReadStream } from "node:fs"
 import { stat } from "node:fs/promises"
 import path from "node:path"
-import { Readable } from "node:stream"
+import { Readable, Transform } from "node:stream"
 
 import type { PlaybackMode, PlaybackProfile } from "@/lib/types"
 import { markAniListWatchingStarted } from "@/server/anilist/client"
 import { requireApiUser } from "@/server/auth/api"
-import { guardApiRequest } from "@/server/security/abuseGuard"
+import { guardRequest } from "@/server/security/abuseGuard"
 import {
   acquireStreamUpload,
   createUnmeteredStreamUploadLease,
@@ -49,6 +49,8 @@ type ByteRange =
   | "invalid"
 
 const streamLogTtlMs = 30 * 60 * 1000
+const maxStreamPreloadCacheSeconds = 10 * 60
+const streamCacheControl = `private, max-age=${maxStreamPreloadCacheSeconds}, no-transform`
 const transcodeStartupTimeoutMs = 15_000
 const transcodeStartupByteThreshold = 64 * 1024
 const ffmpegShutdownGraceMs = 2_000
@@ -73,8 +75,12 @@ export function OPTIONS() {
   })
 }
 
+async function guardStreamRequest(request: Request) {
+  return guardRequest(request, { kind: "api", count: false })
+}
+
 export async function HEAD(request: Request, context: StreamContext) {
-  const abuseError = await guardApiRequest(request)
+  const abuseError = await guardStreamRequest(request)
 
   if (abuseError) {
     return abuseError
@@ -139,7 +145,7 @@ export async function HEAD(request: Request, context: StreamContext) {
   const headers = new Headers({
     ...streamCorsHeaders(),
     "accept-ranges": mode === "direct" ? "bytes" : "none",
-    "cache-control": mode === "direct" ? "private, max-age=0, no-transform" : "no-store",
+    "cache-control": streamCacheControl,
     "content-disposition": getInlineContentDispositionForRequest(request, resolved.file, mode),
     "content-type": mode === "direct" ? getDirectContentType(resolved.file) : "video/mp4",
     "x-content-type-options": "nosniff",
@@ -451,6 +457,38 @@ function releaseStreamUploadOnce(lease: StreamUploadLease) {
   }
 }
 
+function createUploadThrottledReadable(input: {
+  readable: Readable
+  request: Request
+  uploadLease: StreamUploadLease
+  onBytes?: (bytes: number) => void
+}) {
+  const throttled = new Transform({
+    transform(chunk, _encoding, callback) {
+      const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      const bytes = data.byteLength
+
+      void input.uploadLease
+        .waitForUploadBytes(bytes, input.request.signal)
+        .then(() => {
+          input.uploadLease.observeUploadBytes(bytes)
+          input.onBytes?.(bytes)
+          callback(null, data)
+        })
+        .catch((error) =>
+          callback(error instanceof Error ? error : new Error(String(error)))
+        )
+    },
+  })
+
+  throttled.once("error", () => {
+    input.readable.destroy()
+  })
+  input.readable.pipe(throttled)
+
+  return throttled
+}
+
 function getDirectContentType(file: string) {
   const extension = path.extname(file).toLowerCase()
 
@@ -577,7 +615,7 @@ async function handleDirect(input: {
   const headers = new Headers({
     ...streamCorsHeaders(),
     "accept-ranges": "bytes",
-    "cache-control": "private, max-age=0, no-transform",
+    "cache-control": streamCacheControl,
     "content-disposition": getInlineContentDispositionForRequest(request, file, "direct"),
     "content-type": getDirectContentType(file),
     "x-content-type-options": "nosniff",
@@ -586,10 +624,6 @@ async function handleDirect(input: {
   setStreamSourceHeaders(headers, request, "direct")
 
   function bindFileStream(fileStream: ReturnType<typeof createReadStream>) {
-    fileStream.on("data", (chunk: Buffer) => {
-      uploadLease.observeUploadBytes(chunk.byteLength)
-    })
-
     const abort = () => {
       fileStream.destroy()
       releaseUpload()
@@ -614,9 +648,14 @@ async function handleDirect(input: {
       start: range.start,
       end: range.end,
     }))
+    const throttledStream = createUploadThrottledReadable({
+      readable: fileStream,
+      request,
+      uploadLease,
+    })
 
     return new Response(
-      Readable.toWeb(fileStream) as ReadableStream<Uint8Array>,
+      Readable.toWeb(throttledStream) as ReadableStream<Uint8Array>,
       {
         status: 206,
         headers,
@@ -626,9 +665,14 @@ async function handleDirect(input: {
 
   headers.set("content-length", String(size))
   const fileStream = bindFileStream(createReadStream(file))
+  const throttledStream = createUploadThrottledReadable({
+    readable: fileStream,
+    request,
+    uploadLease,
+  })
 
   return new Response(
-    Readable.toWeb(fileStream) as ReadableStream<Uint8Array>,
+    Readable.toWeb(throttledStream) as ReadableStream<Uint8Array>,
     {
       headers,
     }
@@ -787,15 +831,31 @@ async function handleDirectAudioRemux(input: {
           return
         }
 
-        try {
-          input.uploadLease.observeUploadBytes(chunk.byteLength)
-          controller.enqueue(new Uint8Array(chunk))
-        } catch {
-          clientClosed = true
-          settled = true
-          stopChild()
-          releaseUpload()
-        }
+        child.stdout?.pause()
+        void input.uploadLease
+          .waitForUploadBytes(chunk.byteLength, input.request.signal)
+          .then(() => {
+            if (settled) {
+              return
+            }
+
+            try {
+              input.uploadLease.observeUploadBytes(chunk.byteLength)
+              controller.enqueue(new Uint8Array(chunk))
+              child.stdout?.resume()
+            } catch {
+              clientClosed = true
+              settled = true
+              stopChild()
+              releaseUpload()
+            }
+          })
+          .catch(() => {
+            clientClosed = true
+            settled = true
+            stopChild()
+            releaseUpload()
+          })
       })
 
       child.once("error", (error) => {
@@ -845,7 +905,7 @@ async function handleDirectAudioRemux(input: {
 
   const headers = new Headers({
     ...streamCorsHeaders(),
-    "cache-control": "no-store",
+    "cache-control": streamCacheControl,
     "content-disposition": getInlineContentDispositionForRequest(input.request, input.file, "direct"),
     "content-type": target.contentType,
   })
@@ -1086,19 +1146,38 @@ async function handleTranscode(
           return
         }
 
-        try {
-          bytesSent += chunk.byteLength
-          uploadLease?.observeUploadBytes(chunk.byteLength)
-          if (bytesSent >= transcodeStartupByteThreshold) {
-            clearStartupTimer()
-          }
-          controller.enqueue(new Uint8Array(chunk))
-        } catch {
-          clientClosed = true
-          settled = true
-          stopChild()
-          release()
-        }
+        child.stdout?.pause()
+        const uploadWait =
+          uploadLease?.waitForUploadBytes(chunk.byteLength, request.signal) ??
+          Promise.resolve()
+
+        void uploadWait
+          .then(() => {
+            if (settled) {
+              return
+            }
+
+            try {
+              bytesSent += chunk.byteLength
+              uploadLease?.observeUploadBytes(chunk.byteLength)
+              if (bytesSent >= transcodeStartupByteThreshold) {
+                clearStartupTimer()
+              }
+              controller.enqueue(new Uint8Array(chunk))
+              child.stdout?.resume()
+            } catch {
+              clientClosed = true
+              settled = true
+              stopChild()
+              release()
+            }
+          })
+          .catch(() => {
+            clientClosed = true
+            settled = true
+            stopChild()
+            release()
+          })
       })
 
       child.once("error", (error) => {
@@ -1156,7 +1235,7 @@ async function handleTranscode(
 
   const headers = new Headers({
     ...streamCorsHeaders(),
-    "cache-control": "no-store",
+    "cache-control": streamCacheControl,
     "content-disposition": getInlineContentDispositionForRequest(request, file, "transcode"),
     "content-type": "video/mp4",
   })
@@ -1167,7 +1246,7 @@ async function handleTranscode(
 }
 
 export async function GET(request: Request, context: StreamContext) {
-  const abuseError = await guardApiRequest(request)
+  const abuseError = await guardStreamRequest(request)
 
   if (abuseError) {
     return abuseError

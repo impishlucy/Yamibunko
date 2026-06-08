@@ -1307,12 +1307,27 @@ export async function startServerCast(input: {
     }
 
     const sessionId = crypto.randomUUID()
+    const sessionRef: { current?: ServerCastSession } = {}
+    const heartbeat = setInterval(() => {
+      const activeSession = sessionRef.current
+
+      if (!activeSession) {
+        return
+      }
+
+      try {
+        socket.send(heartbeatNamespace, { type: "PING" }, "receiver-0")
+        if (sessions.get(activeSession.id) === activeSession) {
+          touchSession(activeSession)
+        }
+      } catch {
+        closeServerCastSession(activeSession.id)
+      }
+    }, 5_000)
     const session: ServerCastSession = {
       contentId: candidate.url,
       device,
-      heartbeat: setInterval(() => {
-        socket.send(heartbeatNamespace, { type: "PING" }, "receiver-0")
-      }, 5_000),
+      heartbeat,
       id: sessionId,
       idleTimer: setTimeout(() => undefined, sessionMaxIdleMs),
       mediaSessionId: state.mediaSessionId,
@@ -1320,6 +1335,7 @@ export async function startServerCast(input: {
       transportId,
       username: input.username,
     }
+    sessionRef.current = session
     session.heartbeat.unref?.()
     touchSession(session)
     sessions.set(sessionId, session)
@@ -1398,27 +1414,40 @@ export async function controlServerCast(input: {
   sessionId: string
   username: string
 }) {
+  const idleState = {
+    isAlive: false,
+    playerState: "IDLE",
+    positionSeconds: 0,
+  } satisfies ServerCastMediaState
   const session = getSessionForUser(input.sessionId, input.username)
 
   if (!session) {
+    if (input.action === "stop") {
+      return idleState
+    }
+
     throw new Error("Server Cast session is gone.")
   }
 
-  const mediaSessionId = await resolveServerCastMediaSessionId(session)
-
   if (input.action === "stop") {
-    session.socket.send(
-      mediaNamespace,
-      { type: "STOP", mediaSessionId },
-      session.transportId
-    )
+    const mediaSessionId = await resolveServerCastMediaSessionId(session).catch(() => null)
+
+    if (mediaSessionId !== null) {
+      try {
+        session.socket.send(
+          mediaNamespace,
+          { type: "STOP", mediaSessionId },
+          session.transportId
+        )
+      } catch {
+      }
+    }
+
     closeServerCastSession(input.sessionId)
-    return {
-      isAlive: false,
-      playerState: "IDLE",
-      positionSeconds: 0,
-    } satisfies ServerCastMediaState
+    return idleState
   }
+
+  const mediaSessionId = await resolveServerCastMediaSessionId(session)
 
   const payload = input.action === "seek"
     ? {
