@@ -37,6 +37,42 @@ public class AppSettings
 
     private static readonly string SettingsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.json");
 
+    public static bool TryGetOutdatedTranscodeAccelReplacement(string? value, out string replacement)
+    {
+        replacement = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var normalized = value.Trim().ToLowerInvariant();
+
+        if (normalized == "qsv" || normalized == "intel")
+        {
+            replacement = "intel_gpu";
+            return true;
+        }
+
+        if (normalized == "amd")
+        {
+            replacement = "amd_gpu";
+            return true;
+        }
+
+        return false;
+    }
+
+    public static string NormalizeTranscodeAccel(string? value)
+    {
+        if (TryGetOutdatedTranscodeAccelReplacement(value, out var replacement))
+        {
+            return replacement;
+        }
+
+        return string.IsNullOrWhiteSpace(value) ? "cpu" : value.Trim().ToLowerInvariant();
+    }
+
     public static AppSettings? Load()
     {
         if (!File.Exists(SettingsPath)) return null;

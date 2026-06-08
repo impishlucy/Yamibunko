@@ -1,7 +1,9 @@
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Interactivity;
 using Avalonia.Markup.Xaml;
 using Avalonia.Platform.Storage;
+using Avalonia.Media;
 using System;
 using System.IO;
 using System.Text.RegularExpressions;
@@ -12,15 +14,19 @@ public partial class SetupWindow : Window
 {
     private static readonly Regex BaseUrlRegex = new(@"^https?://\S+$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex ClientIdRegex = new(@"^\d+$", RegexOptions.Compiled);
+    private const string ForcedCatalogModeTooltipText = "HW encoding is not supported for AV1 on your device, encode mode is disabled";
 
     public event Action<AppSettings>? OnSetupComplete;
     private readonly AppSettings? _initialSettings;
+    private HardwareAccelerationDetection? _hardwareDetection;
+    private object? _defaultDisableFileProcessingTooltip;
     private bool _isSetupComplete;
     private bool _catalogModeForced;
 
     public SetupWindow()
     {
         AvaloniaXamlLoader.Load(this);
+        CaptureDefaultDisableFileProcessingTooltip();
         UpdateFileProcessingState();
         ValidateForm();
         RefreshCatalogModeLockAsync();
@@ -30,6 +36,7 @@ public partial class SetupWindow : Window
     {
         _initialSettings = settings;
         AvaloniaXamlLoader.Load(this);
+        CaptureDefaultDisableFileProcessingTooltip();
         PopulateForm(settings);
         UpdateFileProcessingState();
         ValidateForm();
@@ -161,15 +168,16 @@ public partial class SetupWindow : Window
 
     private void SaveButton_Click(object? sender, RoutedEventArgs e)
     {
+        var importEnabled = !_catalogModeForced && !IsFileProcessingDisabled();
         var settings = new AppSettings
         {
             BaseUrl = GetTextBoxValue("BaseUrlBox"),
             InputFolderPath = GetTextBoxValue("InputFolderBox"),
             OutputFolderPath = GetTextBoxValue("OutputFolderBox"),
-            ImportEnabled = !_catalogModeForced && !IsFileProcessingDisabled(),
+            ImportEnabled = importEnabled,
             FfmpegDir = _initialSettings?.FfmpegDir ?? "",
-            TranscodeAccel = _initialSettings?.TranscodeAccel ?? "cpu",
-            TranscodeHwDevice = _initialSettings?.TranscodeHwDevice ?? "",
+            TranscodeAccel = ResolveSavedTranscodeAcceleration(importEnabled),
+            TranscodeHwDevice = ResolveSavedTranscodeHwDevice(importEnabled),
             AnilistClientId = GetTextBoxValue("ClientIdBox"),
             AnilistClientSecret = GetTextBoxValue("ClientSecretBox"),
             BunPath = _initialSettings?.BunPath ?? ""
@@ -196,17 +204,48 @@ public partial class SetupWindow : Window
         return _catalogModeForced || this.FindControl<CheckBox>("DisableFileProcessingBox")?.IsChecked == true;
     }
 
+    private string ResolveSavedTranscodeAcceleration(bool importEnabled)
+    {
+        if (_hardwareDetection != null)
+        {
+            return importEnabled && _hardwareDetection.Av1ImportAcceleration != null
+                ? _hardwareDetection.Av1ImportAcceleration
+                : _hardwareDetection.LiveTranscodeAcceleration;
+        }
+
+        return AppSettings.NormalizeTranscodeAccel(_initialSettings?.TranscodeAccel);
+    }
+
+    private string ResolveSavedTranscodeHwDevice(bool importEnabled)
+    {
+        if (_hardwareDetection != null)
+        {
+            return importEnabled && _hardwareDetection.Av1ImportAcceleration != null
+                ? _hardwareDetection.Av1ImportDevice ?? string.Empty
+                : _hardwareDetection.LiveTranscodeDevice ?? string.Empty;
+        }
+
+        return _initialSettings?.TranscodeHwDevice ?? string.Empty;
+    }
+
     private async void RefreshCatalogModeLockAsync()
     {
         try
         {
             var detection = await HardwareAccelerationDetector.DetectAsync(_initialSettings?.FfmpegDir, !string.IsNullOrWhiteSpace(_initialSettings?.FfmpegDir));
+            _hardwareDetection = detection;
             SetCatalogModeForced(detection.Av1ImportAcceleration == null);
         }
         catch
         {
             SetCatalogModeForced(true);
         }
+    }
+
+    private void CaptureDefaultDisableFileProcessingTooltip()
+    {
+        var container = this.FindControl<Border>("DisableFileProcessingContainer");
+        _defaultDisableFileProcessingTooltip = container != null ? ToolTip.GetTip(container) : null;
     }
 
     private void SetCatalogModeForced(bool forced)
@@ -222,13 +261,33 @@ public partial class SetupWindow : Window
             disableFileProcessingBox.IsEnabled = !forced;
         }
 
-        if (container != null && forced)
+        if (container != null)
         {
-            ToolTip.SetTip(container, HardwareAccelerationDetector.Av1CatalogModeTooltip);
+            ToolTip.SetTip(container, forced ? CreateForcedCatalogModeTooltip() : _defaultDisableFileProcessingTooltip);
         }
 
         UpdateFileProcessingState();
         ValidateForm();
+    }
+
+    private static Control CreateForcedCatalogModeTooltip()
+    {
+        return new Border
+        {
+            Width = 310,
+            Padding = new Thickness(4),
+            Background = Brush.Parse("#18181B"),
+            BorderBrush = Brush.Parse("#EF4444"),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(8),
+            Child = new TextBlock
+            {
+                Text = ForcedCatalogModeTooltipText,
+                FontSize = 13,
+                TextWrapping = TextWrapping.Wrap,
+                Foreground = Brush.Parse("#EF4444")
+            }
+        };
     }
 
     private void UpdateFileProcessingState()

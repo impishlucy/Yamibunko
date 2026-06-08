@@ -64,7 +64,7 @@ let cachedConfig: ServerConfig | undefined
 let cachedIssues: string[] | undefined
 
 
-export function normalizeTranscodeAccelerationValue(value: string) {
+export function getOutdatedTranscodeAccelerationReplacement(value: string) {
   const normalized = value.trim().toLowerCase()
 
   if (normalized === "qsv" || normalized === "intel") {
@@ -75,7 +75,13 @@ export function normalizeTranscodeAccelerationValue(value: string) {
     return "amd_gpu"
   }
 
-  return normalized
+  return null
+}
+
+export function normalizeTranscodeAccelerationValue(value: string) {
+  return (
+    getOutdatedTranscodeAccelerationReplacement(value) ?? value.trim().toLowerCase()
+  )
 }
 
 function cleanPath(value: string) {

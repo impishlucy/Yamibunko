@@ -7,6 +7,7 @@ import {
   type HardwareAcceleration,
 } from "@/server/startup/hardwareAcceleration"
 import {
+  getOutdatedTranscodeAccelerationReplacement,
   normalizeTranscodeAccelerationValue,
   type TranscodeAcceleration,
 } from "@/server/config"
@@ -153,6 +154,25 @@ function applyEnvironmentAliases() {
       process.env[canonical] = cleanValue(value)
     }
   }
+}
+
+function logOutdatedDotEnvTranscodeAcceleration() {
+  const value = process.env.TRANSCODE_ACCEL
+
+  if (!value) {
+    return
+  }
+
+  const cleanedValue = cleanValue(value)
+  const replacement = getOutdatedTranscodeAccelerationReplacement(cleanedValue)
+
+  if (!replacement) {
+    return
+  }
+
+  console.log(
+    `[Warning] [Startup] Selected TRANSCODE_ACCEL value '${cleanedValue}' is outdated. Use TRANSCODE_ACCEL=${replacement} in .env.`
+  )
 }
 
 function normalizeTranscodeAcceleration() {
@@ -311,6 +331,11 @@ export function bootstrapEnvironment() {
 
   const loadedDotEnv = loadDotEnv(dotEnvPath)
   applyEnvironmentAliases()
+
+  if (loadedDotEnv && !hadRuntimeEnvironment && !appliedLauncherParameters) {
+    logOutdatedDotEnvTranscodeAcceleration()
+  }
+
   normalizeTranscodeAcceleration()
   normalizeImportEnabled()
 

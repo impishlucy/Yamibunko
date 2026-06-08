@@ -514,7 +514,14 @@ public class ServerManager
 
     private async Task DetectHardwareAccelerationAsync(AppSettings settings)
     {
-        Log("Detecting hardware acceleration type...");
+        var previousAcceleration = settings.TranscodeAccel;
+        var hadOutdatedAcceleration = AppSettings.TryGetOutdatedTranscodeAccelReplacement(
+            previousAcceleration,
+            out var outdatedReplacement);
+
+        Log(hadOutdatedAcceleration
+            ? $"Outdated TRANSCODE_ACCEL value '{previousAcceleration}' was found in settings.json. Running hardware check and updating it."
+            : "Detecting hardware acceleration type...");
 
         var detection = await HardwareAccelerationDetector.DetectAsync(settings.FfmpegDir, true);
 
@@ -531,6 +538,11 @@ public class ServerManager
         settings.TranscodeHwDevice = settings.ImportEnabled && detection.Av1ImportAcceleration != null
             ? detection.Av1ImportDevice ?? string.Empty
             : detection.LiveTranscodeDevice ?? string.Empty;
+
+        if (hadOutdatedAcceleration)
+        {
+            Log($"Updated TRANSCODE_ACCEL from outdated value '{previousAcceleration}' to '{settings.TranscodeAccel}'. Suggested replacement for the old value was '{outdatedReplacement}'.");
+        }
 
         Log(detection.Av1ImportAcceleration == null
             ? $"AV1 hardware encoding unavailable. Live transcoding acceleration: {settings.TranscodeAccel}."
