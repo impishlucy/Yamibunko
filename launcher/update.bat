@@ -13,6 +13,7 @@ exit /b %UPDATE_EXIT%
 
 # POWERSHELL_SCRIPT
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 
 $installRoot = [System.IO.Path]::GetFullPath($env:INSTALL_ROOT).TrimEnd("\")
 $webappRoot = [System.IO.Path]::Combine($installRoot, "webapp")
@@ -153,6 +154,85 @@ function Compare-VersionText($left, $right) {
     return 0
 }
 
+function Get-CommandPath($commandName) {
+    $command = Get-Command $commandName -ErrorAction SilentlyContinue
+    if ($null -eq $command) {
+        return $null
+    }
+
+    return $command.Source
+}
+
+function Invoke-DownloadFile($url, $destinationPath) {
+    $curlPath = Get-CommandPath "curl.exe"
+
+    if (![string]::IsNullOrWhiteSpace($curlPath)) {
+        & $curlPath `
+            --fail `
+            --location `
+            --retry 3 `
+            --retry-delay 2 `
+            --connect-timeout 20 `
+            --header "User-Agent: Yamibunko-Updater" `
+            --output $destinationPath `
+            $url
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Download failed. curl.exe exited with code $LASTEXITCODE."
+        }
+
+        return
+    }
+
+    Invoke-WebRequest -Uri $url -OutFile $destinationPath -UseBasicParsing -Headers @{ "User-Agent" = "Yamibunko-Updater" }
+}
+
+function Expand-ReleaseArchive($archivePath, $destinationPath) {
+    $tarPath = Get-CommandPath "tar.exe"
+
+    if (![string]::IsNullOrWhiteSpace($tarPath)) {
+        & $tarPath -xf $archivePath -C $destinationPath
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Extraction failed. tar.exe exited with code $LASTEXITCODE."
+        }
+
+        return
+    }
+
+    Expand-Archive -Path $archivePath -DestinationPath $destinationPath -Force
+}
+
+function Copy-ReleaseFiles($sourcePath, $destinationPath) {
+    $robocopyPath = Get-CommandPath "robocopy.exe"
+
+    if (![string]::IsNullOrWhiteSpace($robocopyPath)) {
+        & $robocopyPath `
+            $sourcePath `
+            $destinationPath `
+            /E `
+            /COPY:DAT `
+            /DCOPY:DAT `
+            /R:2 `
+            /W:1 `
+            /MT:8 `
+            /NFL `
+            /NDL `
+            /NP
+
+        if ($LASTEXITCODE -ge 8) {
+            throw "Could not copy the updated files. robocopy.exe exited with code $LASTEXITCODE."
+        }
+
+        return
+    }
+
+    Get-ChildItem -LiteralPath $sourcePath -Force | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $destinationPath -Recurse -Force
+    }
+}
+
+
 $runningProcess = Get-RunningYamibunkoProcess
 if ($null -ne $runningProcess) {
     Write-Host ("Yamibunko is still running (PID " + $runningProcess.ProcessId + "). Close the launcher/server before updating.")
@@ -193,10 +273,10 @@ try {
     New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
 
     Write-Host "Downloading latest Yamibunko Windows release..."
-    Invoke-WebRequest -Uri $releaseUrl -OutFile $zipPath -UseBasicParsing -Headers @{ "User-Agent" = "Yamibunko-Updater" }
+    Invoke-DownloadFile $releaseUrl $zipPath
 
     Write-Host "Extracting release..."
-    Expand-Archive -Path $zipPath -DestinationPath $extractRoot -Force
+    Expand-ReleaseArchive $zipPath $extractRoot
 
     $sourceRoot = [System.IO.Path]::Combine($extractRoot, "yamibunko-win")
     if (!(Test-Path -LiteralPath $sourceRoot -PathType Container)) {
@@ -209,10 +289,7 @@ try {
     }
 
     Write-Host "Updating files..."
-    Get-ChildItem -LiteralPath $sourceRoot -Force | ForEach-Object {
-        Copy-Item -LiteralPath $_.FullName -Destination $installRoot -Recurse -Force
-    }
-
+    Copy-ReleaseFiles $sourceRoot $installRoot
 
     Write-Host "Update done."
     exit 0
