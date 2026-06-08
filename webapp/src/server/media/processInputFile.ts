@@ -23,15 +23,16 @@ import {
   ffprobe,
   getFileSubtitleInputArgs,
   getHardwareInputArgs,
-  getHevcFileArgs,
+  getWebmFileArgs,
   runFfmpeg,
-  type Mp4SubtitleOutputStream,
+  type WebmSubtitleOutputStream,
 } from "@/server/media/ffmpeg"
 import {
   formatEpisodeFileName,
   formatSeasonFolderName,
-  parseAnimeFileName,
-  parseAnimeFileNameWithFallbackTitle,
+  getAnimeMetadataLookupSeason,
+  getFolderTitleFallbackCandidates,
+  parseAnimeFilePath,
   sanitizeExportPathPart,
 } from "@/server/media/filename"
 import {
@@ -48,13 +49,20 @@ import {
   findAnimeMetadata,
   isAniListMetadataLookupUnavailableError,
 } from "@/server/metadata/anilist"
-import { getAudioOutputIndexesToAac } from "@/server/media/streamMetadata"
+import { getAudioOutputIndexesToOpus } from "@/server/media/streamMetadata"
+import {
+  findSubtitleSidecar,
+  isConvertibleTextSubtitleCodec,
+  isWebVttSubtitleCodec,
+  normalizeSubtitleCodecName,
+  type SubtitleSidecar,
+} from "@/server/media/subtitles"
 import { errorMessage, fileName } from "@/server/utils/format"
 import { debugLog } from "@/server/utils/debugLog"
 
-const hardwareMaxHevcBytesPerMinute = 25 * 1024 * 1024
-const cpuMaxHevcBytesPerMinute = 30 * 1024 * 1024
-const targetBytesPerMinute = 22 * 1024 * 1024
+const hardwareMaxAv1BytesPerMinute = 18 * 1024 * 1024
+const cpuMaxAv1BytesPerMinute = 22 * 1024 * 1024
+const targetBytesPerMinute = 18 * 1024 * 1024
 const targetAudioKbps = 320
 const failedImportsFolderName = "_failed_imports"
 const activeInputImportOutputs = new Map<string, number>()
@@ -216,7 +224,7 @@ function formatDeferredWorkKind(kind: DeferredInputWorkKind) {
   }
 
   if (kind === "container-remux") {
-    return "MP4 remux"
+    return "WebM remux"
   }
 
   if (kind === "existing-output") {
@@ -261,22 +269,15 @@ function isInvalidMediaProbeError(error: unknown) {
   )
 }
 
-function hasHevcVideo(probe: ProbeResult) {
+function hasAv1Video(probe: ProbeResult) {
   return (probe.streams ?? []).some(
     (stream) =>
       stream.codec_type === "video" &&
-      ["hevc", "h265"].includes((stream.codec_name ?? "").toLowerCase())
+      (stream.codec_name ?? "").toLowerCase() === "av1"
   )
 }
 
-const mp4ContainerFormatNames = new Set([
-  "mov",
-  "mp4",
-  "m4a",
-  "3gp",
-  "3g2",
-  "mj2",
-])
+const webmContainerFormatNames = new Set(["matroska", "webm"])
 
 function getProbeFormatNames(probe: ProbeResult) {
   return (probe.format?.format_name ?? "")
@@ -285,8 +286,8 @@ function getProbeFormatNames(probe: ProbeResult) {
     .filter(Boolean)
 }
 
-function usesMp4OutputContainer(filePath: string, probe: ProbeResult) {
-  if (path.extname(filePath).toLowerCase() !== ".mp4") {
+function usesWebmOutputContainer(filePath: string, probe: ProbeResult) {
+  if (path.extname(filePath).toLowerCase() !== ".webm") {
     return false
   }
 
@@ -294,46 +295,70 @@ function usesMp4OutputContainer(filePath: string, probe: ProbeResult) {
 
   return (
     formatNames.length === 0 ||
-    formatNames.some((formatName) => mp4ContainerFormatNames.has(formatName))
+    formatNames.some((formatName) => webmContainerFormatNames.has(formatName))
   )
 }
 
-const mp4CopyableSubtitleCodecs = new Set(["mov_text"])
-const mp4ConvertibleTextSubtitleCodecs = new Set([
-  "ass",
-  "ssa",
-  "subrip",
-  "srt",
-  "text",
-  "webvtt",
-])
+function hasEmbeddedSubtitles(probe: ProbeResult) {
+  return (probe.streams ?? []).some((stream) => stream.codec_type === "subtitle")
+}
 
-function getMp4SubtitleOutputStreams(probe: ProbeResult): Mp4SubtitleOutputStream[] {
-  return (probe.streams ?? [])
+function hasNonWebVttEmbeddedSubtitle(probe: ProbeResult) {
+  return (probe.streams ?? []).some(
+    (stream) =>
+      stream.codec_type === "subtitle" && !isWebVttSubtitleCodec(stream.codec_name)
+  )
+}
+
+function getWebmSubtitleOutputStreams(input: {
+  probe: ProbeResult
+  sidecarSubtitle?: SubtitleSidecar | null
+}): WebmSubtitleOutputStream[] {
+  const embeddedStreams = (input.probe.streams ?? [])
     .map((stream) => {
-      const codec = (stream.codec_name ?? "").trim().toLowerCase()
+      const codec = normalizeSubtitleCodecName(stream.codec_name)
 
       if (stream.codec_type !== "subtitle" || !Number.isInteger(stream.index)) {
         return null
       }
 
-      if (mp4CopyableSubtitleCodecs.has(codec)) {
-        return { streamIndex: stream.index as number, codec: "copy" as const }
+      if (isWebVttSubtitleCodec(codec)) {
+        return {
+          inputIndex: 0,
+          streamIndex: stream.index as number,
+          codec: "copy" as const,
+        }
       }
 
-      if (mp4ConvertibleTextSubtitleCodecs.has(codec)) {
-        return { streamIndex: stream.index as number, codec: "mov_text" as const }
+      if (isConvertibleTextSubtitleCodec(codec)) {
+        return {
+          inputIndex: 0,
+          streamIndex: stream.index as number,
+          codec: "webvtt" as const,
+        }
       }
 
       return null
     })
-    .filter((stream): stream is Mp4SubtitleOutputStream => stream !== null)
+    .filter((stream): stream is WebmSubtitleOutputStream => stream !== null)
+
+  if (embeddedStreams.length || !input.sidecarSubtitle) {
+    return embeddedStreams
+  }
+
+  return [
+    {
+      inputIndex: 1,
+      streamIndex: 0,
+      codec: isWebVttSubtitleCodec(input.sidecarSubtitle.codec) ? "copy" : "webvtt",
+    },
+  ]
 }
 
-function getMaxHevcBytesPerMinute() {
+function getMaxAv1BytesPerMinute() {
   return getServerConfig().transcodeAccel === "cpu"
-    ? cpuMaxHevcBytesPerMinute
-    : hardwareMaxHevcBytesPerMinute
+    ? cpuMaxAv1BytesPerMinute
+    : hardwareMaxAv1BytesPerMinute
 }
 
 function calculateVideoBitrateKbps(bytesPerMinute = targetBytesPerMinute) {
@@ -541,80 +566,6 @@ function sanitizeFailedImportRelativePath(relativePath: string) {
 
       return sanitizeExportPathPart(part) || fallback
     })
-}
-
-function cleanFolderTitleCandidate(value: string) {
-  return value
-    .replace(/\[[^\]]*\]|\([^)]*\)/g, " ")
-    .replace(/[._]+/g, " ")
-    .replace(/[-–—]\s*[A-Z0-9]{2,}$/g, " ")
-    .replace(/\b(?:season|s)\s*\d{1,2}\b/gi, " ")
-    .replace(/\b(?:480p|720p|1080p|2160p|4k|bluray|blu-ray|bdrip|web[- ]?dl|webrip|remux|x264|x265|h264|h265|hevc|avc|aac|flac|opus|ddp?|dts|10\s*bits?|8\s*bits?|dual audio|multi audio)\b/gi, " ")
-    .replace(/[-–—]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-}
-
-function isIgnoredFolderTitleCandidate(value: string) {
-  const normalized = value.trim().toLowerCase()
-
-  return (
-    !normalized ||
-    normalized === failedImportsFolderName ||
-    normalized === "season" ||
-    normalized === "seasons" ||
-    normalized === "special" ||
-    normalized === "specials" ||
-    normalized === "ova" ||
-    normalized === "ovas" ||
-    normalized === "movie" ||
-    normalized === "movies" ||
-    normalized === "extra" ||
-    normalized === "extras" ||
-    normalized === "episode" ||
-    normalized === "episodes" ||
-    normalized === "done" ||
-    /^s\d{1,2}$/i.test(normalized) ||
-    /^season\s*\d{1,2}$/i.test(normalized)
-  )
-}
-
-function getFolderTitleFallbackCandidates(inputDir: string, filePath: string, parsedTitle?: string) {
-  const inputRoot = path.resolve(inputDir)
-  const fileDirectory = path.dirname(path.resolve(filePath))
-  const relativeDirectory = path.relative(inputRoot, fileDirectory)
-
-  if (!relativeDirectory || relativeDirectory.startsWith("..") || path.isAbsolute(relativeDirectory)) {
-    return []
-  }
-
-  const parts = relativeDirectory.split(path.sep).filter(Boolean)
-  let candidateIndex = parts.length - 1
-
-  while (candidateIndex >= 0) {
-    const part = parts[candidateIndex]
-    const cleaned = cleanFolderTitleCandidate(part)
-
-    if (cleaned.length >= 2 && !isIgnoredFolderTitleCandidate(cleaned)) {
-      break
-    }
-
-    candidateIndex -= 1
-  }
-
-  if (candidateIndex < 0) {
-    return []
-  }
-
-  const cleaned = cleanFolderTitleCandidate(parts[candidateIndex])
-  const key = cleaned.toLowerCase()
-  const parsedTitleNormalized = parsedTitle?.trim().toLowerCase()
-
-  if (parsedTitleNormalized && key === parsedTitleNormalized) {
-    return []
-  }
-
-  return [cleaned]
 }
 
 function formatDetectedEpisode(input: {
@@ -841,10 +792,11 @@ async function transcodeFile(
   outputPath: string,
   options: {
     convertVideo: boolean
-    audioOutputIndexesToAac: number[]
-    subtitleStreams: Mp4SubtitleOutputStream[]
+    audioOutputIndexesToOpus: number[]
+    subtitleStreams: WebmSubtitleOutputStream[]
     videoBitrateKbps: number
     maxVideoBitrateKbps: number
+    sidecarSubtitle?: SubtitleSidecar | null
     jobId?: string
   }
 ) {
@@ -857,10 +809,11 @@ async function transcodeFile(
     ...(options.convertVideo
       ? getHardwareInputArgs({ keepFramesOnDevice: true })
       : []),
-    ...getFileSubtitleInputArgs(options),
+    ...getFileSubtitleInputArgs(),
     "-i",
     inputPath,
-    ...getHevcFileArgs(options),
+    ...(options.sidecarSubtitle ? ["-i", options.sidecarSubtitle.filePath] : []),
+    ...getWebmFileArgs(options),
     "-y",
     outputPath,
   ]
@@ -939,28 +892,13 @@ export async function processInputFile(
     debugImport(jobId, "Input file is stable.")
 
     debugImport(jobId, "Parsing anime filename.")
-    let parsed = parseAnimeFileName(filePath)
+    const parsed = parseAnimeFilePath(filePath, { rootDir: config.inputDir })
 
-    if (!parsed) {
-      const fallbackTitles = getFolderTitleFallbackCandidates(config.inputDir, filePath)
-
-      for (const fallbackTitle of fallbackTitles) {
-        const fallbackParsed = parseAnimeFileNameWithFallbackTitle(
-          filePath,
-          fallbackTitle
-        )
-
-        if (!fallbackParsed) {
-          continue
-        }
-
-        parsed = fallbackParsed
-        debugImport(
-          jobId,
-          `Parsed input file using folder title fallback - Title ${fallbackParsed.title}, Season ${fallbackParsed.season}${fallbackParsed.part ? `, Part ${fallbackParsed.part}` : ""}, Episode ${fallbackParsed.episode}`
-        )
-        break
-      }
+    if (parsed?.titleSource === "folder") {
+      debugImport(
+        jobId,
+        `Parsed input file using folder title fallback - Title ${parsed.title}, Season ${parsed.season}${parsed.part ? `, Part ${parsed.part}` : ""}, Episode ${parsed.episode}`
+      )
     }
 
     if (!parsed) {
@@ -1025,7 +963,7 @@ export async function processInputFile(
     try {
       metadata = await findAnimeMetadata(
         parsed.title,
-        parsed.season,
+        getAnimeMetadataLookupSeason(parsed),
         parsed.episode,
         parsed.part
       )
@@ -1051,7 +989,7 @@ export async function processInputFile(
 
           const fallbackMetadata = await findAnimeMetadata(
             fallbackTitle,
-            parsed.season,
+            getAnimeMetadataLookupSeason(parsed),
             parsed.episode,
             parsed.part
           )
@@ -1061,7 +999,7 @@ export async function processInputFile(
           }
 
           metadata = fallbackMetadata
-          resolvedParsed = { ...parsed, title: fallbackTitle }
+          resolvedParsed = { ...parsed, title: fallbackTitle, titleSource: "folder" }
           debugImport(jobId, `Folder title fallback matched - ${fallbackTitle}.`)
           break
         }
@@ -1124,7 +1062,7 @@ export async function processInputFile(
       }
     }
 
-    const inputParsed: NonNullable<ReturnType<typeof parseAnimeFileName>> = resolvedParsed
+    const inputParsed = resolvedParsed
     const inputMetadata: NonNullable<Awaited<ReturnType<typeof findAnimeMetadata>>> = metadata
 
     debugImport(jobId, `AniList metadata lookup completed - Anime id ${inputMetadata.id}.`)
@@ -1213,6 +1151,13 @@ export async function processInputFile(
     }
 
     debugImport(jobId, `ffprobe completed - Streams ${(probe.streams ?? []).length}.`)
+
+    const embeddedSubtitles = hasEmbeddedSubtitles(probe)
+    const sidecarSubtitle = embeddedSubtitles ? null : await findSubtitleSidecar(filePath)
+
+    if (sidecarSubtitle) {
+      debugImport(jobId, `Subtitle sidecar detected - ${sidecarSubtitle.filePath}`)
+    }
 
     const durationSeconds = parseDurationSeconds(probe)
     debugImport(jobId, `Parsed duration - ${durationSeconds}s.`)
@@ -1489,54 +1434,75 @@ export async function processInputFile(
       inputStat.size,
       durationSeconds
     )
-    const maxHevcBytesPerMinute = getMaxHevcBytesPerMinute()
-    const inputHasHevcVideo = hasHevcVideo(probe)
-    const audioOutputIndexesToAac = getAudioOutputIndexesToAac(probe)
-    const subtitleStreams = getMp4SubtitleOutputStreams(probe)
-    const convertAudioToAac = audioOutputIndexesToAac.length > 0
-    const inputUsesMp4Container = inputHasHevcVideo
-      ? usesMp4OutputContainer(filePath, probe)
+    const maxAv1BytesPerMinute = getMaxAv1BytesPerMinute()
+    const inputHasAv1Video = hasAv1Video(probe)
+    const inputUsesWebmContainer = usesWebmOutputContainer(filePath, probe)
+    const subtitleStreams = getWebmSubtitleOutputStreams({
+      probe,
+      sidecarSubtitle,
+    })
+    const inputHasSubtitleSource = embeddedSubtitles || Boolean(sidecarSubtitle)
+    const inputHasEmbeddedWebVttSubtitles = embeddedSubtitles
+      ? !hasNonWebVttEmbeddedSubtitle(probe)
       : false
-    const requiresVideoShrink = inputHasHevcVideo
-      ? inputBytesPerMinute > maxHevcBytesPerMinute
+    const inputHasWebVttSubtitles = inputHasSubtitleSource
+      ? inputHasEmbeddedWebVttSubtitles
+      : true
+    const convertAudioToOpusOutputIndexes = getAudioOutputIndexesToOpus(probe)
+    const convertAudioToOpus = convertAudioToOpusOutputIndexes.length > 0
+    const requiresWebmContainerRemux = inputHasAv1Video && !inputUsesWebmContainer
+    const requiresSubtitleWebVttConversion = inputHasSubtitleSource
+      ? !inputHasWebVttSubtitles || Boolean(sidecarSubtitle)
       : false
-    const requiresMp4ContainerRemux = inputHasHevcVideo
-      ? !inputUsesMp4Container
+    const inputMatchesWebmAv1OpusWebVtt =
+      inputUsesWebmContainer &&
+      inputHasAv1Video &&
+      !convertAudioToOpus &&
+      inputHasWebVttSubtitles
+    const requiresVideoShrink = inputMatchesWebmAv1OpusWebVtt
+      ? inputBytesPerMinute > maxAv1BytesPerMinute
       : false
-    const requiredSingleStepEdits = inputHasHevcVideo
-      ? [requiresVideoShrink, requiresMp4ContainerRemux, convertAudioToAac].filter(
-          Boolean
-        ).length
+    const requiredSingleStepEdits = inputHasAv1Video
+      ? [
+          requiresWebmContainerRemux,
+          convertAudioToOpus,
+          requiresSubtitleWebVttConversion,
+        ].filter(Boolean).length
       : 0
-    const videoTranscodeReason: VideoTranscodeReason = !inputHasHevcVideo
+    const videoTranscodeReason: VideoTranscodeReason = !inputHasAv1Video
       ? "full"
-      : requiredSingleStepEdits > 1
-        ? "full"
-        : requiresVideoShrink
-          ? "shrink"
+      : requiresVideoShrink
+        ? "shrink"
+        : requiredSingleStepEdits > 1
+          ? "full"
           : "none"
     const convertVideo = videoTranscodeReason !== "none"
+    const audioOutputIndexesToOpus = convertVideo
+      ? (probe.streams ?? [])
+          .filter((stream) => stream.codec_type === "audio")
+          .map((_stream, outputAudioIndex) => outputAudioIndex)
+      : convertAudioToOpusOutputIndexes
     const importFileEditKind: ImportFileEditKind = convertVideo
       ? "video-transcode"
-      : convertAudioToAac
+      : convertAudioToOpus
         ? "audio-transcode"
-        : requiresMp4ContainerRemux
+        : requiresWebmContainerRemux || requiresSubtitleWebVttConversion
           ? "container-remux"
           : "direct-move"
     const needsFfmpegProcessing = importFileEditKind !== "direct-move"
     const videoBitrateKbps = calculateVideoBitrateKbps()
-    const skippedDetailedEditChecks = !inputHasHevcVideo
+    const skippedDetailedEditChecks = !inputHasAv1Video
 
     debugImport(
       jobId,
       skippedDetailedEditChecks
-        ? `Processing decision - hevc false, action ${importFileEditKind}, videoTranscodeReason ${videoTranscodeReason}, needsFfmpegProcessing ${needsFfmpegProcessing}; skipped shrink/remux/audio-decision checks because full processing is required. Audio tracks to AAC for output [${audioOutputIndexesToAac.join(", ")}], subtitleTracks [${subtitleStreams.map((stream) => `${stream.streamIndex}:${stream.codec}`).join(", ")}]`
-        : `Processing decision - hevc ${inputHasHevcVideo}, belowMaxSize ${!requiresVideoShrink}, mp4Container ${inputUsesMp4Container}, audioTracksToAac [${audioOutputIndexesToAac.join(", ")}], subtitleTracks [${subtitleStreams.map((stream) => `${stream.streamIndex}:${stream.codec}`).join(", ")}], requiredEdits ${requiredSingleStepEdits}, action ${importFileEditKind}, videoTranscodeReason ${videoTranscodeReason}, needsFfmpegProcessing ${needsFfmpegProcessing}`
+        ? `Processing decision - av1 false, action ${importFileEditKind}, videoTranscodeReason ${videoTranscodeReason}, needsFfmpegProcessing ${needsFfmpegProcessing}; skipped WebM/audio/subtitle/shrink decision checks because full processing is required. Audio tracks to Opus for output [${audioOutputIndexesToOpus.join(", ")}], subtitleTracks [${subtitleStreams.map((stream) => `${stream.inputIndex}:${stream.streamIndex}:${stream.codec}`).join(", ")}]`
+        : `Processing decision - av1 ${inputHasAv1Video}, webmContainer ${inputUsesWebmContainer}, opusAudio ${!convertAudioToOpus}, webVttSubtitles ${inputHasWebVttSubtitles}, conformsBeforeShrink ${inputMatchesWebmAv1OpusWebVtt}, belowMaxSize ${!requiresVideoShrink}, audioTracksToOpus [${audioOutputIndexesToOpus.join(", ")}], subtitleTracks [${subtitleStreams.map((stream) => `${stream.inputIndex}:${stream.streamIndex}:${stream.codec}`).join(", ")}], requiredFormatEdits ${requiredSingleStepEdits}, action ${importFileEditKind}, videoTranscodeReason ${videoTranscodeReason}, needsFfmpegProcessing ${needsFfmpegProcessing}`
     )
 
     const safeLibraryTitle = safePathSegment(libraryTitle, "Library title")
     const safeMediaTitle = safePathSegment(mediaTitle, "Media title")
-    const extension = needsFfmpegProcessing ? ".mp4" : path.extname(filePath)
+    const extension = ".webm"
     const finalName = formatEpisodeFileName({
       title: safeMediaTitle,
       season: librarySeason,
@@ -1589,6 +1555,15 @@ export async function processInputFile(
         destinationPath,
         jobId,
       })
+    }
+
+    async function removeInputSidecarIfUsed() {
+      if (!sidecarSubtitle || !(await pathExists(sidecarSubtitle.filePath))) {
+        return
+      }
+
+      debugImport(jobId, `Removing consumed subtitle sidecar - ${sidecarSubtitle.filePath}`)
+      await unlinkFileWithRetry(sidecarSubtitle.filePath, { jobId })
     }
 
     debugImport(jobId, "Checking for existing episode/file conflicts.")
@@ -1745,17 +1720,18 @@ export async function processInputFile(
           ? videoTranscodeReason === "shrink"
             ? "Shrinking media file."
             : "Transcoding media file."
-          : convertAudioToAac
-            ? "Converting audio tracks to LC-AAC."
-            : "Remuxing media file to MP4.",
+          : convertAudioToOpus
+            ? "Converting audio tracks to Opus."
+            : "Remuxing media file to WebM.",
       })
 
       await transcodeFile(filePath, tempPath, {
         convertVideo,
-        audioOutputIndexesToAac,
+        audioOutputIndexesToOpus,
         subtitleStreams,
+        sidecarSubtitle,
         videoBitrateKbps,
-        maxVideoBitrateKbps: calculateVideoBitrateKbps(maxHevcBytesPerMinute),
+        maxVideoBitrateKbps: calculateVideoBitrateKbps(maxAv1BytesPerMinute),
         jobId,
       })
       debugImport(jobId, "FFmpeg processing step completed successfully.")
@@ -1771,6 +1747,7 @@ export async function processInputFile(
       debugImport(jobId, "Temporary job directory removed.")
       debugImport(jobId, "Removing original input file after processed output move.")
       await unlinkFileWithRetry(filePath, { jobId })
+      await removeInputSidecarIfUsed()
       debugImport(jobId, "Cleaning input parent folders.")
       await removeNonMediaOnlyInputParents(filePath, { jobId })
       debugImport(jobId, "Input parent cleanup completed.")
@@ -1781,6 +1758,7 @@ export async function processInputFile(
         debugImport(jobId, "Removing duplicate input source for existing output file.")
         await unlinkFileWithRetry(filePath, { jobId })
       }
+      await removeInputSidecarIfUsed()
 
       debugImport(jobId, "Cleaning input parent folders after existing output recovery.")
       await removeNonMediaOnlyInputParents(filePath, { jobId })
@@ -1812,6 +1790,7 @@ export async function processInputFile(
         debugImport(jobId, "Source still exists after direct-import move; removing it.")
         await unlinkFileWithRetry(filePath, { jobId })
       }
+      await removeInputSidecarIfUsed()
 
       debugImport(jobId, "Direct-import file move completed.")
       debugImport(jobId, "Cleaning input parent folders.")
@@ -1863,29 +1842,29 @@ export async function processInputFile(
     }
 
     if (needsFfmpegProcessing && !convertVideo && options.deferAudioTranscodes) {
-      const queueMessage = convertAudioToAac
+      const queueMessage = convertAudioToOpus
         ? "Queued for audio transcode."
-        : "Queued for MP4 remux."
+        : "Queued for WebM remux."
 
       updateJob(jobId, {
         message: queueMessage,
       })
       debugImport(
         jobId,
-        convertAudioToAac
-          ? "Audio-only LC-AAC transcode queued in the shared file-edit queue."
-          : "Container remux queued in the shared file-edit queue."
+        convertAudioToOpus
+          ? "Audio-only Opus transcode queued in the shared file-edit queue."
+          : "Container/subtitle remux queued in the shared file-edit queue."
       )
 
       return queueDeferredImportWork({
-        kind: convertAudioToAac ? "audio-transcode" : "container-remux",
+        kind: convertAudioToOpus ? "audio-transcode" : "container-remux",
         outputPath: finalPath,
         planned: true,
         message: queueMessage,
         work: runFfmpegImport,
         processing: {
           ...processingInfo,
-          kind: convertAudioToAac ? "audio-transcode" : "container-remux",
+          kind: convertAudioToOpus ? "audio-transcode" : "container-remux",
         },
       })
     }

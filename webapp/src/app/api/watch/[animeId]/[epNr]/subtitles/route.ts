@@ -9,6 +9,14 @@ import { ffprobe } from "@/server/media/ffmpeg"
 import type { ProbeResult } from "@/server/media/mediaFiles"
 import { resolveEpisodeMedia } from "@/server/media/resolveMediaId"
 import { getMediaStreamMetadata } from "@/server/media/streamMetadata"
+import {
+  findSubtitleSidecar,
+  isWebVttSubtitleCodec,
+  normalizeSubtitleCodecName,
+  readWebVttSidecar,
+  sidecarSubtitleStreamId,
+  type SubtitleSidecar,
+} from "@/server/media/subtitles"
 import { errorMessage, fileName, parsePositiveInt } from "@/server/utils/format"
 
 export const runtime = "nodejs"
@@ -23,6 +31,24 @@ type SubtitleContext = {
 
 const ffmpegShutdownGraceMs = 2_000
 const maxSubtitleBytes = 8 * 1024 * 1024
+
+function normalizeWebVttResponse(value: string) {
+  const normalized = value
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .trim()
+
+  if (!normalized) {
+    return "WEBVTT\n"
+  }
+
+  if (/^WEBVTT(?:[ \t].*)?(?:\n|$)/i.test(normalized)) {
+    return `${normalized}\n`
+  }
+
+  return `WEBVTT\n\n${normalized}\n`
+}
 
 function subtitleCorsHeaders() {
   return {
@@ -49,14 +75,18 @@ function jsonError(message: string, status: number) {
   )
 }
 
-function parseStreamIndex(value: string | null) {
+function parseSubtitleStreamId(value: string | null) {
   if (!value) {
     return null
   }
 
+  if (value === sidecarSubtitleStreamId) {
+    return value
+  }
+
   const index = Number(value)
 
-  return Number.isInteger(index) && index >= 0 ? index : null
+  return Number.isInteger(index) && index >= 0 ? String(index) : null
 }
 
 function parseOffsetSeconds(value: string | null) {
@@ -157,13 +187,6 @@ function shiftWebVttTimestamps(value: string, offsetSeconds: number) {
   return shiftedBlocks.join("\n\n")
 }
 
-function stripSubtitleFormatting(value: string) {
-  return value
-    .replace(/\{\\[^}]*}/g, "")
-    .replace(/<[^>]*>/g, "")
-    .replace(/[ \t]+$/gm, "")
-}
-
 async function resolveSubtitleUser(input: {
   animeId: string
   seasonNumber: number
@@ -192,39 +215,23 @@ async function resolveSubtitleUser(input: {
   return { ok: true as const }
 }
 
-function extractSubtitleWebVtt(input: {
+function hasWebVttCueTimings(value: string) {
+  return /(?:^|\n)\s*\S+\s+-->\s+\S+/.test(value)
+}
+
+function runSubtitleWebVttCommand(input: {
   request: Request
-  file: string
-  streamIndex: number
+  args: string[]
+  failureLabel: string
 }) {
-  const child = spawn(
-    getServerConfig().ffmpegPath,
-    [
-      "-hide_banner",
-      "-nostdin",
-      "-loglevel",
-      "error",
-      "-fix_sub_duration",
-      "-copyts",
-      "-i",
-      input.file,
-      "-map",
-      `0:${input.streamIndex}`,
-      "-c:s",
-      "webvtt",
-      "-f",
-      "webvtt",
-      "pipe:1",
-    ],
-    {
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    }
-  )
+  const child = spawn(getServerConfig().ffmpegPath, input.args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  })
 
   if (!child.stdout) {
     child.kill("SIGKILL")
-    return Promise.reject(new Error("Unable to start subtitle extractor."))
+    return Promise.reject(new Error(`Unable to start ${input.failureLabel}.`))
   }
 
   const chunks: Buffer[] = []
@@ -307,14 +314,221 @@ function extractSubtitleWebVtt(input: {
         settled = true
         reject(
           new Error(
-            `Subtitle extractor failed with code ${code}${stderr ? `: ${stderr.trim()}` : ""}`
+            `${input.failureLabel} failed with code ${code}${stderr ? `: ${stderr.trim()}` : ""}`
           )
         )
         return
       }
 
       settled = true
-      resolve(stripSubtitleFormatting(Buffer.concat(chunks).toString("utf8")))
+      resolve(normalizeWebVttResponse(Buffer.concat(chunks).toString("utf8")))
+    })
+  })
+}
+
+function subtitleExtractionArgs(input: {
+  file: string
+  streamIndex: number
+  codec?: string
+}) {
+  const streamMap = `0:${input.streamIndex}`
+  const commonInputArgs = [
+    "-hide_banner",
+    "-nostdin",
+    "-loglevel",
+    "error",
+    "-analyzeduration",
+    "100M",
+    "-probesize",
+    "100M",
+  ]
+  const commonMapArgs = ["-map", streamMap]
+  const webVttOutputArgs = ["-f", "webvtt", "pipe:1"]
+  const encodeOutputArgs = [...commonMapArgs, "-c:s", "webvtt", ...webVttOutputArgs]
+
+  if (isWebVttSubtitleCodec(input.codec)) {
+    return [
+      [
+        ...commonInputArgs,
+        "-copyts",
+        "-i",
+        input.file,
+        ...commonMapArgs,
+        "-c:s",
+        "copy",
+        ...webVttOutputArgs,
+      ],
+      [...commonInputArgs, "-copyts", "-i", input.file, ...encodeOutputArgs],
+    ]
+  }
+
+  return [
+    [
+      ...commonInputArgs,
+      "-fix_sub_duration",
+      "-copyts",
+      "-i",
+      input.file,
+      ...encodeOutputArgs,
+    ],
+  ]
+}
+
+async function extractSubtitleWebVtt(input: {
+  request: Request
+  file: string
+  streamIndex: number
+  codec?: string
+}) {
+  let lastError: Error | null = null
+
+  for (const args of subtitleExtractionArgs(input)) {
+    try {
+      const body = await runSubtitleWebVttCommand({
+        request: input.request,
+        args,
+        failureLabel: "subtitle extractor",
+      })
+
+      if (hasWebVttCueTimings(body)) {
+        return body
+      }
+
+      lastError = new Error("Subtitle extractor returned WebVTT without cue timings.")
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(errorMessage(error))
+    }
+  }
+
+  throw lastError ?? new Error("Subtitle stream could not be extracted.")
+}
+
+
+async function extractSidecarWebVtt(input: {
+  request: Request
+  sidecar: SubtitleSidecar
+}) {
+  if (input.sidecar.extension === ".vtt") {
+    return normalizeWebVttResponse(await readWebVttSidecar(input.sidecar))
+  }
+
+  const child = spawn(
+    getServerConfig().ffmpegPath,
+    [
+      "-hide_banner",
+      "-nostdin",
+      "-loglevel",
+      "error",
+      "-fix_sub_duration",
+      "-i",
+      input.sidecar.filePath,
+      "-map",
+      "0:0",
+      "-c:s",
+      "webvtt",
+      "-f",
+      "webvtt",
+      "pipe:1",
+    ],
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    }
+  )
+
+  if (!child.stdout) {
+    child.kill("SIGKILL")
+    return Promise.reject(new Error("Unable to start subtitle sidecar converter."))
+  }
+
+  const chunks: Buffer[] = []
+  let byteLength = 0
+  let stderr = ""
+  let settled = false
+  let shutdownTimer: ReturnType<typeof setTimeout> | null = null
+
+  const stopChild = () => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      return
+    }
+
+    child.kill("SIGTERM")
+
+    if (!shutdownTimer) {
+      shutdownTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGKILL")
+        }
+      }, ffmpegShutdownGraceMs)
+      shutdownTimer.unref?.()
+    }
+  }
+
+  return new Promise<string>((resolve, reject) => {
+    const finishError = (error: Error) => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      input.request.signal.removeEventListener("abort", onAbort)
+      stopChild()
+      reject(error)
+    }
+
+    const onAbort = () => {
+      finishError(new Error("Subtitle request was cancelled."))
+    }
+
+    input.request.signal.addEventListener("abort", onAbort, { once: true })
+
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr = `${stderr}${chunk.toString("utf8")}`.slice(-4000)
+    })
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      if (settled) {
+        return
+      }
+
+      byteLength += chunk.byteLength
+
+      if (byteLength > maxSubtitleBytes) {
+        finishError(new Error("Subtitle output was too large."))
+        return
+      }
+
+      chunks.push(chunk)
+    })
+
+    child.once("error", (error) => {
+      finishError(error)
+    })
+
+    child.once("close", (code) => {
+      input.request.signal.removeEventListener("abort", onAbort)
+
+      if (shutdownTimer) {
+        clearTimeout(shutdownTimer)
+        shutdownTimer = null
+      }
+
+      if (settled) {
+        return
+      }
+
+      if (code && code !== 0) {
+        settled = true
+        reject(
+          new Error(
+            `Subtitle sidecar converter failed with code ${code}${stderr ? `: ${stderr.trim()}` : ""}`
+          )
+        )
+        return
+      }
+
+      settled = true
+      resolve(normalizeWebVttResponse(Buffer.concat(chunks).toString("utf8")))
     })
   })
 }
@@ -330,10 +544,10 @@ export async function GET(request: Request, context: SubtitleContext) {
   const episodeNumber = parsePositiveInt(epNr)
   const url = new URL(request.url)
   const seasonNumber = parsePositiveInt(url.searchParams.get("season") ?? "1")
-  const streamIndex = parseStreamIndex(url.searchParams.get("stream"))
+  const streamId = parseSubtitleStreamId(url.searchParams.get("stream"))
   const offsetSeconds = parseOffsetSeconds(url.searchParams.get("offset"))
 
-  if (!episodeNumber || !seasonNumber || streamIndex === null) {
+  if (!episodeNumber || !seasonNumber || streamId === null) {
     return jsonError("Subtitle stream not found.", 404)
   }
 
@@ -370,12 +584,21 @@ export async function GET(request: Request, context: SubtitleContext) {
     return jsonError("Media file not found.", 404)
   }
 
+  const config = getServerConfig()
   let subtitleStream
+  let sidecarSubtitle: SubtitleSidecar | null = null
 
   try {
-    const metadata = getMediaStreamMetadata((await ffprobe(media.file)) as ProbeResult)
+    const probe = (await ffprobe(media.file)) as ProbeResult
+    const hasEmbeddedSubtitles = (probe.streams ?? []).some(
+      (stream) => stream.codec_type === "subtitle"
+    )
+    sidecarSubtitle = config.importEnabled || hasEmbeddedSubtitles
+      ? null
+      : await findSubtitleSidecar(media.file)
+    const metadata = getMediaStreamMetadata(probe, { sidecarSubtitle })
     subtitleStream = metadata.subtitleStreams.find(
-      (stream) => stream.index === streamIndex && stream.isSupported
+      (stream) => stream.id === streamId && stream.isSupported
     )
   } catch (error) {
     console.error(
@@ -389,11 +612,20 @@ export async function GET(request: Request, context: SubtitleContext) {
   }
 
   try {
-    const body = await extractSubtitleWebVtt({
-      request,
-      file: media.file,
-      streamIndex: subtitleStream.index,
-    })
+    const body = subtitleStream.id === sidecarSubtitleStreamId
+      ? sidecarSubtitle
+        ? await extractSidecarWebVtt({ request, sidecar: sidecarSubtitle })
+        : null
+      : await extractSubtitleWebVtt({
+          request,
+          file: media.file,
+          streamIndex: subtitleStream.index,
+          codec: normalizeSubtitleCodecName(subtitleStream.codec),
+        })
+
+    if (body === null) {
+      return jsonError("Subtitle sidecar could not be resolved.", 404)
+    }
 
     return new Response(shiftWebVttTimestamps(body, offsetSeconds), {
       headers: {

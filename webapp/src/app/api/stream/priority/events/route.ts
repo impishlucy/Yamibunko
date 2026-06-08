@@ -1,8 +1,7 @@
 import { z } from "zod"
 
-import { requireApiUser, requireSameOriginRequest } from "@/server/auth/api"
+import { requireApiUser } from "@/server/auth/api"
 import {
-  protectCurrentForcedDowngrade,
   subscribeStreamPriorityActions,
   type StreamPriorityAction,
 } from "@/server/bandwidth/streamBandwidth"
@@ -12,12 +11,6 @@ export const dynamic = "force-dynamic"
 
 const priorityEventsQuerySchema = z.object({
   clientId: z.string().trim().min(8).max(128),
-  protected: z.enum(["0", "1"]).optional(),
-})
-
-const priorityProtectionSchema = z.object({
-  clientId: z.string().trim().min(8).max(128),
-  protected: z.boolean(),
 })
 
 function encodeEvent(event: string, data: unknown) {
@@ -38,7 +31,6 @@ export async function GET(request: Request) {
   const url = new URL(request.url)
   const parsed = priorityEventsQuerySchema.safeParse({
     clientId: url.searchParams.get("clientId"),
-    protected: url.searchParams.get("protected") ?? undefined,
   })
 
   if (!parsed.success) {
@@ -48,9 +40,6 @@ export async function GET(request: Request) {
     )
   }
 
-  if (parsed.data.protected === "1") {
-    protectCurrentForcedDowngrade(auth.user.username, parsed.data.clientId)
-  }
 
   const encoder = new TextEncoder()
   let unsubscribe: (() => void) | null = null
@@ -117,35 +106,4 @@ export async function GET(request: Request) {
       Vary: "Cookie",
     },
   })
-}
-
-export async function POST(request: Request) {
-  const originError = await requireSameOriginRequest(request)
-
-  if (originError) {
-    return originError
-  }
-
-  const auth = await requireApiUser(request)
-
-  if (!auth.ok) {
-    return auth.response
-  }
-
-  const parsed = priorityProtectionSchema.safeParse(
-    await request.json().catch(() => null)
-  )
-
-  if (!parsed.success) {
-    return Response.json(
-      { ok: false, error: "INVALID_PRIORITY_PROTECTION_BODY" },
-      { status: 400 }
-    )
-  }
-
-  if (parsed.data.protected) {
-    protectCurrentForcedDowngrade(auth.user.username, parsed.data.clientId)
-  }
-
-  return Response.json({ ok: true })
 }

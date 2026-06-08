@@ -10,21 +10,20 @@ function seasonLabel(seasonNumber?: number) {
 }
 
 function variantLabel(variant: AnimeVariant, libraryTitle: string) {
+  const subtitle = animeVariantSecondTitle({
+    libraryTitle,
+    mediaTitle: variant.title,
+  })
+
   if (variant.format === "MOVIE") {
-    return `[Movie] ${animeVariantSecondTitle({
-      libraryTitle,
-      mediaTitle: variant.title,
-    })}`
+    return `[Movie] ${subtitle}`
   }
 
   if (variant.format === "SPECIAL" || variant.format === "OVA") {
-    return `[Special] ${animeVariantSecondTitle({
-      libraryTitle,
-      mediaTitle: variant.title,
-    })}`
+    return `[Special] ${subtitle}`
   }
 
-  return `[Series] ${seasonLabel(variant.seasonNumber)}`
+  return `[Series] ${subtitle || seasonLabel(variant.seasonNumber)}`
 }
 
 export function AnimeVariantSelect({

@@ -12,6 +12,7 @@ import { ffprobe } from "@/server/media/ffmpeg"
 import type { ProbeResult } from "@/server/media/mediaFiles"
 import { resolveEpisodeMedia } from "@/server/media/resolveMediaId"
 import { getMediaStreamMetadata } from "@/server/media/streamMetadata"
+import { findSubtitleSidecar } from "@/server/media/subtitles"
 import { errorMessage, parsePositiveInt } from "@/server/utils/format"
 
 export const runtime = "nodejs"
@@ -58,12 +59,19 @@ export async function GET(request: Request, context: WatchContext) {
     return Response.json({ error: "Episode not found" }, { status: 404 })
   }
 
+  const config = getServerConfig()
   let streamMetadata
 
   try {
-    streamMetadata = getMediaStreamMetadata(
-      (await ffprobe(media.file)) as ProbeResult
+    const probe = (await ffprobe(media.file)) as ProbeResult
+    const hasEmbeddedSubtitles = (probe.streams ?? []).some(
+      (stream) => stream.codec_type === "subtitle"
     )
+    const sidecarSubtitle = config.importEnabled || hasEmbeddedSubtitles
+      ? null
+      : await findSubtitleSidecar(media.file)
+
+    streamMetadata = getMediaStreamMetadata(probe, { sidecarSubtitle })
   } catch (error) {
     console.error(
       `[Error] [Watch] Unable to inspect media streams - route.ts - Anime ${animeId}, Season ${seasonNumber}, Episode ${episodeNumber} - ${errorMessage(error)}`
@@ -77,7 +85,6 @@ export async function GET(request: Request, context: WatchContext) {
     }
   }
 
-  const config = getServerConfig()
   const liveTranscodeEnabled = config.transcodeAccel !== "cpu"
   const neighbors = getEpisodeNeighbors({
     animeId: anime.id,
@@ -107,10 +114,8 @@ export async function GET(request: Request, context: WatchContext) {
     playback: {
       directUrl: `${base}?${commonQuery}&mode=direct&profile=original`,
       originalTranscodeUrl: `${base}?${commonQuery}&mode=transcode&profile=original`,
-      dataSaverUrl: `${base}?${commonQuery}&mode=transcode&profile=dataSaver`,
       castDirectUrl: `${castBase}?${commonQuery}&mode=direct&profile=original&${castTokenQuery}`,
       castTranscodeUrl: `${castBase}?${commonQuery}&mode=transcode&profile=original&${castTokenQuery}`,
-      castDataSaverUrl: `${castBase}?${commonQuery}&mode=transcode&profile=dataSaver&${castTokenQuery}`,
       liveTranscodeEnabled,
       importEnabled: config.importEnabled,
       subtitleUrl: `${subtitleBase}?${commonQuery}`,

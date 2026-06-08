@@ -1,12 +1,28 @@
-import type { Metadata } from "next"
+import type { Metadata, Viewport } from "next"
 
 import { ThemeProvider } from "@/components/theme-provider"
 
 import "./globals.css"
 
 export const metadata: Metadata = {
-  title: "Anime Library",
+  title: "Yamibunko",
+  applicationName: "Yamibunko",
   description: "Local anime library and processing app",
+  manifest: "/manifest.webmanifest",
+  icons: {
+    icon: "/favicon.ico",
+    shortcut: "/favicon.ico",
+    apple: "/apple-icon.png",
+  },
+  appleWebApp: {
+    capable: true,
+    title: "Yamibunko",
+    statusBarStyle: "black-translucent",
+  },
+}
+
+export const viewport: Viewport = {
+  themeColor: "#09090b",
 }
 
 export default function RootLayout({

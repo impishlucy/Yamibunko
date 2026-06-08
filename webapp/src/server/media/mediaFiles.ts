@@ -22,9 +22,19 @@ export type ProbeStream = {
     forced?: number
     hearing_impaired?: number
   }
-  tags?: {
+  tags?: Record<string, string | undefined> & {
     language?: string
+    LANGUAGE?: string
     title?: string
+    TITLE?: string
+    name?: string
+    NAME?: string
+    handler_name?: string
+    HANDLER_NAME?: string
+    label?: string
+    LABEL?: string
+    description?: string
+    DESCRIPTION?: string
   }
 }
 

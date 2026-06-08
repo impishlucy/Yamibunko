@@ -1932,11 +1932,37 @@ function findSeasonVariant(librarySlug: string, season?: number, part?: number) 
   return seriesVariants[season - 1] ?? null
 }
 
+function findDirectCachedAnimeMatch(title: string, part?: number) {
+  return (
+    listCachedAnimeCandidates()
+      .filter(
+        (row) =>
+          row.library_slug &&
+          isLibraryMemberAnime(row.library_slug, row.id) &&
+          rowHasPartMarker(row, part)
+      )
+      .map((row) => ({
+        row,
+        score: scoreTitleCandidate(title, rowTitles(row)),
+      }))
+      .sort((left, right) => left.score - right.score)
+      .find((candidate) => candidate.score <= 1)?.row ?? null
+  )
+}
+
 export function findCachedAnimeMetadataForFile(
   title: string,
   season?: number,
   part?: number
 ) {
+  if (!season || season <= 1) {
+    const directMatch = findDirectCachedAnimeMatch(title, part)
+
+    if (directMatch) {
+      return toMetadataFromRow(directMatch)
+    }
+  }
+
   const root = findLibraryRootMatch(title)
 
   if (root?.library_slug) {
@@ -1953,19 +1979,7 @@ export function findCachedAnimeMetadataForFile(
     return toMetadataFromRow(root)
   }
 
-  const directMatch = listCachedAnimeCandidates()
-    .filter(
-      (row) =>
-        row.library_slug &&
-        isLibraryMemberAnime(row.library_slug, row.id) &&
-        rowHasPartMarker(row, part)
-    )
-    .map((row) => ({
-      row,
-      score: scoreTitleCandidate(title, rowTitles(row)),
-    }))
-    .sort((left, right) => left.score - right.score)
-    .find((candidate) => candidate.score <= 1)?.row
+  const directMatch = findDirectCachedAnimeMatch(title, part)
 
   return directMatch ? toMetadataFromRow(directMatch) : null
 }

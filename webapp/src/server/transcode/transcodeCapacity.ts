@@ -5,7 +5,6 @@ import os from "node:os"
 import { execa } from "execa"
 
 import type { TranscodeStatus } from "@/lib/types"
-import type { PlaybackProfile } from "@/lib/types"
 import {
   getServerConfigResult,
   type TranscodeAcceleration,
@@ -29,7 +28,6 @@ type PendingTranscodeRequest = {
   id: string
   label: string
   kind: TranscodeKind
-  profile?: PlaybackProfile
   priority: number
   sequence: number
   signal?: AbortSignal
@@ -307,8 +305,7 @@ function intelLinuxPressureSnapshot(): HardwarePressureSnapshot | null {
 
 function getTranscodeCost(
   acceleration: TranscodeAcceleration,
-  kind: TranscodeKind,
-  profile?: PlaybackProfile
+  kind: TranscodeKind
 ) {
   if (kind === "import-video") {
     return 0.5
@@ -322,7 +319,7 @@ function getTranscodeCost(
     return 0.35
   }
 
-  return profile === "dataSaver" ? 0.14 : 0.16
+  return 0.16
 }
 
 function getActiveCost() {
@@ -350,10 +347,7 @@ function scheduleQueueDrain() {
   queueRetryTimer.unref?.()
 }
 
-async function getCanFitTranscode(
-  kind: TranscodeKind,
-  profile?: PlaybackProfile
-) {
+async function getCanFitTranscode(kind: TranscodeKind) {
   const result = getServerConfigResult()
 
   if (!result.ok) {
@@ -367,7 +361,7 @@ async function getCanFitTranscode(
   }
 
   const snapshot = await getHardwarePressureSnapshot(acceleration)
-  const candidateCost = getTranscodeCost(acceleration, kind, profile)
+  const candidateCost = getTranscodeCost(acceleration, kind)
   const activeCost = getActiveCost()
   const localPressureFloor = activeCost
   const effectivePressure = Math.max(snapshot.pressure, localPressureFloor)
@@ -433,7 +427,7 @@ async function drainPendingTranscodes() {
 
       const result = getServerConfigResult()
 
-      if (!result.ok || !(await getCanFitTranscode(request.kind, request.profile))) {
+      if (!result.ok || !(await getCanFitTranscode(request.kind))) {
         scheduleQueueDrain()
         return
       }
@@ -443,7 +437,7 @@ async function drainPendingTranscodes() {
         createLease(
           request.label,
           request.kind,
-          getTranscodeCost(result.config.transcodeAccel, request.kind, request.profile)
+          getTranscodeCost(result.config.transcodeAccel, request.kind)
         )
       )
     }
@@ -538,7 +532,6 @@ export async function getLiveTranscodeStatus(): Promise<TranscodeStatus> {
 function acquireQueuedTranscode(input: {
   label: string
   kind: TranscodeKind
-  profile?: PlaybackProfile
   signal?: AbortSignal
   isVip?: boolean
 }) {
@@ -549,7 +542,6 @@ function acquireQueuedTranscode(input: {
       id,
       label: input.label,
       kind: input.kind,
-      profile: input.profile,
       priority: input.isVip ? -1 : 0,
       sequence: pendingSequence++,
       signal: input.signal,
@@ -580,7 +572,6 @@ function acquireQueuedTranscode(input: {
 
 export function acquireLiveTranscode(
   label: string,
-  profile?: PlaybackProfile,
   signal?: AbortSignal,
   options?: { isVip?: boolean }
 ) {
@@ -595,7 +586,6 @@ export function acquireLiveTranscode(
   return acquireQueuedTranscode({
     label,
     kind: "live",
-    profile,
     signal,
     isVip: options?.isVip,
   })

@@ -12,6 +12,8 @@ export type ParsedAnimeFileName = {
   episode: number
   part?: number
   episodeTitle?: string | null
+  hasExplicitSeason?: boolean
+  titleSource?: "filename" | "folder"
 }
 
 type ParsedAnimeEpisodeIdentifier = Omit<ParsedAnimeFileName, "title">
@@ -227,12 +229,20 @@ type EpisodeMarkerMatch = {
   suffix: string
 }
 
+type NoSeasonEpisodeMarkerMatch = {
+  index: number
+  end: number
+  episode: number
+  suffix: string
+}
+
 const seasonEpisodeMarkerPattern = new RegExp(
   String.raw`\b(?:Season\s*(\d{1,2})|S\s*(\d{1,2}))\s*[-–—]?\s*(?:(?:${partLabelPattern})\s*(${partNumberPattern})\s*[-–—]?\s*|(${partNumberPattern})\s*(?:cour|half)\s*[-–—]?\s*)?(?:E|EP|Episode)\s*(\d{1,4})${episodeVersionSuffixPattern}\b`,
   "i"
 )
 
 const seasonDashEpisodeMarkerPattern = /\bS\s*(\d{1,2})\s*[-–—]\s*(\d{1,4})(?:v\d+)?\b/i
+const noSeasonNamedEpisodeMarkerPattern = /\b(?:E|EP|Episode)\s*(\d{1,4})(?:v\d+)?\b/i
 
 function findEpisodeMarker(value: string): EpisodeMarkerMatch | null {
   const seasonEpisode = seasonEpisodeMarkerPattern.exec(value)
@@ -278,10 +288,42 @@ function findEpisodeMarker(value: string): EpisodeMarkerMatch | null {
   return null
 }
 
+function findNoSeasonEpisodeMarker(value: string): NoSeasonEpisodeMarkerMatch | null {
+  const noSeasonEpisode = noSeasonNamedEpisodeMarkerPattern.exec(value)
+
+  if (!noSeasonEpisode) {
+    return null
+  }
+
+  const episode = toPositiveInteger(noSeasonEpisode[1])
+
+  if (!episode) {
+    return null
+  }
+
+  const end = noSeasonEpisode.index + noSeasonEpisode[0].length
+
+  return {
+    index: noSeasonEpisode.index,
+    end,
+    episode,
+    suffix: value.slice(end),
+  }
+}
+
 function getTitleBeforeEpisodeMarker(value: string, marker: EpisodeMarkerMatch) {
   const titleSegment = value.slice(0, marker.index)
 
   return cleanSeriesTitleSegment(titleSegment, marker.season, marker.part)
+}
+
+function getTitleBeforeNoSeasonEpisodeMarker(
+  value: string,
+  marker: NoSeasonEpisodeMarkerMatch
+) {
+  const titleSegment = value.slice(0, marker.index)
+
+  return cleanSeriesTitleSegment(titleSegment)
 }
 
 export function parseAnimeEpisodeIdentifier(
@@ -298,6 +340,7 @@ export function parseAnimeEpisodeIdentifier(
       episode: marker.episode,
       part: marker.part,
       episodeTitle: cleanEpisodeTitleSegment(marker.suffix),
+      hasExplicitSeason: true,
     }
   }
 
@@ -318,6 +361,7 @@ export function parseAnimeEpisodeIdentifier(
         episode,
         part,
         episodeTitle: cleanEpisodeTitleSegment(match[4]),
+        hasExplicitSeason: true,
       }
     }
   }
@@ -335,6 +379,7 @@ export function parseAnimeEpisodeIdentifier(
         season,
         episode,
         episodeTitle: cleanEpisodeTitleSegment(noTitleSeasonEpisode[3]),
+        hasExplicitSeason: true,
       }
     }
   }
@@ -352,6 +397,7 @@ export function parseAnimeEpisodeIdentifier(
         season,
         episode,
         episodeTitle: cleanEpisodeTitleSegment(noTitleSeasonDashEpisode[3]),
+        hasExplicitSeason: true,
       }
     }
   }
@@ -368,6 +414,7 @@ export function parseAnimeEpisodeIdentifier(
         season: 1,
         episode,
         episodeTitle: cleanEpisodeTitleSegment(noTitleNamedEpisode[2]),
+        hasExplicitSeason: false,
       }
     }
   }
@@ -384,6 +431,7 @@ export function parseAnimeEpisodeIdentifier(
         season: 1,
         episode,
         episodeTitle: cleanEpisodeTitleSegment(noTitleDashEpisode[2]),
+        hasExplicitSeason: false,
       }
     }
   }
@@ -408,7 +456,119 @@ export function parseAnimeFileNameWithFallbackTitle(
     episode: episode.episode,
     part: episode.part,
     episodeTitle: episode.episodeTitle,
+    hasExplicitSeason: episode.hasExplicitSeason,
+    titleSource: "folder",
   }
+}
+
+export function cleanFolderTitleCandidate(value: string) {
+  return cleanAnimeTitleCandidate(value, { removeLooseSeasonMarkers: true })
+    .replace(/[-–—]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function isIgnoredFolderTitleCandidate(value: string) {
+  const normalized = value.trim().toLowerCase()
+
+  return (
+    !normalized ||
+    normalized === "_failed_imports" ||
+    normalized === "season" ||
+    normalized === "seasons" ||
+    normalized === "special" ||
+    normalized === "specials" ||
+    normalized === "ova" ||
+    normalized === "ovas" ||
+    normalized === "movie" ||
+    normalized === "movies" ||
+    normalized === "extra" ||
+    normalized === "extras" ||
+    normalized === "episode" ||
+    normalized === "episodes" ||
+    normalized === "done" ||
+    /^s\d{1,2}$/i.test(normalized) ||
+    /^season\s*\d{1,2}$/i.test(normalized)
+  )
+}
+
+export function getFolderTitleFallbackCandidates(
+  rootDir: string,
+  filePath: string,
+  parsedTitle?: string
+) {
+  const root = path.resolve(rootDir)
+  const fileDirectory = path.dirname(path.resolve(filePath))
+  const relativeDirectory = path.relative(root, fileDirectory)
+
+  if (!relativeDirectory || relativeDirectory.startsWith("..") || path.isAbsolute(relativeDirectory)) {
+    return []
+  }
+
+  const parsedTitleNormalized = parsedTitle?.trim().toLowerCase()
+  const candidates: string[] = []
+  const seen = new Set<string>()
+  const parts = relativeDirectory.split(path.sep).filter(Boolean)
+
+  for (let index = parts.length - 1; index >= 0; index -= 1) {
+    const cleaned = cleanFolderTitleCandidate(parts[index] ?? "")
+    const key = cleaned.toLowerCase()
+
+    if (cleaned.length < 2 || isIgnoredFolderTitleCandidate(cleaned)) {
+      continue
+    }
+
+    if (parsedTitleNormalized && key === parsedTitleNormalized) {
+      continue
+    }
+
+    if (seen.has(key)) {
+      continue
+    }
+
+    seen.add(key)
+    candidates.push(cleaned)
+  }
+
+  return candidates
+}
+
+export function parseAnimeFilePath(
+  filePath: string,
+  options?: { rootDir?: string; fallbackTitles?: string[] }
+): ParsedAnimeFileName | null {
+  const parsed = parseAnimeFileName(filePath)
+
+  if (parsed) {
+    return parsed
+  }
+
+  const fallbackTitles = [
+    ...(options?.fallbackTitles ?? []),
+    ...(options?.rootDir ? getFolderTitleFallbackCandidates(options.rootDir, filePath) : []),
+  ]
+  const seen = new Set<string>()
+
+  for (const fallbackTitle of fallbackTitles) {
+    const key = fallbackTitle.trim().toLowerCase()
+
+    if (!key || seen.has(key)) {
+      continue
+    }
+
+    seen.add(key)
+    const fallbackParsed = parseAnimeFileNameWithFallbackTitle(filePath, fallbackTitle)
+
+    if (fallbackParsed) {
+      return fallbackParsed
+    }
+  }
+
+  return null
+}
+
+export function getAnimeMetadataLookupSeason(parsed: ParsedAnimeFileName) {
+  return parsed.hasExplicitSeason ? parsed.season : undefined
 }
 
 export function parseAnimeFileName(
@@ -434,6 +594,8 @@ export function parseAnimeFileName(
         title: `${titlePrefix} ${titleSuffix}`,
         season: 1,
         episode,
+        hasExplicitSeason: false,
+        titleSource: "filename",
       }
     }
   }
@@ -450,6 +612,25 @@ export function parseAnimeFileName(
         episode: marker.episode,
         part: marker.part,
         episodeTitle: cleanEpisodeTitleSegment(marker.suffix),
+        hasExplicitSeason: true,
+        titleSource: "filename",
+      }
+    }
+  }
+
+  const noSeasonMarker = findNoSeasonEpisodeMarker(normalized)
+
+  if (noSeasonMarker) {
+    const title = getTitleBeforeNoSeasonEpisodeMarker(normalized, noSeasonMarker)
+
+    if (title) {
+      return {
+        title,
+        season: 1,
+        episode: noSeasonMarker.episode,
+        episodeTitle: cleanEpisodeTitleSegment(noSeasonMarker.suffix),
+        hasExplicitSeason: false,
+        titleSource: "filename",
       }
     }
   }
@@ -473,6 +654,8 @@ export function parseAnimeFileName(
         season,
         episode,
         part,
+        hasExplicitSeason: true,
+        titleSource: "filename",
       }
     }
   }
@@ -492,6 +675,8 @@ export function parseAnimeFileName(
         title,
         season,
         episode,
+        hasExplicitSeason: true,
+        titleSource: "filename",
       }
     }
   }
@@ -511,6 +696,8 @@ export function parseAnimeFileName(
         title,
         season,
         episode,
+        hasExplicitSeason: true,
+        titleSource: "filename",
       }
     }
   }
@@ -527,6 +714,8 @@ export function parseAnimeFileName(
         title,
         season: 1,
         episode,
+        hasExplicitSeason: false,
+        titleSource: "filename",
       }
     }
   }

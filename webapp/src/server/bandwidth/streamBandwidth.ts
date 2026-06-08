@@ -1,11 +1,8 @@
 import type { PlaybackMode, PlaybackProfile } from "@/lib/types"
 import { getMaxUploadKbps } from "@/server/bandwidth/uploadCapacity"
-import { getServerConfig } from "@/server/config"
 
 export type StreamPriorityAction = {
   type:
-    | "forceDataSaver"
-    | "restoreOriginal"
     | "waitingForBandwidth"
     | "bandwidthRecheckStarted"
     | "bandwidthRecheckFinished"
@@ -18,7 +15,6 @@ export type StreamUploadLease = {
   id: string
   effectiveMode: PlaybackMode
   effectiveProfile: PlaybackProfile
-  downgraded: boolean
   observeUploadBytes: (bytes: number) => void
   waitForUploadBytes: (bytes: number, signal?: AbortSignal) => Promise<void>
   setForceClose: (handler: () => void) => void
@@ -34,8 +30,6 @@ type ActiveStream = {
   mode: PlaybackMode
   profile: PlaybackProfile
   estimatedUploadKbps: number
-  dataSaverUploadKbps: number | null
-  canTranscodeDataSaver: boolean
   startedAt: number
   observedUploadKbps: number | null
   uploadSamples: UploadSample[]
@@ -64,19 +58,6 @@ type UploadSample = {
   sampledAt: number
 }
 
-type ForcedDowngradeState = {
-  clientKey: string
-  username: string
-  clientId: string
-  contentKey: string
-  originalMode: PlaybackMode
-  originalProfile: PlaybackProfile
-  originalUploadKbps: number
-  dataSaverUploadKbps: number
-  canTranscodeDataSaver: boolean
-  restoreBlocked: boolean
-  downgradedAt: number
-}
 
 type AcquireStreamUploadInput = {
   clientId: string | null
@@ -85,8 +66,6 @@ type AcquireStreamUploadInput = {
   mode: PlaybackMode
   profile: PlaybackProfile
   estimatedUploadKbps: number | null
-  dataSaverUploadKbps: number | null
-  canTranscodeDataSaver: boolean
   animeId: string
   seasonNumber: number
   episodeNumber: number
@@ -136,8 +115,6 @@ const streamBandwidthStore = streamBandwidthGlobal.__yamibunkoStreamBandwidthSto
   },
 }
 
-const admissionOverageFactor = 1.08
-const restoreOverageFactor = 1.02
 const capacityWaitMs = 1000
 const minimumRegularStreamUploadKbps = 6_000
 const minimumVipStreamUploadKbps = 8_000
@@ -153,7 +130,6 @@ const bandwidthRecheckStreamDrainPollMs = 100
 const serverShutdownClientPauseGraceMs = 750
 const serverShutdownStreamDrainTimeoutMs = 5_000
 const activeStreams = new Map<string, ActiveStream>()
-const forcedDowngrades = new Map<string, ForcedDowngradeState>()
 const clientActions = new Map<string, StreamPriorityAction>()
 const clientActionSubscribers = new Map<
   string,
@@ -341,15 +317,6 @@ function canFitMinimumStreamUpload(input: {
   )
 }
 
-function getFairUploadKbpsForCandidate(input: {
-  username: string
-  clientId: string | null
-  isVip: boolean
-  contentKey: string
-}) {
-  return getProjectedFairUploadKbps(input).fairUploadKbps
-}
-
 function getActiveStreamGroupCount() {
   return getActiveStreamGroups().size
 }
@@ -483,32 +450,6 @@ function getUsedUploadKbps(
   }
 
   return used
-}
-
-function canFitUpload(
-  requiredKbps: number,
-  options: {
-    excludeClientKey?: string | null
-    overageFactor?: number
-    measured?: boolean
-  } = {}
-) {
-  const maxUploadKbps = getEffectiveMaxUploadKbps()
-
-  if (!maxUploadKbps) {
-    return true
-  }
-
-  const overageFactor = options.overageFactor ?? admissionOverageFactor
-  const allowedUploadKbps = Math.floor(maxUploadKbps * overageFactor)
-
-  return (
-    getUsedUploadKbps({
-      excludeClientKey: options.excludeClientKey,
-      measured: options.measured ?? false,
-    }) + requiredKbps <=
-    allowedUploadKbps
-  )
 }
 
 function notifyCapacityWaiters() {
@@ -676,11 +617,6 @@ async function drainPendingStreamUploadRequests() {
         continue
       }
 
-      evaluateForcedDowngradeRestores()
-
-      if (request.isVip) {
-        downgradeBlockingStreams(request.estimatedUploadKbps, request.clientId)
-      }
 
       if (!canFitMinimumStreamUpload(request.admissionInput)) {
         schedulePendingStreamUploadDrain()
@@ -968,81 +904,10 @@ function setClientAction(
   setClientActionByKey(getClientActionKey(username, clientId), action)
 }
 
-function getDataSaverMessage() {
-  return "You were changed to Data Saver automatically because the server ran out of bandwidth. Talk to the admin if you want VIP priority to see this less often."
-}
-
-function getRestoreMessage() {
-  return "Enough server upload bandwidth is available again. Playback was restored to your previous quality."
-}
-
 function getBandwidthWaitMessage() {
   return "Server upload bandwidth is full. Waiting for a free slot."
 }
 
-function automaticDataSaverSwitchingEnabled() {
-  return !getServerConfig().importEnabled
-}
-
-function rememberForcedDowngrade(input: {
-  username: string
-  clientId: string | null
-  contentKey: string
-  originalMode: PlaybackMode
-  originalProfile: PlaybackProfile
-  originalUploadKbps: number
-  dataSaverUploadKbps: number | null
-  canTranscodeDataSaver: boolean
-}) {
-  if (
-    !automaticDataSaverSwitchingEnabled() ||
-    !input.clientId ||
-    input.originalProfile === "dataSaver" ||
-    !input.dataSaverUploadKbps ||
-    input.dataSaverUploadKbps >= input.originalUploadKbps
-  ) {
-    return
-  }
-
-  const clientKey = getClientActionKey(input.username, input.clientId)
-  const previousState = forcedDowngrades.get(clientKey)
-
-  forcedDowngrades.set(clientKey, {
-    clientKey,
-    username: input.username,
-    clientId: input.clientId,
-    contentKey: input.contentKey,
-    originalMode:
-      previousState?.contentKey === input.contentKey
-        ? previousState.originalMode
-        : input.originalMode,
-    originalProfile:
-      previousState?.contentKey === input.contentKey
-        ? previousState.originalProfile
-        : input.originalProfile,
-    originalUploadKbps:
-      previousState?.contentKey === input.contentKey
-        ? Math.max(previousState.originalUploadKbps, input.originalUploadKbps)
-        : input.originalUploadKbps,
-    dataSaverUploadKbps: input.dataSaverUploadKbps,
-    canTranscodeDataSaver: input.canTranscodeDataSaver,
-    restoreBlocked:
-      previousState?.contentKey === input.contentKey
-        ? previousState.restoreBlocked
-        : false,
-    downgradedAt: Date.now(),
-  })
-}
-
-function clearForcedDowngrade(username: string, clientId: string | null) {
-  const clientKey = getClientKey(username, clientId)
-
-  if (!clientKey) {
-    return
-  }
-
-  forcedDowngrades.delete(clientKey)
-}
 
 function sleep(milliseconds: number) {
   return new Promise<void>((resolve) => {
@@ -1114,11 +979,6 @@ export function closeActiveStreamsForUser(username: string) {
     }
   }
 
-  for (const [clientKey, state] of forcedDowngrades) {
-    if (state.username === username) {
-      forcedDowngrades.delete(clientKey)
-    }
-  }
 
   for (const key of [...clientActions.keys()]) {
     if (key.startsWith(`${username}:`)) {
@@ -1204,180 +1064,9 @@ export async function runUploadCapacityRecheckWithStreamHold(
     notifyBandwidthRecheckWaiters()
     notifyCapacityWaiters()
     notifyThrottleWaiters()
-    evaluateForcedDowngradeRestores()
-  }
+    }
 }
 
-export function protectCurrentForcedDowngrade(
-  username: string,
-  clientId: string
-) {
-  if (!automaticDataSaverSwitchingEnabled()) {
-    return
-  }
-
-  const clientKey = getClientActionKey(username, clientId)
-  const state = forcedDowngrades.get(clientKey)
-
-  if (!state) {
-    return
-  }
-
-  state.restoreBlocked = true
-
-  const activeStream = getActiveStreamForClient(clientKey)
-
-  if (activeStream) {
-    activeStream.mode = "transcode"
-    activeStream.profile = "dataSaver"
-    activeStream.estimatedUploadKbps = state.dataSaverUploadKbps
-    activeStream.dataSaverUploadKbps = state.dataSaverUploadKbps
-    activeStream.canTranscodeDataSaver = state.canTranscodeDataSaver
-  }
-
-  const action = clientActions.get(clientKey)
-  if (action?.type === "restoreOriginal") {
-    clientActions.delete(clientKey)
-  }
-}
-
-function getActiveStreamForClient(clientKey: string) {
-  return [...activeStreams.values()].find((stream) => stream.clientKey === clientKey)
-}
-
-function evaluateForcedDowngradeRestores() {
-  if (bandwidthRecheckActive) {
-    return
-  }
-
-  if (!automaticDataSaverSwitchingEnabled()) {
-    forcedDowngrades.clear()
-    return
-  }
-
-  const maxUploadKbps = getEffectiveMaxUploadKbps()
-
-  if (!maxUploadKbps) {
-    return
-  }
-
-  for (const [clientKey, state] of forcedDowngrades) {
-    if (state.restoreBlocked) {
-      continue
-    }
-
-    const activeStream = getActiveStreamForClient(clientKey)
-
-    if (!activeStream) {
-      if (Date.now() - state.downgradedAt > 60_000) {
-        forcedDowngrades.delete(clientKey)
-      }
-
-      continue
-    }
-
-    if (activeStream.contentKey !== state.contentKey) {
-      forcedDowngrades.delete(clientKey)
-      continue
-    }
-
-    if (activeStream.profile !== "dataSaver") {
-      forcedDowngrades.delete(clientKey)
-      continue
-    }
-
-    if (
-      !canFitUpload(state.originalUploadKbps, {
-        excludeClientKey: clientKey,
-        overageFactor: restoreOverageFactor,
-      })
-    ) {
-      continue
-    }
-
-    activeStream.mode = state.originalMode
-    activeStream.profile = state.originalProfile
-    activeStream.estimatedUploadKbps = state.originalUploadKbps
-    activeStream.dataSaverUploadKbps = state.dataSaverUploadKbps
-    activeStream.canTranscodeDataSaver = state.canTranscodeDataSaver
-
-    setClientAction(state.username, state.clientId, {
-      type: "restoreOriginal",
-      message: getRestoreMessage(),
-      createdAt: nowIso(),
-    })
-  }
-}
-
-function downgradeBlockingStreams(
-  requiredKbps: number,
-  requesterClientId: string | null
-) {
-  if (bandwidthRecheckActive) {
-    return
-  }
-
-  if (!automaticDataSaverSwitchingEnabled()) {
-    return
-  }
-
-  const maxUploadKbps = getEffectiveMaxUploadKbps()
-
-  if (!maxUploadKbps) {
-    return
-  }
-
-  const candidates = [...activeStreams.values()]
-    .filter(
-      (stream) =>
-        !stream.isVip &&
-        stream.clientId !== requesterClientId &&
-        stream.profile !== "dataSaver" &&
-        stream.canTranscodeDataSaver &&
-        stream.dataSaverUploadKbps !== null &&
-        stream.dataSaverUploadKbps < stream.estimatedUploadKbps
-    )
-    .sort((left, right) => left.startedAt - right.startedAt)
-
-  let projectedUsage = getUsedUploadKbps()
-  const allowedUploadKbps = Math.floor(maxUploadKbps * admissionOverageFactor)
-
-  for (const stream of candidates) {
-    if (projectedUsage + requiredKbps <= allowedUploadKbps) {
-      return
-    }
-
-    const dataSaverUploadKbps = stream.dataSaverUploadKbps
-
-    if (dataSaverUploadKbps === null) {
-      continue
-    }
-
-    rememberForcedDowngrade({
-      username: stream.username,
-      clientId: stream.clientId,
-      contentKey: stream.contentKey,
-      originalMode: stream.mode,
-      originalProfile: stream.profile,
-      originalUploadKbps: stream.estimatedUploadKbps,
-      dataSaverUploadKbps,
-      canTranscodeDataSaver: stream.canTranscodeDataSaver,
-    })
-
-    projectedUsage -= stream.estimatedUploadKbps - dataSaverUploadKbps
-    stream.estimatedUploadKbps = dataSaverUploadKbps
-    stream.mode = "transcode"
-    stream.profile = "dataSaver"
-    stream.uploadSamples = []
-    stream.observedUploadKbps = null
-    setClientAction(stream.username, stream.clientId, {
-      type: "forceDataSaver",
-      message: getDataSaverMessage(),
-      createdAt: nowIso(),
-    })
-    stream.forceClose?.()
-  }
-}
 
 function createLease(input: {
   clientId: string | null
@@ -1386,12 +1075,9 @@ function createLease(input: {
   mode: PlaybackMode
   profile: PlaybackProfile
   estimatedUploadKbps: number
-  dataSaverUploadKbps: number | null
-  canTranscodeDataSaver: boolean
   animeId: string
   seasonNumber: number
   episodeNumber: number
-  downgraded: boolean
 }): StreamUploadLease {
   const id = createId()
   const clientKey = getClientKey(input.username, input.clientId)
@@ -1405,13 +1091,7 @@ function createLease(input: {
 
   closeActiveStreamsForClientKey(clientKey, { exceptContentKey: contentKey })
 
-  if (!input.downgraded) {
-    clearClientAction(input.username, input.clientId)
-  }
-
-  if (input.profile !== "dataSaver") {
-    clearForcedDowngrade(input.username, input.clientId)
-  }
+  clearClientAction(input.username, input.clientId)
 
   activeStreams.set(id, {
     id,
@@ -1422,8 +1102,6 @@ function createLease(input: {
     mode: input.mode,
     profile: input.profile,
     estimatedUploadKbps: input.estimatedUploadKbps,
-    dataSaverUploadKbps: input.dataSaverUploadKbps,
-    canTranscodeDataSaver: input.canTranscodeDataSaver,
     startedAt: Date.now(),
     animeId: input.animeId,
     seasonNumber: input.seasonNumber,
@@ -1444,7 +1122,6 @@ function createLease(input: {
     id,
     effectiveMode: input.mode,
     effectiveProfile: input.profile,
-    downgraded: input.downgraded,
     observeUploadBytes(bytes: number) {
       if (released || !Number.isFinite(bytes) || bytes <= 0) {
         return
@@ -1492,7 +1169,6 @@ function createLease(input: {
 
       released = true
       activeStreams.delete(id)
-      evaluateForcedDowngradeRestores()
       notifyCapacityWaiters()
       notifyThrottleWaiters()
     },
@@ -1515,13 +1191,11 @@ export function createUnmeteredStreamUploadLease(input: {
 
   closeActiveStreamsForClientKey(clientKey, { exceptContentKey: contentKey })
   clearClientAction(input.username, input.clientId)
-  clearForcedDowngrade(input.username, input.clientId)
 
   return {
     id: createId(),
     effectiveMode: input.mode,
     effectiveProfile: input.profile,
-    downgraded: false,
     observeUploadBytes() {},
     waitForUploadBytes() {
       return Promise.resolve()
@@ -1545,11 +1219,6 @@ function applyStreamEstimateOverhead(kbps: number) {
   return Math.max(Math.ceil(kbps * streamEstimateOverheadFactor), 1)
 }
 
-function estimateDataSaverUploadKbps(sourceBitrateKbps: number) {
-  return applyStreamEstimateOverhead(
-    Math.max(Math.floor(sourceBitrateKbps / 2), 628)
-  )
-}
 
 function estimateOriginalUploadKbps(input: {
   mode?: PlaybackMode
@@ -1570,117 +1239,12 @@ export function estimateUploadKbps(input: {
 }) {
   const sourceBitrateKbps = Math.max(input.sourceBitrateKbps ?? 6000, 1)
 
-  if (input.profile === "dataSaver") {
-    return estimateDataSaverUploadKbps(sourceBitrateKbps)
-  }
-
   return estimateOriginalUploadKbps({
     mode: input.mode,
     sourceBitrateKbps,
   })
 }
 
-function shouldUseDataSaverForFairUpload(input: {
-  profile: PlaybackProfile
-  estimatedUploadKbps: number
-  dataSaverUploadKbps: number | null
-  canTranscodeDataSaver: boolean
-  admissionInput: {
-    username: string
-    clientId: string | null
-    isVip: boolean
-    contentKey: string
-  }
-}) {
-  if (
-    input.profile === "dataSaver" ||
-    !automaticDataSaverSwitchingEnabled() ||
-    !input.canTranscodeDataSaver ||
-    !input.dataSaverUploadKbps
-  ) {
-    return false
-  }
-
-  const fairUploadKbps = getFairUploadKbpsForCandidate(input.admissionInput)
-
-  return (
-    fairUploadKbps !== null &&
-    input.estimatedUploadKbps > fairUploadKbps &&
-    input.dataSaverUploadKbps <= fairUploadKbps
-  )
-}
-
-function createFairAdmittedLease(input: {
-  clientId: string | null
-  username: string
-  isVip: boolean
-  mode: PlaybackMode
-  profile: PlaybackProfile
-  estimatedUploadKbps: number
-  dataSaverUploadKbps: number | null
-  canTranscodeDataSaver: boolean
-  animeId: string
-  seasonNumber: number
-  episodeNumber: number
-  contentKey: string
-  admissionInput: {
-    username: string
-    clientId: string | null
-    isVip: boolean
-    contentKey: string
-  }
-}) {
-  if (shouldUseDataSaverForFairUpload(input)) {
-    const dataSaverUploadKbps = input.dataSaverUploadKbps!
-
-    rememberForcedDowngrade({
-      username: input.username,
-      clientId: input.clientId,
-      contentKey: input.contentKey,
-      originalMode: input.mode,
-      originalProfile: input.profile,
-      originalUploadKbps: input.estimatedUploadKbps,
-      dataSaverUploadKbps,
-      canTranscodeDataSaver: input.canTranscodeDataSaver,
-    })
-
-    setClientAction(input.username, input.clientId, {
-      type: "forceDataSaver",
-      message: getDataSaverMessage(),
-      createdAt: nowIso(),
-    })
-
-    return createLease({
-      clientId: input.clientId,
-      username: input.username,
-      isVip: input.isVip,
-      mode: "transcode",
-      profile: "dataSaver",
-      estimatedUploadKbps: dataSaverUploadKbps,
-      dataSaverUploadKbps,
-      canTranscodeDataSaver: input.canTranscodeDataSaver,
-      animeId: input.animeId,
-      seasonNumber: input.seasonNumber,
-      episodeNumber: input.episodeNumber,
-      downgraded: true,
-    })
-  }
-
-  return createLease({
-    clientId: input.clientId,
-    username: input.username,
-    isVip: input.isVip,
-    mode: input.mode,
-    profile: input.profile,
-    estimatedUploadKbps: input.estimatedUploadKbps,
-    dataSaverUploadKbps: input.dataSaverUploadKbps,
-    canTranscodeDataSaver: input.canTranscodeDataSaver,
-    animeId: input.animeId,
-    seasonNumber: input.seasonNumber,
-    episodeNumber: input.episodeNumber,
-    downgraded: false,
-  })
-}
 
 export async function acquireStreamUpload(input: AcquireStreamUploadInput) {
   const clientKey = getClientKey(input.username, input.clientId)
@@ -1724,43 +1288,6 @@ export async function acquireStreamUpload(input: AcquireStreamUploadInput) {
     isVip: input.isVip,
     contentKey,
   }
-  const automaticDataSaverEnabled = automaticDataSaverSwitchingEnabled()
-  const forcedDowngrade = clientKey ? forcedDowngrades.get(clientKey) : null
-
-  if (forcedDowngrade && forcedDowngrade.contentKey !== contentKey) {
-    forcedDowngrades.delete(forcedDowngrade.clientKey)
-  }
-
-  const matchingForcedDowngrade =
-    forcedDowngrade?.contentKey === contentKey ? forcedDowngrade : null
-
-  if (
-    automaticDataSaverEnabled &&
-    matchingForcedDowngrade &&
-    input.profile !== "dataSaver" &&
-    matchingForcedDowngrade.canTranscodeDataSaver &&
-    (matchingForcedDowngrade.restoreBlocked ||
-      !canFitUpload(matchingForcedDowngrade.originalUploadKbps, {
-        excludeClientKey: clientKey,
-        overageFactor: restoreOverageFactor,
-      }))
-  ) {
-    setClientAction(input.username, input.clientId, {
-      type: "forceDataSaver",
-      message: matchingForcedDowngrade.restoreBlocked
-        ? "Data Saver protection is active for the rest of this episode because your stream was downgraded twice within 5 minutes."
-        : getDataSaverMessage(),
-      createdAt: nowIso(),
-    })
-
-    return acquireStreamUpload({
-      ...input,
-      mode: "transcode",
-      profile: "dataSaver",
-      estimatedUploadKbps: matchingForcedDowngrade.dataSaverUploadKbps,
-      dataSaverUploadKbps: matchingForcedDowngrade.dataSaverUploadKbps,
-    })
-  }
 
   if (!input.estimatedUploadKbps || input.estimatedUploadKbps <= 0) {
     return createLease({
@@ -1770,30 +1297,23 @@ export async function acquireStreamUpload(input: AcquireStreamUploadInput) {
       mode: input.mode,
       profile: input.profile,
       estimatedUploadKbps: 0,
-      dataSaverUploadKbps: input.dataSaverUploadKbps,
-      canTranscodeDataSaver: input.canTranscodeDataSaver,
       animeId: input.animeId,
       seasonNumber: input.seasonNumber,
       episodeNumber: input.episodeNumber,
-      downgraded: false,
     })
   }
 
   const createAdmittedLease = () =>
-    createFairAdmittedLease({
+    createLease({
       clientId: input.clientId,
       username: input.username,
       isVip: input.isVip,
       mode: input.mode,
       profile: input.profile,
       estimatedUploadKbps: input.estimatedUploadKbps!,
-      dataSaverUploadKbps: input.dataSaverUploadKbps,
-      canTranscodeDataSaver: input.canTranscodeDataSaver,
       animeId: input.animeId,
       seasonNumber: input.seasonNumber,
       episodeNumber: input.episodeNumber,
-      contentKey,
-      admissionInput,
     })
 
   if (streamServerShutdownActive) {
@@ -1809,12 +1329,6 @@ export async function acquireStreamUpload(input: AcquireStreamUploadInput) {
 
   if (input.signal?.aborted) {
     throw new Error("Stream upload reservation was cancelled")
-  }
-
-  evaluateForcedDowngradeRestores()
-
-  if (input.isVip) {
-    downgradeBlockingStreams(input.estimatedUploadKbps, input.clientId)
   }
 
   if (
@@ -1856,7 +1370,6 @@ export function subscribeStreamPriorityActions(input: {
 
   subscribers.add(input.onAction)
   clientActionSubscribers.set(key, subscribers)
-  evaluateForcedDowngradeRestores()
 
   if (streamServerShutdownActive) {
     input.onAction(streamServerShutdownAction ?? createServerShutdownStartedAction())
@@ -1896,7 +1409,6 @@ export function setTemporaryUploadLimit(active: boolean) {
 
   notifyCapacityWaiters()
   notifyThrottleWaiters()
-  evaluateForcedDowngradeRestores()
 
   return getActiveStreamBandwidthSnapshot()
 }

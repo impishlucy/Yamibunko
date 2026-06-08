@@ -64,6 +64,7 @@ import type {
   Episode,
   MediaStreamInfo,
   PlaybackProfile,
+  SubtitleStreamInfo,
   WatchPayload,
 } from "@/lib/types"
 
@@ -170,8 +171,6 @@ function BufferedSeekBar({
 
 type StreamPriorityAction = {
   type:
-    | "forceDataSaver"
-    | "restoreOriginal"
     | "waitingForBandwidth"
     | "bandwidthRecheckStarted"
     | "bandwidthRecheckFinished"
@@ -199,10 +198,7 @@ type BandwidthRecheckSnapshot = {
 
 type PriorityInfo = {
   type:
-    | "forceDataSaver"
-    | "restoreOriginal"
     | "waitingForBandwidth"
-    | "protectedDataSaver"
     | "bandwidthRecheckStarted"
     | "bandwidthRecheckFinished"
     | "serverShutdownStarted"
@@ -267,6 +263,16 @@ type CastClockSnapshot = {
 type PreloadRangeProbe = {
   contentLength: number
   rangeable: boolean
+}
+
+type PlaybackStatsSnapshot = {
+  playbackType: string
+  container: string
+  videoCodec: string
+  audioCodec: string
+  subtitleFormat: string
+  downloadBitrateMbps: number | null
+  preloadedMegabytes: number | null
 }
 
 const hevcMp4Checks = [
@@ -1181,9 +1187,6 @@ function estimateStreamMbps(input: {
     return Number((source * overheadFactor).toFixed(2))
   }
 
-  if (input.quality === "dataSaver") {
-    return Number((Math.max(source / 2, 0.628) * overheadFactor).toFixed(2))
-  }
 
   return Number(((Math.min(Math.max(source, 1.5), 50) + 0.192) * overheadFactor).toFixed(2))
 }
@@ -1202,6 +1205,16 @@ function getBufferedEnd(video: HTMLVideoElement) {
   }
 
   return end
+}
+
+function getSourceClockSeconds(mediaSeconds: number, sourceOffsetSeconds: number) {
+  const offset = Number.isFinite(sourceOffsetSeconds) ? Math.max(sourceOffsetSeconds, 0) : 0
+
+  if (!Number.isFinite(mediaSeconds)) {
+    return offset
+  }
+
+  return Math.max(offset + mediaSeconds, 0)
 }
 
 function parseContentRangeTotal(value: string | null) {
@@ -1267,18 +1280,85 @@ function parseWebVttTimestamp(value: string) {
   return hours * 3600 + minutes * 60 + seconds
 }
 
+function decodeSubtitleEntity(entity: string) {
+  const normalized = entity.toLowerCase()
+
+  if (normalized === "nbsp") {
+    return " "
+  }
+
+  if (normalized === "amp") {
+    return "&"
+  }
+
+  if (normalized === "lt") {
+    return "<"
+  }
+
+  if (normalized === "gt") {
+    return ">"
+  }
+
+  if (normalized === "quot") {
+    return '"'
+  }
+
+  if (normalized === "apos" || normalized === "#39") {
+    return "'"
+  }
+
+  const decimalMatch = /^#(\d+)$/.exec(normalized)
+
+  if (decimalMatch) {
+    const codePoint = Number(decimalMatch[1])
+    return Number.isInteger(codePoint) && codePoint >= 0 && codePoint <= 0x10ffff
+      ? String.fromCodePoint(codePoint)
+      : ""
+  }
+
+  const hexMatch = /^#x([0-9a-f]+)$/.exec(normalized)
+
+  if (hexMatch) {
+    const codePoint = Number.parseInt(hexMatch[1], 16)
+    return Number.isInteger(codePoint) && codePoint >= 0 && codePoint <= 0x10ffff
+      ? String.fromCodePoint(codePoint)
+      : ""
+  }
+
+  return ""
+}
+
+function removeBracketedSubtitleText(value: string) {
+  let output = value
+
+  for (let pass = 0; pass < 4; pass += 1) {
+    const nextOutput = output
+      .replace(/\s*\([^()\n]*\)\s*/g, " ")
+      .replace(/\s*\[[^[\]\n]*]\s*/g, " ")
+      .replace(/\s*\{[^{}\n]*}\s*/g, " ")
+
+    if (nextOutput === output) {
+      break
+    }
+
+    output = nextOutput
+  }
+
+  return output
+}
+
 function stripSubtitleFormatting(value: string) {
   return value
+    .replace(/\\[Nn]/g, "\n")
+    .replace(/<\s*br\s*\/?\s*>/gi, "\n")
     .replace(/\{\\[^}]*}/g, "")
+    .replace(/<\/?(?:c|v|lang|ruby|rt|b|i|u)(?:\.[^>\s]+)*(?:\s+[^>]*)?>/gi, "")
     .replace(/<[^>]*>/g, "")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/[ \t]+/g, " ")
-    .trim()
+    .replace(/&([^;\s]+);/g, (_match, entity: string) => decodeSubtitleEntity(entity))
+    .split("\n")
+    .map((line) => removeBracketedSubtitleText(line).replace(/[ \t]+/g, " ").trim())
+    .filter(Boolean)
+    .join("\n")
 }
 
 function parseWebVtt(input: string) {
@@ -1296,17 +1376,6 @@ function parseWebVtt(input: string) {
       .filter(Boolean)
 
     if (!lines.length) {
-      continue
-    }
-
-    const firstLine = lines[0].toUpperCase()
-
-    if (
-      firstLine.startsWith("WEBVTT") ||
-      firstLine.startsWith("NOTE") ||
-      firstLine.startsWith("STYLE") ||
-      firstLine.startsWith("REGION")
-    ) {
       continue
     }
 
@@ -1339,6 +1408,7 @@ function parseWebVtt(input: string) {
 
   return cues.sort((a, b) => a.start - b.start)
 }
+
 
 function getActiveSubtitleTexts(cues: SubtitleCue[], seconds: number) {
   if (!Number.isFinite(seconds) || !cues.length) {
@@ -1629,6 +1699,280 @@ function statusLabel(status: PlaybackStatusState) {
   return "Checking"
 }
 
+function formatStatsLabel(value: string | undefined | null) {
+  const trimmed = value?.trim()
+
+  if (!trimmed) {
+    return "Unknown"
+  }
+
+  return trimmed
+}
+
+function formatContainerForStats(input: {
+  status: PlaybackStatusState
+  fileName: string
+  media: WatchPayload["media"]
+  directAudioRemuxActive: boolean
+}) {
+  if (input.status === "transcoding") {
+    return "MP4"
+  }
+
+  const container = input.directAudioRemuxActive
+    ? getDirectAudioRemuxContainer(input.fileName)
+    : getMediaContainer(input.fileName, input.media.container)
+
+  if (container === "mp4") {
+    return "MP4"
+  }
+
+  if (container === "mov") {
+    return "MOV"
+  }
+
+  if (container === "webm") {
+    return "WebM"
+  }
+
+  if (container === "matroska") {
+    return "Matroska / MKV"
+  }
+
+  if (container === "avi") {
+    return "AVI"
+  }
+
+  return formatStatsLabel(input.media.container)
+}
+
+function formatVideoCodecForStats(input: {
+  status: PlaybackStatusState
+  videoCodec?: string
+}) {
+  if (input.status === "transcoding") {
+    return "AVC / H.264"
+  }
+
+  const normalizedCodec = normalizeCodecName(input.videoCodec)
+
+  if (normalizedCodec === "h264" || normalizedCodec === "avc1") {
+    return "AVC / H.264"
+  }
+
+  if (
+    normalizedCodec === "hevc" ||
+    normalizedCodec === "h265" ||
+    normalizedCodec === "hvc1" ||
+    normalizedCodec === "hev1"
+  ) {
+    return "HEVC / H.265"
+  }
+
+  if (normalizedCodec === "av1" || normalizedCodec === "av01") {
+    return "AV1"
+  }
+
+  if (normalizedCodec === "vp9" || normalizedCodec === "vp09") {
+    return "VP9"
+  }
+
+  if (normalizedCodec === "vp8") {
+    return "VP8"
+  }
+
+  return formatStatsLabel(input.videoCodec)
+}
+
+function formatAudioCodecForStats(input: {
+  status: PlaybackStatusState
+  audioStream: MediaStreamInfo | undefined
+}) {
+  if (input.status === "transcoding") {
+    return "AAC-LC"
+  }
+
+  const codec = normalizeCodecName(input.audioStream?.codec)
+  const profile = input.audioStream?.profile?.trim()
+
+  if (codec === "aac") {
+    return profile && /lc/i.test(profile) ? "AAC-LC" : "AAC"
+  }
+
+  if (codec === "opus") {
+    return "Opus"
+  }
+
+  if (codec === "vorbis") {
+    return "Vorbis"
+  }
+
+  if (codec === "ac3") {
+    return "AC-3"
+  }
+
+  if (codec === "eac3") {
+    return "E-AC-3"
+  }
+
+  if (codec === "flac") {
+    return "FLAC"
+  }
+
+  if (codec === "mp3") {
+    return "MP3"
+  }
+
+  return formatStatsLabel(input.audioStream?.codec)
+}
+
+function formatSubtitleCodec(codec: string | undefined) {
+  const normalizedCodec = normalizeCodecName(codec)
+
+  const labels: Record<string, string> = {
+    webvtt: "WebVTT",
+    ass: "ASS",
+    ssa: "SSA",
+    srt: "SRT",
+    subrip: "SRT",
+    movtext: "mov_text",
+    text: "Text",
+    subviewer: "SubViewer",
+    subviewer1: "SubViewer 1",
+    sami: "SAMI",
+    microdvd: "MicroDVD",
+    mpl2: "MPL2",
+    jacosub: "JACOsub",
+    realtext: "RealText",
+    stl: "STL",
+    vplayer: "VPlayer",
+    pjs: "PJS",
+    aqtitle: "AQTitle",
+    ttml: "TTML",
+    dfxp: "TTML",
+    sbv: "SBV",
+    scc: "SCC",
+    eia608: "EIA-608",
+    cea608: "EIA-608",
+    hdmvpgssubtitle: "PGS",
+    dvdsubtitle: "DVD Subtitle",
+    dvbsubtitle: "DVB Subtitle",
+    xsub: "XSUB",
+  }
+
+  return labels[normalizedCodec] ?? formatStatsLabel(codec)
+}
+
+function formatSubtitleFormatForStats(stream: SubtitleStreamInfo | null) {
+  if (!stream) {
+    return "Off"
+  }
+
+  const sourceFormat = formatSubtitleCodec(stream.codec)
+
+  if (sourceFormat === "WebVTT") {
+    return "WebVTT"
+  }
+
+  if (sourceFormat === "Unknown") {
+    return "WebVTT"
+  }
+
+  return `WebVTT (from ${sourceFormat})`
+}
+
+function getPreloadedMegabytes(input: {
+  currentTimeSeconds: number
+  bufferedSeconds: number
+  streamMbps?: number
+}) {
+  if (!input.streamMbps || input.streamMbps <= 0) {
+    return null
+  }
+
+  const preloadedSeconds = Math.max(input.bufferedSeconds - input.currentTimeSeconds, 0)
+
+  if (preloadedSeconds <= 0) {
+    return 0
+  }
+
+  return Number(((preloadedSeconds * input.streamMbps) / 8).toFixed(1))
+}
+
+function formatStatsBitrate(value: number | null) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return "N/A"
+  }
+
+  if (value < 0.1) {
+    return "<0.1 Mbps"
+  }
+
+  return `${value.toFixed(1)} Mbps`
+}
+
+function formatStatsMegabytes(value: number | null) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return "N/A"
+  }
+
+  if (value < 0.1) {
+    return "<0.1 MB"
+  }
+
+  return `${value.toFixed(1)} MB`
+}
+
+function DisplayMethodStatsBadge({
+  stats,
+}: {
+  stats: PlaybackStatsSnapshot
+}) {
+  const rows = [
+    ["Video container", stats.container],
+    ["Video codec", stats.videoCodec],
+    ["Audio codec", stats.audioCodec],
+    ["Subtitle format", stats.subtitleFormat],
+    ["Current download bitrate", formatStatsBitrate(stats.downloadBitrateMbps)],
+    ["Preloaded", formatStatsMegabytes(stats.preloadedMegabytes)],
+  ]
+
+  return (
+    <HoverHint
+      side="bottom"
+      align="start"
+      clickVisibleMs={null}
+      className="w-full"
+      contentClassName="w-72 max-w-[calc(100vw-1rem)] border-violet-300/25 bg-zinc-950/95 px-0 py-0 text-zinc-100 shadow-2xl"
+      label={
+        <span className="block p-3 text-left">
+          <span className="block text-xs font-semibold uppercase tracking-[0.18em] text-violet-200">
+            Stats for nerds
+          </span>
+          <span className="mt-2 grid gap-1.5">
+            {rows.map(([label, value]) => (
+              <span key={label} className="grid grid-cols-[1fr_auto] gap-3 text-xs">
+                <span className="text-zinc-400">{label}</span>
+                <span className="max-w-36 truncate text-right font-medium text-zinc-100" title={value}>
+                  {value}
+                </span>
+              </span>
+            ))}
+          </span>
+        </span>
+      }
+    >
+      <button
+        type="button"
+        className="w-full cursor-help rounded-md border border-white/10 bg-zinc-950 px-2 py-1.5 text-left text-zinc-100 transition hover:border-violet-300/35 hover:bg-zinc-900 lg:px-3 lg:py-2"
+        onClick={(event) => event.stopPropagation()}
+      >
+        {stats.playbackType}
+      </button>
+    </HoverHint>
+  )
+}
+
 
 function formatClientError(error: unknown) {
   if (error instanceof Error) {
@@ -1764,7 +2108,6 @@ export function AnimePlayer({
   const bandwidthRecheckHoldRef = useRef(false)
   const bandwidthRecheckSnapshotRef = useRef<BandwidthRecheckSnapshot | null>(null)
   const handledPriorityActionsRef = useRef<Set<string>>(new Set())
-  const forcedDowngradeHistoryRef = useRef<Array<{ playbackKey: string; downgradedAt: number }>>([])
   const seekPreviewFrameTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const subtitleAnimationFrameRef = useRef<number | null>(null)
   const streamStatsSampleRef = useRef<{
@@ -1817,7 +2160,6 @@ export function AnimePlayer({
   const [isWaitingForMedia, setIsWaitingForMedia] = useState(false)
   const [showHardwareWait, setShowHardwareWait] = useState(false)
   const [priorityInfo, setPriorityInfo] = useState<PriorityInfo | null>(null)
-  const [dataSaverProtectionKey, setDataSaverProtectionKey] = useState<string | null>(null)
   const [currentTime, setCurrentTime] = useState(0)
   const [seekPreview, setSeekPreview] = useState<number | null>(null)
   const [seekPreviewFrame, setSeekPreviewFrame] = useState<SeekPreviewFrame | null>(null)
@@ -1844,6 +2186,7 @@ export function AnimePlayer({
   const [castErrorMessage, setCastErrorMessage] = useState<string | null>(null)
   const [subtitleCues, setSubtitleCues] = useState<SubtitleCue[]>([])
   const [activeSubtitleTexts, setActiveSubtitleTexts] = useState<string[]>([])
+  const [currentDownloadBitrateMbps, setCurrentDownloadBitrateMbps] = useState<number | null>(null)
   const [volume, setVolume] = useState(1)
   const [isMuted, setIsMuted] = useState(false)
   const [volumeOpen, setVolumeOpen] = useState(false)
@@ -1852,10 +2195,7 @@ export function AnimePlayer({
   const isIosDevice = isIosBrowser()
   const isInsideWebVideoCaster = isWebVideoCasterBrowser()
   const liveTranscodeEnabled = playback.liveTranscodeEnabled !== false
-  const importProcessingEnabled = playback.importEnabled !== false
-  const automaticDataSaverSwitchingEnabled = !importProcessingEnabled
-  const dataSaverUnavailable = !liveTranscodeEnabled || importProcessingEnabled
-  const showQualityControl = liveTranscodeEnabled && !importProcessingEnabled
+  const showQualityControl = false
   const selectedAudioStream = useMemo(
     () => media.audioStreams.find((stream) => stream.id === selectedAudioStreamId),
     [media.audioStreams, selectedAudioStreamId]
@@ -1896,17 +2236,53 @@ export function AnimePlayer({
     status,
   })
   const displayMethod = statusLabel(status)
+  const playbackStats = useMemo<PlaybackStatsSnapshot>(
+    () => ({
+      playbackType: displayMethod,
+      container: formatContainerForStats({
+        status,
+        fileName,
+        media,
+        directAudioRemuxActive,
+      }),
+      videoCodec: formatVideoCodecForStats({
+        status,
+        videoCodec: media.videoCodec,
+      }),
+      audioCodec: formatAudioCodecForStats({
+        status,
+        audioStream: playbackAudioStream,
+      }),
+      subtitleFormat: formatSubtitleFormatForStats(selectedSubtitleStream),
+      downloadBitrateMbps: currentDownloadBitrateMbps,
+      preloadedMegabytes: getPreloadedMegabytes({
+        currentTimeSeconds: currentTime,
+        bufferedSeconds: bufferedTime,
+        streamMbps,
+      }),
+    }),
+    [
+      bufferedTime,
+      currentDownloadBitrateMbps,
+      currentTime,
+      directAudioRemuxActive,
+      displayMethod,
+      fileName,
+      media,
+      playbackAudioStream,
+      selectedSubtitleStream,
+      status,
+      streamMbps,
+    ]
+  )
   const castSelectionKey = `${playbackKey}:${quality}:${selectedAudioStreamId ?? ""}:${selectedSubtitleStreamId ?? ""}`
 
-  useEffect(() => {
-    sourceUrlRef.current = sourceUrl
+  function resetStreamStats() {
     streamStatsSampleRef.current = null
-
-    const timer = window.setTimeout(() => {
-    }, 0)
-
-    return () => window.clearTimeout(timer)
-  }, [sourceUrl])
+    setCurrentDownloadBitrateMbps((previousBitrate) =>
+      previousBitrate === null ? previousBitrate : null
+    )
+  }
 
   useEffect(() => {
     isCastingRef.current = isCasting
@@ -1932,17 +2308,6 @@ export function AnimePlayer({
     return () => window.clearTimeout(timer)
   }, [liveTranscodeEnabled, quality])
 
-  useEffect(() => {
-    if (!dataSaverUnavailable || quality === "original") {
-      return
-    }
-
-    const timer = window.setTimeout(() => {
-      setQuality("original")
-    }, 0)
-
-    return () => window.clearTimeout(timer)
-  }, [dataSaverUnavailable, quality])
 
   useEffect(() => {
     const video = videoRef.current
@@ -1958,14 +2323,9 @@ export function AnimePlayer({
     const defaultSubtitle = supportedSubtitleStreams.find(
       (stream) => stream.id === media.defaultSubtitleStreamId
     )
-    const bestDefaultSubtitle = defaultSubtitle
-      ? subtitleLanguageOptions.find(
-          (option) => option.language === defaultSubtitle.language
-        )?.stream ?? defaultSubtitle
-      : null
     const timer = window.setTimeout(() => {
       setSelectedAudioStreamId(media.defaultAudioStreamId)
-      setSelectedSubtitleStreamId(bestDefaultSubtitle?.id ?? null)
+      setSelectedSubtitleStreamId(defaultSubtitle?.id ?? null)
     }, 0)
 
     return () => window.clearTimeout(timer)
@@ -1973,7 +2333,6 @@ export function AnimePlayer({
     media.defaultAudioStreamId,
     media.defaultSubtitleStreamId,
     playbackKey,
-    subtitleLanguageOptions,
     supportedSubtitleStreams,
   ])
 
@@ -1982,30 +2341,20 @@ export function AnimePlayer({
       return
     }
 
-    const selectedStream = supportedSubtitleStreams.find(
+    const selectedStreamExists = supportedSubtitleStreams.some(
       (stream) => stream.id === selectedSubtitleStreamId
     )
-    const bestLanguageOption = selectedStream
-      ? subtitleLanguageOptions.find(
-          (option) => option.language === selectedStream.language
-        )
-      : null
-    const nextSubtitleStreamId = selectedStream
-      ? bestLanguageOption && bestLanguageOption.id !== selectedSubtitleStreamId
-        ? bestLanguageOption.id
-        : selectedSubtitleStreamId
-      : null
 
-    if (nextSubtitleStreamId === selectedSubtitleStreamId) {
+    if (selectedStreamExists) {
       return
     }
 
     const timer = window.setTimeout(() => {
-      setSelectedSubtitleStreamId(nextSubtitleStreamId)
+      setSelectedSubtitleStreamId(null)
     }, 0)
 
     return () => window.clearTimeout(timer)
-  }, [selectedSubtitleStreamId, subtitleLanguageOptions, supportedSubtitleStreams])
+  }, [selectedSubtitleStreamId, supportedSubtitleStreams])
 
   const clearControlsTimer = useCallback(() => {
     if (controlsTimerRef.current) {
@@ -2386,10 +2735,26 @@ export function AnimePlayer({
             )
           }
 
+          const downloadStartedAt = performance.now()
+
           await drainResponseBody(response, (byteLength) => {
             loadedByteLength = Math.min(
               loadedByteLength + byteLength,
               requestedByteLength
+            )
+
+            const elapsedSeconds = Math.max(
+              (performance.now() - downloadStartedAt) / 1000,
+              0.001
+            )
+            const estimatedDownloadBitrateMbps = Number(
+              ((loadedByteLength * 8) / elapsedSeconds / 1_000_000).toFixed(1)
+            )
+
+            setCurrentDownloadBitrateMbps((previousBitrate) =>
+              previousBitrate !== estimatedDownloadBitrateMbps
+                ? estimatedDownloadBitrateMbps
+                : previousBitrate
             )
             updateWarmupDisplay()
           })
@@ -2903,20 +3268,12 @@ export function AnimePlayer({
   )
 
   const getPlaybackClockPosition = useCallback((video: HTMLVideoElement | null) => {
-    if (
-      video &&
-      Number.isFinite(video.currentTime) &&
-      activeSourceStartRef.current > 0
-    ) {
-      return Math.max(activeSourceStartRef.current + video.currentTime, 0)
-    }
-
-    const seconds =
+    const mediaSeconds =
       video && Number.isFinite(video.currentTime)
         ? video.currentTime
         : currentTimeRef.current
 
-    return Math.max(seconds, 0)
+    return getSourceClockSeconds(mediaSeconds, activeSourceStartRef.current)
   }, [])
 
   const getPlaybackPosition = useCallback(() => {
@@ -2930,7 +3287,7 @@ export function AnimePlayer({
       }
 
       const sourceOffset = activeSourceStartRef.current
-      const bufferedEnd = sourceOffset + getBufferedEnd(video)
+      const bufferedEnd = getSourceClockSeconds(getBufferedEnd(video), sourceOffset)
       const nextBufferedTime = Math.max(
         bufferedEnd,
         preloadRangeWarmedUntilRef.current,
@@ -2998,18 +3355,13 @@ export function AnimePlayer({
   )
 
   const getTranscodeUrl = useCallback(
-    (profile: PlaybackProfile, startTime?: number) =>
-      withStreamParams(
-        profile === "dataSaver"
-          ? playback.dataSaverUrl
-          : playback.originalTranscodeUrl,
-        {
-          audioStreamId: selectedAudioStreamId,
-          startTime,
-          clientId: stableClientStreamId,
-        }
-      ),
-    [playback.dataSaverUrl, playback.originalTranscodeUrl, selectedAudioStreamId, stableClientStreamId]
+    (_profile: PlaybackProfile, startTime?: number) =>
+      withStreamParams(playback.originalTranscodeUrl, {
+        audioStreamId: selectedAudioStreamId,
+        startTime,
+        clientId: stableClientStreamId,
+      }),
+    [playback.originalTranscodeUrl, selectedAudioStreamId, stableClientStreamId]
   )
 
   const getWebVideoCasterDirectUrl = useCallback(() => {
@@ -3083,7 +3435,7 @@ export function AnimePlayer({
       shouldAutoPlaySourceRef.current
 
     activeSourceStartRef.current = sourceStartTime
-    streamStatsSampleRef.current = null
+    resetStreamStats()
     preloadRangeWarmedUntilRef.current = sourceStartTime
     setBufferedTime(sourceStartTime)
 
@@ -3150,7 +3502,7 @@ export function AnimePlayer({
     sourceUrlRef.current = null
     activeSourceStartRef.current = 0
     pendingSeekRef.current = null
-    streamStatsSampleRef.current = null
+    resetStreamStats()
     preloadRangeWarmedUntilRef.current = 0
     setBufferedTime(0)
     setSourceUrl(null)
@@ -3170,8 +3522,6 @@ export function AnimePlayer({
 
       if (episodeChanged) {
         playbackKeyRef.current = playbackKey
-        forcedDowngradeHistoryRef.current = []
-        setDataSaverProtectionKey(null)
         setPriorityInfo(null)
         clearPriorityInfoTimer()
         currentTimeRef.current = 0
@@ -3349,6 +3699,11 @@ export function AnimePlayer({
       .then((text) => {
         if (!cancelled) {
           const cues = parseWebVtt(text)
+
+          if (!cues.length && subtitleCuesRef.current.length) {
+            return
+          }
+
           subtitleCuesRef.current = cues
           setSubtitleCues(cues)
           syncSubtitleOverlay()
@@ -3356,10 +3711,12 @@ export function AnimePlayer({
       })
       .catch((error) => {
         if (!cancelled) {
-          subtitleCuesRef.current = []
-          activeSubtitleKeyRef.current = ""
-          setSubtitleCues([])
-          setActiveSubtitleTexts([])
+          if (!subtitleCuesRef.current.length) {
+            activeSubtitleKeyRef.current = ""
+            setSubtitleCues([])
+            setActiveSubtitleTexts([])
+          }
+
           console.error(error)
         }
       })
@@ -3380,6 +3737,8 @@ export function AnimePlayer({
 
     return () => window.cancelAnimationFrame(frame)
   }, [subtitleCues, syncSubtitleOverlay])
+
+
 
   useEffect(() => {
     clearSubtitleAnimationFrame()
@@ -3425,57 +3784,6 @@ export function AnimePlayer({
     },
     [clearPriorityInfoTimer, showControls]
   )
-
-  const registerForcedDowngrade = useCallback(() => {
-    const now = Date.now()
-    const recentDowngrades = forcedDowngradeHistoryRef.current.filter(
-      (entry) =>
-        entry.playbackKey === playbackKey && now - entry.downgradedAt < 5 * 60_000
-    )
-
-    recentDowngrades.push({ playbackKey, downgradedAt: now })
-    forcedDowngradeHistoryRef.current = recentDowngrades
-
-    return recentDowngrades.length >= 2
-  }, [playbackKey])
-
-  const switchQualityFromPriority = useCallback(
-    (nextQuality: PlaybackProfile) => {
-      if (nextQuality === "dataSaver" && dataSaverUnavailable) {
-        return
-      }
-
-      if (!liveTranscodeEnabled) {
-        return
-      }
-
-      const video = videoRef.current
-      const wasPlaying =
-        Boolean(video && !video.paused) || isPlayingRef.current || isCastingRef.current
-
-      shouldAutoPlaySourceRef.current = wasPlaying
-      pendingPrioritySwitchRef.current = true
-      if (wasPlaying) {
-        beginMediaWait(nextQuality !== "original" || statusRef.current === "transcoding")
-      }
-      setQuality(nextQuality)
-      showControls(true)
-    },
-    [beginMediaWait, dataSaverUnavailable, liveTranscodeEnabled, showControls]
-  )
-
-  const markDataSaverProtectionOnServer = useCallback(() => {
-    void fetch("/api/stream/priority/events", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        clientId: clientStreamIdRef.current,
-        protected: true,
-      }),
-    }).catch(() => undefined)
-  }, [])
 
   const handleBandwidthRecheckStarted = useCallback(
     (action: StreamPriorityAction) => {
@@ -3716,62 +4024,6 @@ export function AnimePlayer({
         return
       }
 
-      if (action.type === "forceDataSaver") {
-        if (!automaticDataSaverSwitchingEnabled) {
-          return
-        }
-
-        const protectionAlreadyActive = dataSaverProtectionKey === playbackKey
-        const protectionEnabled = protectionAlreadyActive || registerForcedDowngrade()
-        const message =
-          protectionEnabled && !protectionAlreadyActive
-            ? `${action.message} Data Saver will stay enabled for the rest of this episode because your stream was downgraded twice within 5 minutes.`
-            : action.message
-
-        if (protectionEnabled && !protectionAlreadyActive) {
-          setDataSaverProtectionKey(playbackKey)
-          markDataSaverProtectionOnServer()
-        }
-
-        showPriorityInfoMessage({
-          type: protectionEnabled ? "protectedDataSaver" : action.type,
-          message,
-          createdAt: action.createdAt,
-        })
-
-        if (quality !== "dataSaver") {
-          switchQualityFromPriority("dataSaver")
-        }
-
-        return
-      }
-
-      if (action.type === "restoreOriginal") {
-        if (!automaticDataSaverSwitchingEnabled) {
-          return
-        }
-
-        if (dataSaverProtectionKey === playbackKey) {
-          markDataSaverProtectionOnServer()
-          return
-        }
-
-        showPriorityInfoMessage(
-          {
-            type: action.type,
-            message: action.message,
-            createdAt: action.createdAt,
-          },
-          { autoClearMs: 15_000 }
-        )
-
-        if (quality === "dataSaver") {
-          switchQualityFromPriority("original")
-        }
-
-        return
-      }
-
       showPriorityInfoMessage(
         {
           type: action.type,
@@ -3782,17 +4034,10 @@ export function AnimePlayer({
       )
     },
     [
-      automaticDataSaverSwitchingEnabled,
-      dataSaverProtectionKey,
       handleBandwidthRecheckFinished,
       handleBandwidthRecheckStarted,
       handleServerShutdownStarted,
-      markDataSaverProtectionOnServer,
-      playbackKey,
-      quality,
-      registerForcedDowngrade,
       showPriorityInfoMessage,
-      switchQualityFromPriority,
     ]
   )
 
@@ -3803,14 +4048,11 @@ export function AnimePlayer({
     let reconnectTimer: number | null = null
     let lastEventAt = Date.now()
     const clientId = clientStreamIdRef.current
-    const protectionActive =
-      dataSaverProtectionKey === playbackKey && quality === "dataSaver"
     const priorityEventsUrl = new URL(
       "/api/stream/priority/events",
       window.location.origin
     )
     priorityEventsUrl.searchParams.set("clientId", clientId)
-    priorityEventsUrl.searchParams.set("protected", protectionActive ? "1" : "0")
     const priorityEventsPath = `${priorityEventsUrl.pathname}${priorityEventsUrl.search}`
 
     function markAlive() {
@@ -3895,24 +4137,9 @@ export function AnimePlayer({
         window.clearTimeout(reconnectTimer)
       }
     }
-  }, [
-    dataSaverProtectionKey,
-    handlePriorityAction,
-    playbackKey,
-    quality,
-  ])
+  }, [handlePriorityAction])
 
   function tryDirectPlay() {
-    if (dataSaverProtectionKey === playbackKey) {
-      showPriorityInfoMessage({
-        type: "protectedDataSaver",
-        message:
-          "Data Saver protection is active for the rest of this episode because your stream was downgraded twice within 5 minutes.",
-        createdAt: new Date().toISOString(),
-      })
-      return
-    }
-
     setQuality("original")
     directFallbackAttemptedRef.current = false
     switchSource(getDirectUrl(), "direct", { preservePosition: true })
@@ -4381,7 +4608,6 @@ export function AnimePlayer({
     const castUrls = [
       playback.castDirectUrl,
       playback.castTranscodeUrl,
-      playback.castDataSaverUrl,
       playback.castSubtitleUrl,
     ]
 
@@ -4645,6 +4871,7 @@ export function AnimePlayer({
     video.removeAttribute("src")
     video.load()
     sourceUrlRef.current = null
+    resetStreamStats()
     setSourceUrl(null)
   }
 
@@ -4826,8 +5053,7 @@ export function AnimePlayer({
         clientId: clientStreamIdRef.current,
       })
     )
-    const castTranscodeBaseUrl =
-      quality === "dataSaver" ? playback.castDataSaverUrl : playback.castTranscodeUrl
+    const castTranscodeBaseUrl = playback.castTranscodeUrl
     const transcodeCastStartOffset = startTime > 0.25 ? startTime : 0
     const transcodeCastUrl = getCastReceiverUrl(
       withStreamParams(castTranscodeBaseUrl, {
@@ -4999,8 +5225,7 @@ export function AnimePlayer({
         clientId: clientStreamIdRef.current,
       })
     )
-    const castTranscodeBaseUrl =
-      quality === "dataSaver" ? playback.castDataSaverUrl : playback.castTranscodeUrl
+    const castTranscodeBaseUrl = playback.castTranscodeUrl
     const transcodeCastStartOffset = startTime > 0.25 ? startTime : 0
     const transcodeCastUrl = getCastReceiverUrl(
       withStreamParams(castTranscodeBaseUrl, {
@@ -5497,12 +5722,22 @@ export function AnimePlayer({
     if (elapsedSeconds < 0.75 || bufferedSeconds <= 0) {
       return
     }
+
+    const estimatedDownloadBitrateMbps = Number(
+      ((bufferedSeconds * estimatedMbps) / elapsedSeconds).toFixed(1)
+    )
+
+    setCurrentDownloadBitrateMbps((previousBitrate) =>
+      previousBitrate !== estimatedDownloadBitrateMbps
+        ? estimatedDownloadBitrateMbps
+        : previousBitrate
+    )
   }
 
   function handleTimeUpdate(event: React.SyntheticEvent<HTMLVideoElement>) {
     const video = event.currentTarget
     const sourceOffset = activeSourceStartRef.current
-    const watchedSeconds = sourceOffset + video.currentTime
+    const watchedSeconds = getSourceClockSeconds(video.currentTime, sourceOffset)
     const measuredDuration = Number.isFinite(video.duration)
       ? video.duration + sourceOffset
       : undefined
@@ -5556,29 +5791,12 @@ export function AnimePlayer({
   }
 
   function changeQuality(nextQuality: PlaybackProfile) {
-    if (nextQuality === "dataSaver" && dataSaverUnavailable) {
-      setQuality("original")
-      showControls(true)
-      return
-    }
-
     if (!liveTranscodeEnabled) {
       setQuality("original")
       showControls(true)
       return
     }
 
-    if (dataSaverProtectionKey === playbackKey && nextQuality !== "dataSaver") {
-      setQuality("dataSaver")
-      showPriorityInfoMessage({
-        type: "protectedDataSaver",
-        message:
-          "Data Saver protection is active for the rest of this episode because your stream was downgraded twice within 5 minutes.",
-        createdAt: new Date().toISOString(),
-      })
-      showControls(true)
-      return
-    }
 
     const video = videoRef.current
     const wasPlaying = Boolean(video && !video.paused) || isPlayingRef.current
@@ -5707,6 +5925,11 @@ export function AnimePlayer({
   }
 
   const displayedCurrentTime = seekPreview ?? currentTime
+  const displayedSubtitleText = activeSubtitleTexts.join("\n")
+  const displayedSubtitleLineCount = displayedSubtitleText
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean).length
   const currentPlaybackKey = `${animeId}:${seasonNumber}:${episodeNumber}`
   const playerAspectRatio =
     detectedPlayerAspectRatio?.playbackKey === currentPlaybackKey
@@ -5979,7 +6202,8 @@ export function AnimePlayer({
           onTimeUpdate={handleTimeUpdate}
           onProgress={handleProgress}
           onVolumeChange={(event) => syncLocalVolumeState(event.currentTarget)}
-        />
+        >
+        </video>
 
         {shouldBlockMobilePortraitPlayback ? (
           <div
@@ -6227,6 +6451,7 @@ export function AnimePlayer({
         {shouldShowCastOverlay ? (
           <div className="absolute inset-0 z-30 bg-black text-white">
             <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_18%,rgba(127,29,29,0.2),transparent_36%),linear-gradient(180deg,rgba(24,24,27,0.32),rgba(0,0,0,0.82))]" />
+
 
             {shouldShowCastLoadingOverlay ? (
               <div className="relative z-10 flex h-full flex-col items-center justify-center gap-4 px-4 text-center">
@@ -6485,9 +6710,10 @@ export function AnimePlayer({
           </HoverHint>
         ) : null}
 
+
         <HoverHint
           label={isPlaying ? "Pause" : "Play"}
-          className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 transition-opacity duration-150 ${
+          className={`absolute top-1/2 left-1/2 z-20 -translate-x-1/2 -translate-y-1/2 transition-opacity duration-150 ${
             centerToggleVisible ? "opacity-100" : "pointer-events-none opacity-0"
           }`}
         >
@@ -6536,11 +6762,21 @@ export function AnimePlayer({
           </Button>
         ) : null}
 
-        {activeSubtitleTexts.length && !isAnyCasting ? (
-          <div className="pointer-events-none absolute inset-x-4 bottom-[5.25rem] z-10 flex justify-center px-4 text-center text-lg lg:bottom-24 font-semibold leading-snug text-white drop-shadow-[0_2px_5px_rgba(0,0,0,0.95)] sm:text-xl">
-            <div className="max-w-[90%] whitespace-pre-line">
-              {activeSubtitleTexts.join("\n")}
-            </div>
+        {!isAnyCasting ? (
+          <div className="pointer-events-none absolute inset-x-0 bottom-[5.75rem] z-10 flex justify-center overflow-hidden px-4 text-center text-xl font-semibold leading-snug text-white drop-shadow-[0_2px_5px_rgba(0,0,0,0.95)] sm:text-2xl lg:bottom-[6.75rem]">
+            {displayedSubtitleText ? (
+              <div
+                className="max-w-[70%] whitespace-pre-line break-words [overflow-wrap:anywhere]"
+                style={{
+                  transform:
+                    displayedSubtitleLineCount > 1
+                      ? `translateY(-${Math.min(displayedSubtitleLineCount - 1, 3) * 0.45}rem)`
+                      : undefined,
+                }}
+              >
+                {displayedSubtitleText}
+              </div>
+            ) : null}
           </div>
         ) : null}
 
@@ -6570,7 +6806,6 @@ export function AnimePlayer({
                   }
                 >
                   <option value="original">Full Quality</option>
-                  <option value="dataSaver">Data Saver</option>
                 </select>
               </label>
             ) : null}
@@ -6578,9 +6813,7 @@ export function AnimePlayer({
             {liveTranscodeEnabled ? (
               <div className="grid gap-1 text-zinc-300">
                 <span>Display Method</span>
-                <div className="rounded-md border border-white/10 bg-zinc-950 px-2 py-1.5 text-zinc-100 lg:px-3 lg:py-2">
-                  {displayMethod}
-                </div>
+                <DisplayMethodStatsBadge stats={playbackStats} />
               </div>
             ) : null}
 
@@ -6631,7 +6864,7 @@ export function AnimePlayer({
 
         {!isAnyCasting ? (
           <div
-          className={`absolute inset-x-0 bottom-0 bg-zinc-950/40 p-3 backdrop-blur-md lg:p-4 transition-opacity duration-300 ${
+          className={`absolute inset-x-0 bottom-0 z-20 bg-zinc-950/40 p-3 backdrop-blur-md lg:p-4 transition-opacity duration-300 ${
             controlsAreVisible ? "opacity-100" : "pointer-events-none opacity-0"
           }`}
         >

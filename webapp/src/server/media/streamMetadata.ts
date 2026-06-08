@@ -6,6 +6,14 @@ import type {
   WatchPayload,
 } from "@/lib/types"
 import type { ProbeResult, ProbeStream } from "@/server/media/mediaFiles"
+import {
+  isConvertibleTextSubtitleCodec,
+  normalizeSubtitleCodecName,
+  sidecarSubtitleStreamId,
+  sidecarSubtitleStreamIndex,
+  subtitleCodecLabel,
+  type SubtitleSidecar,
+} from "@/server/media/subtitles"
 
 const languageAliases = new Map(
   Object.entries({
@@ -61,22 +69,6 @@ const languageNames = new Map(
   })
 )
 
-const textSubtitleCodecs = new Set([
-  "ass",
-  "ssa",
-  "subrip",
-  "srt",
-  "webvtt",
-  "mov_text",
-  "text",
-])
-
-function isLcAacProfile(profile: string | undefined | null) {
-  const normalized = profile?.trim().toLowerCase()
-
-  return !normalized || normalized === "lc" || normalized === "aac lc"
-}
-
 function normalizeLanguage(value: string | undefined | null) {
   const normalized = value?.trim().toLowerCase()
 
@@ -95,9 +87,86 @@ function languageLabel(languageCode: string | undefined) {
   return languageNames.get(languageCode) ?? languageCode.toUpperCase()
 }
 
-function streamTitle(stream: ProbeStream) {
-  const title = stream.tags?.title?.trim()
-  return title || undefined
+function streamTagValue(stream: ProbeStream, keys: string[]) {
+  const tags = stream.tags
+
+  if (!tags) {
+    return undefined
+  }
+
+  for (const key of keys) {
+    const directValue = tags[key]?.trim()
+
+    if (directValue) {
+      return directValue
+    }
+
+    const normalizedKey = key.toLowerCase()
+
+    for (const [tagKey, tagValue] of Object.entries(tags)) {
+      if (tagKey.toLowerCase() !== normalizedKey) {
+        continue
+      }
+
+      const trimmedValue = tagValue?.trim()
+
+      if (trimmedValue) {
+        return trimmedValue
+      }
+    }
+  }
+
+  return undefined
+}
+
+function streamLanguage(stream: ProbeStream) {
+  return normalizeLanguage(streamTagValue(stream, ["language"]))
+}
+
+function isGenericStreamTitle(value: string) {
+  const normalizedTitle = value
+    .trim()
+    .toLowerCase()
+    .replace(/[._-]+/g, " ")
+    .replace(/\s+/g, " ")
+
+  return (
+    normalizedTitle === "handler" ||
+    normalizedTitle === "sound handler" ||
+    normalizedTitle === "audio handler" ||
+    normalizedTitle === "subtitle handler" ||
+    /^subtitle handler \d+$/.test(normalizedTitle) ||
+    /^sound handler \d+$/.test(normalizedTitle) ||
+    /^audio handler \d+$/.test(normalizedTitle)
+  )
+}
+
+function streamTitle(stream: ProbeStream, languageCode?: string) {
+  const title = streamTagValue(stream, [
+    "title",
+    "name",
+    "label",
+    "description",
+    "handler_name",
+  ])
+  const trimmedTitle = title?.trim()
+
+  if (!trimmedTitle || isGenericStreamTitle(trimmedTitle)) {
+    return undefined
+  }
+
+  const normalizedTitle = trimmedTitle.toLowerCase()
+  const normalizedLanguage = languageCode?.toLowerCase()
+  const languageName = languageLabel(languageCode).toLowerCase()
+
+  if (
+    normalizedLanguage &&
+    (normalizedTitle === normalizedLanguage || normalizedTitle === languageName)
+  ) {
+    return undefined
+  }
+
+  return trimmedTitle
 }
 
 function uniqueLabels<T extends MediaStreamInfo | SubtitleStreamInfo>(streams: T[]) {
@@ -194,8 +263,8 @@ function isForcedStream(stream: ProbeStream) {
 
 function toBaseStreamInfo(stream: ProbeStream, fallbackIndex: number) {
   const index = streamIndex(stream) ?? fallbackIndex
-  const language = normalizeLanguage(stream.tags?.language)
-  const title = streamTitle(stream)
+  const language = streamLanguage(stream)
+  const title = streamTitle(stream, language)
   const baseLabel = languageLabel(language)
   const label = language && title ? `${baseLabel} - ${title}` : baseLabel
 
@@ -211,46 +280,70 @@ function toBaseStreamInfo(stream: ProbeStream, fallbackIndex: number) {
   }
 }
 
-export function isAudioStreamAacTranscodeTarget(stream: ProbeStream) {
-  const codec = (stream.codec_name ?? "").trim().toLowerCase()
-  const channels = stream.channels
-
-  return (
-    codec !== "aac" ||
-    !isLcAacProfile(stream.profile) ||
-    (typeof channels === "number" && channels > 0 && channels !== 2)
-  )
+export function isAudioStreamOpusTranscodeTarget(stream: ProbeStream) {
+  return (stream.codec_name ?? "").trim().toLowerCase() !== "opus"
 }
 
-export function getAudioOutputIndexesToAac(probe: ProbeResult) {
+export function getAudioOutputIndexesToOpus(probe: ProbeResult) {
   return (probe.streams ?? [])
     .filter((stream) => stream.codec_type === "audio")
     .map((stream, outputAudioIndex) => ({ stream, outputAudioIndex }))
-    .filter(({ stream }) => isAudioStreamAacTranscodeTarget(stream))
+    .filter(({ stream }) => isAudioStreamOpusTranscodeTarget(stream))
     .map(({ outputAudioIndex }) => outputAudioIndex)
 }
 
-export function getMediaStreamMetadata(probe: ProbeResult): WatchPayload["media"] {
+export function getMediaStreamMetadata(
+  probe: ProbeResult,
+  options: { sidecarSubtitle?: SubtitleSidecar | null } = {}
+): WatchPayload["media"] {
   const streams = probe.streams ?? []
   const audioStreams = uniqueLabels(
     streams
       .filter((stream) => stream.codec_type === "audio")
       .map((stream, index): MediaStreamInfo => toBaseStreamInfo(stream, index))
   )
-  const subtitleStreams = uniqueLabels(
-    streams
-      .filter((stream) => stream.codec_type === "subtitle")
-      .map((stream, index): SubtitleStreamInfo => {
-        const base = toBaseStreamInfo(stream, index)
-        const codec = (stream.codec_name ?? "").toLowerCase()
+  const embeddedSubtitleStreams = streams
+    .filter((stream) => stream.codec_type === "subtitle")
+    .map((stream, index): SubtitleStreamInfo => {
+      const base = toBaseStreamInfo(stream, index)
+      const codec = normalizeSubtitleCodecName(stream.codec_name)
+      const hasTrackTitle = Boolean(streamTitle(stream, base.language))
+      const formatLabel = subtitleCodecLabel(codec)
+      const label = hasTrackTitle || formatLabel === "Unknown"
+        ? base.label
+        : `${base.label} - ${formatLabel}`
 
-        return {
-          ...base,
-          isForced: isForcedStream(stream),
-          isSupported: textSubtitleCodecs.has(codec),
-        }
-      })
-  )
+      return {
+        ...base,
+        codec: codec || base.codec,
+        label,
+        isForced: isForcedStream(stream),
+        isSupported: isConvertibleTextSubtitleCodec(codec),
+      }
+    })
+  const sidecarSubtitleStream: SubtitleStreamInfo[] =
+    !embeddedSubtitleStreams.length && options.sidecarSubtitle
+      ? [
+          {
+            id: sidecarSubtitleStreamId,
+            index: sidecarSubtitleStreamIndex,
+            codec: normalizeSubtitleCodecName(options.sidecarSubtitle.codec),
+            language: undefined,
+            label: `Default - Sidecar ${subtitleCodecLabel(
+              options.sidecarSubtitle.codec
+            )}`,
+            isDefault: true,
+            isForced: false,
+            isSupported: isConvertibleTextSubtitleCodec(
+              options.sidecarSubtitle.codec
+            ),
+          },
+        ]
+      : []
+  const subtitleStreams = uniqueLabels([
+    ...embeddedSubtitleStreams,
+    ...sidecarSubtitleStream,
+  ])
   const defaultAudioStream =
     audioStreams.find((stream) => stream.language === "en") ??
     audioStreams.find((stream) => stream.language === "ja") ??

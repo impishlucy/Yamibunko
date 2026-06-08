@@ -94,7 +94,7 @@ export type TranscodeStatus = {
   queued: number
 }
 
-export type PlaybackProfile = "original" | "dataSaver"
+export type PlaybackProfile = "original"
 export type PlaybackMode = "direct" | "transcode"
 
 export type MediaStreamInfo = {
@@ -121,10 +121,8 @@ export type WatchPayload = {
   playback: {
     directUrl: string
     originalTranscodeUrl: string
-    dataSaverUrl: string
     castDirectUrl: string
     castTranscodeUrl: string
-    castDataSaverUrl: string
     liveTranscodeEnabled: boolean
     importEnabled: boolean
     subtitleUrl: string

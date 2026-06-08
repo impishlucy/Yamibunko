@@ -21,7 +21,7 @@ import { getServerConfig } from "@/server/config"
 import { isLocalStreamBandwidthBypassRequest } from "@/server/http/request"
 import {
   ffprobe,
-  getLiveH264Args,
+  getLiveMp4AvcAacLcArgs,
   getLiveTranscodeInputArgs,
 } from "@/server/media/ffmpeg"
 import { validateCastStreamToken } from "@/server/media/castTokens"
@@ -168,8 +168,8 @@ function getMode(value: string | null): PlaybackMode {
   return value === "transcode" ? "transcode" : "direct"
 }
 
-function getProfile(value: string | null): PlaybackProfile {
-  return value === "dataSaver" ? "dataSaver" : "original"
+function getProfile(): PlaybackProfile {
+  return "original"
 }
 
 function liveTranscodingEnabled() {
@@ -188,9 +188,6 @@ async function runCooperativeSyncStep<T>(work: () => T) {
   return result
 }
 
-function automaticDataSaverSwitchingEnabled() {
-  return !getServerConfig().importEnabled
-}
 
 function parseOptionalStreamIndex(value: string | null) {
   if (!value) {
@@ -967,7 +964,6 @@ async function handleTranscode(
 
   const lease = await acquireLiveTranscode(
     `${animeId}:${seasonNumber}:${episodeNumber}:${profile}`,
-    profile,
     request.signal,
     { isVip }
   ).catch((error) => {
@@ -1018,7 +1014,7 @@ async function handleTranscode(
       ...(startSeconds > 0 ? ["-ss", startSeconds.toFixed(3)] : []),
       "-i",
       file,
-      ...getLiveH264Args(profile, {
+      ...getLiveMp4AvcAacLcArgs(profile, {
         audioStreamIndex,
         sourceBitrateKbps,
       }),
@@ -1028,8 +1024,6 @@ async function handleTranscode(
       "2048",
       "-avoid_negative_ts",
       "make_zero",
-      "-tag:v",
-      "avc1",
       "-flush_packets",
       "1",
       "-muxdelay",
@@ -1263,7 +1257,7 @@ export async function GET(request: Request, context: StreamContext) {
   const url = new URL(request.url)
   const seasonNumber = parsePositiveInt(url.searchParams.get("season") ?? "1")
   const mode = getMode(url.searchParams.get("mode"))
-  const profile = getProfile(url.searchParams.get("profile"))
+  const profile = getProfile()
   const startSeconds = parseStartSeconds(url.searchParams.get("start"))
   const clientId = parseClientId(url.searchParams.get("clientId"))
   const requestedAudioStreamIndex = parseOptionalStreamIndex(
@@ -1367,11 +1361,6 @@ export async function GET(request: Request, context: StreamContext) {
     profile,
     mode,
   })
-  const dataSaverUploadKbps = estimateUploadKbps({
-    sourceBitrateKbps,
-    profile: "dataSaver",
-    mode: "transcode",
-  })
   let uploadLease: StreamUploadLease
 
   if (bypassUploadBandwidth) {
@@ -1393,9 +1382,6 @@ export async function GET(request: Request, context: StreamContext) {
         mode,
         profile,
         estimatedUploadKbps: requestedUploadKbps,
-        dataSaverUploadKbps,
-        canTranscodeDataSaver:
-          liveTranscodingEnabled() && automaticDataSaverSwitchingEnabled(),
         animeId,
         seasonNumber,
         episodeNumber,
