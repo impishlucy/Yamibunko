@@ -68,7 +68,7 @@ AniList features require an [AniList API client](https://anilist.co/settings/dev
 
 ```text
 Examples:
-http://192.168.1.10:3000/api/anilist/oauth/callback
+http://192.168.178.10:3000/api/anilist/oauth/callback
 https://your-domain.example/api/anilist/oauth/callback
 ```
 
