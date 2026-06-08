@@ -53,7 +53,8 @@ The only required things are an 64bit OS and .NET 10.
 6. Save the setup and wait for the launcher to start the web UI.
 
 The launcher prepares the local runtime, downloads whats needed and starts the webapp.<br/>
-If the web UI does not open automatically, check the launcher log window.
+If the web UI does not open automatically, check the launcher log window.<br/>
+You can close the Logs if you want, the app runs in the backround and has right clickable tray icon.
 
 ### Update (with Launcher)
 1. Stop any Yamibunko instance running and wait for shutdown.
