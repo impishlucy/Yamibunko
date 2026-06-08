@@ -7,14 +7,12 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
-using System.Linq;
 using System.Net.Http;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Win32;
 
 namespace Launcher;
 
@@ -22,8 +20,6 @@ public class ServerManager
 {
     private static readonly TimeSpan DefaultCommandTimeout = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan InstallCommandTimeout = TimeSpan.FromMinutes(30);
-    private static readonly TimeSpan HardwareDetectionTimeout = TimeSpan.FromSeconds(8);
-
     private Process? _serverProcess;
     private Process? _activeManagedProcess;
     private Task? _stopServerTask;
@@ -520,47 +516,25 @@ public class ServerManager
     {
         Log("Detecting hardware acceleration type...");
 
-        var hardware = new HardwareDetectionInfo("", "");
+        var detection = await HardwareAccelerationDetector.DetectAsync(settings.FfmpegDir, true);
 
-        try
+        if (settings.ImportEnabled && detection.Av1ImportAcceleration == null)
         {
-            hardware = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-                ? await DetectWindowsHardwareAsync()
-                : await DetectUnixHardwareAsync();
-        }
-        catch (Exception ex)
-        {
-            Log($"Hardware detection failed: {ex.Message}");
+            Log(HardwareAccelerationDetector.Av1HardwareUnsupportedMessage);
+            Log("Catalog mode was enabled automatically because AV1 hardware encoding is unavailable.");
+            settings.ImportEnabled = false;
         }
 
-        var gpuInfo = hardware.GpuInfo.ToLowerInvariant();
-        var cpuInfo = hardware.CpuInfo.ToLowerInvariant();
+        settings.TranscodeAccel = settings.ImportEnabled && detection.Av1ImportAcceleration != null
+            ? detection.Av1ImportAcceleration
+            : detection.LiveTranscodeAcceleration;
+        settings.TranscodeHwDevice = settings.ImportEnabled && detection.Av1ImportAcceleration != null
+            ? detection.Av1ImportDevice ?? string.Empty
+            : detection.LiveTranscodeDevice ?? string.Empty;
 
-        if (HasNvidiaGpu(gpuInfo))
-        {
-            Log("Found Nvidia GPU, using nvenc.");
-            settings.TranscodeAccel = "nvenc";
-        }
-        else if (HasIntelHardware(gpuInfo))
-        {
-            Log("Found Intel GPU, using qsv.");
-            settings.TranscodeAccel = "qsv";
-        }
-        else if (HasAmdGpu(gpuInfo))
-        {
-            Log("Found AMD GPU, using amd.");
-            settings.TranscodeAccel = "amd";
-        }
-        else if (HasIntelHardware(cpuInfo))
-        {
-            Log("Found Intel CPU, using qsv.");
-            settings.TranscodeAccel = "qsv";
-        }
-        else
-        {
-            Log("No supported hardware acceleration detected, using CPU fallback.");
-            settings.TranscodeAccel = "cpu";
-        }
+        Log(detection.Av1ImportAcceleration == null
+            ? $"AV1 hardware encoding unavailable. Live transcoding acceleration: {settings.TranscodeAccel}."
+            : $"AV1 hardware encoding acceleration: {detection.Av1ImportAcceleration}. Live transcoding acceleration: {detection.LiveTranscodeAcceleration}.");
 
         settings.Save();
     }
@@ -1047,148 +1021,6 @@ public class ServerManager
         }
     }
 
-    private async Task<HardwareDetectionInfo> DetectWindowsHardwareAsync()
-    {
-        var gpuInfo = ReadWindowsGpuNamesFromRegistry();
-        var cpuInfo = ReadWindowsCpuNameFromRegistry();
-
-        if (string.IsNullOrWhiteSpace(gpuInfo))
-        {
-            gpuInfo = await RunPowerShellOutputAsync("Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name");
-        }
-
-        if (string.IsNullOrWhiteSpace(cpuInfo))
-        {
-            cpuInfo = await RunPowerShellOutputAsync("Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Name");
-        }
-
-        return new HardwareDetectionInfo(gpuInfo, cpuInfo);
-    }
-
-    private async Task<HardwareDetectionInfo> DetectUnixHardwareAsync()
-    {
-        var gpuResult = await TryRunProcessAsync("lspci", Array.Empty<string>(), new CommandOptions
-        {
-            LogErrors = false,
-            Timeout = HardwareDetectionTimeout
-        });
-
-        var cpuInfo = ReadUnixCpuInfo();
-        if (string.IsNullOrWhiteSpace(cpuInfo) && RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
-        {
-            var cpuResult = await TryRunProcessAsync("sysctl", new[] { "-n", "machdep.cpu.brand_string" }, new CommandOptions
-            {
-                LogErrors = false,
-                Timeout = HardwareDetectionTimeout
-            });
-
-            cpuInfo = cpuResult?.Output ?? "";
-        }
-
-        return new HardwareDetectionInfo(gpuResult?.Output ?? "", cpuInfo);
-    }
-
-    private async Task<string> RunPowerShellOutputAsync(string command)
-    {
-        var result = await TryRunProcessAsync("powershell", new[]
-        {
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            command
-        }, new CommandOptions
-        {
-            LogErrors = false,
-            Timeout = HardwareDetectionTimeout
-        });
-
-        return result?.Output ?? "";
-    }
-
-    private string ReadWindowsGpuNamesFromRegistry()
-    {
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-        {
-            return "";
-        }
-
-        try
-        {
-            using var videoKey = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\Video");
-            if (videoKey == null)
-            {
-                return "";
-            }
-
-            var names = new List<string>();
-            foreach (var adapterId in videoKey.GetSubKeyNames())
-            {
-                using var adapterKey = videoKey.OpenSubKey(Path.Combine(adapterId, "0000"));
-                var driverDescription = adapterKey?.GetValue("DriverDesc") as string;
-                if (!string.IsNullOrWhiteSpace(driverDescription))
-                {
-                    names.Add(driverDescription);
-                }
-            }
-
-            return string.Join(Environment.NewLine, names.Distinct(StringComparer.OrdinalIgnoreCase));
-        }
-        catch
-        {
-            return "";
-        }
-    }
-
-    private string ReadWindowsCpuNameFromRegistry()
-    {
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-        {
-            return "";
-        }
-
-        try
-        {
-            using var processorKey = Registry.LocalMachine.OpenSubKey(@"HARDWARE\DESCRIPTION\System\CentralProcessor\0");
-            return processorKey?.GetValue("ProcessorNameString") as string ?? "";
-        }
-        catch
-        {
-            return "";
-        }
-    }
-
-    private static string ReadUnixCpuInfo()
-    {
-        try
-        {
-            return File.Exists("/proc/cpuinfo") ? File.ReadAllText("/proc/cpuinfo") : "";
-        }
-        catch
-        {
-            return "";
-        }
-    }
-
-    private static bool HasNvidiaGpu(string gpuInfo)
-    {
-        return ContainsAny(gpuInfo, "nvidia", "geforce", "quadro");
-    }
-
-    private static bool HasAmdGpu(string gpuInfo)
-    {
-        return ContainsAny(gpuInfo, "amd", "radeon", "advanced micro devices", "ati technologies", "firepro");
-    }
-
-    private static bool HasIntelHardware(string hardwareInfo)
-    {
-        return ContainsAny(hardwareInfo, "intel", "iris", "uhd graphics");
-    }
-
-    private static bool ContainsAny(string value, params string[] tokens)
-    {
-        return tokens.Any(value.Contains);
-    }
-
     private static bool TryGetNodeMajorVersion(string? output, out int version)
     {
         version = 0;
@@ -1215,6 +1047,7 @@ public class ServerManager
             ["IMPORT_ENABLED"] = settings.ImportEnabled ? "true" : "false",
             ["FFMPEG_DIR"] = settings.FfmpegDir,
             ["TRANSCODE_ACCEL"] = settings.TranscodeAccel,
+            ["TRANSCODE_HW_DEVICE"] = settings.TranscodeHwDevice,
             ["ANILIST_CLIENT_ID"] = settings.AnilistClientId,
             ["ANILIST_CLIENT_SECRET"] = settings.AnilistClientSecret
         };
@@ -1389,7 +1222,6 @@ public class ServerManager
 
     private sealed record CommandResult(int ExitCode, string Output, string Error);
 
-    private sealed record HardwareDetectionInfo(string GpuInfo, string CpuInfo);
 
     [Flags]
     private enum JobObjectLimitFlags : uint

@@ -16,12 +16,14 @@ public partial class SetupWindow : Window
     public event Action<AppSettings>? OnSetupComplete;
     private readonly AppSettings? _initialSettings;
     private bool _isSetupComplete;
+    private bool _catalogModeForced;
 
     public SetupWindow()
     {
         AvaloniaXamlLoader.Load(this);
         UpdateFileProcessingState();
         ValidateForm();
+        RefreshCatalogModeLockAsync();
     }
 
     public SetupWindow(AppSettings settings)
@@ -31,6 +33,7 @@ public partial class SetupWindow : Window
         PopulateForm(settings);
         UpdateFileProcessingState();
         ValidateForm();
+        RefreshCatalogModeLockAsync();
     }
 
     private void OnInputChanged(object? sender, TextChangedEventArgs e)
@@ -40,6 +43,12 @@ public partial class SetupWindow : Window
 
     private void OnDisableFileProcessingChanged(object? sender, RoutedEventArgs e)
     {
+        if (_catalogModeForced)
+        {
+            SetCatalogModeForced(true);
+            return;
+        }
+
         UpdateFileProcessingState();
         ValidateForm();
     }
@@ -157,9 +166,10 @@ public partial class SetupWindow : Window
             BaseUrl = GetTextBoxValue("BaseUrlBox"),
             InputFolderPath = GetTextBoxValue("InputFolderBox"),
             OutputFolderPath = GetTextBoxValue("OutputFolderBox"),
-            ImportEnabled = !IsFileProcessingDisabled(),
+            ImportEnabled = !_catalogModeForced && !IsFileProcessingDisabled(),
             FfmpegDir = _initialSettings?.FfmpegDir ?? "",
             TranscodeAccel = _initialSettings?.TranscodeAccel ?? "cpu",
+            TranscodeHwDevice = _initialSettings?.TranscodeHwDevice ?? "",
             AnilistClientId = GetTextBoxValue("ClientIdBox"),
             AnilistClientSecret = GetTextBoxValue("ClientSecretBox"),
             BunPath = _initialSettings?.BunPath ?? ""
@@ -183,7 +193,42 @@ public partial class SetupWindow : Window
 
     private bool IsFileProcessingDisabled()
     {
-        return this.FindControl<CheckBox>("DisableFileProcessingBox")?.IsChecked == true;
+        return _catalogModeForced || this.FindControl<CheckBox>("DisableFileProcessingBox")?.IsChecked == true;
+    }
+
+    private async void RefreshCatalogModeLockAsync()
+    {
+        try
+        {
+            var detection = await HardwareAccelerationDetector.DetectAsync(_initialSettings?.FfmpegDir, !string.IsNullOrWhiteSpace(_initialSettings?.FfmpegDir));
+            SetCatalogModeForced(detection.Av1ImportAcceleration == null);
+        }
+        catch
+        {
+            SetCatalogModeForced(true);
+        }
+    }
+
+    private void SetCatalogModeForced(bool forced)
+    {
+        _catalogModeForced = forced;
+
+        var disableFileProcessingBox = this.FindControl<CheckBox>("DisableFileProcessingBox");
+        var container = this.FindControl<Border>("DisableFileProcessingContainer");
+
+        if (disableFileProcessingBox != null)
+        {
+            disableFileProcessingBox.IsChecked = forced || disableFileProcessingBox.IsChecked == true;
+            disableFileProcessingBox.IsEnabled = !forced;
+        }
+
+        if (container != null && forced)
+        {
+            ToolTip.SetTip(container, HardwareAccelerationDetector.Av1CatalogModeTooltip);
+        }
+
+        UpdateFileProcessingState();
+        ValidateForm();
     }
 
     private void UpdateFileProcessingState()

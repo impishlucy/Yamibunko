@@ -6,14 +6,29 @@ import { z } from "zod"
 import { defaultSpoilerSettings, type SafeSettings } from "@/lib/types"
 import { normalizeBaseUrl } from "@/server/http/baseUrl"
 
-export type TranscodeAcceleration = "nvenc" | "qsv" | "amd" | "cpu"
+export type TranscodeAcceleration =
+  | "nvenc"
+  | "intel_gpu"
+  | "intel_cpu"
+  | "amd_gpu"
+  | "amd_cpu"
+  | "cpu"
+export type FileEncodeAcceleration = Exclude<TranscodeAcceleration, "cpu">
 
 const serverConfigSchema = z.object({
   FFMPEG_DIR: z.string().trim().min(1),
   ANIME_INPUT_DIR: z.string().trim().min(1),
   ANIME_MEDIA_DIR: z.string().trim().optional(),
   IMPORT_ENABLED: z.enum(["true", "false"]).default("true"),
-  TRANSCODE_ACCEL: z.enum(["nvenc", "qsv", "amd", "cpu"]),
+  TRANSCODE_ACCEL: z.enum([
+    "nvenc",
+    "intel_gpu",
+    "intel_cpu",
+    "amd_gpu",
+    "amd_cpu",
+    "cpu",
+  ]),
+  TRANSCODE_HW_DEVICE: z.string().trim().optional(),
   ANILIST_CLIENT_ID: z.string().trim().optional(),
   ANILIST_CLIENT_SECRET: z.string().trim().optional(),
   BASE_URL: z.url(),
@@ -35,6 +50,7 @@ export type ServerConfig = {
   tempDir: string
   importEnabled: boolean
   transcodeAccel: TranscodeAcceleration
+  transcodeHwDevice?: string
   anilistClientId?: string
   anilistClientSecret?: string
   baseUrl: string
@@ -46,6 +62,21 @@ type ConfigResult =
 
 let cachedConfig: ServerConfig | undefined
 let cachedIssues: string[] | undefined
+
+
+export function normalizeTranscodeAccelerationValue(value: string) {
+  const normalized = value.trim().toLowerCase()
+
+  if (normalized === "qsv" || normalized === "intel") {
+    return "intel_gpu"
+  }
+
+  if (normalized === "amd") {
+    return "amd_gpu"
+  }
+
+  return normalized
+}
 
 function cleanPath(value: string) {
   return value.trim().replace(/^['"]|['"]$/g, "")
@@ -83,8 +114,9 @@ function readEnvironment() {
       ? process.env.IMPORT_ENABLED.trim().toLowerCase()
       : "true",
     TRANSCODE_ACCEL: process.env.TRANSCODE_ACCEL
-      ? process.env.TRANSCODE_ACCEL.trim().toLowerCase()
+      ? normalizeTranscodeAccelerationValue(process.env.TRANSCODE_ACCEL)
       : undefined,
+    TRANSCODE_HW_DEVICE: process.env.TRANSCODE_HW_DEVICE,
     ANILIST_CLIENT_ID: process.env.ANILIST_CLIENT_ID,
     ANILIST_CLIENT_SECRET: process.env.ANILIST_CLIENT_SECRET,
     BASE_URL: process.env.BASE_URL ?? process.env.APP_BASE_URL,
@@ -102,6 +134,9 @@ function mapConfig(env: z.infer<typeof serverConfigSchema>): ServerConfig {
     tempDir: getDefaultTempDir(),
     importEnabled: env.IMPORT_ENABLED === "true",
     transcodeAccel: env.TRANSCODE_ACCEL,
+    transcodeHwDevice: env.TRANSCODE_HW_DEVICE
+      ? cleanPath(env.TRANSCODE_HW_DEVICE)
+      : undefined,
     anilistClientId: env.ANILIST_CLIENT_ID
       ? cleanPath(env.ANILIST_CLIENT_ID)
       : undefined,

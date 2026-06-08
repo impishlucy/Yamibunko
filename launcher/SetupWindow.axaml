@@ -31,7 +31,7 @@
             <TextBlock Text="AniList Client Secret (Optional)" Foreground="#D4D4D8"/>
             <TextBox Name="ClientSecretBox" PlaceholderText="Client Secret" PasswordChar="*" TextChanged="OnInputChanged"/>
 
-            <CheckBox Name="DisableFileProcessingBox" IsChecked="False" Click="OnDisableFileProcessingChanged">
+            <Border Name="DisableFileProcessingContainer">
                 <ToolTip.Tip>
                     <Border Width="310" Padding="4" Background="#18181B" BorderBrush="#7C3AED" BorderThickness="1" CornerRadius="8">
                         <StackPanel Spacing="6">
@@ -41,8 +41,10 @@
                         </StackPanel>
                     </Border>
                 </ToolTip.Tip>
-                <TextBlock Text="Disable file processing ⓘ"/>
-            </CheckBox>
+                <CheckBox Name="DisableFileProcessingBox" IsChecked="False" Click="OnDisableFileProcessingChanged">
+                    <TextBlock Text="Disable file processing ⓘ"/>
+                </CheckBox>
+            </Border>
 
             <Button Name="SaveButton" Content="Save &amp; Start Server" Click="SaveButton_Click" IsEnabled="False" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Margin="0,20,0,0"/>
         </StackPanel>

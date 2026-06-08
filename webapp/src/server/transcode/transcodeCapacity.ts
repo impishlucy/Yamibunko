@@ -68,6 +68,14 @@ let queueRetryTimer: ReturnType<typeof setTimeout> | null = null
 let drainingQueue = false
 const pendingTranscodes: PendingTranscodeRequest[] = []
 
+function isIntelAcceleration(acceleration: TranscodeAcceleration) {
+  return acceleration === "intel_gpu" || acceleration === "intel_cpu"
+}
+
+function isAmdAcceleration(acceleration: TranscodeAcceleration) {
+  return acceleration === "amd_gpu" || acceleration === "amd_cpu"
+}
+
 function availableParallelism() {
   return Math.max(os.availableParallelism?.() ?? os.cpus().length ?? 1, 1)
 }
@@ -251,13 +259,13 @@ async function getHardwarePressureSnapshot(
           pressure: getCpuPressure(),
           source: "cpu-fallback",
         })
-      : acceleration === "amd"
+      : isAmdAcceleration(acceleration)
         ? ((await getWindowsGpuPressureSnapshot()) ??
           amdLinuxPressureSnapshot() ?? {
             pressure: getCpuPressure(),
             source: "cpu-fallback",
           })
-        : acceleration === "qsv"
+        : isIntelAcceleration(acceleration)
           ? ((await getWindowsGpuPressureSnapshot()) ??
             intelLinuxPressureSnapshot() ?? {
               pressure: getCpuPressure(),
@@ -356,7 +364,7 @@ async function getCanFitTranscode(kind: TranscodeKind) {
 
   const acceleration = result.config.transcodeAccel
 
-  if (acceleration === "cpu") {
+  if (acceleration === "cpu" && kind === "import-video") {
     return false
   }
 
@@ -454,10 +462,6 @@ async function getDynamicLiveCapacity() {
   }
 
   const acceleration = result.config.transcodeAccel
-
-  if (acceleration === "cpu") {
-    return 0
-  }
 
   const snapshot = await getHardwarePressureSnapshot(acceleration)
   const liveCost = getTranscodeCost(acceleration, "live")
@@ -575,14 +579,6 @@ export function acquireLiveTranscode(
   signal?: AbortSignal,
   options?: { isVip?: boolean }
 ) {
-  const result = getServerConfigResult()
-
-  if (result.ok && result.config.transcodeAccel === "cpu") {
-    return Promise.reject(
-      new Error("Live transcoding is disabled when TRANSCODE_ACCEL=cpu")
-    )
-  }
-
   return acquireQueuedTranscode({
     label,
     kind: "live",

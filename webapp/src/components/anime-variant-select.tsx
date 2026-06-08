@@ -2,28 +2,92 @@
 
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
 
-import { animeVariantSecondTitle } from "@/lib/anime-title"
+import { animeVariantSecondTitle, getAnimeTitleSuffix } from "@/lib/anime-title"
 import type { AnimeVariant } from "@/lib/types"
 
 function seasonLabel(seasonNumber?: number) {
   return `Season ${String(seasonNumber ?? 1).padStart(2, "0")}`
 }
 
+function shortSeasonLabel(seasonNumber?: number) {
+  return `S${seasonNumber ?? 1}`
+}
+
+function normalizeTitle(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/&/g, "and")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function isSameOrSeasonOnlyTitle(input: {
+  libraryTitle: string
+  mediaTitle: string
+  seasonNumber?: number
+}) {
+  const libraryTitle = normalizeTitle(input.libraryTitle)
+  const mediaTitle = normalizeTitle(input.mediaTitle)
+
+  if (!libraryTitle || !mediaTitle) {
+    return false
+  }
+
+  if (libraryTitle === mediaTitle) {
+    return true
+  }
+
+  if (!input.seasonNumber || !mediaTitle.startsWith(`${libraryTitle} `)) {
+    return false
+  }
+
+  const suffix = mediaTitle.slice(libraryTitle.length + 1)
+  const seasonOnlyPattern = new RegExp(
+    String.raw`^(?:season\s*0*${input.seasonNumber}|s\s*0*${input.seasonNumber})(?:\s*(?:part|cour|pt|p)\s*0*\d{1,2})?$`,
+    "i"
+  )
+
+  return seasonOnlyPattern.test(suffix)
+}
+
 function variantLabel(variant: AnimeVariant, libraryTitle: string) {
-  const subtitle = animeVariantSecondTitle({
+  const title = animeVariantSecondTitle({
     libraryTitle,
     mediaTitle: variant.title,
   })
 
   if (variant.format === "MOVIE") {
-    return `[Movie] ${subtitle}`
+    return `[Movie] ${title}`
   }
 
   if (variant.format === "SPECIAL" || variant.format === "OVA") {
-    return `[Special] ${subtitle}`
+    return `[Special] ${title}`
   }
 
-  return `[Series] ${subtitle || seasonLabel(variant.seasonNumber)}`
+  const titleSuffix = getAnimeTitleSuffix({
+    libraryTitle,
+    mediaTitle: variant.title,
+  })
+  const seasonNumber = variant.seasonNumber ?? 1
+  const hasSeasonPrefix = seasonNumber > 1
+  const seriesTitle = titleSuffix ?? title
+
+  if (hasSeasonPrefix) {
+    const isSeasonOnlyTitle = isSameOrSeasonOnlyTitle({
+      libraryTitle,
+      mediaTitle: seriesTitle,
+      seasonNumber,
+    })
+
+    if (!seriesTitle || isSeasonOnlyTitle) {
+      return `[Series] ${shortSeasonLabel(seasonNumber)}`
+    }
+
+    return `[Series] ${shortSeasonLabel(seasonNumber)} - ${seriesTitle}`
+  }
+
+  return `[Series] ${seriesTitle || seasonLabel(variant.seasonNumber)}`
 }
 
 export function AnimeVariantSelect({

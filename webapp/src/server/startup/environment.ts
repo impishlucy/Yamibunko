@@ -1,6 +1,15 @@
 import { existsSync, readFileSync, statSync } from "node:fs"
 import path from "node:path"
 
+import {
+  av1HardwareUnsupportedMessage,
+  detectHardwareAcceleration,
+  type HardwareAcceleration,
+} from "@/server/startup/hardwareAcceleration"
+import {
+  normalizeTranscodeAccelerationValue,
+  type TranscodeAcceleration,
+} from "@/server/config"
 import { normalizeBaseUrl } from "@/server/http/baseUrl"
 
 const baseRequiredEnvironmentKeys = [
@@ -26,6 +35,7 @@ const launcherAliases = new Map<string, string>([
   ["FFMPEG_DIR", "FFMPEG_DIR"],
   ["FFMPEG_BIN_DIR", "FFMPEG_DIR"],
   ["TRANSCODE_ACCEL", "TRANSCODE_ACCEL"],
+  ["TRANSCODE_HW_DEVICE", "TRANSCODE_HW_DEVICE"],
   ["IMPORT_ENABLED", "IMPORT_ENABLED"],
   ["ANILIST_CLIENT_ID", "ANILIST_CLIENT_ID"],
   ["ANILIST_CLIENT_SECRET", "ANILIST_CLIENT_SECRET"],
@@ -40,6 +50,7 @@ const requiredCanonicalKeys = new Set<string>([
 const loggedEnvironmentKeys = [
   ...baseRequiredEnvironmentKeys,
   ...importRequiredEnvironmentKeys,
+  "TRANSCODE_HW_DEVICE",
   "IMPORT_ENABLED",
   "ANILIST_CLIENT_ID",
   "ANILIST_CLIENT_SECRET",
@@ -148,7 +159,11 @@ function normalizeTranscodeAcceleration() {
   const value = process.env.TRANSCODE_ACCEL
 
   if (value) {
-    process.env.TRANSCODE_ACCEL = cleanValue(value).toLowerCase()
+    process.env.TRANSCODE_ACCEL = normalizeTranscodeAccelerationValue(cleanValue(value))
+  }
+
+  if (process.env.TRANSCODE_HW_DEVICE) {
+    process.env.TRANSCODE_HW_DEVICE = cleanValue(process.env.TRANSCODE_HW_DEVICE)
   }
 }
 
@@ -165,6 +180,22 @@ function normalizeImportEnabled() {
 
 function isImportEnabled() {
   return process.env.IMPORT_ENABLED !== "false"
+}
+
+function getSelectedAv1HardwareAcceleration(): HardwareAcceleration | null {
+  const value = process.env.TRANSCODE_ACCEL
+
+  if (
+    value === "nvenc" ||
+    value === "intel_gpu" ||
+    value === "intel_cpu" ||
+    value === "amd_gpu" ||
+    value === "amd_cpu"
+  ) {
+    return value as Exclude<TranscodeAcceleration, "cpu">
+  }
+
+  return null
 }
 
 function getRequiredEnvironmentKeys() {
@@ -322,18 +353,26 @@ export function bootstrapEnvironment() {
   }
 
   if (
-    !["nvenc", "qsv", "amd", "cpu"].includes(process.env.TRANSCODE_ACCEL ?? "")
+    ![
+      "nvenc",
+      "intel_gpu",
+      "intel_cpu",
+      "amd_gpu",
+      "amd_cpu",
+      "cpu",
+    ].includes(process.env.TRANSCODE_ACCEL ?? "")
   ) {
     console.error(
       `[Error] [Startup] TRANSCODE_ACCEL validation failed - environment.ts - ${process.env.TRANSCODE_ACCEL}`
     )
     throw new Error(
-      "CRITICAL STARTUP ERROR: TRANSCODE_ACCEL must be one of nvenc, qsv, amd, or cpu."
+      "CRITICAL STARTUP ERROR: TRANSCODE_ACCEL must be one of nvenc, intel_gpu, intel_cpu, amd_gpu, amd_cpu, or cpu."
     )
   }
 
   if (
-    process.env.TRANSCODE_ACCEL === "amd" &&
+    (process.env.TRANSCODE_ACCEL === "amd_gpu" ||
+      process.env.TRANSCODE_ACCEL === "amd_cpu") &&
     process.platform !== "win32" &&
     process.platform !== "linux"
   ) {
@@ -364,6 +403,48 @@ export function bootstrapEnvironment() {
   assertExistingDirectory("FFmpeg binary folder", ffmpegDir)
   assertExistingFile("FFmpeg", path.join(ffmpegDir, executableName("ffmpeg")))
   assertExistingFile("FFprobe", path.join(ffmpegDir, executableName("ffprobe")))
+
+  if (loadedDotEnv && !hadRuntimeEnvironment && !appliedLauncherParameters) {
+    const acceleration = detectHardwareAcceleration({
+      ffmpegDir,
+      probeEncoders: true,
+      av1AccelerationFilter: isImportEnabled()
+        ? getSelectedAv1HardwareAcceleration()
+        : undefined,
+    })
+
+    if (isImportEnabled()) {
+      if (!acceleration.av1ImportAcceleration) {
+        console.error(`[Error] [Startup] ${av1HardwareUnsupportedMessage}`)
+        throw new Error(av1HardwareUnsupportedMessage)
+      }
+
+      process.env.TRANSCODE_ACCEL = acceleration.av1ImportAcceleration
+      process.env.TRANSCODE_HW_DEVICE = acceleration.av1ImportDevice ?? ""
+    } else {
+      process.env.TRANSCODE_ACCEL = acceleration.liveTranscodeAcceleration
+      process.env.TRANSCODE_HW_DEVICE = acceleration.liveTranscodeDevice ?? ""
+    }
+
+    console.log(
+      `[Info] [Startup] Hardware acceleration selected - Requested: ${
+        process.env.TRANSCODE_ACCEL ?? "unknown"
+      }, Import AV1: ${acceleration.av1ImportAcceleration ?? "unsupported"}${
+        acceleration.av1ImportDevice ? ` (${acceleration.av1ImportDevice})` : ""
+      }, Live transcode: ${acceleration.liveTranscodeAcceleration}${
+        acceleration.liveTranscodeDevice ? ` (${acceleration.liveTranscodeDevice})` : ""
+      }`
+    )
+  }
+
+  if (isImportEnabled() && process.env.TRANSCODE_ACCEL === "cpu") {
+    console.error(
+      "[Error] [Startup] CPU AV1 encoding is unsupported while import mode is enabled - environment.ts"
+    )
+    throw new Error(
+      "CRITICAL STARTUP ERROR: CPU AV1 encoding is not supported. Use hardware AV1 encoding or disable import mode."
+    )
+  }
 
   console.log("[Info] [Startup] Validated startup configuration.")
 

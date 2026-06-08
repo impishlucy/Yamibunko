@@ -27,6 +27,7 @@ public class AppSettings
     public bool ImportEnabled { get; set; } = true;
     public string FfmpegDir { get; set; } = "";
     public string TranscodeAccel { get; set; } = "cpu";
+    public string TranscodeHwDevice { get; set; } = "";
     public string AnilistClientId { get; set; } = "";
     public string AnilistClientSecret { get; set; } = "";
     public string BunPath { get; set; } = "";
