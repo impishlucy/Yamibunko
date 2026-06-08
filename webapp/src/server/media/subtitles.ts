@@ -1,7 +1,6 @@
-import { readFile } from "node:fs/promises"
+import { constants } from "node:fs"
+import { access, open } from "node:fs/promises"
 import path from "node:path"
-
-import { pathExists } from "@/server/media/mediaFiles"
 
 export const subtitleSidecarExtensions = [".vtt", ".ass", ".ssa", ".srt"] as const
 
@@ -164,11 +163,23 @@ export function isSubtitleSidecarFile(filePath: string) {
   return subtitleSidecarExtensions.includes(extension as SubtitleSidecarExtension)
 }
 
+async function pathExists(filePath: string) {
+  try {
+    await access(filePath, constants.F_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
 export async function findSubtitleSidecar(mediaFilePath: string) {
   const parsed = path.parse(mediaFilePath)
 
   for (const extension of subtitleSidecarExtensions) {
-    const candidate = path.join(parsed.dir, `${parsed.name}${extension}`)
+    const candidate = path.format({
+      dir: parsed.dir,
+      base: `${parsed.name}${extension}`,
+    })
 
     if (await pathExists(candidate)) {
       return {
@@ -187,6 +198,12 @@ export async function readWebVttSidecar(sidecar: SubtitleSidecar) {
     throw new Error(`Subtitle sidecar is not WebVTT: ${sidecar.filePath}`)
   }
 
-  const value = await readFile(sidecar.filePath, "utf8")
-  return value.replace(/^\uFEFF/, "")
+  const file = await open(sidecar.filePath, "r")
+
+  try {
+    const value = await file.readFile({ encoding: "utf8" })
+    return value.replace(/^\uFEFF/, "")
+  } finally {
+    await file.close()
+  }
 }

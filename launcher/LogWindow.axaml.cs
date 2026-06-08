@@ -5,6 +5,7 @@ using Avalonia.Threading;
 using Avalonia.Interactivity;
 using System;
 using System.Collections.ObjectModel;
+using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Diagnostics;
 using System.Text;
@@ -17,6 +18,8 @@ public partial class LogWindow : Window
     private const double BottomScrollThreshold = 6;
 
     private readonly StringBuilder _logText = new();
+    private readonly object _pendingLogLock = new();
+    private readonly List<string> _pendingLogLines = new();
     private Func<Task>? _stopServerAndExitAsync;
     private Action? _openInBrowser;
     private TextBox? _logTextBox;
@@ -27,6 +30,7 @@ public partial class LogWindow : Window
     private bool _autoScrollToBottom = true;
     private bool _isProgrammaticScroll;
     private bool _pendingAutoScrollToBottom;
+    private bool _pendingLogFlushQueued;
     private double _lastScrollOffsetY;
     private double _lastScrollExtentHeight;
 
@@ -58,16 +62,7 @@ public partial class LogWindow : Window
                 return;
             }
 
-            Dispatcher.UIThread.Post(() =>
-            {
-                foreach (var item in e.NewItems)
-                {
-                    if (item is string line)
-                    {
-                        AppendLogLine(line);
-                    }
-                }
-            });
+            QueueLogLines(e.NewItems);
         };
     }
 
@@ -137,6 +132,43 @@ public partial class LogWindow : Window
         ScrollToEnd();
     }
 
+    private void QueueLogLines(System.Collections.IList lines)
+    {
+        lock (_pendingLogLock)
+        {
+            foreach (var item in lines)
+            {
+                if (item is string line)
+                {
+                    _pendingLogLines.Add(line);
+                }
+            }
+
+            if (_pendingLogFlushQueued || _pendingLogLines.Count == 0)
+            {
+                return;
+            }
+
+            _pendingLogFlushQueued = true;
+        }
+
+        Dispatcher.UIThread.Post(FlushPendingLogLines, DispatcherPriority.Background);
+    }
+
+    private void FlushPendingLogLines()
+    {
+        List<string> lines;
+
+        lock (_pendingLogLock)
+        {
+            lines = new List<string>(_pendingLogLines);
+            _pendingLogLines.Clear();
+            _pendingLogFlushQueued = false;
+        }
+
+        AppendLogLines(lines);
+    }
+
     private void ClearDisplayedLogs()
     {
         _logText.Clear();
@@ -160,12 +192,25 @@ public partial class LogWindow : Window
 
     private void AppendLogLine(string line, bool scrollToEnd = true)
     {
-        if (_logText.Length > 0)
+        AppendLogLines(new[] { line }, scrollToEnd);
+    }
+
+    private void AppendLogLines(IReadOnlyList<string> lines, bool scrollToEnd = true)
+    {
+        if (lines.Count == 0)
         {
-            _logText.AppendLine();
+            return;
         }
 
-        _logText.Append(line);
+        foreach (var line in lines)
+        {
+            if (_logText.Length > 0)
+            {
+                _logText.AppendLine();
+            }
+
+            _logText.Append(line);
+        }
 
         if (_logTextBox == null)
         {

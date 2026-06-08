@@ -259,7 +259,7 @@ public class ServerManager
             if (_stopServerTask == null)
             {
                 var processToStop = _activeManagedProcess ?? _serverProcess;
-                _stopServerTask = StopServerCoreAsync(processToStop);
+                _stopServerTask = Task.Run(async () => await StopServerCoreAsync(processToStop).ConfigureAwait(false));
                 createdTask = true;
             }
 
@@ -283,7 +283,7 @@ public class ServerManager
             if (process != null)
             {
                 var isServerProcess = IsServerProcess(process);
-                await StopProcessTreeAsync(process, isServerProcess);
+                await StopProcessTreeAsync(process, isServerProcess).ConfigureAwait(false);
             }
             else
             {
@@ -787,19 +787,18 @@ public class ServerManager
             }
 
             Log("Requesting graceful shutdown...");
-            await RequestGracefulShutdownAsync(process);
+            await RequestGracefulShutdownAsync(process).ConfigureAwait(false);
 
             if (waitForServerShutdown)
             {
                 Log("Waiting for the server to finish active work...");
-                await process.WaitForExitAsync();
-                process.WaitForExit();
+                await process.WaitForExitAsync().ConfigureAwait(false);
                 Log("Server process stopped gracefully.");
             }
             else
             {
                 Log("Waiting for the active startup command to stop...");
-                await WaitForExitOrKillAsync(process, TimeSpan.FromSeconds(10));
+                await WaitForExitOrKillAsync(process, TimeSpan.FromSeconds(10)).ConfigureAwait(false);
                 Log("Startup command stopped.");
             }
         }
@@ -822,11 +821,11 @@ public class ServerManager
                 return;
             }
 
-            await RunSignalCommandAsync("taskkill", $"/PID {process.Id} /T");
+            await RunSignalCommandAsync("taskkill", $"/PID {process.Id} /T").ConfigureAwait(false);
             return;
         }
 
-        await RunSignalCommandAsync("kill", $"-SIGINT {process.Id}");
+        await RunSignalCommandAsync("kill", $"-SIGINT {process.Id}").ConfigureAwait(false);
     }
 
     private async Task RunSignalCommandAsync(string fileName, string arguments)
@@ -841,7 +840,7 @@ public class ServerManager
 
         if (signalProcess != null)
         {
-            await signalProcess.WaitForExitAsync();
+            await signalProcess.WaitForExitAsync().ConfigureAwait(false);
         }
     }
 
@@ -991,8 +990,7 @@ public class ServerManager
 
         try
         {
-            await process.WaitForExitAsync(cancellation.Token);
-            process.WaitForExit();
+            await process.WaitForExitAsync(cancellation.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -1007,14 +1005,12 @@ public class ServerManager
 
         try
         {
-            await process.WaitForExitAsync(cancellation.Token);
-            process.WaitForExit();
+            await process.WaitForExitAsync(cancellation.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
             TryKill(process);
-            await process.WaitForExitAsync();
-            process.WaitForExit();
+            await process.WaitForExitAsync().ConfigureAwait(false);
         }
     }
 
