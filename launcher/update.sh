@@ -243,6 +243,8 @@ fi
 printf "Updating files...\n"
 cp -a "$source_dir"/. "$install_dir"/ || fail "Could not copy the updated files."
 
+printf "Clearing cached webapp build...\n"
+rm -rf "$webapp_dir/.next" || fail "Could not remove webapp/.next. Close any remaining process and run the updater again."
 
 printf "Update done.\n"
 wait_before_exit

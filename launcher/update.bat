@@ -213,6 +213,13 @@ function Copy-ReleaseFiles($sourcePath, $destinationPath) {
     }
 }
 
+function Remove-WebappBuildCache($webappPath) {
+    $buildCachePath = [System.IO.Path]::Combine($webappPath, ".next")
+
+    if (Test-Path -LiteralPath $buildCachePath) {
+        Remove-Item -LiteralPath $buildCachePath -Recurse -Force
+    }
+}
 
 $runningProcess = Get-RunningYamibunkoProcess
 if ($null -ne $runningProcess) {
@@ -271,6 +278,9 @@ try {
 
     Write-Host "Updating files..."
     Copy-ReleaseFiles $sourceRoot $installRoot
+
+    Write-Host "Clearing cached webapp build..."
+    Remove-WebappBuildCache $webappRoot
 
     Write-Host "Update done."
     exit 0
