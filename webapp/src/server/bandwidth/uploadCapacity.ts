@@ -27,7 +27,7 @@ const uploadMeasurementBytes = 4e7
 
 const uploadEndpoint = "https://speed.cloudflare.com/__up"
 const requestTimeoutMs = 120_000
-const usableUploadCapacityFactor = 0.9
+const usableUploadCapacityFactor = 0.95
 const measuredUploadEnvName = "YAMIBUNKO_MEASURED_UPLOAD_BPS"
 const globalUploadCapacity = globalThis as typeof globalThis & {
   __yamibunkoUploadCapacityStore?: UploadCapacityStore
