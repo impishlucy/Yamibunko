@@ -67,7 +67,8 @@ If the web UI does not open automatically, check the launcher log window.
 AniList features require an [AniList API client](https://anilist.co/settings/developer). Configure the client redirect URL to match the Yamibunko callback URL:
 
 ```text
-http://localhost:3000/api/anilist/oauth/callback
+Examples:
+http://192.168.1.10:3000/api/anilist/oauth/callback
 https://your-domain.example/api/anilist/oauth/callback
 ```
 
