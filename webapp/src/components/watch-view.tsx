@@ -7,6 +7,10 @@ import { AnimePlayer } from "@/components/anime-player"
 import { StreamLimitDialog } from "@/components/stream-limit-dialog"
 import { Skeleton } from "@/components/ui/skeleton"
 import { apiGet } from "@/lib/api"
+import {
+  formatSeasonPartLabel,
+  parseSeasonPartFromText,
+} from "@/lib/media-labels"
 import { DEFAULT_PLAYER_ASPECT_RATIO, getPreferredPlayerAspectRatio } from "@/lib/player-aspect-ratio"
 import type { Episode, WatchPayload } from "@/lib/types"
 
@@ -274,6 +278,11 @@ export function WatchView({
     payload.media.videoHeight
   )
   const playerStyle = getPhoneLandscapePlayerStyle(playerAspectRatio, viewportSize)
+  const episodeSeasonPart =
+    parseSeasonPartFromText(payload.episode.fileName) ??
+    parseSeasonPartFromText(payload.episode.filePath) ??
+    { season: payload.episode.seasonNumber }
+  const episodeSeasonLabel = formatSeasonPartLabel(episodeSeasonPart)
 
   return (
     <div className="yami-watch-view flex flex-col gap-4 lg:gap-6">
@@ -285,7 +294,7 @@ export function WatchView({
           •
         </h1>
         <h1 className="min-w-0 truncate text-xl font-semibold text-zinc-50">
-          Season {String(payload.episode.seasonNumber).padStart(2, "0")}
+          {episodeSeasonLabel}
         </h1>
         <h1 className="min-w-0 truncate text-xl font-semibold text-zinc-50">
           -

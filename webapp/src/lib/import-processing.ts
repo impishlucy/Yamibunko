@@ -17,6 +17,8 @@ export type MediaImportProcessingItem = {
   subtitle?: string | null
   seasonNumber: number
   episodeNumber: number
+  displaySeasonLabel?: string | null
+  displayEpisodeLabel?: string | null
   fileName: string
   queuedAt: string
   startedAt?: string | null

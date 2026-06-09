@@ -9,6 +9,7 @@ import { Clock3, PlayCircle } from "lucide-react"
 import { StreamLimitDialog } from "@/components/stream-limit-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent } from "@/components/ui/card"
+import { getEpisodeBadgeLabel } from "@/lib/media-labels"
 import { cn } from "@/lib/utils"
 import {
   defaultSpoilerSettings,
@@ -89,6 +90,12 @@ export function EpisodeCard({
   const displayTitle = shouldHideTitle
     ? fallbackEpisodeTitle(episode)
     : episode.title ?? episode.fileName
+  const episodeBadgeLabel = getEpisodeBadgeLabel({
+    fileName: episode.fileName,
+    filePath: episode.filePath,
+    seasonNumber: episode.seasonNumber,
+    episodeNumber: episode.episodeNumber,
+  })
 
   async function openEpisode() {
     try {
@@ -181,8 +188,7 @@ export function EpisodeCard({
                   variant="outline"
                   className="border-violet-400/25 text-sm text-violet-200"
                 >
-                  S{String(episode.seasonNumber).padStart(2, "0")} E
-                  {String(episode.episodeNumber).padStart(2, "0")}
+                  {episodeBadgeLabel}
                 </Badge>
                 <h3 className="truncate px-2 py-0.5 text-lg font-medium text-zinc-100 lg:text-base">
                   {displayTitle}

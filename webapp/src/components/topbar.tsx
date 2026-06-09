@@ -128,7 +128,9 @@ function formatProcessingItemLabel(item: MediaImportProcessingItem) {
 }
 
 function formatProcessingItemMeta(item: MediaImportProcessingItem) {
-  const episode = `S${String(item.seasonNumber).padStart(2, "0")} E${String(item.episodeNumber).padStart(2, "0")}`
+  const episode =
+    item.displayEpisodeLabel ??
+    `S${String(item.seasonNumber).padStart(2, "0")} E${String(item.episodeNumber).padStart(2, "0")}`
 
   if (item.kind === "direct-move") {
     return `${episode} · moving`
@@ -139,7 +141,7 @@ function formatProcessingItemMeta(item: MediaImportProcessingItem) {
   }
 
   if (item.kind === "container-remux") {
-    return `${episode} · MP4 remux`
+    return `${episode} · WebM remux`
   }
 
   return `${episode} · video transcode`

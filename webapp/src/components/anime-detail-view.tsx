@@ -9,6 +9,7 @@ import { EpisodeCard } from "@/components/episode-card"
 import { MobileDescription } from "@/components/mobile-description"
 import { Badge } from "@/components/ui/badge"
 import { getAnimeTitleSuffix, animeVariantSecondTitle } from "@/lib/anime-title"
+import { getSeasonPartLabelFromTitle } from "@/lib/media-labels"
 import { apiGet } from "@/lib/api"
 import {
   clientLibraryRefreshEvent,
@@ -32,6 +33,12 @@ function selectedSubtitle(input: {
   seasonNumber?: number
 }) {
   if (isSeriesFormat(input.format)) {
+    const seasonPartLabel = getSeasonPartLabelFromTitle(input.title)
+
+    if (seasonPartLabel) {
+      return seasonPartLabel
+    }
+
     const suffix = getAnimeTitleSuffix({
       libraryTitle: input.libraryTitle,
       mediaTitle: input.title,
@@ -112,7 +119,7 @@ export function AnimeDetailView({
   const subtitle = selectedSubtitle({
     format: anime.format,
     libraryTitle: libraryEntry.title,
-    title: anime.title,
+    title: selectedVariant?.title ?? anime.title,
     seasonNumber: selectedVariant?.seasonNumber,
   })
   const episodesBySeason = useMemo(() => {

@@ -2,84 +2,74 @@
 
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
 
-import { animeVariantSecondTitle, getAnimeTitleSuffix } from "@/lib/anime-title"
+import { getAnimeTitleSuffix } from "@/lib/anime-title"
+import {
+  formatSeasonPartCompactLabel,
+  parseSeasonPartFromText,
+  type ParsedSeasonPart,
+} from "@/lib/media-labels"
 import type { AnimeVariant } from "@/lib/types"
 
-function seasonLabel(seasonNumber?: number) {
-  return `Season ${String(seasonNumber ?? 1).padStart(2, "0")}`
-}
+const numberMarkerPattern =
+  String.raw`(?:\d{1,2}|[ivx]+|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|1st|2nd|3rd|[4-9]th|10th)`
+const seasonPartSeparatorPattern = String.raw`(?:\s|[:：\-–—])*`
+const leadingSeasonPartPattern = new RegExp(
+  String.raw`^\s*(?:season|s)\s*0*\d{1,2}(?:(?:${seasonPartSeparatorPattern}(?:part|pt\.?|p|cour|c)\s*${numberMarkerPattern})|(?:${seasonPartSeparatorPattern}${numberMarkerPattern}\s*(?:cour|half)))?(?:\s*(?::|[-–—])\s*|\s+)?`,
+  "i"
+)
+const seasonPartOnlyPattern = new RegExp(
+  String.raw`^\s*(?:season|s)\s*0*\d{1,2}(?:(?:${seasonPartSeparatorPattern}(?:part|pt\.?|p|cour|c)\s*${numberMarkerPattern})|(?:${seasonPartSeparatorPattern}${numberMarkerPattern}\s*(?:cour|half)))?\s*$`,
+  "i"
+)
 
-function shortSeasonLabel(seasonNumber?: number) {
-  return `S${seasonNumber ?? 1}`
-}
-
-function normalizeTitle(value: string) {
+function cleanSubtitle(value: string) {
   return value
-    .toLowerCase()
-    .replace(/&/g, "and")
-    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/^\s*(?:[:：\-–—]+\s*)+/, "")
+    .replace(/\s*(?:[:：\-–—]+\s*)+$/, "")
     .replace(/\s+/g, " ")
     .trim()
 }
 
-function seasonPartLabelFromTitle(value: string) {
-  const normalized = normalizeTitle(value)
-    .replace(/([a-z])([0-9])/gi, "$1 $2")
-    .replace(/([0-9])([a-z])/gi, "$1 $2")
-  const match = /\b(?:season|s)\s*0*(\d{1,2})(?:\s*(?:part|cour|pt|p)\s*0*(\d{1,2}))?\b/i.exec(
-    normalized
-  )
-
-  if (!match) {
-    return null
-  }
-
-  const season = Number.parseInt(match[1] ?? "", 10)
-  const part = Number.parseInt(match[2] ?? "", 10)
-
-  if (!Number.isFinite(season) || season <= 0) {
-    return null
-  }
-
-  return Number.isFinite(part) && part > 1
-    ? `S${season} Part ${part}`
-    : `S${season}`
+function stripRedundantSeasonPartPrefix(value: string) {
+  return cleanSubtitle(value.replace(leadingSeasonPartPattern, ""))
 }
 
-function isSameOrSeasonOnlyTitle(input: {
-  libraryTitle: string
-  mediaTitle: string
-  seasonNumber?: number
-}) {
-  const libraryTitle = normalizeTitle(input.libraryTitle)
-  const mediaTitle = normalizeTitle(input.mediaTitle)
+function getSeriesSeasonPart(variant: AnimeVariant): ParsedSeasonPart {
+  const titleSeasonPart = parseSeasonPartFromText(variant.title)
 
-  if (!libraryTitle || !mediaTitle) {
-    return false
+  if (titleSeasonPart) {
+    return titleSeasonPart
   }
 
-  if (libraryTitle === mediaTitle) {
-    return true
+  return { season: variant.seasonNumber ?? 1 }
+}
+
+function getSeriesSubtitle(input: { libraryTitle: string; mediaTitle: string }) {
+  const titleSuffix = getAnimeTitleSuffix(input)
+
+  if (!titleSuffix) {
+    return null
   }
 
-  if (!input.seasonNumber || !mediaTitle.startsWith(`${libraryTitle} `)) {
-    return false
+  if (seasonPartOnlyPattern.test(titleSuffix)) {
+    return null
   }
 
-  const suffix = mediaTitle.slice(libraryTitle.length + 1)
-  const seasonOnlyPattern = new RegExp(
-    String.raw`^(?:season\s*0*${input.seasonNumber}|s\s*0*${input.seasonNumber})(?:\s*(?:part|cour|pt|p)\s*0*\d{1,2})?$`,
-    "i"
-  )
+  const strippedSubtitle = stripRedundantSeasonPartPrefix(titleSuffix)
 
-  return seasonOnlyPattern.test(suffix)
+  if (!strippedSubtitle || seasonPartOnlyPattern.test(strippedSubtitle)) {
+    return null
+  }
+
+  return strippedSubtitle
 }
 
 function variantLabel(variant: AnimeVariant, libraryTitle: string) {
-  const title = animeVariantSecondTitle({
+  const titleSuffix = getAnimeTitleSuffix({
     libraryTitle,
     mediaTitle: variant.title,
   })
+  const title = titleSuffix ?? variant.title
 
   if (variant.format === "MOVIE") {
     return `[Movie] ${title}`
@@ -89,34 +79,13 @@ function variantLabel(variant: AnimeVariant, libraryTitle: string) {
     return `[Special] ${title}`
   }
 
-  const titleSuffix = getAnimeTitleSuffix({
+  const seasonPartLabel = formatSeasonPartCompactLabel(getSeriesSeasonPart(variant))
+  const subtitle = getSeriesSubtitle({
     libraryTitle,
     mediaTitle: variant.title,
   })
-  const seasonNumber = variant.seasonNumber ?? 1
-  const hasSeasonPrefix = seasonNumber > 1
-  const seriesTitle = titleSuffix ?? title
 
-  if (hasSeasonPrefix) {
-    const titleSeasonPartLabel = seasonPartLabelFromTitle(seriesTitle)
-    const isSeasonOnlyTitle = isSameOrSeasonOnlyTitle({
-      libraryTitle,
-      mediaTitle: seriesTitle,
-      seasonNumber,
-    })
-
-    if (!seriesTitle || isSeasonOnlyTitle) {
-      return `[Series] ${titleSeasonPartLabel ?? shortSeasonLabel(seasonNumber)}`
-    }
-
-    if (titleSeasonPartLabel) {
-      return `[Series] ${titleSeasonPartLabel}`
-    }
-
-    return `[Series] ${shortSeasonLabel(seasonNumber)} - ${seriesTitle}`
-  }
-
-  return `[Series] ${seriesTitle || seasonLabel(variant.seasonNumber)}`
+  return `[Series] ${subtitle ? `${seasonPartLabel} - ${subtitle}` : seasonPartLabel}`
 }
 
 export function AnimeVariantSelect({

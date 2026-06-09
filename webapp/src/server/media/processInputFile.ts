@@ -97,6 +97,8 @@ export type DeferredInputProcessingInfo = {
   subtitle?: string | null
   seasonNumber: number
   episodeNumber: number
+  displaySeasonLabel?: string | null
+  displayEpisodeLabel?: string | null
   fileName: string
 }
 
@@ -148,8 +150,22 @@ function isSeriesFormat(format?: string | null) {
   return !format || format === "TV" || format === "TV_SHORT" || format === "ONA"
 }
 
-function seasonLabel(seasonNumber: number) {
-  return `Season ${String(seasonNumber).padStart(2, "0")}`
+function seasonLabel(seasonNumber: number, partNumber?: number) {
+  return formatSeasonFolderName(seasonNumber, partNumber)
+}
+
+function episodeBadgeLabel(input: {
+  seasonNumber: number
+  episodeNumber: number
+  partNumber?: number
+}) {
+  const season = String(input.seasonNumber).padStart(2, "0")
+  const part = input.partNumber && input.partNumber > 1
+    ? `P${String(input.partNumber).padStart(2, "0")}`
+    : ""
+  const episode = String(input.episodeNumber).padStart(2, "0")
+
+  return `S${season}${part} E${episode}`
 }
 
 function getImportProcessingSubtitle(input: {
@@ -157,6 +173,7 @@ function getImportProcessingSubtitle(input: {
   libraryTitle: string
   mediaTitle: string
   seasonNumber: number
+  partNumber?: number
 }) {
   const suffix = getAnimeTitleSuffix({
     libraryTitle: input.libraryTitle,
@@ -168,7 +185,7 @@ function getImportProcessingSubtitle(input: {
   }
 
   if (isSeriesFormat(input.format) && input.seasonNumber > 1) {
-    return seasonLabel(input.seasonNumber)
+    return seasonLabel(input.seasonNumber, input.partNumber)
   }
 
   return null
@@ -608,11 +625,12 @@ function formatDetectedEpisode(input: {
   animeTitle: string
   seasonNumber: number
   episodeNumber: number
+  partNumber?: number
   episodeTitle?: string | null
 }) {
   const episodeName = input.episodeTitle?.trim()
 
-  return `Anime: ${input.animeTitle}, Season ${input.seasonNumber}, Episode ${input.episodeNumber}${episodeName ? ` (${episodeName})` : ""}`
+  return `Anime: ${input.animeTitle}, ${seasonLabel(input.seasonNumber, input.partNumber)}, Episode ${input.episodeNumber}${episodeName ? ` (${episodeName})` : ""}`
 }
 
 async function moveFailedInputToFailedImports(
@@ -1216,7 +1234,7 @@ export async function processInputFile(
     const libraryTitle = library.title
 
     console.log(
-      `[Info] [Media] Detected input episode - ${formatDetectedEpisode({ animeTitle: libraryTitle, seasonNumber: librarySeason, episodeNumber: inputParsed.episode, episodeTitle: inputParsed.episodeTitle })} - ${fileName(filePath)}`
+      `[Info] [Media] Detected input episode - ${formatDetectedEpisode({ animeTitle: libraryTitle, seasonNumber: inputParsed.season, partNumber: inputParsed.part, episodeNumber: inputParsed.episode, episodeTitle: inputParsed.episodeTitle })} - ${fileName(filePath)}`
     )
 
     function emitEpisodeAdded() {
@@ -1313,7 +1331,7 @@ export async function processInputFile(
         })
 
       console.log(
-        `[Info] [File Import] ${input.kind === "catalog-only" ? "Scheduled" : "Added to queue"} - ${label} - ${formatDetectedEpisode({ animeTitle: libraryTitle, seasonNumber: librarySeason, episodeNumber: inputParsed.episode, episodeTitle: inputParsed.episodeTitle })} - ${fileName(filePath)}`
+        `[Info] [File Import] ${input.kind === "catalog-only" ? "Scheduled" : "Added to queue"} - ${label} - ${formatDetectedEpisode({ animeTitle: libraryTitle, seasonNumber: inputParsed.season, partNumber: inputParsed.part, episodeNumber: inputParsed.episode, episodeTitle: inputParsed.episodeTitle })} - ${fileName(filePath)}`
       )
 
       if (options.onDeferredWork) {
@@ -1437,7 +1455,7 @@ export async function processInputFile(
         emitEpisodeAdded()
 
         console.log(
-          `[Info] [Media] Database import completed - ${formatDetectedEpisode({ animeTitle: libraryTitle, seasonNumber: librarySeason, episodeNumber: inputParsed.episode, episodeTitle: inputParsed.episodeTitle })} - ${fileName(resolvedInputPath)}`
+          `[Info] [Media] Database import completed - ${formatDetectedEpisode({ animeTitle: libraryTitle, seasonNumber: inputParsed.season, partNumber: inputParsed.part, episodeNumber: inputParsed.episode, episodeTitle: inputParsed.episodeTitle })} - ${fileName(resolvedInputPath)}`
         )
 
         const message = "Input file added to the library without moving, deleting, or transcoding."
@@ -1579,10 +1597,17 @@ export async function processInputFile(
         format: inputMetadata.format,
         libraryTitle,
         mediaTitle,
-        seasonNumber: librarySeason,
+        seasonNumber: inputParsed.season,
+        partNumber: inputParsed.part,
       }),
-      seasonNumber: librarySeason,
+      seasonNumber: inputParsed.season,
       episodeNumber: inputParsed.episode,
+      displaySeasonLabel: seasonLabel(inputParsed.season, inputParsed.part),
+      displayEpisodeLabel: episodeBadgeLabel({
+        seasonNumber: inputParsed.season,
+        partNumber: inputParsed.part,
+        episodeNumber: inputParsed.episode,
+      }),
       fileName: finalName,
     }
 
@@ -1633,7 +1658,7 @@ export async function processInputFile(
     if (existingEpisodeFileExists && existingEpisode) {
       const existingPath = path.resolve(existingEpisode.filePath)
       const inputPath = path.resolve(filePath)
-      const message = `Episode already exists in the library: ${safeLibraryTitle} S${String(librarySeason).padStart(2, "0")}E${String(inputParsed.episode).padStart(2, "0")}`
+      const message = `Episode already exists in the library: ${safeLibraryTitle} ${episodeBadgeLabel({ seasonNumber: inputParsed.season, partNumber: inputParsed.part, episodeNumber: inputParsed.episode }).replace(" ", "")}`
 
       console.warn(
         `[Warn] [Media] ${message}; cleaning duplicate input if needed - ${filePath}`
@@ -1662,7 +1687,7 @@ export async function processInputFile(
 
     if (legacySeasonEpisode && (await pathExists(legacySeasonEpisode.filePath))) {
       console.warn(
-        `[Warn] [Media] Existing episode was stored under parsed Season ${inputParsed.season}; moving it to library Season ${librarySeason} - ${legacySeasonEpisode.filePath}`
+        `[Warn] [Media] Existing episode was stored under parsed ${seasonLabel(inputParsed.season, inputParsed.part)}; moving it to internal library Season ${librarySeason} - ${legacySeasonEpisode.filePath}`
       )
 
       if (finalPathExists) {
@@ -1737,7 +1762,7 @@ export async function processInputFile(
       emitEpisodeAdded()
 
       console.log(
-        `[Info] [Media] Database import completed - ${formatDetectedEpisode({ animeTitle: libraryTitle, seasonNumber: librarySeason, episodeNumber: importEpisodeNumber, episodeTitle: inputParsed.episodeTitle })} - ${fileName(finalPath)}`
+        `[Info] [Media] Database import completed - ${formatDetectedEpisode({ animeTitle: libraryTitle, seasonNumber: inputParsed.season, partNumber: inputParsed.part, episodeNumber: importEpisodeNumber, episodeTitle: inputParsed.episodeTitle })} - ${fileName(finalPath)}`
       )
       debugImport(jobId, "Episode row saved.")
 

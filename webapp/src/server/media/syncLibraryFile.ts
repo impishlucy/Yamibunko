@@ -12,6 +12,7 @@ import { getServerConfig } from "@/server/config"
 import { ffprobe } from "@/server/media/ffmpeg"
 import {
   getAnimeMetadataLookupSeason,
+  formatSeasonFolderName,
   getFolderTitleFallbackCandidates,
   parseAnimeFilePath,
   parseSeasonPartMarker,
@@ -142,6 +143,33 @@ function parseSeasonFolder(value: string) {
   return marker
 }
 
+
+function formatLibraryEpisodeLabel(input: {
+  season: number
+  episode: number
+  part?: number
+}) {
+  return `${formatSeasonFolderName(input.season, input.part)}, Episode ${input.episode}`
+}
+
+function formatDeletedEpisodeLabel(input: {
+  filePath: string
+  seasonNumber: number
+  episodeNumber: number
+}) {
+  const parsed = parseLibraryPath(input.filePath)
+
+  if (parsed) {
+    return formatLibraryEpisodeLabel({
+      season: parsed.season,
+      part: parsed.part,
+      episode: parsed.episode,
+    })
+  }
+
+  return `Season ${input.seasonNumber}, Episode ${input.episodeNumber}`
+}
+
 function parseLibraryPath(filePath: string): ParsedLibraryPath | null {
   const root = path.resolve(getServerConfig().mediaDir)
   const resolved = path.resolve(filePath)
@@ -260,7 +288,7 @@ export async function syncLibraryFile(filePath: string) {
   }
 
   console.log(
-    `[Info] [Media] Detected library episode - Anime: ${parsed.animeTitle}, Season ${parsed.season}, Episode ${parsed.episode} - ${fileName(resolvedPath)}`
+    `[Info] [Media] Detected library episode - Anime: ${parsed.animeTitle}, ${formatLibraryEpisodeLabel({ season: parsed.season, part: parsed.part, episode: parsed.episode })} - ${fileName(resolvedPath)}`
   )
 
   debugLibrarySync("Starting AniList metadata lookup for library file.")
@@ -376,7 +404,7 @@ export async function syncLibraryFile(filePath: string) {
   }
 
   console.log(
-    `[Info] [Media] Library database import completed - Anime: ${parsed.animeTitle}, Season ${librarySeason}, Episode ${parsed.episode} - ${fileName(resolvedPath)}`
+    `[Info] [Media] Library database import completed - Anime: ${parsed.animeTitle}, ${formatLibraryEpisodeLabel({ season: parsed.season, part: parsed.part, episode: parsed.episode })} - ${fileName(resolvedPath)}`
   )
   debugLibrarySync("Library file sync completed.")
 
@@ -404,7 +432,7 @@ export async function removeLibraryFile(filePath: string) {
 
   if (episode) {
     console.log(
-      `[Info] [Media] Removed deleted library file from database - Anime id ${episode.animeId}, Season ${episode.seasonNumber}, Episode ${episode.episodeNumber}`
+      `[Info] [Media] Removed deleted library file from database - Anime id ${episode.animeId}, ${formatDeletedEpisodeLabel({ filePath: resolvedPath, seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber })}`
     )
 
     if (eventTarget) {

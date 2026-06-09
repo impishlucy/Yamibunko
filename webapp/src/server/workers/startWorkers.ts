@@ -130,7 +130,7 @@ function formatImportFileActionKind(kind: ImportFileActionKind) {
     case "audio-transcode":
       return "audio transcode"
     case "container-remux":
-      return "MP4 remux"
+      return "WebM remux"
     case "direct-move":
     case "direct-import":
       return "direct import move"
@@ -150,7 +150,10 @@ function formatQueuedImportFileActionLabel(item: QueuedImportFileActionWork) {
 }
 
 function formatProcessingInfoLabel(processing: DeferredInputProcessingInfo) {
-  return `${processing.animeTitle} - Season ${processing.seasonNumber}, Episode ${processing.episodeNumber} - ${processing.fileName}`
+  const season = processing.displaySeasonLabel ?? `Season ${processing.seasonNumber}`
+  const episode = processing.displayEpisodeLabel ?? `Episode ${processing.episodeNumber}`
+
+  return `${processing.animeTitle} - ${season}, ${episode} - ${processing.fileName}`
 }
 
 const scanIntervalMs = 5 * 60 * 1000
