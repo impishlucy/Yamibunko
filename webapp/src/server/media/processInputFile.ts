@@ -21,10 +21,11 @@ import { createJob, updateJob } from "@/server/db/jobs"
 import { getServerConfig } from "@/server/config"
 import {
   ffprobe,
+  getFileHardwareInputArgs,
   getFileSubtitleInputArgs,
-  getHardwareInputArgs,
   getWebmFileArgs,
   runFfmpeg,
+  webmFileExtension,
   type WebmSubtitleOutputStream,
 } from "@/server/media/ffmpeg"
 import {
@@ -60,9 +61,8 @@ import {
 import { errorMessage, fileName } from "@/server/utils/format"
 import { debugLog } from "@/server/utils/debugLog"
 
-const hardwareMaxAv1BytesPerMinute = 18 * 1024 * 1024
-const cpuMaxAv1BytesPerMinute = 22 * 1024 * 1024
-const targetBytesPerMinute = 18 * 1024 * 1024
+const targetAv1BytesPerMinute = 22 * 1024 * 1024
+const targetBytesPerMinute = targetAv1BytesPerMinute
 const targetAudioKbps = 320
 const failedImportsFolderName = "_failed_imports"
 const activeInputImportOutputs = new Map<string, number>()
@@ -277,6 +277,14 @@ function hasAv1Video(probe: ProbeResult) {
   )
 }
 
+function getPrimaryVideoCodec(probe: ProbeResult) {
+  return (
+    (probe.streams ?? [])
+      .find((stream) => stream.codec_type === "video")
+      ?.codec_name?.trim() || null
+  )
+}
+
 const webmContainerFormatNames = new Set(["matroska", "webm"])
 
 function getProbeFormatNames(probe: ProbeResult) {
@@ -287,7 +295,7 @@ function getProbeFormatNames(probe: ProbeResult) {
 }
 
 function usesWebmOutputContainer(filePath: string, probe: ProbeResult) {
-  if (path.extname(filePath).toLowerCase() !== ".webm") {
+  if (path.extname(filePath).toLowerCase() !== webmFileExtension) {
     return false
   }
 
@@ -297,6 +305,39 @@ function usesWebmOutputContainer(filePath: string, probe: ProbeResult) {
     formatNames.length === 0 ||
     formatNames.some((formatName) => webmContainerFormatNames.has(formatName))
   )
+}
+
+function assertValidWebmAv1Output(filePath: string, probe: ProbeResult) {
+  if (!usesWebmOutputContainer(filePath, probe)) {
+    throw new Error(`FFmpeg output is not a WebM container: ${filePath}`)
+  }
+
+  if (!hasAv1Video(probe)) {
+    throw new Error(`FFmpeg output is not AV1 video: ${filePath}`)
+  }
+
+  const invalidAudioCodec = (probe.streams ?? []).find(
+    (stream) =>
+      stream.codec_type === "audio" &&
+      (stream.codec_name ?? "").trim().toLowerCase() !== "opus"
+  )?.codec_name
+
+  if (invalidAudioCodec) {
+    throw new Error(
+      `FFmpeg output has non-Opus audio (${invalidAudioCodec}): ${filePath}`
+    )
+  }
+
+  const invalidSubtitleCodec = (probe.streams ?? []).find(
+    (stream) =>
+      stream.codec_type === "subtitle" && !isWebVttSubtitleCodec(stream.codec_name)
+  )?.codec_name
+
+  if (invalidSubtitleCodec) {
+    throw new Error(
+      `FFmpeg output has non-WebVTT subtitles (${invalidSubtitleCodec}): ${filePath}`
+    )
+  }
 }
 
 function hasEmbeddedSubtitles(probe: ProbeResult) {
@@ -353,12 +394,6 @@ function getWebmSubtitleOutputStreams(input: {
       codec: isWebVttSubtitleCodec(input.sidecarSubtitle.codec) ? "copy" : "webvtt",
     },
   ]
-}
-
-function getMaxAv1BytesPerMinute() {
-  return getServerConfig().transcodeAccel === "cpu"
-    ? cpuMaxAv1BytesPerMinute
-    : hardwareMaxAv1BytesPerMinute
 }
 
 function calculateVideoBitrateKbps(bytesPerMinute = targetBytesPerMinute) {
@@ -796,6 +831,7 @@ async function transcodeFile(
     subtitleStreams: WebmSubtitleOutputStream[]
     videoBitrateKbps: number
     maxVideoBitrateKbps: number
+    inputVideoCodec?: string | null
     sidecarSubtitle?: SubtitleSidecar | null
     jobId?: string
   }
@@ -807,7 +843,10 @@ async function transcodeFile(
     "-loglevel",
     "warning",
     ...(options.convertVideo
-      ? getHardwareInputArgs({ keepFramesOnDevice: true })
+      ? getFileHardwareInputArgs({
+          inputVideoCodec: options.inputVideoCodec,
+          keepFramesOnDevice: true,
+        })
       : []),
     ...getFileSubtitleInputArgs(),
     "-i",
@@ -838,6 +877,9 @@ async function transcodeFile(
   if (!(await pathExists(outputPath))) {
     throw new Error(`FFmpeg completed but did not create output file: ${outputPath}`)
   }
+
+  const outputProbe = (await ffprobe(outputPath)) as ProbeResult
+  assertValidWebmAv1Output(outputPath, outputProbe)
 
   if (options.jobId) {
     const outputStat = await stat(outputPath)
@@ -1434,7 +1476,8 @@ export async function processInputFile(
       inputStat.size,
       durationSeconds
     )
-    const maxAv1BytesPerMinute = getMaxAv1BytesPerMinute()
+    const maxAv1BytesPerMinute = targetAv1BytesPerMinute
+    const inputVideoCodec = getPrimaryVideoCodec(probe)
     const inputHasAv1Video = hasAv1Video(probe)
     const inputUsesWebmContainer = usesWebmOutputContainer(filePath, probe)
     const subtitleStreams = getWebmSubtitleOutputStreams({
@@ -1473,9 +1516,7 @@ export async function processInputFile(
       ? "full"
       : requiresVideoShrink
         ? "shrink"
-        : requiredSingleStepEdits > 1
-          ? "full"
-          : "none"
+        : "none"
     const convertVideo = videoTranscodeReason !== "none"
     const audioOutputIndexesToOpus = convertVideo
       ? (probe.streams ?? [])
@@ -1496,13 +1537,13 @@ export async function processInputFile(
     debugImport(
       jobId,
       skippedDetailedEditChecks
-        ? `Processing decision - av1 false, action ${importFileEditKind}, videoTranscodeReason ${videoTranscodeReason}, needsFfmpegProcessing ${needsFfmpegProcessing}; skipped WebM/audio/subtitle/shrink decision checks because full processing is required. Audio tracks to Opus for output [${audioOutputIndexesToOpus.join(", ")}], subtitleTracks [${subtitleStreams.map((stream) => `${stream.inputIndex}:${stream.streamIndex}:${stream.codec}`).join(", ")}]`
-        : `Processing decision - av1 ${inputHasAv1Video}, webmContainer ${inputUsesWebmContainer}, opusAudio ${!convertAudioToOpus}, webVttSubtitles ${inputHasWebVttSubtitles}, conformsBeforeShrink ${inputMatchesWebmAv1OpusWebVtt}, belowMaxSize ${!requiresVideoShrink}, audioTracksToOpus [${audioOutputIndexesToOpus.join(", ")}], subtitleTracks [${subtitleStreams.map((stream) => `${stream.inputIndex}:${stream.streamIndex}:${stream.codec}`).join(", ")}], requiredFormatEdits ${requiredSingleStepEdits}, action ${importFileEditKind}, videoTranscodeReason ${videoTranscodeReason}, needsFfmpegProcessing ${needsFfmpegProcessing}`
+        ? `Processing decision - inputCodec ${inputVideoCodec ?? "unknown"}, av1 false, action ${importFileEditKind}, videoTranscodeReason ${videoTranscodeReason}, needsFfmpegProcessing ${needsFfmpegProcessing}; skipped WebM/audio/subtitle/shrink decision checks because full processing is required. Audio tracks to Opus for output [${audioOutputIndexesToOpus.join(", ")}], subtitleTracks [${subtitleStreams.map((stream) => `${stream.inputIndex}:${stream.streamIndex}:${stream.codec}`).join(", ")}]`
+        : `Processing decision - inputCodec ${inputVideoCodec ?? "unknown"}, av1 ${inputHasAv1Video}, webmContainer ${inputUsesWebmContainer}, opusAudio ${!convertAudioToOpus}, webVttSubtitles ${inputHasWebVttSubtitles}, conformsBeforeShrink ${inputMatchesWebmAv1OpusWebVtt}, belowMaxSize ${!requiresVideoShrink}, audioTracksToOpus [${audioOutputIndexesToOpus.join(", ")}], subtitleTracks [${subtitleStreams.map((stream) => `${stream.inputIndex}:${stream.streamIndex}:${stream.codec}`).join(", ")}], requiredFormatEdits ${requiredSingleStepEdits}, action ${importFileEditKind}, videoTranscodeReason ${videoTranscodeReason}, needsFfmpegProcessing ${needsFfmpegProcessing}`
     )
 
     const safeLibraryTitle = safePathSegment(libraryTitle, "Library title")
     const safeMediaTitle = safePathSegment(mediaTitle, "Media title")
-    const extension = ".webm"
+    const extension = webmFileExtension
     const finalName = formatEpisodeFileName({
       title: safeMediaTitle,
       season: librarySeason,
@@ -1727,6 +1768,7 @@ export async function processInputFile(
 
       await transcodeFile(filePath, tempPath, {
         convertVideo,
+        inputVideoCodec,
         audioOutputIndexesToOpus,
         subtitleStreams,
         sidecarSubtitle,

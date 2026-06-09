@@ -527,19 +527,15 @@ public class ServerManager
 
         var detection = await HardwareAccelerationDetector.DetectAsync(settings.FfmpegDir, true);
 
-        if (settings.ImportEnabled && detection.Av1ImportAcceleration == null)
+        if (settings.ImportEnabled && !HardwareAccelerationDetector.SupportsAv1ImportAcceleration(detection))
         {
             Log(HardwareAccelerationDetector.Av1HardwareUnsupportedMessage);
             Log("Catalog mode was enabled automatically because AV1 hardware encoding is unavailable.");
             settings.ImportEnabled = false;
         }
 
-        settings.TranscodeAccel = settings.ImportEnabled && detection.Av1ImportAcceleration != null
-            ? detection.Av1ImportAcceleration
-            : detection.LiveTranscodeAcceleration;
-        settings.TranscodeHwDevice = settings.ImportEnabled && detection.Av1ImportAcceleration != null
-            ? detection.Av1ImportDevice ?? string.Empty
-            : detection.LiveTranscodeDevice ?? string.Empty;
+        settings.TranscodeAccel = HardwareAccelerationDetector.SelectServerTranscodeAcceleration(detection, settings.ImportEnabled);
+        settings.TranscodeHwDevice = HardwareAccelerationDetector.SelectServerTranscodeDevice(detection, settings.ImportEnabled);
 
         var selectedAccelerationLabel = HardwareAccelerationDetector.FormatAccelerationForDisplay(settings.TranscodeAccel);
         var av1ImportAccelerationLabel = HardwareAccelerationDetector.FormatAccelerationForDisplay(detection.Av1ImportAcceleration);
@@ -550,7 +546,7 @@ public class ServerManager
             Log($"Updated TRANSCODE_ACCEL from outdated value '{previousAcceleration}' to '{selectedAccelerationLabel}'. Suggested replacement for the old value was '{outdatedReplacement}'.");
         }
 
-        Log(detection.Av1ImportAcceleration == null
+        Log(!HardwareAccelerationDetector.SupportsAv1ImportAcceleration(detection)
             ? $"AV1 hardware encoding unavailable. Live transcoding acceleration: {selectedAccelerationLabel}."
             : $"AV1 hardware encoding acceleration: {av1ImportAccelerationLabel}. Live transcoding acceleration: {liveTranscodeAccelerationLabel}.");
 

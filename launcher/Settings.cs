@@ -70,7 +70,12 @@ public class AppSettings
             return replacement;
         }
 
-        return string.IsNullOrWhiteSpace(value) ? "cpu" : value.Trim().ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "cpu";
+        }
+
+        return value.Trim().ToLowerInvariant();
     }
 
     public static AppSettings? Load()

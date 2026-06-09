@@ -15,6 +15,9 @@ let cachedQsvDevice: string | undefined
 
 const targetAacBitrate = "320k"
 
+export const webmFileExtension = ".webm"
+export const webmOutputFormat = "webm"
+
 function isIntelAcceleration(acceleration: TranscodeAcceleration) {
   return acceleration === "intel_gpu" || acceleration === "intel_cpu"
 }
@@ -180,8 +183,89 @@ export function getHardwareInputArgs(
   return []
 }
 
-export function getLiveTranscodeInputArgs() {
+function normalizeInputVideoCodec(codec: string | null | undefined) {
+  return (codec ?? "").trim().toLowerCase().replace(/[^a-z0-9_]+/g, "_")
+}
+
+function mappedHardwareDecoder(
+  codec: string | null | undefined,
+  decoders: Record<string, string>
+) {
+  return decoders[normalizeInputVideoCodec(codec)]
+}
+
+function getNvidiaInputDecoder(codec: string | null | undefined) {
+  return mappedHardwareDecoder(codec, {
+    av1: "av1_cuvid",
+    avc: "h264_cuvid",
+    avc1: "h264_cuvid",
+    h264: "h264_cuvid",
+    h265: "hevc_cuvid",
+    hevc: "hevc_cuvid",
+    mjpeg: "mjpeg_cuvid",
+    mpeg1video: "mpeg1_cuvid",
+    mpeg2video: "mpeg2_cuvid",
+    mpeg4: "mpeg4_cuvid",
+    vc1: "vc1_cuvid",
+    vp8: "vp8_cuvid",
+    vp9: "vp9_cuvid",
+    wmv3: "vc1_cuvid",
+  })
+}
+
+function getIntelInputDecoder(codec: string | null | undefined) {
+  return mappedHardwareDecoder(codec, {
+    av1: "av1_qsv",
+    avc: "h264_qsv",
+    avc1: "h264_qsv",
+    h264: "h264_qsv",
+    h265: "hevc_qsv",
+    hevc: "hevc_qsv",
+    mjpeg: "mjpeg_qsv",
+    mpeg2video: "mpeg2_qsv",
+    vp9: "vp9_qsv",
+  })
+}
+
+export function getHardwareInputArgsForCodec(input: {
+  inputVideoCodec?: string | null
+  keepFramesOnDevice?: boolean
+}) {
   const config = getServerConfig()
+  const baseArgs = getHardwareInputArgs({
+    keepFramesOnDevice: input.keepFramesOnDevice,
+  })
+
+  if (config.transcodeAccel === "nvenc") {
+    const decoder = getNvidiaInputDecoder(input.inputVideoCodec)
+    return decoder ? [...baseArgs, "-c:v", decoder] : baseArgs
+  }
+
+  if (isIntelAcceleration(config.transcodeAccel)) {
+    const decoder = getIntelInputDecoder(input.inputVideoCodec)
+    return decoder ? [...baseArgs, "-c:v", decoder] : baseArgs
+  }
+
+  return baseArgs
+}
+
+export function getFileHardwareInputArgs(input: {
+  inputVideoCodec?: string | null
+  keepFramesOnDevice?: boolean
+}) {
+  return getHardwareInputArgsForCodec(input)
+}
+
+export function getLiveTranscodeInputArgs(input: {
+  inputVideoCodec?: string | null
+} = {}) {
+  const config = getServerConfig()
+
+  if (config.transcodeAccel === "nvenc" || isIntelAcceleration(config.transcodeAccel)) {
+    return getHardwareInputArgsForCodec({
+      inputVideoCodec: input.inputVideoCodec,
+    })
+  }
 
   if (isAmdAcceleration(config.transcodeAccel) && getAmdBackend() === "vaapi") {
     return ["-vaapi_device", getAmdVaapiDevice()]
@@ -548,6 +632,6 @@ export function getWebmFileArgs(input: {
     "-flush_packets",
     "1",
     "-f",
-    "webm",
+    webmOutputFormat,
   ]
 }

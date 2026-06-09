@@ -17,14 +17,62 @@ public static class HardwareAccelerationDetector
 
     public static string FormatAccelerationForDisplay(string? acceleration)
     {
-        if (string.IsNullOrWhiteSpace(acceleration))
+        if (IsUnsupportedAcceleration(acceleration))
         {
             return "unsupported";
         }
 
-        return string.Equals(acceleration.Trim(), "cpu", StringComparison.OrdinalIgnoreCase)
+        return string.Equals(acceleration!.Trim(), "cpu", StringComparison.OrdinalIgnoreCase)
             ? "software"
             : acceleration.Trim();
+    }
+
+    public static string SelectServerTranscodeAcceleration(HardwareAccelerationDetection detection, bool importEnabled)
+    {
+        return ShouldUseAv1ImportAcceleration(detection, importEnabled)
+            ? NormalizeSupportedAccelerationForExport(detection.Av1ImportAcceleration)
+            : NormalizeLiveAccelerationForExport(detection.LiveTranscodeAcceleration);
+    }
+
+    public static string SelectServerTranscodeDevice(HardwareAccelerationDetection detection, bool importEnabled)
+    {
+        return ShouldUseAv1ImportAcceleration(detection, importEnabled)
+            ? detection.Av1ImportDevice ?? string.Empty
+            : detection.LiveTranscodeDevice ?? string.Empty;
+    }
+
+    public static bool IsUnsupportedAcceleration(string? acceleration)
+    {
+        return string.IsNullOrWhiteSpace(acceleration)
+            || string.Equals(acceleration.Trim(), "unsupported", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool SupportsAv1ImportAcceleration(HardwareAccelerationDetection detection)
+    {
+        return !IsUnsupportedAcceleration(detection.Av1ImportAcceleration);
+    }
+
+    private static bool ShouldUseAv1ImportAcceleration(HardwareAccelerationDetection detection, bool importEnabled)
+    {
+        return importEnabled && SupportsAv1ImportAcceleration(detection);
+    }
+
+    private static string NormalizeSupportedAccelerationForExport(string? acceleration)
+    {
+        return string.IsNullOrWhiteSpace(acceleration)
+            ? "cpu"
+            : acceleration.Trim().ToLowerInvariant();
+    }
+
+    private static string NormalizeLiveAccelerationForExport(string? acceleration)
+    {
+        if (IsUnsupportedAcceleration(acceleration)
+            || string.Equals(acceleration?.Trim(), "software", StringComparison.OrdinalIgnoreCase))
+        {
+            return "cpu";
+        }
+
+        return acceleration!.Trim().ToLowerInvariant();
     }
 
     private static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(8);

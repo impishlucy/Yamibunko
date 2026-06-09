@@ -431,6 +431,14 @@ function calculateSourceBitrateKbps(input: {
   )
 }
 
+function getPrimaryVideoCodec(probe: ProbeResult) {
+  return (
+    (probe.streams ?? [])
+      .find((stream) => stream.codec_type === "video")
+      ?.codec_name?.trim() || null
+  )
+}
+
 function parseClientId(value: string | null) {
   if (!value) {
     return null
@@ -507,6 +515,34 @@ function getDirectContentType(file: string) {
 
   if (extension === ".avi") {
     return "video/x-msvideo"
+  }
+
+  if (extension === ".flv") {
+    return "video/x-flv"
+  }
+
+  if (extension === ".ts" || extension === ".m2ts" || extension === ".mts") {
+    return "video/mp2t"
+  }
+
+  if (extension === ".mpg" || extension === ".mpeg") {
+    return "video/mpeg"
+  }
+
+  if (extension === ".ogm" || extension === ".ogv") {
+    return "video/ogg"
+  }
+
+  if (extension === ".wmv") {
+    return "video/x-ms-wmv"
+  }
+
+  if (extension === ".3gp") {
+    return "video/3gpp"
+  }
+
+  if (extension === ".3g2") {
+    return "video/3gpp2"
   }
 
   return "application/octet-stream"
@@ -950,6 +986,7 @@ async function handleTranscode(
   startSeconds: number,
   durationSeconds?: number,
   sourceBitrateKbps?: number,
+  inputVideoCodec?: string | null,
   audioStreamIndex?: number,
   uploadLease?: StreamUploadLease
 ) {
@@ -1010,7 +1047,7 @@ async function handleTranscode(
       "-fflags",
       "+genpts",
       "-ignore_unknown",
-      ...getLiveTranscodeInputArgs(),
+      ...getLiveTranscodeInputArgs({ inputVideoCodec }),
       ...(startSeconds > 0 ? ["-ss", startSeconds.toFixed(3)] : []),
       "-i",
       file,
@@ -1327,22 +1364,23 @@ export async function GET(request: Request, context: StreamContext) {
     requestedAudioStreamIndex,
     defaultDirectAudioStreamIndex: undefined,
   }
+  let inputVideoCodec: string | null = null
 
   const shouldInspectStreams =
     mode === "transcode" || typeof requestedAudioStreamIndex === "number"
 
   if (shouldInspectStreams) {
     try {
-      const metadata = getMediaStreamMetadata(
-        (await ffprobe(resolved.file)) as ProbeResult
-      )
+      const probe = (await ffprobe(resolved.file)) as ProbeResult
+      inputVideoCodec = getPrimaryVideoCodec(probe)
+      const metadata = getMediaStreamMetadata(probe)
       audioSelection = resolveAudioSelection({
         metadata,
         requestedAudioStreamIndex,
       })
     } catch (error) {
       console.warn(
-        `[Warn] [Stream] Unable to inspect audio streams, using first audio stream - stream/route.ts - ${resolved.file} - ${errorMessage(error)}`
+        `[Warn] [Stream] Unable to inspect streams, using first audio stream and generic hardware decode - stream/route.ts - ${resolved.file} - ${errorMessage(error)}`
       )
     }
   }
@@ -1464,6 +1502,7 @@ export async function GET(request: Request, context: StreamContext) {
     startSeconds,
     resolved.durationSeconds,
     sourceBitrateKbps,
+    inputVideoCodec,
     audioSelection.requestedAudioStreamIndex,
     uploadLease
   )

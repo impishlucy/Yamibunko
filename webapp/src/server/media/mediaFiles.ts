@@ -54,6 +54,17 @@ export const mediaExtensions = new Set([
   ".avi",
   ".mov",
   ".webm",
+  ".flv",
+  ".ts",
+  ".m2ts",
+  ".mts",
+  ".mpg",
+  ".mpeg",
+  ".ogm",
+  ".ogv",
+  ".wmv",
+  ".3gp",
+  ".3g2",
 ])
 
 export function isMediaFile(filePath: string) {

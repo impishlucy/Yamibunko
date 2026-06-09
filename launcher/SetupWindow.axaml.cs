@@ -208,9 +208,7 @@ public partial class SetupWindow : Window
     {
         if (_hardwareDetection != null)
         {
-            return importEnabled && _hardwareDetection.Av1ImportAcceleration != null
-                ? _hardwareDetection.Av1ImportAcceleration
-                : _hardwareDetection.LiveTranscodeAcceleration;
+            return HardwareAccelerationDetector.SelectServerTranscodeAcceleration(_hardwareDetection, importEnabled);
         }
 
         return AppSettings.NormalizeTranscodeAccel(_initialSettings?.TranscodeAccel);
@@ -220,9 +218,7 @@ public partial class SetupWindow : Window
     {
         if (_hardwareDetection != null)
         {
-            return importEnabled && _hardwareDetection.Av1ImportAcceleration != null
-                ? _hardwareDetection.Av1ImportDevice ?? string.Empty
-                : _hardwareDetection.LiveTranscodeDevice ?? string.Empty;
+            return HardwareAccelerationDetector.SelectServerTranscodeDevice(_hardwareDetection, importEnabled);
         }
 
         return _initialSettings?.TranscodeHwDevice ?? string.Empty;
@@ -235,7 +231,7 @@ public partial class SetupWindow : Window
             var detection = await HardwareAccelerationDetector.DetectAsync(_initialSettings?.FfmpegDir, !string.IsNullOrWhiteSpace(_initialSettings?.FfmpegDir));
             _hardwareDetection = detection;
             UpdateHardwareAccelerationStatusText(detection);
-            SetCatalogModeForced(detection.Av1ImportAcceleration == null);
+            SetCatalogModeForced(!HardwareAccelerationDetector.SupportsAv1ImportAcceleration(detection));
         }
         catch
         {
@@ -258,7 +254,7 @@ public partial class SetupWindow : Window
             return;
         }
 
-        var encodeAcceleration = detection.Av1ImportAcceleration == null
+        var encodeAcceleration = !HardwareAccelerationDetector.SupportsAv1ImportAcceleration(detection)
             ? "unsupported"
             : HardwareAccelerationDetector.FormatAccelerationForDisplay(detection.Av1ImportAcceleration);
         var liveAcceleration = HardwareAccelerationDetector.FormatAccelerationForDisplay(detection.LiveTranscodeAcceleration);
