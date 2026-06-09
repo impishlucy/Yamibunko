@@ -22,6 +22,7 @@ public partial class SetupWindow : Window
     private object? _defaultDisableFileProcessingTooltip;
     private bool _isSetupComplete;
     private bool _catalogModeForced;
+    private bool _hardwareDetectionComplete;
 
     public SetupWindow()
     {
@@ -163,11 +164,16 @@ public partial class SetupWindow : Window
         bool isOutputValid = fileProcessingDisabled || Directory.Exists(outputPath);
         bool isClientIdValid = string.IsNullOrWhiteSpace(clientId) || ClientIdRegex.IsMatch(clientId);
 
-        saveButton.IsEnabled = isBaseUrlValid && isInputValid && isOutputValid && isClientIdValid;
+        saveButton.IsEnabled = _hardwareDetectionComplete && isBaseUrlValid && isInputValid && isOutputValid && isClientIdValid;
     }
 
     private void SaveButton_Click(object? sender, RoutedEventArgs e)
     {
+        if (!_hardwareDetectionComplete)
+        {
+            return;
+        }
+
         var importEnabled = !_catalogModeForced && !IsFileProcessingDisabled();
         var settings = new AppSettings
         {
@@ -226,16 +232,21 @@ public partial class SetupWindow : Window
 
     private async void RefreshCatalogModeLockAsync()
     {
+        _hardwareDetectionComplete = false;
+        ValidateForm();
+
         try
         {
             var detection = await HardwareAccelerationDetector.DetectAsync(_initialSettings?.FfmpegDir, !string.IsNullOrWhiteSpace(_initialSettings?.FfmpegDir));
             _hardwareDetection = detection;
             UpdateHardwareAccelerationStatusText(detection);
+            _hardwareDetectionComplete = true;
             SetCatalogModeForced(!HardwareAccelerationDetector.SupportsAv1ImportAcceleration(detection));
         }
         catch
         {
             UpdateHardwareAccelerationStatusText(null);
+            _hardwareDetectionComplete = true;
             SetCatalogModeForced(true);
         }
     }
