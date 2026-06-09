@@ -27,7 +27,6 @@ public class AppSettings
     public bool ImportEnabled { get; set; } = true;
     public string FfmpegDir { get; set; } = "";
     public string TranscodeAccel { get; set; } = "cpu";
-    public string TranscodeHwDevice { get; set; } = "";
     public string AnilistClientId { get; set; } = "";
     public string AnilistClientSecret { get; set; } = "";
     public string BunPath { get; set; } = "";
@@ -48,19 +47,14 @@ public class AppSettings
 
         var normalized = value.Trim().ToLowerInvariant();
 
-        if (normalized == "qsv" || normalized == "intel")
+        replacement = normalized switch
         {
-            replacement = "intel_gpu";
-            return true;
-        }
+            "qsv" or "intel" => "intel_gpu",
+            "amd" => "amd_gpu",
+            _ => string.Empty
+        };
 
-        if (normalized == "amd")
-        {
-            replacement = "amd_gpu";
-            return true;
-        }
-
-        return false;
+        return replacement.Length > 0;
     }
 
     public static string NormalizeTranscodeAccel(string? value)
@@ -80,7 +74,10 @@ public class AppSettings
 
     public static AppSettings? Load()
     {
-        if (!File.Exists(SettingsPath)) return null;
+        if (!File.Exists(SettingsPath))
+        {
+            return null;
+        }
 
         var json = File.ReadAllText(SettingsPath);
         var propertyKinds = ReadPropertyKinds(json);

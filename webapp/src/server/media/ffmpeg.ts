@@ -3,6 +3,8 @@ import path from "node:path"
 
 import { execa } from "execa"
 
+import { registerImportEncodingProcess } from "@/server/transcode/processPriority"
+
 import type { PlaybackProfile } from "@/lib/types"
 import {
   getServerConfig,
@@ -17,14 +19,6 @@ const targetAacBitrate = "320k"
 
 export const webmFileExtension = ".webm"
 export const webmOutputFormat = "webm"
-
-function isIntelAcceleration(acceleration: TranscodeAcceleration) {
-  return acceleration === "intel_gpu" || acceleration === "intel_cpu"
-}
-
-function isAmdAcceleration(acceleration: TranscodeAcceleration) {
-  return acceleration === "amd_gpu" || acceleration === "amd_cpu"
-}
 
 function isHardwareAcceleration(acceleration: TranscodeAcceleration) {
   return acceleration !== "cpu"
@@ -64,37 +58,28 @@ export async function ffprobe(file: string) {
 
 export function runFfmpeg(
   args: string[],
-  options: { protectFromParentSignals?: boolean } = {}
+  options: {
+    priorityRole?: "import-encoding"
+    protectFromParentSignals?: boolean
+  } = {}
 ) {
   const config = getServerConfig()
 
-  return execa(config.ffmpegPath, args, {
+  const child = execa(config.ffmpegPath, args, {
     windowsHide: true,
     stdin: "ignore",
     cleanup: !options.protectFromParentSignals,
     detached: options.protectFromParentSignals,
   })
-}
 
-function isRenderDevicePath(value: string) {
-  return /^\/dev\/dri\/renderD\d+$/.test(value)
-}
+  if (options.priorityRole === "import-encoding") {
+    registerImportEncodingProcess(child)
+  }
 
-function getConfiguredRenderDevice() {
-  const device = getServerConfig().transcodeHwDevice
-
-  return process.platform === "linux" && device && isRenderDevicePath(device)
-    ? device
-    : undefined
+  return child
 }
 
 function findLinuxRenderDevice(vendorId: string) {
-  const configuredDevice = getConfiguredRenderDevice()
-
-  if (configuredDevice) {
-    return configuredDevice
-  }
-
   try {
     const renderNodes = readdirSync("/sys/class/drm")
       .filter((entry) => /^renderD\d+$/.test(entry))
@@ -111,18 +96,12 @@ function findLinuxRenderDevice(vendorId: string) {
 }
 
 function getAmdVaapiDevice() {
-  if (!cachedAmdVaapiDevice || getConfiguredRenderDevice()) {
-    cachedAmdVaapiDevice = findLinuxRenderDevice("0x1002")
-  }
-
+  cachedAmdVaapiDevice ??= findLinuxRenderDevice("0x1002")
   return cachedAmdVaapiDevice
 }
 
 function getQsvDevice() {
-  if (!cachedQsvDevice || getConfiguredRenderDevice()) {
-    cachedQsvDevice = findLinuxRenderDevice("0x8086")
-  }
-
+  cachedQsvDevice ??= findLinuxRenderDevice("0x8086")
   return cachedQsvDevice
 }
 
@@ -145,42 +124,46 @@ export function getHardwareInputArgs(
 ) {
   const config = getServerConfig()
 
-  if (config.transcodeAccel === "nvenc") {
-    return options.keepFramesOnDevice
-      ? ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-      : ["-hwaccel", "cuda"]
-  }
-
-  if (isIntelAcceleration(config.transcodeAccel)) {
-    const deviceArgs = process.platform === "linux" ? ["-qsv_device", getQsvDevice()] : []
-
-    return options.keepFramesOnDevice
-      ? [...deviceArgs, "-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
-      : [...deviceArgs, "-hwaccel", "qsv"]
-  }
-
-  if (isAmdAcceleration(config.transcodeAccel)) {
-    const backend = getAmdBackend()
-
-    if (backend === "amf") {
+  switch (config.transcodeAccel) {
+    case "nvenc":
       return options.keepFramesOnDevice
-        ? ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"]
-        : ["-hwaccel", "d3d11va"]
+        ? ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+        : ["-hwaccel", "cuda"]
+
+    case "intel_gpu":
+    case "intel_cpu": {
+      const deviceArgs = process.platform === "linux" ? ["-qsv_device", getQsvDevice()] : []
+
+      return options.keepFramesOnDevice
+        ? [...deviceArgs, "-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
+        : [...deviceArgs, "-hwaccel", "qsv"]
     }
 
-    return options.keepFramesOnDevice
-      ? [
-          "-vaapi_device",
-          getAmdVaapiDevice(),
-          "-hwaccel",
-          "vaapi",
-          "-hwaccel_output_format",
-          "vaapi",
-        ]
-      : ["-vaapi_device", getAmdVaapiDevice(), "-hwaccel", "vaapi"]
-  }
+    case "amd_gpu":
+    case "amd_cpu": {
+      const backend = getAmdBackend()
 
-  return []
+      if (backend === "amf") {
+        return options.keepFramesOnDevice
+          ? ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"]
+          : ["-hwaccel", "d3d11va"]
+      }
+
+      return options.keepFramesOnDevice
+        ? [
+            "-vaapi_device",
+            getAmdVaapiDevice(),
+            "-hwaccel",
+            "vaapi",
+            "-hwaccel_output_format",
+            "vaapi",
+          ]
+        : ["-vaapi_device", getAmdVaapiDevice(), "-hwaccel", "vaapi"]
+    }
+
+    case "cpu":
+      return []
+  }
 }
 
 function normalizeInputVideoCodec(codec: string | null | undefined) {
@@ -236,17 +219,23 @@ export function getHardwareInputArgsForCodec(input: {
     keepFramesOnDevice: input.keepFramesOnDevice,
   })
 
-  if (config.transcodeAccel === "nvenc") {
-    const decoder = getNvidiaInputDecoder(input.inputVideoCodec)
-    return decoder ? [...baseArgs, "-c:v", decoder] : baseArgs
-  }
+  switch (config.transcodeAccel) {
+    case "nvenc": {
+      const decoder = getNvidiaInputDecoder(input.inputVideoCodec)
+      return decoder ? [...baseArgs, "-c:v", decoder] : baseArgs
+    }
 
-  if (isIntelAcceleration(config.transcodeAccel)) {
-    const decoder = getIntelInputDecoder(input.inputVideoCodec)
-    return decoder ? [...baseArgs, "-c:v", decoder] : baseArgs
-  }
+    case "intel_gpu":
+    case "intel_cpu": {
+      const decoder = getIntelInputDecoder(input.inputVideoCodec)
+      return decoder ? [...baseArgs, "-c:v", decoder] : baseArgs
+    }
 
-  return baseArgs
+    case "amd_gpu":
+    case "amd_cpu":
+    case "cpu":
+      return baseArgs
+  }
 }
 
 export function getFileHardwareInputArgs(input: {
@@ -261,81 +250,88 @@ export function getLiveTranscodeInputArgs(input: {
 } = {}) {
   const config = getServerConfig()
 
-  if (config.transcodeAccel === "nvenc" || isIntelAcceleration(config.transcodeAccel)) {
-    return getHardwareInputArgsForCodec({
-      inputVideoCodec: input.inputVideoCodec,
-    })
-  }
+  switch (config.transcodeAccel) {
+    case "nvenc":
+    case "intel_gpu":
+    case "intel_cpu":
+      return getHardwareInputArgsForCodec({
+        inputVideoCodec: input.inputVideoCodec,
+      })
 
-  if (isAmdAcceleration(config.transcodeAccel) && getAmdBackend() === "vaapi") {
-    return ["-vaapi_device", getAmdVaapiDevice()]
-  }
+    case "amd_gpu":
+    case "amd_cpu":
+      return getAmdBackend() === "vaapi"
+        ? ["-vaapi_device", getAmdVaapiDevice()]
+        : getHardwareInputArgs()
 
-  return getHardwareInputArgs()
+    case "cpu":
+      return getHardwareInputArgs()
+  }
 }
 
 export function getHardwareInputLabel() {
   const config = getServerConfig()
 
-  if (config.transcodeAccel === "nvenc") {
-    return "cuda"
+  switch (config.transcodeAccel) {
+    case "nvenc":
+      return "cuda"
+    case "intel_gpu":
+    case "intel_cpu":
+      return process.platform === "linux" ? `qsv:${getQsvDevice()}` : "qsv"
+    case "amd_gpu":
+    case "amd_cpu":
+      return getAmdBackend() === "amf"
+        ? "d3d11va/amf"
+        : `vaapi:${getAmdVaapiDevice()}`
+    case "cpu":
+      return "none"
   }
-
-  if (isIntelAcceleration(config.transcodeAccel)) {
-    return process.platform === "linux" ? `qsv:${getQsvDevice()}` : "qsv"
-  }
-
-  if (isAmdAcceleration(config.transcodeAccel)) {
-    return getAmdBackend() === "amf"
-      ? "d3d11va/amf"
-      : `vaapi:${getAmdVaapiDevice()}`
-  }
-
-  return "none"
 }
 
 function getLiveAvcEncoderArgs(acceleration: TranscodeAcceleration) {
-  if (acceleration === "nvenc") {
-    return [
-      "-c:v",
-      "h264_nvenc",
-      "-preset",
-      "p2",
-      "-tune",
-      "hq",
-      "-spatial-aq",
-      "1",
-      "-temporal-aq",
-      "1",
-      "-aq-strength",
-      "6",
-      "-rc-lookahead",
-      "16",
-      "-bf",
-      "3",
-      "-b_ref_mode",
-      "middle",
-    ]
-  }
+  switch (acceleration) {
+    case "nvenc":
+      return [
+        "-c:v",
+        "h264_nvenc",
+        "-preset",
+        "p2",
+        "-tune",
+        "hq",
+        "-spatial-aq",
+        "1",
+        "-temporal-aq",
+        "1",
+        "-aq-strength",
+        "6",
+        "-rc-lookahead",
+        "16",
+        "-bf",
+        "3",
+        "-b_ref_mode",
+        "middle",
+      ]
 
-  if (isIntelAcceleration(acceleration)) {
-    return ["-c:v", "h264_qsv", "-preset", "faster", "-async_depth", "8"]
-  }
+    case "intel_gpu":
+    case "intel_cpu":
+      return ["-c:v", "h264_qsv", "-preset", "faster", "-async_depth", "8"]
 
-  if (isAmdAcceleration(acceleration)) {
-    return getAmdBackend() === "amf"
-      ? [
-          "-c:v",
-          "h264_amf",
-          "-usage",
-          "lowlatency_high_quality",
-          "-quality",
-          "balanced",
-        ]
-      : ["-c:v", "h264_vaapi"]
-  }
+    case "amd_gpu":
+    case "amd_cpu":
+      return getAmdBackend() === "amf"
+        ? [
+            "-c:v",
+            "h264_amf",
+            "-usage",
+            "lowlatency_high_quality",
+            "-quality",
+            "balanced",
+          ]
+        : ["-c:v", "h264_vaapi"]
 
-  return ["-c:v", "libx264", "-preset", "superfast"]
+    case "cpu":
+      return ["-c:v", "libx264", "-preset", "superfast"]
+  }
 }
 
 function getFileVideoBitrateArgs(input: {
@@ -440,19 +436,18 @@ function getLiveOriginalQualityArgs(
     getLiveOriginalVideoBitrateKbps(sourceBitrateKbps)
   )
 
-  if (acceleration === "nvenc") {
-    return ["-rc:v", "vbr", "-cq:v", "20", ...bitrateArgs]
+  switch (acceleration) {
+    case "nvenc":
+      return ["-rc:v", "vbr", "-cq:v", "20", ...bitrateArgs]
+    case "intel_gpu":
+    case "intel_cpu":
+      return ["-global_quality:v", "20", ...bitrateArgs]
+    case "amd_gpu":
+    case "amd_cpu":
+      return [...getAmdLiveQualityArgs(), ...bitrateArgs]
+    case "cpu":
+      return ["-crf", "20", ...bitrateArgs]
   }
-
-  if (isIntelAcceleration(acceleration)) {
-    return ["-global_quality:v", "20", ...bitrateArgs]
-  }
-
-  if (isAmdAcceleration(acceleration)) {
-    return [...getAmdLiveQualityArgs(), ...bitrateArgs]
-  }
-
-  return ["-crf", "20", ...bitrateArgs]
 }
 
 function getAmdLiveQualityArgs() {
@@ -464,23 +459,20 @@ function getAmdLiveQualityArgs() {
 }
 
 function getLiveAvcFormatArgs(acceleration: TranscodeAcceleration) {
-  const format = isIntelAcceleration(acceleration) ? "format=nv12" : "format=yuv420p"
-
-  if (acceleration === "nvenc") {
-    return ["-vf", format]
+  switch (acceleration) {
+    case "nvenc":
+      return ["-vf", "format=yuv420p"]
+    case "intel_gpu":
+    case "intel_cpu":
+      return ["-vf", "format=nv12"]
+    case "amd_gpu":
+    case "amd_cpu":
+      return getAmdBackend() === "amf"
+        ? ["-vf", "format=yuv420p"]
+        : ["-vf", "format=nv12,hwupload"]
+    case "cpu":
+      return []
   }
-
-  if (isIntelAcceleration(acceleration)) {
-    return ["-vf", format]
-  }
-
-  if (isAmdAcceleration(acceleration)) {
-    return getAmdBackend() === "amf"
-      ? ["-vf", format]
-      : ["-vf", "format=nv12,hwupload"]
-  }
-
-  return []
 }
 
 function getLivePixelFormatArgs(acceleration: TranscodeAcceleration) {
@@ -490,15 +482,17 @@ function getLivePixelFormatArgs(acceleration: TranscodeAcceleration) {
 function getLiveBrowserAvcArgs(acceleration: TranscodeAcceleration) {
   const args = ["-profile:v", "high"]
 
-  if (acceleration === "nvenc") {
-    return [...args, "-forced-idr:v", "1"]
+  switch (acceleration) {
+    case "nvenc":
+      return [...args, "-forced-idr:v", "1"]
+    case "cpu":
+      return [...args, "-tune", "zerolatency"]
+    case "intel_gpu":
+    case "intel_cpu":
+    case "amd_gpu":
+    case "amd_cpu":
+      return args
   }
-
-  if (acceleration === "cpu") {
-    return [...args, "-tune", "zerolatency"]
-  }
-
-  return args
 }
 
 function isFileEncodeAcceleration(
@@ -521,53 +515,52 @@ function getAv1FileEncoderArgs(input: {
 
   const bitrateArgs = getFileVideoBitrateArgs(input)
 
-  if (config.transcodeAccel === "nvenc") {
-    return [
-      "-c:v",
-      "av1_nvenc",
-      "-preset",
-      "p4",
-      "-tune",
-      "hq",
-      "-rc:v",
-      "vbr",
-      "-cq:v",
-      "24",
-      ...bitrateArgs,
-      "-multipass",
-      "fullres",
-      "-spatial-aq",
-      "1",
-      "-temporal-aq",
-      "1",
-      "-aq-strength",
-      "8",
-      "-rc-lookahead",
-      "32",
-      "-bf",
-      "4",
-    ]
-  }
+  switch (config.transcodeAccel) {
+    case "nvenc":
+      return [
+        "-c:v",
+        "av1_nvenc",
+        "-preset",
+        "p4",
+        "-tune",
+        "hq",
+        "-rc:v",
+        "vbr",
+        "-cq:v",
+        "24",
+        ...bitrateArgs,
+        "-multipass",
+        "fullres",
+        "-spatial-aq",
+        "1",
+        "-temporal-aq",
+        "1",
+        "-aq-strength",
+        "8",
+        "-rc-lookahead",
+        "32",
+        "-bf",
+        "4",
+      ]
 
-  if (isIntelAcceleration(config.transcodeAccel)) {
-    return [
-      "-c:v",
-      "av1_qsv",
-      "-preset",
-      "medium",
-      "-async_depth",
-      "6",
-      "-global_quality:v",
-      "24",
-      ...bitrateArgs,
-    ]
-  }
+    case "intel_gpu":
+    case "intel_cpu":
+      return [
+        "-c:v",
+        "av1_qsv",
+        "-preset",
+        "medium",
+        "-async_depth",
+        "6",
+        "-global_quality:v",
+        "24",
+        ...bitrateArgs,
+      ]
 
-  if (isAmdAcceleration(config.transcodeAccel)) {
-    return getAmdAv1EncoderArgs(input)
+    case "amd_gpu":
+    case "amd_cpu":
+      return getAmdAv1EncoderArgs(input)
   }
-
-  throw new Error("Unsupported AV1 hardware encoder.")
 }
 
 export type WebmSubtitleOutputStream = {

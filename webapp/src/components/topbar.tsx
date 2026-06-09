@@ -121,6 +121,13 @@ function parseProcessingStateEvent(event: Event) {
   }
 }
 
+const processingActionLabels: Record<MediaImportProcessingItem["kind"], string> = {
+  "direct-move": "moving",
+  "audio-transcode": "audio transcode",
+  "container-remux": "WebM remux",
+  "video-transcode": "video transcode",
+}
+
 function formatProcessingItemLabel(item: MediaImportProcessingItem) {
   return item.subtitle
     ? `Adding Episodes to ${item.animeTitle}: ${item.subtitle}`
@@ -132,19 +139,7 @@ function formatProcessingItemMeta(item: MediaImportProcessingItem) {
     item.displayEpisodeLabel ??
     `S${String(item.seasonNumber).padStart(2, "0")} E${String(item.episodeNumber).padStart(2, "0")}`
 
-  if (item.kind === "direct-move") {
-    return `${episode} · moving`
-  }
-
-  if (item.kind === "audio-transcode") {
-    return `${episode} · audio transcode`
-  }
-
-  if (item.kind === "container-remux") {
-    return `${episode} · WebM remux`
-  }
-
-  return `${episode} · video transcode`
+  return `${episode} · ${processingActionLabels[item.kind]}`
 }
 
 export function Topbar({ user }: { user: CurrentUser }) {

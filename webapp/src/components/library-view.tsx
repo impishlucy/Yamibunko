@@ -134,7 +134,7 @@ export function LibraryView() {
       <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <h1 className="text-2xl font-semibold text-zinc-50 lg:text-3xl">Library</h1>
-          <p className="text-sm text-zinc-500">{items.length} titles</p>
+          <p className="text-sm text-zinc-500">{items.length} Series total.</p>
         </div>
         <label className="relative w-full sm:max-w-xs">
           <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-zinc-500" />

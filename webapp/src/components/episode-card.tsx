@@ -3,13 +3,14 @@
 import Image from "next/image"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
-import { useState } from "react"
-import { Clock3, PlayCircle } from "lucide-react"
+import { type MouseEvent, useState } from "react"
+import { Clock3, Eye, EyeOff, PlayCircle } from "lucide-react"
 
 import { StreamLimitDialog } from "@/components/stream-limit-dialog"
-import { Badge } from "@/components/ui/badge"
 import { Card, CardContent } from "@/components/ui/card"
-import { getEpisodeBadgeLabel } from "@/lib/media-labels"
+import { clientLibraryRefreshEvent } from "@/lib/library-events"
+import { formatEpisodeDisplayTitle } from "@/lib/media-labels"
+import { episodeCompletionRatio } from "@/lib/watch-progress"
 import { cn } from "@/lib/utils"
 import {
   defaultSpoilerSettings,
@@ -26,16 +27,20 @@ function formatDuration(seconds?: number) {
   return `${minutes} min`
 }
 
-function fallbackEpisodeTitle(episode: Episode) {
-  return `Episode ${String(episode.episodeNumber).padStart(2, "0")}`
-}
-
 function isWatchedEpisode(episode: Episode) {
   if (episode.progress?.completed) {
     return true
   }
 
-  return (episode.progress?.ratio ?? 0) >= 0.8
+  return (episode.progress?.ratio ?? 0) >= episodeCompletionRatio
+}
+
+function hasWatchProgress(episode: Episode) {
+  return Boolean(
+    episode.progress?.completed ||
+      (episode.progress?.watchedSeconds ?? 0) > 0 ||
+      (episode.progress?.ratio ?? 0) > 0
+  )
 }
 
 async function hasActiveStream() {
@@ -65,17 +70,40 @@ async function replaceActiveStream() {
   }
 }
 
+async function saveWatchState(episode: Episode, watched: boolean) {
+  const response = await fetch(
+    `/api/anime/${episode.animeId}/episodes/${episode.episodeNumber}/watch-state`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        season: episode.seasonNumber,
+        watched,
+      }),
+    }
+  )
+
+  if (!response.ok) {
+    throw new Error(`Watch state update failed: ${response.status}`)
+  }
+}
+
 export function EpisodeCard({
   episode,
   spoilerSettings = defaultSpoilerSettings,
+  onProgressChange,
 }: {
   episode: Episode
   spoilerSettings?: SpoilerSettings
+  onProgressChange?: () => void
 }) {
   const router = useRouter()
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [pendingHref, setPendingHref] = useState<string | null>(null)
   const [replacing, setReplacing] = useState(false)
+  const [watchStateBusy, setWatchStateBusy] = useState(false)
   const href = `/watch/${episode.animeId}/${episode.episodeNumber}?season=${episode.seasonNumber}`
   const progressRatio = episode.progress?.completed
     ? 1
@@ -87,15 +115,14 @@ export function EpisodeCard({
     spoilerSettings.removeUnwatchedEpisodeTitles &&
     shouldProtectEpisode &&
     Boolean(episode.title)
-  const displayTitle = shouldHideTitle
-    ? fallbackEpisodeTitle(episode)
-    : episode.title ?? episode.fileName
-  const episodeBadgeLabel = getEpisodeBadgeLabel({
-    fileName: episode.fileName,
-    filePath: episode.filePath,
-    seasonNumber: episode.seasonNumber,
+  const displayTitle = formatEpisodeDisplayTitle({
     episodeNumber: episode.episodeNumber,
+    title: shouldHideTitle ? null : episode.title,
   })
+  const hasProgress = hasWatchProgress(episode)
+  const nextWatchedState = !hasProgress
+  const watchStateLabel = nextWatchedState ? "Mark watched" : "Mark not watched"
+  const WatchStateIcon = nextWatchedState ? Eye : EyeOff
 
   async function openEpisode() {
     try {
@@ -129,67 +156,74 @@ export function EpisodeCard({
     }
   }
 
+  async function updateWatchState() {
+    setWatchStateBusy(true)
+
+    try {
+      await saveWatchState(episode, nextWatchedState)
+      window.dispatchEvent(new Event(clientLibraryRefreshEvent))
+      onProgressChange?.()
+    } finally {
+      setWatchStateBusy(false)
+    }
+  }
+
+  const linkProps = {
+    href,
+    prefetch: false,
+    onClick: (event: MouseEvent<HTMLAnchorElement>) => {
+      if (
+        event.defaultPrevented ||
+        event.button !== 0 ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.shiftKey ||
+        event.altKey
+      ) {
+        return
+      }
+
+      event.preventDefault()
+      void openEpisode()
+    },
+  }
+
   return (
     <>
-      <Link
-        href={href}
-        prefetch={false}
-        className="group block"
-        onClick={(event) => {
-          if (
-            event.defaultPrevented ||
-            event.button !== 0 ||
-            event.metaKey ||
-            event.ctrlKey ||
-            event.shiftKey ||
-            event.altKey
-          ) {
-            return
-          }
-
-          event.preventDefault()
-          void openEpisode()
-        }}
-      >
-        <Card className="rounded-lg border-white/10 bg-zinc-900/75 py-0 transition hover:border-violet-400/40 hover:bg-zinc-900">
-          <div className="grid grid-cols-[104px_1fr] overflow-hidden sm:grid-cols-[148px_1fr] lg:grid-cols-[200px_1fr]">
-            <div className="relative overflow-hidden bg-zinc-800">
-              {episode.thumbnail ? (
-                <Image
-                  src={episode.thumbnail}
-                  alt=""
-                  fill
-                  unoptimized
-                  sizes="(min-width: 1024px) 185px, (min-width: 640px) 148px, 104px"
-                  className={cn(
-                    "h-full w-full object-cover opacity-80 transition group-hover:opacity-100",
-                    shouldBlurThumbnail ? "scale-105 blur-md" : null
-                  )}
-                />
-              ) : (
-                <div className="h-full w-full bg-[linear-gradient(135deg,#272333,#121217)]" />
-              )}
-              {episode.progress?.completed ? (
-                <span className="absolute inset-0 bg-zinc-950/55" />
-              ) : null}
-              <span className="absolute inset-0 grid place-items-center text-violet-100 opacity-0 transition group-hover:opacity-100">
-                <PlayCircle className="size-8 drop-shadow" />
-              </span>
-              {progressRatio > 0 ? (
-                <span
-                  className="absolute bottom-0 left-0 h-1 bg-red-600"
-                  style={{ width: `${Math.round(progressRatio * 100)}%` }}
-                />
-              ) : null}
-            </div>
-            <CardContent className="flex min-w-0 flex-col justify-between p-3">
+      <Card className="group rounded-lg border-white/10 bg-zinc-900/75 py-0 transition hover:border-violet-400/40 hover:bg-zinc-900">
+        <div className="grid grid-cols-[104px_1fr_48px] overflow-hidden sm:grid-cols-[148px_1fr_56px] lg:grid-cols-[200px_1fr_64px]">
+          <Link {...linkProps} className="relative overflow-hidden bg-zinc-800">
+            {episode.thumbnail ? (
+              <Image
+                src={episode.thumbnail}
+                alt=""
+                fill
+                unoptimized
+                sizes="(min-width: 1024px) 185px, (min-width: 640px) 148px, 104px"
+                className={cn(
+                  "h-full w-full object-cover opacity-80 transition group-hover:opacity-100",
+                  shouldBlurThumbnail ? "scale-105 blur-md" : null
+                )}
+              />
+            ) : (
+              <div className="h-full w-full bg-[linear-gradient(135deg,#272333,#121217)]" />
+            )}
+            {episode.progress?.completed ? (
+              <span className="absolute inset-0 bg-zinc-950/55" />
+            ) : null}
+            <span className="absolute inset-0 grid place-items-center text-violet-100 opacity-0 transition group-hover:opacity-100">
+              <PlayCircle className="size-8 drop-shadow" />
+            </span>
+            {progressRatio > 0 ? (
+              <span
+                className="absolute bottom-0 left-0 h-1 bg-red-600"
+                style={{ width: `${Math.round(progressRatio * 100)}%` }}
+              />
+            ) : null}
+          </Link>
+          <Link {...linkProps} className="min-w-0">
+            <CardContent className="flex min-h-full min-w-0 flex-col justify-between p-3">
               <div className="min-h-full min-w-0 space-y-1">
-                <Badge
-                  variant="outline"
-                  className="border-violet-400/25 text-sm text-violet-200"
-                >
-                  {episodeBadgeLabel}
-                </Badge>
                 <h3 className="truncate px-2 py-0.5 text-lg font-medium text-zinc-100 lg:text-base">
                   {displayTitle}
                 </h3>
@@ -199,9 +233,23 @@ export function EpisodeCard({
                 </p>
               </div>
             </CardContent>
-          </div>
-        </Card>
-      </Link>
+          </Link>
+          <button
+            type="button"
+            title={watchStateLabel}
+            aria-label={watchStateLabel}
+            disabled={watchStateBusy}
+            className="flex min-h-full items-center justify-center border-l border-white/5 px-2 text-zinc-300 transition hover:bg-violet-500/15 hover:text-violet-100 disabled:pointer-events-none disabled:opacity-50"
+            onClick={(event) => {
+              event.preventDefault()
+              event.stopPropagation()
+              void updateWatchState()
+            }}
+          >
+            <WatchStateIcon className="size-5" />
+          </button>
+        </div>
+      </Card>
       <StreamLimitDialog
         open={confirmOpen}
         onConfirm={confirmReplace}

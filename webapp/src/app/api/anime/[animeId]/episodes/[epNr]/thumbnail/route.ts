@@ -108,18 +108,13 @@ async function generatePreviewFrame(filePath: string, frameTime: number) {
   return Buffer.concat(chunks)
 }
 
+const imageContentTypesByExtension = new Map<string, string>([
+  [".webp", "image/webp"],
+  [".png", "image/png"],
+])
+
 function contentTypeForImagePath(filePath: string) {
-  const extension = path.extname(filePath).toLowerCase()
-
-  if (extension === ".webp") {
-    return "image/webp"
-  }
-
-  if (extension === ".png") {
-    return "image/png"
-  }
-
-  return "image/jpeg"
+  return imageContentTypesByExtension.get(path.extname(filePath).toLowerCase()) ?? "image/jpeg"
 }
 
 async function existingImageStat(filePath: string) {

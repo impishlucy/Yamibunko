@@ -3,6 +3,7 @@
 import type { ReactNode } from "react"
 import { usePathname } from "next/navigation"
 
+import { RouteNoticeToast } from "@/components/route-notice-toast"
 import { Topbar } from "@/components/topbar"
 import { cn } from "@/lib/utils"
 import type { CurrentUser } from "@/server/auth/session"
@@ -29,6 +30,7 @@ export function AppShell({
         >
           {children}
         </main>
+        <RouteNoticeToast />
       </div>
     </div>
   )

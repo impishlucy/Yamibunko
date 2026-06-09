@@ -34,13 +34,6 @@ public static class HardwareAccelerationDetector
             : NormalizeLiveAccelerationForExport(detection.LiveTranscodeAcceleration);
     }
 
-    public static string SelectServerTranscodeDevice(HardwareAccelerationDetection detection, bool importEnabled)
-    {
-        return ShouldUseAv1ImportAcceleration(detection, importEnabled)
-            ? detection.Av1ImportDevice ?? string.Empty
-            : detection.LiveTranscodeDevice ?? string.Empty;
-    }
-
     public static bool IsUnsupportedAcceleration(string? acceleration)
     {
         return string.IsNullOrWhiteSpace(acceleration)
@@ -325,19 +318,16 @@ public static class HardwareAccelerationDetector
 
     private static bool IsNvidiaAcceleration(string acceleration)
     {
-        return string.Equals(acceleration, "nvenc", StringComparison.OrdinalIgnoreCase);
+        return acceleration.Equals("nvenc", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsIntelAcceleration(string acceleration)
     {
-        return string.Equals(acceleration, "intel_gpu", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(acceleration, "intel_cpu", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool IsAmdAcceleration(string acceleration)
-    {
-        return string.Equals(acceleration, "amd_gpu", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(acceleration, "amd_cpu", StringComparison.OrdinalIgnoreCase);
+        return acceleration.ToLowerInvariant() switch
+        {
+            "intel_gpu" or "intel_cpu" => true,
+            _ => false
+        };
     }
 
     private static bool SupportsNvidiaAv1Encode(string value)
@@ -424,25 +414,24 @@ public static class HardwareAccelerationDetector
             return new string?[] { null };
         }
 
-        if (IsAmdAcceleration(acceleration))
+        var vendorId = acceleration.ToLowerInvariant() switch
         {
-            var devices = hardware.RenderDevices
-                .Where(device => string.Equals(device.VendorId, "0x1002", StringComparison.OrdinalIgnoreCase))
-                .Select(device => (string?)device.Path)
-                .ToArray();
-            return devices.Length > 0 ? devices : new string?[] { "/dev/dri/renderD128" };
+            "amd_gpu" or "amd_cpu" => "0x1002",
+            "intel_gpu" or "intel_cpu" => "0x8086",
+            _ => null
+        };
+
+        if (vendorId == null)
+        {
+            return new string?[] { null };
         }
 
-        if (IsIntelAcceleration(acceleration))
-        {
-            var devices = hardware.RenderDevices
-                .Where(device => string.Equals(device.VendorId, "0x8086", StringComparison.OrdinalIgnoreCase))
-                .Select(device => (string?)device.Path)
-                .ToArray();
-            return devices.Length > 0 ? devices : new string?[] { "/dev/dri/renderD128" };
-        }
+        var devices = hardware.RenderDevices
+            .Where(device => string.Equals(device.VendorId, vendorId, StringComparison.OrdinalIgnoreCase))
+            .Select(device => (string?)device.Path)
+            .ToArray();
 
-        return new string?[] { null };
+        return devices.Length > 0 ? devices : new string?[] { "/dev/dri/renderD128" };
     }
 
     private static IReadOnlyList<EncoderCandidate> UniqueCandidates(IEnumerable<EncoderCandidate> candidates)
@@ -662,44 +651,44 @@ public static class HardwareAccelerationDetector
 
     private static IReadOnlyList<string> GetAv1ProbeQualityArgs(string acceleration)
     {
-        if (IsNvidiaAcceleration(acceleration))
+        switch (acceleration.ToLowerInvariant())
         {
-            return new[]
-            {
-                "-preset",
-                "p4",
-                "-tune",
-                "hq",
-                "-rc:v",
-                "vbr",
-                "-cq:v",
-                "24",
-                "-b:v",
-                "2M",
-                "-maxrate",
-                "3M",
-                "-bufsize",
-                "6M",
-                "-multipass",
-                "fullres"
-            };
-        }
+            case "nvenc":
+                return new[]
+                {
+                    "-preset",
+                    "p4",
+                    "-tune",
+                    "hq",
+                    "-rc:v",
+                    "vbr",
+                    "-cq:v",
+                    "24",
+                    "-b:v",
+                    "2M",
+                    "-maxrate",
+                    "3M",
+                    "-bufsize",
+                    "6M",
+                    "-multipass",
+                    "fullres"
+                };
 
-        if (IsIntelAcceleration(acceleration))
-        {
-            return new[]
-            {
-                "-preset",
-                "medium",
-                "-global_quality:v",
-                "24",
-                "-b:v",
-                "2M",
-                "-maxrate",
-                "3M",
-                "-bufsize",
-                "6M"
-            };
+            case "intel_gpu":
+            case "intel_cpu":
+                return new[]
+                {
+                    "-preset",
+                    "medium",
+                    "-global_quality:v",
+                    "24",
+                    "-b:v",
+                    "2M",
+                    "-maxrate",
+                    "3M",
+                    "-bufsize",
+                    "6M"
+                };
         }
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))

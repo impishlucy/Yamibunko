@@ -18,7 +18,7 @@ type YamibunkoDatabase = DatabaseSync & {
 
 let database: YamibunkoDatabase | undefined
 
-const currentSchemaVersion = 13
+const currentSchemaVersion = 14
 
 function getDatabasePath() {
   return path.join(
@@ -721,6 +721,16 @@ function runSchemaMigrations(db: YamibunkoDatabase) {
       "users",
       "disable_update_badges",
       "disable_update_badges INTEGER NOT NULL DEFAULT 0"
+    )
+  }
+
+
+  if (version < 14) {
+    ensureColumn(
+      db,
+      "episode_progress",
+      "completed",
+      "completed INTEGER NOT NULL DEFAULT 0"
     )
   }
 

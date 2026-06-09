@@ -2,90 +2,29 @@
 
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
 
-import { getAnimeTitleSuffix } from "@/lib/anime-title"
-import {
-  formatSeasonPartCompactLabel,
-  parseSeasonPartFromText,
-  type ParsedSeasonPart,
-} from "@/lib/media-labels"
+import { formatSeriesEntryLabel, getAnimeRealTitleSuffix } from "@/lib/anime-title"
 import type { AnimeVariant } from "@/lib/types"
 
-const numberMarkerPattern =
-  String.raw`(?:\d{1,2}|[ivx]+|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|1st|2nd|3rd|[4-9]th|10th)`
-const seasonPartSeparatorPattern = String.raw`(?:\s|[:：\-–—])*`
-const leadingSeasonPartPattern = new RegExp(
-  String.raw`^\s*(?:season|s)\s*0*\d{1,2}(?:(?:${seasonPartSeparatorPattern}(?:part|pt\.?|p|cour|c)\s*${numberMarkerPattern})|(?:${seasonPartSeparatorPattern}${numberMarkerPattern}\s*(?:cour|half)))?(?:\s*(?::|[-–—])\s*|\s+)?`,
-  "i"
-)
-const seasonPartOnlyPattern = new RegExp(
-  String.raw`^\s*(?:season|s)\s*0*\d{1,2}(?:(?:${seasonPartSeparatorPattern}(?:part|pt\.?|p|cour|c)\s*${numberMarkerPattern})|(?:${seasonPartSeparatorPattern}${numberMarkerPattern}\s*(?:cour|half)))?\s*$`,
-  "i"
-)
-
-function cleanSubtitle(value: string) {
-  return value
-    .replace(/^\s*(?:[:：\-–—]+\s*)+/, "")
-    .replace(/\s*(?:[:：\-–—]+\s*)+$/, "")
-    .replace(/\s+/g, " ")
-    .trim()
-}
-
-function stripRedundantSeasonPartPrefix(value: string) {
-  return cleanSubtitle(value.replace(leadingSeasonPartPattern, ""))
-}
-
-function getSeriesSeasonPart(variant: AnimeVariant): ParsedSeasonPart {
-  const titleSeasonPart = parseSeasonPartFromText(variant.title)
-
-  if (titleSeasonPart) {
-    return titleSeasonPart
-  }
-
-  return { season: variant.seasonNumber ?? 1 }
-}
-
-function getSeriesSubtitle(input: { libraryTitle: string; mediaTitle: string }) {
-  const titleSuffix = getAnimeTitleSuffix(input)
-
-  if (!titleSuffix) {
-    return null
-  }
-
-  if (seasonPartOnlyPattern.test(titleSuffix)) {
-    return null
-  }
-
-  const strippedSubtitle = stripRedundantSeasonPartPrefix(titleSuffix)
-
-  if (!strippedSubtitle || seasonPartOnlyPattern.test(strippedSubtitle)) {
-    return null
-  }
-
-  return strippedSubtitle
-}
-
 function variantLabel(variant: AnimeVariant, libraryTitle: string) {
-  const titleSuffix = getAnimeTitleSuffix({
+  const titleSuffix = getAnimeRealTitleSuffix({
     libraryTitle,
     mediaTitle: variant.title,
   })
   const title = titleSuffix ?? variant.title
 
-  if (variant.format === "MOVIE") {
-    return `[Movie] ${title}`
+  switch (variant.format) {
+    case "MOVIE":
+      return `[Movie] ${title}`
+    case "SPECIAL":
+    case "OVA":
+      return `[Special] ${title}`
+    default:
+      return `[Series] ${formatSeriesEntryLabel({
+        libraryTitle,
+        mediaTitle: variant.title,
+        seasonNumber: variant.seasonNumber,
+      })}`
   }
-
-  if (variant.format === "SPECIAL" || variant.format === "OVA") {
-    return `[Special] ${title}`
-  }
-
-  const seasonPartLabel = formatSeasonPartCompactLabel(getSeriesSeasonPart(variant))
-  const subtitle = getSeriesSubtitle({
-    libraryTitle,
-    mediaTitle: variant.title,
-  })
-
-  return `[Series] ${subtitle ? `${seasonPartLabel} - ${subtitle}` : seasonPartLabel}`
 }
 
 export function AnimeVariantSelect({

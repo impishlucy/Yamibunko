@@ -4,6 +4,8 @@ import os from "node:os"
 
 import { execa } from "execa"
 
+import { registerLiveTranscodeProcessPriority } from "@/server/transcode/processPriority"
+
 import type { TranscodeStatus } from "@/lib/types"
 import {
   getServerConfigResult,
@@ -330,11 +332,20 @@ function getTranscodeCost(
   return 0.16
 }
 
-function getActiveCost() {
-  return [...activeTranscodes.values()].reduce(
-    (total, transcode) => total + transcode.cost,
-    0
-  )
+function getActiveCost(options: { includeImportTranscodes?: boolean } = {}) {
+  return [...activeTranscodes.values()].reduce((total, transcode) => {
+    if (!options.includeImportTranscodes && transcode.kind !== "live") {
+      return total
+    }
+
+    return total + transcode.cost
+  }, 0)
+}
+
+function getActiveImportCount() {
+  return [...activeTranscodes.values()].filter(
+    (transcode) => transcode.kind !== "live"
+  ).length
 }
 
 function getActiveLiveCount() {
@@ -368,11 +379,16 @@ async function getCanFitTranscode(kind: TranscodeKind) {
     return false
   }
 
+  const hasActiveImports = getActiveImportCount() > 0
   const snapshot = await getHardwarePressureSnapshot(acceleration)
   const candidateCost = getTranscodeCost(acceleration, kind)
-  const activeCost = getActiveCost()
-  const localPressureFloor = activeCost
-  const effectivePressure = Math.max(snapshot.pressure, localPressureFloor)
+  const activeCost = getActiveCost({
+    includeImportTranscodes: kind !== "live",
+  })
+  const effectivePressure =
+    kind === "live" && hasActiveImports
+      ? activeCost
+      : Math.max(snapshot.pressure, activeCost)
 
   return effectivePressure + candidateCost <= hardwarePressureLimit
 }
@@ -388,9 +404,12 @@ function removePendingRequest(id: string) {
 export function cancelPendingLiveTranscodes(
   reason = "Live transcode request was cancelled"
 ) {
-  const pendingLiveRequests = pendingTranscodes.splice(0)
+  const pendingLiveRequests = pendingTranscodes.filter(
+    (request) => request.kind === "live"
+  )
 
   for (const request of pendingLiveRequests) {
+    removePendingRequest(request.id)
     request.reject(new Error(reason))
   }
 
@@ -463,10 +482,13 @@ async function getDynamicLiveCapacity() {
 
   const acceleration = result.config.transcodeAccel
 
+  const hasActiveImports = getActiveImportCount() > 0
   const snapshot = await getHardwarePressureSnapshot(acceleration)
   const liveCost = getTranscodeCost(acceleration, "live")
-  const activeCost = getActiveCost()
-  const effectivePressure = Math.max(snapshot.pressure, activeCost)
+  const activeCost = getActiveCost({ includeImportTranscodes: false })
+  const effectivePressure = hasActiveImports
+    ? activeCost
+    : Math.max(snapshot.pressure, activeCost)
   const remainingPressure = Math.max(
     hardwarePressureLimit - effectivePressure,
     0
@@ -482,6 +504,9 @@ function createLease(
 ): LiveTranscodeLease {
   const id = randomUUID()
   let released = false
+  const releasePriority =
+    kind === "live" ? registerLiveTranscodeProcessPriority() : null
+
   activeTranscodes.set(id, {
     label,
     kind,
@@ -499,31 +524,29 @@ function createLease(
 
       released = true
       activeTranscodes.delete(id)
+      releasePriority?.()
       void drainPendingTranscodes()
     },
   }
 }
 
-export function registerImportTranscodeCapacity(
+export function acquireImportTranscodeCapacity(
   label: string,
-  kind: ImportTranscodeCapacityKind
-): LiveTranscodeLease {
-  const result = getServerConfigResult()
-  const transcodeKind: TranscodeKind =
-    kind === "video" ? "import-video" : "import-remux"
-  const cost = result.ok
-    ? getTranscodeCost(result.config.transcodeAccel, transcodeKind)
-    : kind === "video"
-      ? 0.5
-      : 0.12
-
-  return createLease(label, transcodeKind, cost)
+  kind: ImportTranscodeCapacityKind,
+  signal?: AbortSignal
+) {
+  return acquireQueuedTranscode({
+    label,
+    kind: kind === "video" ? "import-video" : "import-remux",
+    priority: kind === "video" ? 11 : 10,
+    signal,
+  })
 }
 
 export async function getLiveTranscodeStatus(): Promise<TranscodeStatus> {
   const available = await getDynamicLiveCapacity()
   const active = getActiveLiveCount()
-  const queued = pendingTranscodes.length
+  const queued = pendingTranscodes.filter((request) => request.kind === "live").length
 
   return {
     max: active + available,
@@ -537,7 +560,7 @@ function acquireQueuedTranscode(input: {
   label: string
   kind: TranscodeKind
   signal?: AbortSignal
-  isVip?: boolean
+  priority: number
 }) {
   const id = randomUUID()
 
@@ -546,7 +569,7 @@ function acquireQueuedTranscode(input: {
       id,
       label: input.label,
       kind: input.kind,
-      priority: input.isVip ? -1 : 0,
+      priority: input.priority,
       sequence: pendingSequence++,
       signal: input.signal,
       resolve,
@@ -583,6 +606,6 @@ export function acquireLiveTranscode(
     label,
     kind: "live",
     signal,
-    isVip: options?.isVip,
+    priority: options?.isVip ? -1 : 0,
   })
 }

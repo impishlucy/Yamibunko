@@ -18,6 +18,12 @@ export type ServerCastTextTrack = {
   url: string
 }
 
+export type ServerCastTrackingTarget = {
+  animeId: number
+  seasonNumber: number
+  episodeNumber: number
+}
+
 export type ServerCastCandidate = {
   id: string
   url: string
@@ -27,6 +33,7 @@ export type ServerCastCandidate = {
   sourceStartOffset: number
   textTrack?: ServerCastTextTrack
   title?: string
+  tracking?: ServerCastTrackingTarget
 }
 
 export type ServerCastMediaState = {

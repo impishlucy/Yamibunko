@@ -34,7 +34,7 @@ import {
 import { registerMediaImportProcessingItem } from "@/server/media/importProcessingStatus"
 import {
   cancelPendingLiveTranscodes,
-  registerImportTranscodeCapacity,
+  acquireImportTranscodeCapacity,
   type ImportTranscodeCapacityKind,
   type LiveTranscodeLease,
 } from "@/server/transcode/transcodeCapacity"
@@ -482,9 +482,10 @@ export function startWorkers() {
         const capacityKind = getImportFileActionCapacityKind(item.kind)
 
         if (capacityKind) {
-          liveCapacityLease = registerImportTranscodeCapacity(
+          liveCapacityLease = await acquireImportTranscodeCapacity(
             item.label,
-            capacityKind
+            capacityKind,
+            shutdownAbortController.signal
           )
         }
 

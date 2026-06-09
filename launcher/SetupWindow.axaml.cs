@@ -7,6 +7,7 @@ using Avalonia.Media;
 using System;
 using System.IO;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 
 namespace Launcher;
 
@@ -63,33 +64,7 @@ public partial class SetupWindow : Window
 
     private async void SelectInputFolder_Click(object? sender, RoutedEventArgs e)
     {
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel == null)
-        {
-            return;
-        }
-
-        var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
-        {
-            Title = "Select Input Folder Directory",
-            AllowMultiple = false
-        });
-
-        if (folders.Count == 0)
-        {
-            return;
-        }
-
-        var uri = folders[0].Path;
-        if (uri != null && uri.IsAbsoluteUri)
-        {
-            SetTextBoxValue("InputFolderBox", uri.LocalPath);
-        }
-        else
-        {
-            // fallback: show the URI string or use storage APIs to access files
-            SetTextBoxValue("InputFolderBox", uri?.ToString() ?? string.Empty);
-        }
+        await SelectFolderIntoTextBoxAsync("Select Input Folder Directory", "InputFolderBox");
     }
 
     private async void SelectOutputFolder_Click(object? sender, RoutedEventArgs e)
@@ -99,6 +74,11 @@ public partial class SetupWindow : Window
             return;
         }
 
+        await SelectFolderIntoTextBoxAsync("Select Output Folder Directory", "OutputFolderBox");
+    }
+
+    private async Task SelectFolderIntoTextBoxAsync(string title, string textBoxName)
+    {
         var topLevel = TopLevel.GetTopLevel(this);
         if (topLevel == null)
         {
@@ -107,7 +87,7 @@ public partial class SetupWindow : Window
 
         var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
         {
-            Title = "Select Output Folder Directory",
+            Title = title,
             AllowMultiple = false
         });
 
@@ -117,15 +97,7 @@ public partial class SetupWindow : Window
         }
 
         var uri = folders[0].Path;
-        if (uri != null && uri.IsAbsoluteUri)
-        {
-            SetTextBoxValue("OutputFolderBox", uri.LocalPath);
-        }
-        else
-        {
-            // fallback: show the URI string or use storage APIs to access files
-            SetTextBoxValue("OutputFolderBox", uri?.ToString() ?? string.Empty);
-        }
+        SetTextBoxValue(textBoxName, uri?.IsAbsoluteUri == true ? uri.LocalPath : uri?.ToString() ?? string.Empty);
     }
 
     private void PopulateForm(AppSettings settings)
@@ -183,7 +155,6 @@ public partial class SetupWindow : Window
             ImportEnabled = importEnabled,
             FfmpegDir = _initialSettings?.FfmpegDir ?? "",
             TranscodeAccel = ResolveSavedTranscodeAcceleration(importEnabled),
-            TranscodeHwDevice = ResolveSavedTranscodeHwDevice(importEnabled),
             AnilistClientId = GetTextBoxValue("ClientIdBox"),
             AnilistClientSecret = GetTextBoxValue("ClientSecretBox"),
             BunPath = _initialSettings?.BunPath ?? ""
@@ -218,16 +189,6 @@ public partial class SetupWindow : Window
         }
 
         return AppSettings.NormalizeTranscodeAccel(_initialSettings?.TranscodeAccel);
-    }
-
-    private string ResolveSavedTranscodeHwDevice(bool importEnabled)
-    {
-        if (_hardwareDetection != null)
-        {
-            return HardwareAccelerationDetector.SelectServerTranscodeDevice(_hardwareDetection, importEnabled);
-        }
-
-        return _initialSettings?.TranscodeHwDevice ?? string.Empty;
     }
 
     private async void RefreshCatalogModeLockAsync()

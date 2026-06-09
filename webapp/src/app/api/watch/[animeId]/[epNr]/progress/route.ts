@@ -1,10 +1,10 @@
 import { z } from "zod"
 
 import { requireApiUser, requireSameOriginRequest } from "@/server/auth/api"
-import { saveAniListProgress } from "@/server/anilist/client"
-import { upsertEpisodeProgress } from "@/server/db/library"
-import { getEpisode, getEpisodeNeighbors } from "@/server/media/libraryStore"
-import { errorMessage, parsePositiveInt } from "@/server/utils/format"
+import { getEpisode } from "@/server/media/libraryStore"
+import { parsePositiveInt } from "@/server/utils/format"
+import { isEpisodeCompleteByProgress } from "@/lib/watch-progress"
+import { saveEpisodePlaybackProgress } from "@/server/media/watchProgress"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -73,39 +73,20 @@ export async function POST(request: Request, context: ProgressContext) {
     parsed.data.durationSeconds ?? episode.durationSeconds ?? null
   const completed =
     parsed.data.completed ??
-    (durationSeconds
-      ? parsed.data.watchedSeconds / durationSeconds >= 0.8
-      : false)
+    isEpisodeCompleteByProgress({
+      watchedSeconds: parsed.data.watchedSeconds,
+      durationSeconds,
+    })
 
-  upsertEpisodeProgress({
+  saveEpisodePlaybackProgress({
     username: auth.user.username,
     animeId: animeIdNumber,
-    seasonNr: seasonNumber,
-    epNr: episodeNumber,
+    seasonNumber,
+    episodeNumber,
     watchedSeconds: parsed.data.watchedSeconds,
     durationSeconds,
     completed,
   })
-
-  if (completed) {
-    const neighbors = getEpisodeNeighbors({
-      animeId: animeIdNumber,
-      seasonNr: seasonNumber,
-      epNr: episodeNumber,
-      username: auth.user.username,
-    })
-
-    await saveAniListProgress({
-      username: auth.user.username,
-      animeId: animeIdNumber,
-      progress: episodeNumber,
-      completed: !neighbors.nextEpisode,
-    }).catch((error) => {
-      console.error(
-        `[Error] [Anilist] Progress sync failed - watch/progress/route.ts - ${errorMessage(error)}`
-      )
-    })
-  }
 
   return Response.json({
     ok: true,

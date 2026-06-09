@@ -22,6 +22,7 @@ import {
 import { Button } from "@/components/ui/button"
 import { HoverHint } from "@/components/ui/hover-hint"
 import { getPreferredPlayerAspectRatio } from "@/lib/player-aspect-ratio"
+import { episodeCompletionRatio } from "@/lib/watch-progress"
 import {
   serverCastControlApiPath,
   serverCastDevicesApiPath,
@@ -343,29 +344,38 @@ function getWebVideoCasterSourceFileName(
   return `${label} - ${baseName}.${extension}`
 }
 
+const containerByExtension = new Map<string, string>([
+  ["mp4", "mp4"],
+  ["m4v", "mp4"],
+  ["mov", "mov"],
+  ["mkv", "matroska"],
+  ["webm", "webm"],
+  ["avi", "avi"],
+])
+
+const directMimeTypesByContainer: Record<string, string[]> = {
+  mp4: ["video/mp4"],
+  mov: ["video/quicktime", "video/mp4"],
+  webm: ["video/webm"],
+  matroska: ["video/x-matroska"],
+  avi: ["video/x-msvideo"],
+}
+
+const fallbackDirectMimeTypes = ["video/mp4", "video/webm", "video/x-matroska"]
+
+const h264CodecChecks = ["avc1.640028", "avc1.4D401F", "avc1.42E01E", "avc1"]
+const hevcMatroskaCodecChecks = ["hvc1", "hev1", "hevc"]
+const hevcCodecChecks = ["hvc1.1.6.L93.B0", "hev1.1.6.L93.B0", "hvc1", "hev1"]
+
 function getMediaContainer(fileName: string, container: string | undefined) {
   const extension = fileName.split(".").at(-1)?.toLowerCase() ?? ""
+  const extensionContainer = containerByExtension.get(extension)
+
+  if (extensionContainer) {
+    return extensionContainer
+  }
+
   const normalizedContainer = container?.trim().toLowerCase() ?? ""
-
-  if (extension === "mp4" || extension === "m4v") {
-    return "mp4"
-  }
-
-  if (extension === "mov") {
-    return "mov"
-  }
-
-  if (extension === "mkv") {
-    return "matroska"
-  }
-
-  if (extension === "webm") {
-    return "webm"
-  }
-
-  if (extension === "avi") {
-    return "avi"
-  }
 
   if (normalizedContainer.includes("mp4") || normalizedContainer.includes("mov")) {
     return "mp4"
@@ -387,64 +397,32 @@ function getMediaContainer(fileName: string, container: string | undefined) {
 }
 
 function getDirectMimeTypes(container: string) {
-  if (container === "mp4") {
-    return ["video/mp4"]
-  }
-
-  if (container === "mov") {
-    return ["video/quicktime", "video/mp4"]
-  }
-
-  if (container === "webm") {
-    return ["video/webm"]
-  }
-
-  if (container === "matroska") {
-    return ["video/x-matroska"]
-  }
-
-  if (container === "avi") {
-    return ["video/x-msvideo"]
-  }
-
-  return ["video/mp4", "video/webm", "video/x-matroska"]
+  return directMimeTypesByContainer[container] ?? fallbackDirectMimeTypes
 }
 
 function getVideoCodecChecks(codec: string | undefined, mimeType: string) {
-  const normalizedCodec = normalizeCodecName(codec)
-
-  if (!normalizedCodec) {
-    return []
+  switch (normalizeCodecName(codec)) {
+    case "h264":
+    case "avc1":
+      return h264CodecChecks
+    case "hevc":
+    case "h265":
+    case "hvc1":
+    case "hev1":
+      return mimeType === "video/x-matroska"
+        ? hevcMatroskaCodecChecks
+        : hevcCodecChecks
+    case "vp9":
+    case "vp09":
+      return ["vp09.00.10.08", "vp9"]
+    case "vp8":
+      return ["vp8"]
+    case "av1":
+    case "av01":
+      return ["av01.0.05M.08", "av01"]
+    default:
+      return []
   }
-
-  if (normalizedCodec === "h264" || normalizedCodec === "avc1") {
-    return ["avc1.640028", "avc1.4D401F", "avc1.42E01E", "avc1"]
-  }
-
-  if (
-    normalizedCodec === "hevc" ||
-    normalizedCodec === "h265" ||
-    normalizedCodec === "hvc1" ||
-    normalizedCodec === "hev1"
-  ) {
-    return mimeType === "video/x-matroska"
-      ? ["hvc1", "hev1", "hevc"]
-      : ["hvc1.1.6.L93.B0", "hev1.1.6.L93.B0", "hvc1", "hev1"]
-  }
-
-  if (normalizedCodec === "vp9" || normalizedCodec === "vp09") {
-    return ["vp09.00.10.08", "vp9"]
-  }
-
-  if (normalizedCodec === "vp8") {
-    return ["vp8"]
-  }
-
-  if (normalizedCodec === "av1" || normalizedCodec === "av01") {
-    return ["av01.0.05M.08", "av01"]
-  }
-
-  return []
 }
 
 function getAacCodecChecks(profile: string | undefined) {
@@ -462,41 +440,30 @@ function getAacCodecChecks(profile: string | undefined) {
 }
 
 function getAudioCodecChecks(audioStream: MediaStreamInfo | undefined) {
-  const normalizedCodec = normalizeCodecName(audioStream?.codec)
-
-  if (!audioStream || !normalizedCodec) {
+  if (!audioStream) {
     return []
   }
 
-  if (normalizedCodec === "aac") {
-    return getAacCodecChecks(audioStream.profile)
+  switch (normalizeCodecName(audioStream.codec)) {
+    case "aac":
+      return getAacCodecChecks(audioStream.profile)
+    case "mp3":
+    case "mp2":
+    case "mp1":
+      return ["mp4a.40.34", "mp4a.69", "mp4a.6B", "mp3"]
+    case "opus":
+      return ["opus"]
+    case "vorbis":
+      return ["vorbis"]
+    case "flac":
+      return ["flac"]
+    case "ac3":
+      return ["ac-3"]
+    case "eac3":
+      return ["ec-3"]
+    default:
+      return []
   }
-
-  if (normalizedCodec === "mp3" || normalizedCodec === "mp2" || normalizedCodec === "mp1") {
-    return ["mp4a.40.34", "mp4a.69", "mp4a.6B", "mp3"]
-  }
-
-  if (normalizedCodec === "opus") {
-    return ["opus"]
-  }
-
-  if (normalizedCodec === "vorbis") {
-    return ["vorbis"]
-  }
-
-  if (normalizedCodec === "flac") {
-    return ["flac"]
-  }
-
-  if (normalizedCodec === "ac3") {
-    return ["ac-3"]
-  }
-
-  if (normalizedCodec === "eac3") {
-    return ["ec-3"]
-  }
-
-  return []
 }
 
 function buildDirectPlaybackChecks(input: {
@@ -852,6 +819,14 @@ function getIosExternalCastPageUrl() {
   return url.toString()
 }
 
+function isCurrentPageHttpsOrigin() {
+  if (typeof window === "undefined") {
+    return false
+  }
+
+  return window.location.protocol === "https:"
+}
+
 function isCurrentPageHttpPrivateLanOrigin() {
   if (typeof window === "undefined") {
     return false
@@ -1015,6 +990,13 @@ function isPlayerControlTarget(target: EventTarget | null) {
   )
 }
 
+const castDirectContentTypesByExtension = new Map<string, string>([
+  ["mp4", "video/mp4"],
+  ["m4v", "video/mp4"],
+  ["webm", "video/webm"],
+  ["mkv", "video/x-matroska"],
+])
+
 function getCastDirectContentType(fileName: string, usesAudioRemux = false) {
   const extension = fileName.split(".").at(-1)?.toLowerCase() ?? ""
 
@@ -1022,19 +1004,10 @@ function getCastDirectContentType(fileName: string, usesAudioRemux = false) {
     return extension === "webm" ? "video/webm" : "video/mp4"
   }
 
-  if (extension === "mp4" || extension === "m4v") {
-    return "video/mp4"
-  }
-
-  if (extension === "webm") {
-    return "video/webm"
-  }
-
-  if (extension === "mkv") {
-    return "video/x-matroska"
-  }
-
-  return "application/octet-stream"
+  return (
+    castDirectContentTypesByExtension.get(extension) ??
+    "application/octet-stream"
+  )
 }
 
 function formatTime(seconds: number) {
@@ -2196,8 +2169,23 @@ export function AnimePlayer({
   const [volumeOpen, setVolumeOpen] = useState(false)
 
   const playbackKey = `${animeId}:${seasonNumber}:${episodeNumber}`
+  const castProgressTracking = useMemo(() => {
+    const parsedAnimeId = Number(animeId)
+
+    if (!Number.isInteger(parsedAnimeId) || parsedAnimeId <= 0) {
+      return undefined
+    }
+
+    return {
+      animeId: parsedAnimeId,
+      seasonNumber,
+      episodeNumber,
+    }
+  }, [animeId, episodeNumber, seasonNumber])
   const isIosDevice = isIosBrowser()
   const isInsideWebVideoCaster = isWebVideoCasterBrowser()
+  const canExposeWebVideoCasterSources =
+    isIphoneBrowser() && isInsideWebVideoCaster && isCurrentPageHttpsOrigin()
   const liveTranscodeEnabled = playback.liveTranscodeEnabled !== false
   const showQualityControl = false
   const selectedAudioStream = useMemo(
@@ -3214,7 +3202,7 @@ export function AnimePlayer({
 
     if (
       effectiveDuration &&
-      watchedSeconds / effectiveDuration >= 0.8 &&
+      watchedSeconds / effectiveDuration >= episodeCompletionRatio &&
       !completedProgressRef.current
     ) {
       completedProgressRef.current = true
@@ -3231,7 +3219,7 @@ export function AnimePlayer({
     const finalTime =
       knownDuration && Number.isFinite(knownDuration) ? knownDuration : endedTime
     const completedEnough =
-      knownDuration && knownDuration > 0 ? endedTime / knownDuration >= 0.9 : endedTime >= 60
+      knownDuration && knownDuration > 0 ? endedTime / knownDuration >= episodeCompletionRatio : endedTime >= 60
 
     setIsPlaying(false)
     completedProgressRef.current = Boolean(completedEnough)
@@ -3412,7 +3400,7 @@ export function AnimePlayer({
   ) {
     const video = videoRef.current
     const previousPosition = options.preservePosition ? getPlaybackPosition() : 0
-    const useWebVideoCasterSourceList = isIosDevice && isInsideWebVideoCaster
+    const useWebVideoCasterSourceList = canExposeWebVideoCasterSources
     const sourceUsesOffset =
       nextStatus === "transcoding" ||
       (!useWebVideoCasterSourceList && localDirectAudioRemuxActive)
@@ -3587,7 +3575,7 @@ export function AnimePlayer({
       }
 
       const video = videoRef.current
-      const useWebVideoCasterSources = isIosDevice && isInsideWebVideoCaster
+      const useWebVideoCasterSources = canExposeWebVideoCasterSources
       const canUseDirect = useWebVideoCasterSources
         ? true
         : video
@@ -3654,6 +3642,7 @@ export function AnimePlayer({
     getDirectUrl,
     getTranscodeUrl,
     getWebVideoCasterDirectUrl,
+    canExposeWebVideoCasterSources,
     isInsideWebVideoCaster,
     isIosDevice,
     liveTranscodeEnabled,
@@ -4224,7 +4213,7 @@ export function AnimePlayer({
       statusRef.current === "direct" &&
       quality === "original" &&
       !directFallbackAttemptedRef.current &&
-      !(isIosDevice && isInsideWebVideoCaster)
+      !canExposeWebVideoCasterSources
     )
   }
 
@@ -4237,7 +4226,7 @@ export function AnimePlayer({
     }
 
     switchSourceRef.current(
-      isIosDevice && isInsideWebVideoCaster
+      canExposeWebVideoCasterSources
         ? getWebVideoCasterTranscodeUrl()
         : getTranscodeUrl("original"),
       "transcoding",
@@ -5266,6 +5255,7 @@ export function AnimePlayer({
         durationSeconds,
         textTrack: getSelectedCastTextTrack(directCastStartOffset),
         title,
+        tracking: castProgressTracking,
       })
     }
 
@@ -5279,6 +5269,7 @@ export function AnimePlayer({
         durationSeconds,
         textTrack: getSelectedCastTextTrack(transcodeCastStartOffset),
         title,
+        tracking: castProgressTracking,
       })
     }
 
@@ -5975,7 +5966,7 @@ export function AnimePlayer({
   const shouldUseIosExternalCastHandoff = isIosDevice && !isInsideWebVideoCaster && shouldOpenIosExternalCastApp()
   const shouldUseIosServerCast = isIosDevice && !isInsideWebVideoCaster && shouldUseIosServerCastBridge()
   const shouldShowIosExternalCastEpisodeNav =
-    shouldBlockMobilePortraitPlayback && isIosDevice && isInsideWebVideoCaster
+    shouldBlockMobilePortraitPlayback && canExposeWebVideoCasterSources
   const castButtonLabel = shouldDisableIosWebVideoCasterCast
     ? "Use Web Video Caster's cast controls"
     : shouldUseIosExternalCastHandoff
@@ -6000,7 +5991,7 @@ export function AnimePlayer({
   }`
   const settingsSelectClass =
     "h-8 w-full rounded-md lg:h-10 border border-white/10 bg-zinc-950 px-2 text-xs text-zinc-100 outline-none focus:border-violet-400"
-  const webVideoCasterSources = isInsideWebVideoCaster
+  const webVideoCasterSources = canExposeWebVideoCasterSources
     ? {
         directUrl: getWebVideoCasterDirectUrl(),
         transcodeUrl: liveTranscodeEnabled ? getWebVideoCasterTranscodeUrl() : null,
@@ -7202,10 +7193,6 @@ export function AnimePlayer({
           </div>
         </div>
       ) : null}
-
-      <p className="sr-only">
-        Player for {animeId} season {seasonNumber} episode {episodeNumber}
-      </p>
     </div>
   )
 }

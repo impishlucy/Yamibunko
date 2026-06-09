@@ -8,8 +8,7 @@ import { AnimeVariantSelect } from "@/components/anime-variant-select"
 import { EpisodeCard } from "@/components/episode-card"
 import { MobileDescription } from "@/components/mobile-description"
 import { Badge } from "@/components/ui/badge"
-import { getAnimeTitleSuffix, animeVariantSecondTitle } from "@/lib/anime-title"
-import { getSeasonPartLabelFromTitle } from "@/lib/media-labels"
+import { animeVariantSecondTitle, formatSeriesEntryLabel } from "@/lib/anime-title"
 import { apiGet } from "@/lib/api"
 import {
   clientLibraryRefreshEvent,
@@ -22,10 +21,6 @@ function isSeriesFormat(format?: string) {
   return !format || format === "TV" || format === "TV_SHORT" || format === "ONA"
 }
 
-function seasonLabel(seasonNumber?: number) {
-  return `Season ${String(seasonNumber ?? 1).padStart(2, "0")}`
-}
-
 function selectedSubtitle(input: {
   format?: string
   libraryTitle: string
@@ -33,24 +28,11 @@ function selectedSubtitle(input: {
   seasonNumber?: number
 }) {
   if (isSeriesFormat(input.format)) {
-    const seasonPartLabel = getSeasonPartLabelFromTitle(input.title)
-
-    if (seasonPartLabel) {
-      return seasonPartLabel
-    }
-
-    const suffix = getAnimeTitleSuffix({
+    return formatSeriesEntryLabel({
       libraryTitle: input.libraryTitle,
       mediaTitle: input.title,
+      seasonNumber: input.seasonNumber,
     })
-
-    if (suffix) {
-      return suffix
-    }
-
-    const seasonNumber = input.seasonNumber ?? 1
-
-    return seasonNumber > 1 ? seasonLabel(seasonNumber) : null
   }
 
   return animeVariantSecondTitle({
@@ -315,6 +297,7 @@ export function AnimeDetailView({
                   key={`${episode.animeId}-${episode.seasonNumber}-${episode.episodeNumber}`}
                   episode={episode}
                   spoilerSettings={data.spoilers}
+                  onProgressChange={scheduleRefresh}
                 />
               ))}
             </div>

@@ -16,6 +16,12 @@ const textTrackSchema = z.object({
   url: z.string().trim().min(1).max(4000),
 })
 
+const trackingSchema = z.object({
+  animeId: z.number().int().positive(),
+  seasonNumber: z.number().int().positive(),
+  episodeNumber: z.number().int().positive(),
+})
+
 const candidateSchema = z.object({
   id: z.string().trim().min(1).max(64),
   url: z.string().trim().min(1).max(4000),
@@ -25,6 +31,7 @@ const candidateSchema = z.object({
   sourceStartOffset: z.number().finite().min(0),
   textTrack: textTrackSchema.optional(),
   title: z.string().trim().min(1).max(240).optional(),
+  tracking: trackingSchema.optional(),
 })
 
 const startSchema = z.object({

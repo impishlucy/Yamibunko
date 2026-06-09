@@ -1,4 +1,5 @@
 import type { AnimeInfo, AnimeSummary, AnimeVariant, Episode } from "@/lib/types"
+import { getStoredEpisodeWatchedSeconds } from "@/lib/watch-progress"
 import { getDb, nowIso } from "@/server/db/sqlite"
 import {
   fileName as baseFileName,
@@ -1615,7 +1616,10 @@ export function upsertEpisodeProgress(input: {
       )
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(username, anime_id, season_nr, ep_nr) DO UPDATE SET
-        watched_seconds = MAX(episode_progress.watched_seconds, excluded.watched_seconds),
+        watched_seconds = CASE
+          WHEN episode_progress.completed = 1 OR excluded.completed = 1 THEN 0
+          ELSE MAX(episode_progress.watched_seconds, excluded.watched_seconds)
+        END,
         duration_seconds = COALESCE(excluded.duration_seconds, episode_progress.duration_seconds),
         completed = CASE
           WHEN episode_progress.completed = 1 OR excluded.completed = 1 THEN 1
@@ -1629,7 +1633,7 @@ export function upsertEpisodeProgress(input: {
       input.animeId,
       input.seasonNr,
       input.epNr,
-      Math.max(input.watchedSeconds, 0),
+      getStoredEpisodeWatchedSeconds(input),
       input.durationSeconds ?? null,
       input.completed ? 1 : 0,
       now,
@@ -1673,6 +1677,62 @@ export function markEpisodesCompleteThrough(input: {
     .run(now, input.username, input.animeId, Math.max(input.progress, 0))
 
   return completedEpisodes.length
+}
+
+export function setEpisodeWatchState(input: {
+  username: string
+  animeId: number
+  seasonNr: number
+  epNr: number
+  watched: boolean
+}) {
+  const now = nowIso()
+  const episodes = listEpisodes(input.animeId).filter(
+    (episode) => episode.seasonNumber === input.seasonNr
+  )
+  const affectedEpisodes = episodes.filter((episode) =>
+    input.watched
+      ? episode.episodeNumber <= input.epNr
+      : episode.episodeNumber >= input.epNr
+  )
+
+  if (input.watched) {
+    for (const episode of affectedEpisodes) {
+      upsertEpisodeProgress({
+        username: input.username,
+        animeId: input.animeId,
+        seasonNr: input.seasonNr,
+        epNr: episode.episodeNumber,
+        watchedSeconds: episode.durationSeconds ?? 0,
+        durationSeconds: episode.durationSeconds ?? null,
+        completed: true,
+      })
+    }
+  } else if (affectedEpisodes.length) {
+    getDb()
+      .query(
+        `
+        UPDATE episode_progress
+        SET watched_seconds = 0,
+            completed = 0,
+            updated_at = ?
+        WHERE username = ?
+          AND anime_id = ?
+          AND season_nr = ?
+          AND ep_nr >= ?
+      `
+      )
+      .run(now, input.username, input.animeId, input.seasonNr, input.epNr)
+  }
+
+  return {
+    affectedEpisodes: affectedEpisodes.length,
+    anilistProgress: input.watched ? input.epNr : Math.max(input.epNr - 1, 0),
+    completedSeason:
+      input.watched &&
+      episodes.length > 0 &&
+      input.epNr >= episodes[episodes.length - 1].episodeNumber,
+  }
 }
 
 function normalizeComparableTitle(value: string) {

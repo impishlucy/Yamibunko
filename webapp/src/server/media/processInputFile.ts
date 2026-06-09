@@ -231,28 +231,17 @@ async function runWithActiveInputImportOutput<T>(
   }
 }
 
+const deferredWorkKindLabels: Record<DeferredInputWorkKind, string> = {
+  "video-transcode": "video transcode",
+  "audio-transcode": "audio transcode",
+  "container-remux": "WebM remux",
+  "direct-move": "direct import move",
+  "existing-output": "existing output finalization",
+  "catalog-only": "catalog-only library registration",
+}
+
 function formatDeferredWorkKind(kind: DeferredInputWorkKind) {
-  if (kind === "video-transcode") {
-    return "video transcode"
-  }
-
-  if (kind === "audio-transcode") {
-    return "audio transcode"
-  }
-
-  if (kind === "container-remux") {
-    return "WebM remux"
-  }
-
-  if (kind === "existing-output") {
-    return "existing output finalization"
-  }
-
-  if (kind === "catalog-only") {
-    return "catalog-only library registration"
-  }
-
-  return "direct import move"
+  return deferredWorkKindLabels[kind]
 }
 
 function isTranscodeWaitCancellation(error: unknown) {
@@ -885,7 +874,10 @@ async function transcodeFile(
   }
 
   try {
-    await runFfmpeg(args, { protectFromParentSignals: true })
+    await runFfmpeg(args, {
+      priorityRole: options.convertVideo ? "import-encoding" : undefined,
+      protectFromParentSignals: true,
+    })
   } catch (error) {
     if (options.jobId) {
       debugError(options.jobId, "FFmpeg file processing failed", error)

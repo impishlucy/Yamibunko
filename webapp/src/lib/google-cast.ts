@@ -167,6 +167,7 @@ export const googleCastSenderUrlMessage =
 let castFrameworkPromise: Promise<boolean> | null = null
 let castFrameworkInitialized = false
 const castVolumeInitializedSessions = new WeakSet<object>()
+const deviceLocalHostnames = new Set(["localhost", "::1", "[::1]"])
 
 export type GoogleCastMediaLoadResult = "loaded" | "failed" | "timeout"
 
@@ -227,11 +228,7 @@ function parseIpv4(hostname: string) {
 function isDeviceLocalHost(hostname: string) {
   const normalized = hostname.trim().toLowerCase()
 
-  if (
-    normalized === "localhost" ||
-    normalized === "::1" ||
-    normalized === "[::1]"
-  ) {
+  if (deviceLocalHostnames.has(normalized)) {
     return true
   }
 

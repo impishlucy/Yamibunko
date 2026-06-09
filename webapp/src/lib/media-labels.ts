@@ -35,12 +35,21 @@ const wordNumberValues: Record<string, number> = {
 
 const partNumberPattern =
   String.raw`(?:\d{1,2}|[ivx]+|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|1st|2nd|3rd|[4-9]th|10th)`
+const seasonPartSeparatorPattern = String.raw`(?:\s|[:：\-–—])*`
 const seasonPartPattern = new RegExp(
   String.raw`\b(?:season|s)\s*0*(\d{1,2})(?:(?:\s*(?:part|pt|p|cour|c)\s*(${partNumberPattern}))|(?:\s*(${partNumberPattern})\s*(?:cour|half)))?\b`,
   "gi"
 )
 const seasonPartEpisodePattern = new RegExp(
   String.raw`\b(?:season|s)\s*0*(\d{1,2})(?:(?:\s*(?:part|pt|p|cour|c)\s*(${partNumberPattern}))|(?:\s*(${partNumberPattern})\s*(?:cour|half)))?\s*(?:e|ep|episode)\s*0*(\d{1,4})\b`,
+  "i"
+)
+const leadingSeasonPartPattern = new RegExp(
+  String.raw`^\s*(?:season|s)\s*0*\d{1,2}(?:(?:${seasonPartSeparatorPattern}(?:part|pt\.?|p|cour|c)\s*${partNumberPattern})|(?:${seasonPartSeparatorPattern}${partNumberPattern}\s*(?:cour|half)))?(?:\s*(?::|[-–—])\s*|\s+)?`,
+  "i"
+)
+const seasonPartOnlyPattern = new RegExp(
+  String.raw`^\s*(?:season|s)\s*0*\d{1,2}(?:(?:${seasonPartSeparatorPattern}(?:part|pt\.?|p|cour|c)\s*${partNumberPattern})|(?:${seasonPartSeparatorPattern}${partNumberPattern}\s*(?:cour|half)))?\s*$`,
   "i"
 )
 
@@ -79,6 +88,24 @@ function toPositiveInteger(value: string | undefined) {
 
   const parsed = Number.parseInt(value, 10)
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
+}
+
+function cleanLabelSubtitle(value: string) {
+  return value
+    .replace(/^\s*(?:[:：\-–—]+\s*)+/, "")
+    .replace(/\s*(?:[:：\-–—]+\s*)+$/, "")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function isGenericEpisodeTitle(title: string, episodeNumber: number) {
+  const escapedEpisode = String(episodeNumber).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  const pattern = new RegExp(
+    String.raw`^(?:episode|ep\.?)\s*0*${escapedEpisode}$`,
+    "i"
+  )
+
+  return pattern.test(title.trim())
 }
 
 export function parseSeasonPartFromText(value: string): ParsedSeasonPart | null {
@@ -129,23 +156,37 @@ export function parseSeasonPartEpisodeFromText(
 }
 
 export function formatSeasonPartLabel(input: ParsedSeasonPart) {
-  const season = `Season ${String(input.season).padStart(2, "0")}`
+  const season = `Season ${input.season}`
 
   if (!input.part || input.part <= 1) {
     return season
   }
 
-  return `${season} Part ${String(input.part).padStart(2, "0")}`
+  return `${season} Part ${input.part}`
 }
 
 export function formatSeasonPartCompactLabel(input: ParsedSeasonPart) {
-  const season = `S${String(input.season).padStart(2, "0")}`
+  const season = `S${input.season}`
 
   if (!input.part || input.part <= 1) {
     return season
   }
 
-  return `${season} P${String(input.part).padStart(2, "0")}`
+  return `${season}.${input.part}`
+}
+
+export function formatEpisodeDisplayTitle(input: {
+  episodeNumber: number
+  title?: string | null
+}) {
+  const episodeNumber = input.episodeNumber
+  const title = input.title?.trim()
+
+  if (!title || isGenericEpisodeTitle(title, episodeNumber)) {
+    return `Episode ${episodeNumber}`
+  }
+
+  return `Ep. ${episodeNumber} - ${title}`
 }
 
 export function formatEpisodeBadgeLabel(input: ParsedSeasonPartEpisode) {
@@ -173,6 +214,14 @@ export function getEpisodeBadgeLabel(input: {
   const episode = parsedFileName?.episode ?? input.episodeNumber
 
   return formatEpisodeBadgeLabel({ season, part, episode })
+}
+
+export function isSeasonPartOnlyText(value: string) {
+  return seasonPartOnlyPattern.test(value)
+}
+
+export function stripLeadingSeasonPartText(value: string) {
+  return cleanLabelSubtitle(value.replace(leadingSeasonPartPattern, ""))
 }
 
 export function getSeasonPartLabelFromTitle(value: string) {

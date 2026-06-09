@@ -163,38 +163,38 @@ const noTitleSeasonPartEpisodePatterns = [
   ),
 ]
 
-function parseRomanNumeral(value: string) {
-  const romanValues: Record<string, number> = {
-    i: 1,
-    ii: 2,
-    iii: 3,
-    iv: 4,
-    v: 5,
-    vi: 6,
-    vii: 7,
-    viii: 8,
-    ix: 9,
-    x: 10,
-  }
+const romanNumberValues: Record<string, number> = {
+  i: 1,
+  ii: 2,
+  iii: 3,
+  iv: 4,
+  v: 5,
+  vi: 6,
+  vii: 7,
+  viii: 8,
+  ix: 9,
+  x: 10,
+}
 
-  return romanValues[value.toLowerCase()] ?? null
+const wordNumberValues: Record<string, number> = {
+  first: 1,
+  second: 2,
+  third: 3,
+  fourth: 4,
+  fifth: 5,
+  sixth: 6,
+  seventh: 7,
+  eighth: 8,
+  ninth: 9,
+  tenth: 10,
+}
+
+function parseRomanNumeral(value: string) {
+  return romanNumberValues[value.toLowerCase()] ?? null
 }
 
 function parseWordNumber(value: string) {
-  const wordValues: Record<string, number> = {
-    first: 1,
-    second: 2,
-    third: 3,
-    fourth: 4,
-    fifth: 5,
-    sixth: 6,
-    seventh: 7,
-    eighth: 8,
-    ninth: 9,
-    tenth: 10,
-  }
-
-  return wordValues[value.toLowerCase()] ?? null
+  return wordNumberValues[value.toLowerCase()] ?? null
 }
 
 function parsePartNumber(value: string | undefined) {
@@ -610,6 +610,23 @@ export function cleanFolderTitleCandidate(value: string) {
     .trim()
 }
 
+const ignoredFolderTitleCandidates = new Set([
+  "_failed_imports",
+  "season",
+  "seasons",
+  "special",
+  "specials",
+  "ova",
+  "ovas",
+  "movie",
+  "movies",
+  "extra",
+  "extras",
+  "episode",
+  "episodes",
+  "done",
+])
+
 function isIgnoredFolderTitleCandidate(value: string) {
   const normalized = value.trim().toLowerCase()
   const marker = parseSeasonPartMarker(normalized)
@@ -624,20 +641,7 @@ function isIgnoredFolderTitleCandidate(value: string) {
   return (
     !normalized ||
     markerOnly ||
-    normalized === "_failed_imports" ||
-    normalized === "season" ||
-    normalized === "seasons" ||
-    normalized === "special" ||
-    normalized === "specials" ||
-    normalized === "ova" ||
-    normalized === "ovas" ||
-    normalized === "movie" ||
-    normalized === "movies" ||
-    normalized === "extra" ||
-    normalized === "extras" ||
-    normalized === "episode" ||
-    normalized === "episodes" ||
-    normalized === "done" ||
+    ignoredFolderTitleCandidates.has(normalized) ||
     /^s\d{1,2}$/i.test(normalized) ||
     /^season\s*\d{1,2}$/i.test(normalized)
   )

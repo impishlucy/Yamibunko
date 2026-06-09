@@ -34,15 +34,14 @@ function clamp(value: number, min: number, max: number) {
 }
 
 function getAlignedLeft(rect: DOMRect, width: number, align: HoverHintProps["align"]) {
-  if (align === "start") {
-    return rect.left
+  switch (align) {
+    case "start":
+      return rect.left
+    case "end":
+      return rect.right - width
+    default:
+      return rect.left + rect.width / 2 - width / 2
   }
-
-  if (align === "end") {
-    return rect.right - width
-  }
-
-  return rect.left + rect.width / 2 - width / 2
 }
 
 function getHintPosition(input: {

@@ -69,10 +69,18 @@ const languageNames = new Map(
   })
 )
 
+const unknownLanguageLabels = new Set(["und", "unknown"])
+const genericStreamTitles = new Set([
+  "handler",
+  "sound handler",
+  "audio handler",
+  "subtitle handler",
+])
+
 function normalizeLanguage(value: string | undefined | null) {
   const normalized = value?.trim().toLowerCase()
 
-  if (!normalized || normalized === "und" || normalized === "unknown") {
+  if (!normalized || unknownLanguageLabels.has(normalized)) {
     return undefined
   }
 
@@ -131,10 +139,7 @@ function isGenericStreamTitle(value: string) {
     .replace(/\s+/g, " ")
 
   return (
-    normalizedTitle === "handler" ||
-    normalizedTitle === "sound handler" ||
-    normalizedTitle === "audio handler" ||
-    normalizedTitle === "subtitle handler" ||
+    genericStreamTitles.has(normalizedTitle) ||
     /^subtitle handler \d+$/.test(normalizedTitle) ||
     /^sound handler \d+$/.test(normalizedTitle) ||
     /^audio handler \d+$/.test(normalizedTitle)
@@ -379,19 +384,20 @@ export function getMediaStreamMetadata(
     videoCodec: firstVideoStream?.codec_name ?? undefined,
     videoWidth: firstVideoStream?.width,
     videoHeight: firstVideoStream?.height,
-    container: probe.format?.format_name
-      ?.split(",")
-      .map((item) => item.trim())
-      .filter(Boolean)[0],
+    container: firstContainerName(probe),
     sourceBitrateMbps,
   }
 }
 
-export function getFileContainerLabel(filePath: string, probe: ProbeResult) {
-  const probedContainer = probe.format?.format_name
+function firstContainerName(probe: ProbeResult) {
+  return probe.format?.format_name
     ?.split(",")
     .map((item) => item.trim())
     .filter(Boolean)[0]
+}
+
+export function getFileContainerLabel(filePath: string, probe: ProbeResult) {
+  const probedContainer = firstContainerName(probe)
 
   if (probedContainer) {
     return probedContainer

@@ -33,34 +33,27 @@ type AniListOAuthStatus =
   | "denied"
   | "login-required"
 
-function getAniListOAuthMessage(status: AniListOAuthStatus | null) {
-  if (!status) {
-    return null
-  }
-
-  if (status === "connected") {
-    return { kind: "success" as const, text: "AniList connected." }
-  }
-
-  if (status === "invalid-state") {
-    return {
-      kind: "error" as const,
-      text: "AniList connection failed because the OAuth state expired or did not match.",
-    }
-  }
-
-  if (status === "denied") {
-    return { kind: "error" as const, text: "AniList authorization was denied." }
-  }
-
-  if (status === "login-required") {
-    return { kind: "error" as const, text: "Log in before connecting AniList." }
-  }
-
-  return {
-    kind: "error" as const,
+const aniListOAuthMessages: Record<
+  AniListOAuthStatus,
+  { kind: "success" | "error"; text: string }
+> = {
+  connected: { kind: "success", text: "AniList connected." },
+  failed: {
+    kind: "error",
     text: "AniList connection failed. Check the OAuth app settings and server logs.",
-  }
+  },
+  "invalid-state": {
+    kind: "error",
+    text: "AniList connection failed because the OAuth state expired or did not match.",
+  },
+  denied: { kind: "error", text: "AniList authorization was denied." },
+  "login-required": { kind: "error", text: "Log in before connecting AniList." },
+}
+
+const aniListOAuthStatuses = new Set<string>(Object.keys(aniListOAuthMessages))
+
+function getAniListOAuthMessage(status: AniListOAuthStatus | null) {
+  return status ? aniListOAuthMessages[status] : null
 }
 
 function getInitialAniListOAuthStatus(): AniListOAuthStatus | null {
@@ -69,18 +62,9 @@ function getInitialAniListOAuthStatus(): AniListOAuthStatus | null {
   }
 
   const status = new URLSearchParams(window.location.search).get("anilist")
-
-  if (
-    status === "connected" ||
-    status === "failed" ||
-    status === "invalid-state" ||
-    status === "denied" ||
-    status === "login-required"
-  ) {
-    return status
-  }
-
-  return null
+  return aniListOAuthStatuses.has(status ?? "")
+    ? (status as AniListOAuthStatus)
+    : null
 }
 
 export function SettingsForm({ settings }: SettingsFormProps) {

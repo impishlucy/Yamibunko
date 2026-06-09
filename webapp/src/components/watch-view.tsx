@@ -7,8 +7,9 @@ import { AnimePlayer } from "@/components/anime-player"
 import { StreamLimitDialog } from "@/components/stream-limit-dialog"
 import { Skeleton } from "@/components/ui/skeleton"
 import { apiGet } from "@/lib/api"
+import { formatWatchSeriesTitle } from "@/lib/anime-title"
 import {
-  formatSeasonPartLabel,
+  formatEpisodeDisplayTitle,
   parseSeasonPartFromText,
 } from "@/lib/media-labels"
 import { DEFAULT_PLAYER_ASPECT_RATIO, getPreferredPlayerAspectRatio } from "@/lib/player-aspect-ratio"
@@ -282,25 +283,20 @@ export function WatchView({
     parseSeasonPartFromText(payload.episode.fileName) ??
     parseSeasonPartFromText(payload.episode.filePath) ??
     { season: payload.episode.seasonNumber }
-  const episodeSeasonLabel = formatSeasonPartLabel(episodeSeasonPart)
+  const watchSeriesTitle = formatWatchSeriesTitle({
+    mediaTitle: payload.anime.title,
+    seasonPart: episodeSeasonPart,
+  })
+  const watchEpisodeTitle = formatEpisodeDisplayTitle({
+    episodeNumber: payload.episode.episodeNumber,
+    title: payload.episode.title,
+  })
 
   return (
     <div className="yami-watch-view flex flex-col gap-4 lg:gap-6">
       <section className="yami-watch-heading mx-auto flex max-w-5xl flex-wrap items-center justify-center gap-2 text-center lg:gap-3">
         <h1 className="min-w-0 truncate text-xl font-semibold text-zinc-50">
-          {payload.anime.title}
-        </h1>
-        <h1 className="min-w-0 truncate text-xl font-semibold text-zinc-50">
-          •
-        </h1>
-        <h1 className="min-w-0 truncate text-xl font-semibold text-zinc-50">
-          {episodeSeasonLabel}
-        </h1>
-        <h1 className="min-w-0 truncate text-xl font-semibold text-zinc-50">
-          -
-        </h1>
-        <h1 className="min-w-0 truncate text-xl font-semibold text-zinc-50">
-          Episode {String(payload.episode.episodeNumber).padStart(2, "0")}
+          {watchSeriesTitle} - {watchEpisodeTitle}
         </h1>
       </section>
 

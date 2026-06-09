@@ -468,6 +468,8 @@ export async function saveAniListProgress(input: {
   animeId: number
   progress: number
   completed?: boolean
+  allowProgressDecrease?: boolean
+  updateLocalProgress?: boolean
 }) {
   const connection = getAniListConnection(input.username)
   const accessToken = getAniListAccessTokenForUser(input.username)
@@ -478,7 +480,9 @@ export async function saveAniListProgress(input: {
 
   const current = await getCachedOrSyncedEntry(connection, input.animeId)
   const currentStatus = toMediaListStatus(current?.status)
-  const progress = Math.max(input.progress, current?.progress ?? 0, 0)
+  const progress = input.allowProgressDecrease
+    ? Math.max(input.progress, 0)
+    : Math.max(input.progress, current?.progress ?? 0, 0)
   const status = input.completed
     ? completedStatus
     : watchingStatuses.has(current?.status ?? "")
@@ -499,11 +503,13 @@ export async function saveAniListProgress(input: {
   const savedEntry = rawSavedEntry ?? null
 
   cacheSavedEntry(connection, savedEntry)
-  markEpisodesCompleteThrough({
-    username: input.username,
-    animeId: input.animeId,
-    progress,
-  })
+  if (input.updateLocalProgress !== false) {
+    markEpisodesCompleteThrough({
+      username: input.username,
+      animeId: input.animeId,
+      progress,
+    })
+  }
 
   console.log(
     `[Info] [Anilist] Saved progress - Anime id ${input.animeId}, Episode ${progress}, Status: ${status}`

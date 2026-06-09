@@ -8,7 +8,10 @@ import type {
   ServerCastCandidate,
   ServerCastDevice,
   ServerCastMediaState,
+  ServerCastTrackingTarget,
 } from "@/lib/server-cast"
+import { isEpisodeCompleteByProgress } from "@/lib/watch-progress"
+import { saveEpisodePlaybackProgress } from "@/server/media/watchProgress"
 
 const mdnsAddress = "224.0.0.251"
 const mdnsPort = 5353
@@ -22,6 +25,7 @@ const serverCastSourceId = `sender-${crypto.randomBytes(4).toString("hex")}`
 const sessionMaxIdleMs = 30 * 60_000
 const statusTimeoutMs = 7_000
 const loadTimeoutMs = 45_000
+const localHostnames = new Set(["localhost", "::1", "[::1]"])
 
 const discoveredDevices = new Map<string, ServerCastDevice>()
 const sessions = new Map<string, ServerCastSession>()
@@ -101,8 +105,12 @@ type ServerCastSession = {
   heartbeat: ReturnType<typeof setInterval>
   id: string
   idleTimer: ReturnType<typeof setTimeout>
+  completedProgressSaved: boolean
   mediaSessionId?: number
+  progressTimer: ReturnType<typeof setInterval>
   socket: CastSocket
+  sourceStartOffset: number
+  tracking?: ServerCastTrackingTarget
   transportId: string
   username: string
 }
@@ -159,7 +167,7 @@ function isPrivateLanIpv4(hostname: string) {
 function isLocalHost(hostname: string) {
   const normalized = hostname.trim().toLowerCase()
 
-  if (normalized === "localhost" || normalized === "::1" || normalized === "[::1]") {
+  if (localHostnames.has(normalized)) {
     return true
   }
 
@@ -1104,6 +1112,69 @@ function touchSession(session: ServerCastSession) {
   session.idleTimer.unref?.()
 }
 
+function saveServerCastProgress(session: ServerCastSession, state: ServerCastMediaState) {
+  const tracking = session.tracking
+
+  if (!tracking) {
+    return
+  }
+
+  if (state.contentId && state.contentId !== session.contentId) {
+    return
+  }
+
+  const durationSeconds = state.durationSeconds
+  const watchedSeconds = Math.max(
+    session.sourceStartOffset + Math.max(state.positionSeconds, 0),
+    0
+  )
+  const completed =
+    state.idleReason === "FINISHED" ||
+    isEpisodeCompleteByProgress({ watchedSeconds, durationSeconds })
+
+  if (!completed && state.playerState !== "PLAYING" && state.playerState !== "BUFFERING") {
+    return
+  }
+
+  if (completed && session.completedProgressSaved) {
+    return
+  }
+
+  if (completed) {
+    session.completedProgressSaved = true
+  }
+
+  saveEpisodePlaybackProgress({
+    username: session.username,
+    animeId: tracking.animeId,
+    seasonNumber: tracking.seasonNumber,
+    episodeNumber: tracking.episodeNumber,
+    watchedSeconds,
+    durationSeconds,
+    completed,
+  })
+}
+
+async function refreshServerCastProgress(session: ServerCastSession) {
+  const payload = await session.socket.request<MediaStatusPayload>(
+    mediaNamespace,
+    { type: "GET_STATUS" },
+    session.transportId,
+    statusTimeoutMs
+  )
+  const state = mediaStatusFromPayload(payload)
+
+  if (state.mediaSessionId) {
+    session.mediaSessionId = state.mediaSessionId
+  }
+
+  saveServerCastProgress(session, state)
+
+  if (!state.isAlive || state.playerState === "IDLE") {
+    closeServerCastSession(session.id)
+  }
+}
+
 function closeServerCastSession(sessionId: string) {
   const session = sessions.get(sessionId)
 
@@ -1112,6 +1183,7 @@ function closeServerCastSession(sessionId: string) {
   }
 
   clearInterval(session.heartbeat)
+  clearInterval(session.progressTimer)
   clearTimeout(session.idleTimer)
   session.socket.close()
   sessions.delete(sessionId)
@@ -1324,21 +1396,38 @@ export async function startServerCast(input: {
         closeServerCastSession(activeSession.id)
       }
     }, 5_000)
+    const progressTimer = setInterval(() => {
+      const activeSession = sessionRef.current
+
+      if (!activeSession || sessions.get(activeSession.id) !== activeSession) {
+        return
+      }
+
+      void refreshServerCastProgress(activeSession).catch(() => {
+        closeServerCastSession(activeSession.id)
+      })
+    }, 5_000)
     const session: ServerCastSession = {
+      completedProgressSaved: false,
       contentId: candidate.url,
       device,
       heartbeat,
       id: sessionId,
       idleTimer: setTimeout(() => undefined, sessionMaxIdleMs),
       mediaSessionId: state.mediaSessionId,
+      progressTimer,
       socket,
+      sourceStartOffset: candidate.sourceStartOffset,
+      tracking: candidate.tracking,
       transportId,
       username: input.username,
     }
     sessionRef.current = session
     session.heartbeat.unref?.()
+    session.progressTimer.unref?.()
     touchSession(session)
     sessions.set(sessionId, session)
+    saveServerCastProgress(session, state)
 
     return {
       candidate,
@@ -1383,6 +1472,8 @@ export async function getServerCastStatus(sessionId: string, username: string) {
   if (state.mediaSessionId) {
     session.mediaSessionId = state.mediaSessionId
   }
+
+  saveServerCastProgress(session, state)
 
   return state
 }
@@ -1467,6 +1558,8 @@ export async function controlServerCast(input: {
   if (state.mediaSessionId) {
     session.mediaSessionId = state.mediaSessionId
   }
+
+  saveServerCastProgress(session, state)
 
   return state
 }

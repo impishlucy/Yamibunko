@@ -28,7 +28,6 @@ const serverConfigSchema = z.object({
     "amd_cpu",
     "cpu",
   ]),
-  TRANSCODE_HW_DEVICE: z.string().trim().optional(),
   ANILIST_CLIENT_ID: z.string().trim().optional(),
   ANILIST_CLIENT_SECRET: z.string().trim().optional(),
   BASE_URL: z.url(),
@@ -50,7 +49,6 @@ export type ServerConfig = {
   tempDir: string
   importEnabled: boolean
   transcodeAccel: TranscodeAcceleration
-  transcodeHwDevice?: string
   anilistClientId?: string
   anilistClientSecret?: string
   baseUrl: string
@@ -65,17 +63,15 @@ let cachedIssues: string[] | undefined
 
 
 export function getOutdatedTranscodeAccelerationReplacement(value: string) {
-  const normalized = value.trim().toLowerCase()
-
-  if (normalized === "qsv" || normalized === "intel") {
-    return "intel_gpu"
+  switch (value.trim().toLowerCase()) {
+    case "qsv":
+    case "intel":
+      return "intel_gpu"
+    case "amd":
+      return "amd_gpu"
+    default:
+      return null
   }
-
-  if (normalized === "amd") {
-    return "amd_gpu"
-  }
-
-  return null
 }
 
 export function normalizeTranscodeAccelerationValue(value: string) {
@@ -93,19 +89,21 @@ function executableName(name: "ffmpeg" | "ffprobe") {
 }
 
 export function getDefaultTempDir() {
-  if (process.platform === "win32") {
-    const base =
-      process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local")
-    return path.join(base, "yamibunko", "cache")
+  switch (process.platform) {
+    case "win32": {
+      const base =
+        process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local")
+      return path.join(base, "yamibunko", "cache")
+    }
+
+    case "linux": {
+      const base = process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), ".cache")
+      return path.join(base, "yamibunko")
+    }
+
+    default:
+      return path.join(os.tmpdir(), "yamibunko")
   }
-
-  if (process.platform === "linux") {
-    const base = process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), ".cache")
-    return path.join(base, "yamibunko")
-  }
-
-
-  return path.join(os.tmpdir(), "yamibunko")
 }
 
 function readEnvironment() {
@@ -122,7 +120,6 @@ function readEnvironment() {
     TRANSCODE_ACCEL: process.env.TRANSCODE_ACCEL
       ? normalizeTranscodeAccelerationValue(process.env.TRANSCODE_ACCEL)
       : undefined,
-    TRANSCODE_HW_DEVICE: process.env.TRANSCODE_HW_DEVICE,
     ANILIST_CLIENT_ID: process.env.ANILIST_CLIENT_ID,
     ANILIST_CLIENT_SECRET: process.env.ANILIST_CLIENT_SECRET,
     BASE_URL: process.env.BASE_URL ?? process.env.APP_BASE_URL,
@@ -140,9 +137,6 @@ function mapConfig(env: z.infer<typeof serverConfigSchema>): ServerConfig {
     tempDir: getDefaultTempDir(),
     importEnabled: env.IMPORT_ENABLED === "true",
     transcodeAccel: env.TRANSCODE_ACCEL,
-    transcodeHwDevice: env.TRANSCODE_HW_DEVICE
-      ? cleanPath(env.TRANSCODE_HW_DEVICE)
-      : undefined,
     anilistClientId: env.ANILIST_CLIENT_ID
       ? cleanPath(env.ANILIST_CLIENT_ID)
       : undefined,

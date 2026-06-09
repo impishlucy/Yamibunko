@@ -5,7 +5,6 @@ import path from "node:path"
 import { Readable, Transform } from "node:stream"
 
 import type { PlaybackMode, PlaybackProfile } from "@/lib/types"
-import { markAniListWatchingStarted } from "@/server/anilist/client"
 import { requireApiUser } from "@/server/auth/api"
 import { guardRequest } from "@/server/security/abuseGuard"
 import {
@@ -28,6 +27,7 @@ import { validateCastStreamToken } from "@/server/media/castTokens"
 import type { ProbeResult } from "@/server/media/mediaFiles"
 import { getMediaStreamMetadata } from "@/server/media/streamMetadata"
 import { resolveEpisodeMedia } from "@/server/media/resolveMediaId"
+import { createElapsedPlaybackProgressTracker } from "@/server/media/watchProgress"
 import { acquireLiveTranscode } from "@/server/transcode/transcodeCapacity"
 import { errorMessage, fileName, parsePositiveInt } from "@/server/utils/format"
 
@@ -55,8 +55,6 @@ const transcodeStartupTimeoutMs = 15_000
 const transcodeStartupByteThreshold = 64 * 1024
 const ffmpegShutdownGraceMs = 2_000
 const loggedStreamStarts = new Map<string, number>()
-const aniListWatchingStartTtlMs = 15 * 60 * 1000
-const aniListWatchingStartMarks = new Map<string, number>()
 
 function streamCorsHeaders() {
   return {
@@ -319,6 +317,7 @@ async function resolveStreamUser(input: {
         ok: true as const,
         username: castAuth.username,
         displayUsername: `${castAuth.username} (cast)`,
+        isCastStream: true,
         isVip:
           (await runCooperativeSyncStep(() => getUser(castAuth.username)))?.isVip ??
           false,
@@ -336,6 +335,7 @@ async function resolveStreamUser(input: {
     ok: true as const,
     username: auth.user.username,
     displayUsername: auth.user.username,
+    isCastStream: false,
     isVip: auth.user.isVip,
   }
 }
@@ -369,32 +369,6 @@ function logStreamStartOnce(input: {
   )
 }
 
-
-function markAniListWatchingStartedOnce(input: {
-  username: string
-  animeId: number
-}) {
-  const now = Date.now()
-  const key = `${input.username}:${input.animeId}`
-  const lastMarkedAt = aniListWatchingStartMarks.get(key)
-
-  if (lastMarkedAt && now - lastMarkedAt < aniListWatchingStartTtlMs) {
-    return
-  }
-
-  for (const [cachedKey, markedAt] of aniListWatchingStartMarks) {
-    if (now - markedAt >= aniListWatchingStartTtlMs) {
-      aniListWatchingStartMarks.delete(cachedKey)
-    }
-  }
-
-  aniListWatchingStartMarks.set(key, now)
-  void markAniListWatchingStarted(input).catch((error) => {
-    console.error(
-      `[Error] [Anilist] Unable to mark anime as watching - stream/route.ts - Anime ${input.animeId} - ${errorMessage(error)}`
-    )
-  })
-}
 
 function appendStderr(current: string, chunk: Buffer) {
   const next = current + chunk.toString("utf8")
@@ -494,58 +468,31 @@ function createUploadThrottledReadable(input: {
   return throttled
 }
 
+const directContentTypesByExtension = new Map<string, string>([
+  [".mp4", "video/mp4"],
+  [".m4v", "video/mp4"],
+  [".webm", "video/webm"],
+  [".mkv", "video/x-matroska"],
+  [".mov", "video/quicktime"],
+  [".avi", "video/x-msvideo"],
+  [".flv", "video/x-flv"],
+  [".ts", "video/mp2t"],
+  [".m2ts", "video/mp2t"],
+  [".mts", "video/mp2t"],
+  [".mpg", "video/mpeg"],
+  [".mpeg", "video/mpeg"],
+  [".ogm", "video/ogg"],
+  [".ogv", "video/ogg"],
+  [".wmv", "video/x-ms-wmv"],
+  [".3gp", "video/3gpp"],
+  [".3g2", "video/3gpp2"],
+])
+
 function getDirectContentType(file: string) {
-  const extension = path.extname(file).toLowerCase()
-
-  if (extension === ".mp4" || extension === ".m4v") {
-    return "video/mp4"
-  }
-
-  if (extension === ".webm") {
-    return "video/webm"
-  }
-
-  if (extension === ".mkv") {
-    return "video/x-matroska"
-  }
-
-  if (extension === ".mov") {
-    return "video/quicktime"
-  }
-
-  if (extension === ".avi") {
-    return "video/x-msvideo"
-  }
-
-  if (extension === ".flv") {
-    return "video/x-flv"
-  }
-
-  if (extension === ".ts" || extension === ".m2ts" || extension === ".mts") {
-    return "video/mp2t"
-  }
-
-  if (extension === ".mpg" || extension === ".mpeg") {
-    return "video/mpeg"
-  }
-
-  if (extension === ".ogm" || extension === ".ogv") {
-    return "video/ogg"
-  }
-
-  if (extension === ".wmv") {
-    return "video/x-ms-wmv"
-  }
-
-  if (extension === ".3gp") {
-    return "video/3gpp"
-  }
-
-  if (extension === ".3g2") {
-    return "video/3gpp2"
-  }
-
-  return "application/octet-stream"
+  return (
+    directContentTypesByExtension.get(path.extname(file).toLowerCase()) ??
+    "application/octet-stream"
+  )
 }
 
 function setDurationHeaders(headers: Headers, durationSeconds?: number) {
@@ -619,7 +566,42 @@ function setStreamSourceHeaders(
   headers.set("x-yamibunko-stream-source", source)
 }
 
-async function handleDirect(input: {
+type StreamProgressTarget = {
+  animeIdNumber: number
+  enabled: boolean
+  episodeNumber: number
+  progressUsername: string
+  seasonNumber: number
+}
+
+function getRangeStartSeconds(input: {
+  durationSeconds?: number
+  range: Exclude<ByteRange, "invalid"> | null
+  size: number
+}) {
+  if (!input.range || !input.durationSeconds || input.size <= 0) {
+    return 0
+  }
+
+  return (input.range.start / input.size) * input.durationSeconds
+}
+
+function createStreamProgressTracker(input: StreamProgressTarget & {
+  durationSeconds?: number
+  startSeconds: number
+}) {
+  return createElapsedPlaybackProgressTracker({
+    username: input.progressUsername,
+    animeId: input.animeIdNumber,
+    seasonNumber: input.seasonNumber,
+    episodeNumber: input.episodeNumber,
+    durationSeconds: input.durationSeconds,
+    enabled: input.enabled,
+    startSeconds: input.startSeconds,
+  })
+}
+
+async function handleDirect(input: StreamProgressTarget & {
   request: Request
   file: string
   size: number
@@ -645,6 +627,26 @@ async function handleDirect(input: {
     })
   }
 
+  const progressTracker = createStreamProgressTracker({
+    ...input,
+    startSeconds: getRangeStartSeconds({
+      durationSeconds: input.durationSeconds,
+      range,
+      size,
+    }),
+  })
+  let released = false
+
+  function releaseStream() {
+    if (released) {
+      return
+    }
+
+    released = true
+    progressTracker.stop()
+    releaseUpload()
+  }
+
   const headers = new Headers({
     ...streamCorsHeaders(),
     "accept-ranges": "bytes",
@@ -659,12 +661,12 @@ async function handleDirect(input: {
   function bindFileStream(fileStream: ReturnType<typeof createReadStream>) {
     const abort = () => {
       fileStream.destroy()
-      releaseUpload()
+      releaseStream()
     }
 
     uploadLease.setForceClose(abort)
-    fileStream.once("close", releaseUpload)
-    fileStream.once("error", releaseUpload)
+    fileStream.once("close", releaseStream)
+    fileStream.once("error", releaseStream)
     request.signal.addEventListener("abort", abort, { once: true })
     fileStream.once("close", () => {
       request.signal.removeEventListener("abort", abort)
@@ -746,7 +748,7 @@ function shouldUseDirectAudioRemux(input: {
   )
 }
 
-async function handleDirectAudioRemux(input: {
+async function handleDirectAudioRemux(input: StreamProgressTarget & {
   request: Request
   file: string
   animeId: string
@@ -824,6 +826,21 @@ async function handleDirectAudioRemux(input: {
   let clientClosed = false
   let shutdownTimer: ReturnType<typeof setTimeout> | null = null
   const releaseUpload = releaseStreamUploadOnce(input.uploadLease)
+  const progressTracker = createStreamProgressTracker({
+    ...input,
+    startSeconds: input.startSeconds,
+  })
+  let released = false
+
+  function releaseStream() {
+    if (released) {
+      return
+    }
+
+    released = true
+    progressTracker.stop()
+    releaseUpload()
+  }
 
   child.stderr?.on("data", (chunk: Buffer) => {
     stderr = appendStderr(stderr, chunk)
@@ -850,7 +867,7 @@ async function handleDirectAudioRemux(input: {
     clientClosed = true
     settled = true
     stopChild()
-    releaseUpload()
+    releaseStream()
   }
 
   input.uploadLease.setForceClose(onAbort)
@@ -880,14 +897,14 @@ async function handleDirectAudioRemux(input: {
               clientClosed = true
               settled = true
               stopChild()
-              releaseUpload()
+              releaseStream()
             }
           })
           .catch(() => {
             clientClosed = true
             settled = true
             stopChild()
-            releaseUpload()
+            releaseStream()
           })
       })
 
@@ -901,7 +918,7 @@ async function handleDirectAudioRemux(input: {
           controller.error(error)
         }
 
-        releaseUpload()
+        releaseStream()
       })
 
       child.once("close", (code, signal) => {
@@ -925,14 +942,14 @@ async function handleDirectAudioRemux(input: {
           controller.close()
         }
 
-        releaseUpload()
+        releaseStream()
       })
     },
     cancel() {
       clientClosed = true
       settled = true
       stopChild()
-      releaseUpload()
+      releaseStream()
     },
   })
 
@@ -988,7 +1005,8 @@ async function handleTranscode(
   sourceBitrateKbps?: number,
   inputVideoCodec?: string | null,
   audioStreamIndex?: number,
-  uploadLease?: StreamUploadLease
+  uploadLease?: StreamUploadLease,
+  progressTarget?: StreamProgressTarget
 ) {
   let waitLogged = false
   const waitLogTimer = setTimeout(() => {
@@ -1098,6 +1116,17 @@ async function handleTranscode(
 
   let released = false
   const releaseUpload = uploadLease ? releaseStreamUploadOnce(uploadLease) : null
+  const progressTracker = createStreamProgressTracker({
+    ...(progressTarget ?? {
+      animeIdNumber: 0,
+      enabled: false,
+      episodeNumber,
+      progressUsername: username,
+      seasonNumber,
+    }),
+    durationSeconds,
+    startSeconds,
+  })
   let settled = false
   let clientClosed = false
   let startupTimer: ReturnType<typeof setTimeout> | null = null
@@ -1136,6 +1165,7 @@ async function handleTranscode(
     clearStartupTimer()
     request.signal.removeEventListener("abort", onAbort)
     lease.release()
+    progressTracker.stop()
     releaseUpload?.()
   }
 
@@ -1443,13 +1473,15 @@ export async function GET(request: Request, context: StreamContext) {
     return jsonError("Server is shutting down. New streams are disabled.", 503)
   }
 
-  markAniListWatchingStartedOnce({
-    username: streamUser.username,
-    animeId: animeIdNumber,
-  })
-
   const effectiveMode = uploadLease.effectiveMode
   const effectiveProfile = uploadLease.effectiveProfile
+  const streamProgressTarget = {
+    animeIdNumber,
+    enabled: streamUser.isCastStream,
+    episodeNumber,
+    progressUsername: streamUser.username,
+    seasonNumber,
+  }
 
   if (effectiveMode === "direct") {
     if (
@@ -1457,6 +1489,7 @@ export async function GET(request: Request, context: StreamContext) {
       typeof selectedDirectAudioStreamIndex === "number"
     ) {
       return await handleDirectAudioRemux({
+        ...streamProgressTarget,
         request,
         file: resolved.file,
         animeId,
@@ -1482,6 +1515,7 @@ export async function GET(request: Request, context: StreamContext) {
     })
 
     return handleDirect({
+      ...streamProgressTarget,
       request,
       file: resolved.file,
       size: resolved.size,
@@ -1504,6 +1538,7 @@ export async function GET(request: Request, context: StreamContext) {
     sourceBitrateKbps,
     inputVideoCodec,
     audioSelection.requestedAudioStreamIndex,
-    uploadLease
+    uploadLease,
+    streamProgressTarget
   )
 }

@@ -535,7 +535,6 @@ public class ServerManager
         }
 
         settings.TranscodeAccel = HardwareAccelerationDetector.SelectServerTranscodeAcceleration(detection, settings.ImportEnabled);
-        settings.TranscodeHwDevice = HardwareAccelerationDetector.SelectServerTranscodeDevice(detection, settings.ImportEnabled);
 
         var selectedAccelerationLabel = HardwareAccelerationDetector.FormatAccelerationForDisplay(settings.TranscodeAccel);
         var av1ImportAccelerationLabel = HardwareAccelerationDetector.FormatAccelerationForDisplay(detection.Av1ImportAcceleration);
@@ -1096,7 +1095,6 @@ public class ServerManager
             ["IMPORT_ENABLED"] = settings.ImportEnabled ? "true" : "false",
             ["FFMPEG_DIR"] = settings.FfmpegDir,
             ["TRANSCODE_ACCEL"] = settings.TranscodeAccel,
-            ["TRANSCODE_HW_DEVICE"] = settings.TranscodeHwDevice,
             ["ANILIST_CLIENT_ID"] = settings.AnilistClientId,
             ["ANILIST_CLIENT_SECRET"] = settings.AnilistClientSecret
         };

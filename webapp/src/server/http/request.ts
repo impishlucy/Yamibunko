@@ -3,6 +3,8 @@ import { headers } from "next/headers"
 import { allowedDevOrigins } from "@/lib/allowed-dev-origins"
 import { normalizeBaseUrl } from "@/server/http/baseUrl"
 
+const deviceLocalHostnames = new Set(["localhost", "::1", "[::1]"])
+
 function firstForwardedValue(value: string | null) {
   return value?.split(",")[0]?.trim() ?? null
 }
@@ -75,7 +77,7 @@ function parseIpv4(hostname: string) {
 export function isDeviceLocalHost(hostname: string) {
   const normalized = hostname.trim().toLowerCase()
 
-  if (normalized === "localhost" || normalized === "::1" || normalized === "[::1]") {
+  if (deviceLocalHostnames.has(normalized)) {
     return true
   }
 

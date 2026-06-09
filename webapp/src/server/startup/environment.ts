@@ -36,7 +36,6 @@ const launcherAliases = new Map<string, string>([
   ["FFMPEG_DIR", "FFMPEG_DIR"],
   ["FFMPEG_BIN_DIR", "FFMPEG_DIR"],
   ["TRANSCODE_ACCEL", "TRANSCODE_ACCEL"],
-  ["TRANSCODE_HW_DEVICE", "TRANSCODE_HW_DEVICE"],
   ["IMPORT_ENABLED", "IMPORT_ENABLED"],
   ["ANILIST_CLIENT_ID", "ANILIST_CLIENT_ID"],
   ["ANILIST_CLIENT_SECRET", "ANILIST_CLIENT_SECRET"],
@@ -51,7 +50,6 @@ const requiredCanonicalKeys = new Set<string>([
 const loggedEnvironmentKeys = [
   ...baseRequiredEnvironmentKeys,
   ...importRequiredEnvironmentKeys,
-  "TRANSCODE_HW_DEVICE",
   "IMPORT_ENABLED",
   "ANILIST_CLIENT_ID",
   "ANILIST_CLIENT_SECRET",
@@ -180,10 +178,6 @@ function normalizeTranscodeAcceleration() {
 
   if (value) {
     process.env.TRANSCODE_ACCEL = normalizeTranscodeAccelerationValue(cleanValue(value))
-  }
-
-  if (process.env.TRANSCODE_HW_DEVICE) {
-    process.env.TRANSCODE_HW_DEVICE = cleanValue(process.env.TRANSCODE_HW_DEVICE)
   }
 }
 
@@ -445,10 +439,8 @@ export function bootstrapEnvironment() {
       }
 
       process.env.TRANSCODE_ACCEL = acceleration.av1ImportAcceleration
-      process.env.TRANSCODE_HW_DEVICE = acceleration.av1ImportDevice ?? ""
     } else {
       process.env.TRANSCODE_ACCEL = acceleration.liveTranscodeAcceleration
-      process.env.TRANSCODE_HW_DEVICE = acceleration.liveTranscodeDevice ?? ""
     }
 
     console.log(
