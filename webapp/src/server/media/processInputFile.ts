@@ -446,6 +446,7 @@ function mediaFolderSegments(input: {
   format: string | null | undefined
   season: number
   mediaTitle: string
+  part?: number
 }) {
   if (input.format === "MOVIE") {
     return ["Movies"]
@@ -455,7 +456,7 @@ function mediaFolderSegments(input: {
     return ["Specials", input.mediaTitle]
   }
 
-  return [formatSeasonFolderName(input.season)]
+  return [formatSeasonFolderName(input.season, input.part)]
 }
 
 async function replaceFile(
@@ -1546,7 +1547,8 @@ export async function processInputFile(
     const extension = webmFileExtension
     const finalName = formatEpisodeFileName({
       title: safeMediaTitle,
-      season: librarySeason,
+      season: inputParsed.season,
+      part: inputParsed.part,
       episode: inputParsed.episode,
       extension,
     })
@@ -1555,7 +1557,8 @@ export async function processInputFile(
       safeLibraryTitle,
       ...mediaFolderSegments({
         format: inputMetadata.format,
-        season: librarySeason,
+        season: inputParsed.season,
+        part: inputParsed.part,
         mediaTitle: safeMediaTitle,
       }),
       finalName

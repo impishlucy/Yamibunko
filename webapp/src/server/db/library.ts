@@ -877,6 +877,27 @@ export function getMaxCachedStreamingEpisodeNumber(animeId: number) {
 }
 
 
+function parseWordSeasonNumber(value: string | undefined) {
+  if (!value) {
+    return null
+  }
+
+  const values: Record<string, number> = {
+    first: 1,
+    second: 2,
+    third: 3,
+    fourth: 4,
+    fifth: 5,
+    sixth: 6,
+    seventh: 7,
+    eighth: 8,
+    ninth: 9,
+    tenth: 10,
+  }
+
+  return values[value.toLowerCase()] ?? null
+}
+
 function extractSeasonMarkerFromTitle(value: string | null | undefined) {
   if (!value) {
     return null
@@ -884,12 +905,19 @@ function extractSeasonMarkerFromTitle(value: string | null | undefined) {
 
   const normalized = value
     .toLowerCase()
+    .replace(/([a-z])([0-9])/gi, "$1 $2")
+    .replace(/([0-9])([a-z])/gi, "$1 $2")
     .replace(/[^a-z0-9]+/g, " ")
     .replace(/\s+/g, " ")
     .trim()
   const seasonMatch = /\bseason\s*0*(\d{1,2})\b/i.exec(normalized)
   const shortSeasonMatch = /\bs\s*0*(\d{1,2})\b/i.exec(normalized)
-  const season = parsePositiveInt(seasonMatch?.[1] ?? shortSeasonMatch?.[1])
+  const ordinalSeasonMatch = /\b(\d{1,2})(?:st|nd|rd|th)?\s+season\b/i.exec(normalized)
+  const wordSeasonMatch = /\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+season\b/i.exec(normalized)
+  const season =
+    parsePositiveInt(
+      seasonMatch?.[1] ?? shortSeasonMatch?.[1] ?? ordinalSeasonMatch?.[1]
+    ) ?? parseWordSeasonNumber(wordSeasonMatch?.[1])
 
   return season && season > 0 ? season : null
 }
@@ -911,15 +939,51 @@ function titleSeasonMarker(
   return null
 }
 
+function getCachedSeriesVariantSeasonNumber(librarySlug: string, animeId: number) {
+  const seriesVariants = listCachedAnimeVariants(librarySlug).filter((variant) =>
+    seriesFormats.has(variant.format ?? "")
+  )
+  const variantIndex = seriesVariants.findIndex((variant) => variant.id === animeId)
+
+  return variantIndex >= 0 ? variantIndex + 1 : null
+}
+
+function extractPartMarkerFromTitle(value: string | null | undefined) {
+  if (!value) {
+    return null
+  }
+
+  for (let part = 2; part <= 10; part += 1) {
+    if (hasPartMarker(value, part)) {
+      return part
+    }
+  }
+
+  return null
+}
+
+function titlePartMarker(
+  row: Pick<
+    AnimeRow,
+    "title_user_preferred" | "title_english" | "title_romaji" | "title_native"
+  >
+) {
+  for (const title of rowTitles(row)) {
+    const part = extractPartMarkerFromTitle(title)
+
+    if (part) {
+      return part
+    }
+  }
+
+  return null
+}
+
 export function resolveLibrarySeasonNumberForAnime(input: {
   animeId: number
   parsedSeason: number
   parsedPart?: number
 }) {
-  if (input.parsedPart && input.parsedPart > 1) {
-    return input.parsedSeason
-  }
-
   const row = getDb()
     .query<AnimeRow>("SELECT * FROM anime WHERE id = ?")
     .get(input.animeId)
@@ -928,28 +992,34 @@ export function resolveLibrarySeasonNumberForAnime(input: {
     return input.parsedSeason
   }
 
-  const markerSeason = titleSeasonMarker(row)
-
-  if (markerSeason) {
-    return markerSeason
-  }
-
   const library = getDb()
     .query<LibraryEntryRow>(
       "SELECT slug, title, primary_anime_id FROM library_entries WHERE slug = ?"
     )
     .get(row.library_slug)
+  const variantSeason = getCachedSeriesVariantSeasonNumber(row.library_slug, row.id)
+  const requestedPart =
+    input.parsedPart && input.parsedPart > 1
+      ? input.parsedPart
+      : titlePartMarker(row)
+
+  if (requestedPart && requestedPart > 1) {
+    const minimumPartSeason = input.parsedSeason + requestedPart - 1
+
+    return Math.max(variantSeason ?? 0, minimumPartSeason)
+  }
+
+  const markerSeason = titleSeasonMarker(row)
+
+  if (markerSeason) {
+    return Math.max(markerSeason, variantSeason ?? 0)
+  }
 
   if (!library || row.id === library.primary_anime_id) {
     return input.parsedSeason
   }
 
-  const seriesVariants = listCachedAnimeVariants(row.library_slug).filter(
-    (variant) => seriesFormats.has(variant.format ?? "")
-  )
-  const variantIndex = seriesVariants.findIndex((variant) => variant.id === row.id)
-
-  return variantIndex >= 0 ? variantIndex + 1 : input.parsedSeason
+  return variantSeason ?? input.parsedSeason
 }
 
 export function upsertEpisode(input: {
@@ -1783,6 +1853,10 @@ function rowHasSeasonMarker(
   return rowTitles(row)
     .filter((title): title is string => Boolean(title))
     .some((title) => {
+      if (extractSeasonMarkerFromTitle(title) === season) {
+        return true
+      }
+
       const normalized = title
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, " ")

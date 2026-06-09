@@ -14,6 +14,7 @@ import {
   getAnimeMetadataLookupSeason,
   getFolderTitleFallbackCandidates,
   parseAnimeFilePath,
+  parseSeasonPartMarker,
   sanitizeExportPathPart,
 } from "@/server/media/filename"
 import {
@@ -28,7 +29,7 @@ import {
 import { emitLibraryChange } from "@/server/media/libraryEvents"
 import { isInputImportOutputActive } from "@/server/media/processInputFile"
 import { findAnimeMetadata } from "@/server/metadata/anilist"
-import { errorMessage, fileName, parsePositiveInt } from "@/server/utils/format"
+import { errorMessage, fileName } from "@/server/utils/format"
 import { debugLog } from "@/server/utils/debugLog"
 
 type ParsedLibraryPath = {
@@ -132,13 +133,13 @@ async function runWithTemporaryFileAccessRetry<T>(
 }
 
 function parseSeasonFolder(value: string) {
-  const match = /^(?:season\s*|season_)(\d{1,2})$/i.exec(value.trim())
+  const marker = parseSeasonPartMarker(value)
 
-  if (!match) {
+  if (!marker?.season) {
     return null
   }
 
-  return parsePositiveInt(match[1])
+  return marker
 }
 
 function parseLibraryPath(filePath: string): ParsedLibraryPath | null {
@@ -181,7 +182,8 @@ function parseLibraryPath(filePath: string): ParsedLibraryPath | null {
 
   const season = parsedFileName.hasExplicitSeason
     ? parsedFileName.season
-    : seasonFolder ?? parsedFileName.season
+    : seasonFolder?.season ?? parsedFileName.season
+  const part = parsedFileName.part ?? seasonFolder?.part
   const animeTitle = sanitizeExportPathPart(parsedFileName.title)
 
   if (!animeTitle || !parsedFileName.episode) {
@@ -192,8 +194,13 @@ function parseLibraryPath(filePath: string): ParsedLibraryPath | null {
     animeTitle,
     season,
     episode: parsedFileName.episode,
-    part: parsedFileName.part,
-    metadataLookupSeason: getAnimeMetadataLookupSeason(parsedFileName),
+    part,
+    metadataLookupSeason: getAnimeMetadataLookupSeason({
+      ...parsedFileName,
+      season,
+      part,
+      hasExplicitSeason: parsedFileName.hasExplicitSeason || Boolean(seasonFolder?.season),
+    }),
   }
 }
 

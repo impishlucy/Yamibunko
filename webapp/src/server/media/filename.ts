@@ -66,7 +66,7 @@ export function cleanAnimeTitleCandidate(
     title = title
       .replace(
         new RegExp(
-          String.raw`\s+(?:part|pt\.?|cour)\s*(?:0?${part}|[ivx]+|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|1st|2nd|3rd|[4-9]th|10th)$`,
+          String.raw`\s+(?:part|pt\.?|cour|p|c)\s*(?:0?${part}|[ivx]+|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|1st|2nd|3rd|[4-9]th|10th)$`,
           "i"
         ),
         ""
@@ -84,7 +84,7 @@ export function cleanAnimeTitleCandidate(
     title = title.replace(/\b(?:season|s)\s*\d{1,2}\b/gi, " ")
   } else if (season) {
     title = title.replace(
-      new RegExp(String.raw`\s+(?:season\s*0?${season}|s0?${season})$`, "i"),
+      new RegExp(String.raw`\s+(?:season\s*0?${season}|s\s*0?${season})$`, "i"),
       ""
     )
   }
@@ -218,6 +218,124 @@ function parsePartNumber(value: string | undefined) {
   }
 
   return null
+}
+
+export type SeasonPartMarker = {
+  season?: number
+  part?: number
+}
+
+function normalizeSeasonPartMarkerValue(value: string) {
+  return normalizeTitle(value)
+    .replace(/([a-z])([0-9])/gi, "$1 $2")
+    .replace(/([0-9])([a-z])/gi, "$1 $2")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function parsePartMarkerFromValue(value: string) {
+  const labeledPartPattern = new RegExp(
+    String.raw`\b(?:part|pt|p|cour|c)\s*(${partNumberPattern})\b`,
+    "i"
+  )
+  const reversePartPattern = new RegExp(
+    String.raw`\b(${partNumberPattern})\s*(?:cour|half)\b`,
+    "i"
+  )
+  const match = labeledPartPattern.exec(value) ?? reversePartPattern.exec(value)
+
+  return parsePartNumber(match?.[1]) ?? undefined
+}
+
+export function parseSeasonPartMarker(value: string): SeasonPartMarker | null {
+  const normalized = normalizeSeasonPartMarkerValue(value)
+
+  if (!normalized) {
+    return null
+  }
+
+  const seasonMatch = /\b(?:season|s)\s*0*(\d{1,2})\b/i.exec(normalized)
+  const season = toPositiveInteger(seasonMatch?.[1]) ?? undefined
+  const part = parsePartMarkerFromValue(normalized)
+
+  if (!season && !part) {
+    return null
+  }
+
+  return { season, part }
+}
+
+function mergeSeasonPartMarker(
+  left: SeasonPartMarker | null,
+  right: SeasonPartMarker | null
+): SeasonPartMarker | null {
+  if (!left) {
+    return right
+  }
+
+  if (!right) {
+    return left
+  }
+
+  return {
+    season: right.season ?? left.season,
+    part: right.part ?? left.part,
+  }
+}
+
+function getDirectorySeasonPartMarker(rootDir: string, filePath: string) {
+  const root = path.resolve(rootDir)
+  const fileDirectory = path.dirname(path.resolve(filePath))
+  const relativeDirectory = path.relative(root, fileDirectory)
+
+  if (
+    !relativeDirectory ||
+    relativeDirectory.startsWith("..") ||
+    path.isAbsolute(relativeDirectory)
+  ) {
+    return null
+  }
+
+  return relativeDirectory
+    .split(path.sep)
+    .filter(Boolean)
+    .reduce<SeasonPartMarker | null>((marker, segment) => {
+      const next = parseSeasonPartMarker(segment)
+
+      if (!next) {
+        return marker
+      }
+
+      return mergeSeasonPartMarker(marker, next)
+    }, null)
+}
+
+function applySeasonPartMarker(
+  parsed: ParsedAnimeFileName,
+  marker: SeasonPartMarker | null
+): ParsedAnimeFileName {
+  if (!marker) {
+    return parsed
+  }
+
+  const season =
+    !parsed.hasExplicitSeason && marker.season ? marker.season : parsed.season
+  const part =
+    parsed.part ??
+    (marker.part && (!marker.season || marker.season === season)
+      ? marker.part
+      : undefined)
+
+  if (season === parsed.season && part === parsed.part) {
+    return parsed
+  }
+
+  return {
+    ...parsed,
+    season,
+    part,
+    hasExplicitSeason: parsed.hasExplicitSeason || Boolean(marker.season),
+  }
 }
 
 type EpisodeMarkerMatch = {
@@ -436,6 +554,21 @@ export function parseAnimeEpisodeIdentifier(
     }
   }
 
+  const noTitlePlainEpisode = /^(\d{1,3})(?:v\d+)?$/i.exec(normalized)
+
+  if (noTitlePlainEpisode) {
+    const episode = toPositiveInteger(noTitlePlainEpisode[1])
+
+    if (episode) {
+      return {
+        season: 1,
+        episode,
+        episodeTitle: null,
+        hasExplicitSeason: false,
+      }
+    }
+  }
+
   return null
 }
 
@@ -462,7 +595,16 @@ export function parseAnimeFileNameWithFallbackTitle(
 }
 
 export function cleanFolderTitleCandidate(value: string) {
-  return cleanAnimeTitleCandidate(value, { removeLooseSeasonMarkers: true })
+  const marker = parseSeasonPartMarker(value)
+  const expandedValue = value
+    .replace(/([A-Za-z])([0-9])/g, "$1 $2")
+    .replace(/([0-9])([A-Za-z])/g, "$1 $2")
+
+  return cleanAnimeTitleCandidate(expandedValue, {
+    season: marker?.season,
+    part: marker?.part,
+    removeLooseSeasonMarkers: !marker?.season,
+  })
     .replace(/[-–—]+/g, " ")
     .replace(/\s+/g, " ")
     .trim()
@@ -470,9 +612,18 @@ export function cleanFolderTitleCandidate(value: string) {
 
 function isIgnoredFolderTitleCandidate(value: string) {
   const normalized = value.trim().toLowerCase()
+  const marker = parseSeasonPartMarker(normalized)
+  const markerOnly = marker
+    ? !cleanAnimeTitleCandidate(normalized, {
+        season: marker.season,
+        part: marker.part,
+        removeLooseSeasonMarkers: !marker.season,
+      })
+    : false
 
   return (
     !normalized ||
+    markerOnly ||
     normalized === "_failed_imports" ||
     normalized === "season" ||
     normalized === "seasons" ||
@@ -537,10 +688,13 @@ export function parseAnimeFilePath(
   filePath: string,
   options?: { rootDir?: string; fallbackTitles?: string[] }
 ): ParsedAnimeFileName | null {
+  const directoryMarker = options?.rootDir
+    ? getDirectorySeasonPartMarker(options.rootDir, filePath)
+    : null
   const parsed = parseAnimeFileName(filePath)
 
   if (parsed) {
-    return parsed
+    return applySeasonPartMarker(parsed, directoryMarker)
   }
 
   const fallbackTitles = [
@@ -560,7 +714,7 @@ export function parseAnimeFilePath(
     const fallbackParsed = parseAnimeFileNameWithFallbackTitle(filePath, fallbackTitle)
 
     if (fallbackParsed) {
-      return fallbackParsed
+      return applySeasonPartMarker(fallbackParsed, directoryMarker)
     }
   }
 
@@ -804,17 +958,28 @@ export function formatEpisodeFileName(input: {
   season: number
   episode: number
   extension: string
+  part?: number
 }) {
   const season = String(input.season).padStart(2, "0")
+  const part =
+    input.part && input.part > 1
+      ? `P${String(input.part).padStart(2, "0")}`
+      : ""
   const episode = String(input.episode).padStart(2, "0")
   const safeTitle = sanitizeExportPathPart(input.title) || "Anime"
   const extension = input.extension.startsWith(".")
     ? input.extension
     : `.${input.extension}`
 
-  return `${safeTitle} - S${season}E${episode}${extension.toLowerCase()}`
+  return `${safeTitle} - S${season}${part}E${episode}${extension.toLowerCase()}`
 }
 
-export function formatSeasonFolderName(season: number) {
-  return `Season ${String(season).padStart(2, "0")}`
+export function formatSeasonFolderName(season: number, part?: number) {
+  const seasonLabel = `Season ${String(season).padStart(2, "0")}`
+
+  if (!part || part <= 1) {
+    return seasonLabel
+  }
+
+  return `${seasonLabel} Part ${String(part).padStart(2, "0")}`
 }

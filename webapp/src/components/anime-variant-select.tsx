@@ -22,6 +22,30 @@ function normalizeTitle(value: string) {
     .trim()
 }
 
+function seasonPartLabelFromTitle(value: string) {
+  const normalized = normalizeTitle(value)
+    .replace(/([a-z])([0-9])/gi, "$1 $2")
+    .replace(/([0-9])([a-z])/gi, "$1 $2")
+  const match = /\b(?:season|s)\s*0*(\d{1,2})(?:\s*(?:part|cour|pt|p)\s*0*(\d{1,2}))?\b/i.exec(
+    normalized
+  )
+
+  if (!match) {
+    return null
+  }
+
+  const season = Number.parseInt(match[1] ?? "", 10)
+  const part = Number.parseInt(match[2] ?? "", 10)
+
+  if (!Number.isFinite(season) || season <= 0) {
+    return null
+  }
+
+  return Number.isFinite(part) && part > 1
+    ? `S${season} Part ${part}`
+    : `S${season}`
+}
+
 function isSameOrSeasonOnlyTitle(input: {
   libraryTitle: string
   mediaTitle: string
@@ -74,6 +98,7 @@ function variantLabel(variant: AnimeVariant, libraryTitle: string) {
   const seriesTitle = titleSuffix ?? title
 
   if (hasSeasonPrefix) {
+    const titleSeasonPartLabel = seasonPartLabelFromTitle(seriesTitle)
     const isSeasonOnlyTitle = isSameOrSeasonOnlyTitle({
       libraryTitle,
       mediaTitle: seriesTitle,
@@ -81,7 +106,11 @@ function variantLabel(variant: AnimeVariant, libraryTitle: string) {
     })
 
     if (!seriesTitle || isSeasonOnlyTitle) {
-      return `[Series] ${shortSeasonLabel(seasonNumber)}`
+      return `[Series] ${titleSeasonPartLabel ?? shortSeasonLabel(seasonNumber)}`
+    }
+
+    if (titleSeasonPartLabel) {
+      return `[Series] ${titleSeasonPartLabel}`
     }
 
     return `[Series] ${shortSeasonLabel(seasonNumber)} - ${seriesTitle}`
