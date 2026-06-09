@@ -147,7 +147,7 @@ function BufferedSeekBar({
     <div className={`relative ${trackClassName}`}>
       <div className="pointer-events-none absolute inset-0 overflow-hidden rounded-full bg-zinc-950/95">
         <div
-          className="absolute inset-y-0 left-0 rounded-full bg-zinc-300/75"
+          className="absolute inset-y-0 left-0 rounded-full bg-zinc-300/60"
           style={{ width: `${visibleBufferedPercent}%` }}
         />
         <div
@@ -155,6 +155,10 @@ function BufferedSeekBar({
           style={{ width: `${playedPercent}%` }}
         />
       </div>
+      <div
+        className="pointer-events-none absolute top-1/2 z-[5] size-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white/90 bg-red-600"
+        style={{ left: `${playedPercent}%` }}
+      />
       <input
         {...inputProps}
         type="range"
@@ -2728,11 +2732,16 @@ export function AnimePlayer({
               preloadRangeWarmedUntilRef.current,
               warmedUntilSeconds
             )
-            setBufferedTime((previousBufferedTime) =>
-              Math.abs(previousBufferedTime - preloadRangeWarmedUntilRef.current) >= 0.25
-                ? preloadRangeWarmedUntilRef.current
+            setBufferedTime((previousBufferedTime) => {
+              const nextBufferedTime = Math.max(
+                previousBufferedTime,
+                preloadRangeWarmedUntilRef.current
+              )
+
+              return Math.abs(previousBufferedTime - nextBufferedTime) >= 0.25
+                ? nextBufferedTime
                 : previousBufferedTime
-            )
+            })
           }
 
           const downloadStartedAt = performance.now()
@@ -3301,11 +3310,13 @@ export function AnimePlayer({
       const clampedBufferedTime =
         knownDuration > 0 ? Math.min(nextBufferedTime, knownDuration) : nextBufferedTime
 
-      setBufferedTime((previousBufferedTime) =>
-        Math.abs(previousBufferedTime - clampedBufferedTime) >= 0.25
-          ? clampedBufferedTime
+      setBufferedTime((previousBufferedTime) => {
+        const nextBufferedTime = Math.max(previousBufferedTime, clampedBufferedTime)
+
+        return Math.abs(previousBufferedTime - nextBufferedTime) >= 0.25
+          ? nextBufferedTime
           : previousBufferedTime
-      )
+      })
     },
     [duration, durationSeconds]
   )
@@ -3434,10 +3445,16 @@ export function AnimePlayer({
       isPlayingRef.current ||
       shouldAutoPlaySourceRef.current
 
+    const previousStatus = statusRef.current
+    const preservedBufferedTime =
+      options.preservePosition && previousStatus === "direct" && nextStatus === "direct"
+        ? Math.max(bufferedTime, previousPosition, sourceStartTime)
+        : sourceStartTime
+
     activeSourceStartRef.current = sourceStartTime
     resetStreamStats()
-    preloadRangeWarmedUntilRef.current = sourceStartTime
-    setBufferedTime(sourceStartTime)
+    preloadRangeWarmedUntilRef.current = preservedBufferedTime
+    setBufferedTime(preservedBufferedTime)
 
     if (options.preservePosition) {
       currentTimeRef.current = previousPosition
@@ -5149,7 +5166,7 @@ export function AnimePlayer({
     if (!liveTranscodeEnabled) {
       safeEndGoogleCastSession(session, true)
       flashCastError(
-        new Error("Live transcoding is disabled when TRANSCODE_ACCEL=cpu.")
+        new Error("Live transcoding is unavailable for this episode.")
       )
       keepLocalPausedAfterFailedCastStart()
       return false

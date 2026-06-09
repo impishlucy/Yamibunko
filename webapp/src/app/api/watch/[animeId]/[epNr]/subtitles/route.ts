@@ -350,7 +350,6 @@ function subtitleExtractionArgs(input: {
     return [
       [
         ...commonInputArgs,
-        "-copyts",
         "-i",
         input.file,
         ...commonMapArgs,
@@ -358,7 +357,7 @@ function subtitleExtractionArgs(input: {
         "copy",
         ...webVttOutputArgs,
       ],
-      [...commonInputArgs, "-copyts", "-i", input.file, ...encodeOutputArgs],
+      [...commonInputArgs, "-i", input.file, ...encodeOutputArgs],
     ]
   }
 
@@ -366,7 +365,6 @@ function subtitleExtractionArgs(input: {
     [
       ...commonInputArgs,
       "-fix_sub_duration",
-      "-copyts",
       "-i",
       input.file,
       ...encodeOutputArgs,
