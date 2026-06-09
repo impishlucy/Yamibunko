@@ -339,6 +339,90 @@ function uniqueCandidates(values: EncoderCandidate[]) {
   return result
 }
 
+function accelerationPriority(acceleration: TranscodeAcceleration) {
+  switch (acceleration) {
+    case "nvenc":
+      return 0
+    case "amd_gpu":
+      return 1
+    case "intel_gpu":
+      return 2
+    case "amd_cpu":
+      return 3
+    case "intel_cpu":
+      return 4
+    default:
+      return 100
+  }
+}
+
+function prioritizeCandidates(values: EncoderCandidate[]) {
+  return uniqueCandidates(values).sort((left, right) => {
+    const sourceComparison = sourcePriority(left.source) - sourcePriority(right.source)
+
+    if (sourceComparison !== 0) {
+      return sourceComparison
+    }
+
+    const accelerationComparison =
+      accelerationPriority(left.acceleration) - accelerationPriority(right.acceleration)
+
+    if (accelerationComparison !== 0) {
+      return accelerationComparison
+    }
+
+    return (left.device ?? "").localeCompare(right.device ?? "")
+  })
+}
+
+function sourcePriority(source: HardwareSource) {
+  return source === "gpu" ? 0 : 1
+}
+
+function prioritizeLiveCandidates(
+  candidates: EncoderCandidate[],
+  av1ImportCandidate: EncoderCandidate | null
+) {
+  return [...candidates].sort((left, right) => {
+    const preferredComparison =
+      preferredCandidatePriority(left, av1ImportCandidate) -
+      preferredCandidatePriority(right, av1ImportCandidate)
+
+    if (preferredComparison !== 0) {
+      return preferredComparison
+    }
+
+    const sourceComparison = sourcePriority(left.source) - sourcePriority(right.source)
+
+    if (sourceComparison !== 0) {
+      return sourceComparison
+    }
+
+    const accelerationComparison =
+      accelerationPriority(left.acceleration) - accelerationPriority(right.acceleration)
+
+    if (accelerationComparison !== 0) {
+      return accelerationComparison
+    }
+
+    return (left.device ?? "").localeCompare(right.device ?? "")
+  })
+}
+
+function preferredCandidatePriority(
+  candidate: EncoderCandidate,
+  preferred: EncoderCandidate | null
+) {
+  if (!preferred) {
+    return 1
+  }
+
+  return candidate.acceleration === preferred.acceleration &&
+    (candidate.device ?? "") === (preferred.device ?? "")
+    ? 0
+    : 1
+}
+
 function getAv1Candidates(
   hardware: HardwareInfo,
   accelerationFilter?: HardwareAcceleration
@@ -377,7 +461,7 @@ function getAv1Candidates(
     return candidates
   })
 
-  const candidates = uniqueCandidates([...gpuCandidates, ...cpuCandidates])
+  const candidates = prioritizeCandidates([...gpuCandidates, ...cpuCandidates])
 
   return accelerationFilter
     ? candidates.filter((candidate) => candidate.acceleration === accelerationFilter)
@@ -422,7 +506,7 @@ function getLiveCandidates(hardware: HardwareInfo) {
     return candidates
   })
 
-  return uniqueCandidates([...gpuCandidates, ...cpuCandidates])
+  return prioritizeCandidates([...gpuCandidates, ...cpuCandidates])
 }
 
 function getAv1ProbeQualityArgs(acceleration: HardwareAcceleration) {
@@ -621,7 +705,7 @@ export function detectHardwareAcceleration(input: {
   )
   const liveTranscodeCandidate = resolveWithOptionalProbe(
     usableFfmpegPath,
-    getLiveCandidates(hardware),
+    prioritizeLiveCandidates(getLiveCandidates(hardware), av1ImportCandidate),
     "live"
   )
 

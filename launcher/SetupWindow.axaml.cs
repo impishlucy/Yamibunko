@@ -234,12 +234,36 @@ public partial class SetupWindow : Window
         {
             var detection = await HardwareAccelerationDetector.DetectAsync(_initialSettings?.FfmpegDir, !string.IsNullOrWhiteSpace(_initialSettings?.FfmpegDir));
             _hardwareDetection = detection;
+            UpdateHardwareAccelerationStatusText(detection);
             SetCatalogModeForced(detection.Av1ImportAcceleration == null);
         }
         catch
         {
+            UpdateHardwareAccelerationStatusText(null);
             SetCatalogModeForced(true);
         }
+    }
+
+    private void UpdateHardwareAccelerationStatusText(HardwareAccelerationDetection? detection)
+    {
+        var statusText = this.FindControl<TextBlock>("HardwareAccelerationStatusText");
+        if (statusText == null)
+        {
+            return;
+        }
+
+        if (detection == null)
+        {
+            statusText.Text = "Video Accelerator: Encoder: unsupported · Live transcoder: software";
+            return;
+        }
+
+        var encodeAcceleration = detection.Av1ImportAcceleration == null
+            ? "unsupported"
+            : HardwareAccelerationDetector.FormatAccelerationForDisplay(detection.Av1ImportAcceleration);
+        var liveAcceleration = HardwareAccelerationDetector.FormatAccelerationForDisplay(detection.LiveTranscodeAcceleration);
+
+        statusText.Text = $"Video Accelerator: Encoder: {encodeAcceleration} · Live transcoder: {liveAcceleration}";
     }
 
     private void CaptureDefaultDisableFileProcessingTooltip()

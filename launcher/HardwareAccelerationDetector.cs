@@ -15,6 +15,18 @@ public static class HardwareAccelerationDetector
     public const string Av1HardwareUnsupportedMessage = "HW encoding is not supported for AV1 on your device";
     public const string Av1CatalogModeTooltip = "HW encoding is not supported for AV1 on your device, encode mode is disabled";
 
+    public static string FormatAccelerationForDisplay(string? acceleration)
+    {
+        if (string.IsNullOrWhiteSpace(acceleration))
+        {
+            return "unsupported";
+        }
+
+        return string.Equals(acceleration.Trim(), "cpu", StringComparison.OrdinalIgnoreCase)
+            ? "software"
+            : acceleration.Trim();
+    }
+
     private static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(10);
 
@@ -31,7 +43,7 @@ public static class HardwareAccelerationDetector
             EncoderProbeKind.Av1);
         var liveAcceleration = await ResolveWithOptionalProbeAsync(
             usableFfmpegPath,
-            GetLiveCandidates(hardware),
+            PrioritizeLiveCandidates(GetLiveCandidates(hardware), av1Acceleration),
             EncoderProbeKind.Live);
 
         return new HardwareAccelerationDetection(
@@ -404,6 +416,51 @@ public static class HardwareAccelerationDetector
         return result;
     }
 
+    private static IReadOnlyList<EncoderCandidate> PrioritizeCandidates(IEnumerable<EncoderCandidate> candidates)
+    {
+        return UniqueCandidates(candidates)
+            .OrderBy(candidate => candidate.Source == HardwareSource.Gpu ? 0 : 1)
+            .ThenBy(candidate => AccelerationPriority(candidate.Acceleration))
+            .ThenBy(candidate => candidate.Device ?? string.Empty, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static IReadOnlyList<EncoderCandidate> PrioritizeLiveCandidates(
+        IReadOnlyList<EncoderCandidate> candidates,
+        EncoderCandidate? av1ImportCandidate)
+    {
+        return candidates
+            .OrderBy(candidate => CandidateMatchesPreferred(candidate, av1ImportCandidate) ? 0 : 1)
+            .ThenBy(candidate => candidate.Source == HardwareSource.Gpu ? 0 : 1)
+            .ThenBy(candidate => AccelerationPriority(candidate.Acceleration))
+            .ThenBy(candidate => candidate.Device ?? string.Empty, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static bool CandidateMatchesPreferred(EncoderCandidate candidate, EncoderCandidate? preferred)
+    {
+        if (preferred is null)
+        {
+            return false;
+        }
+
+        return string.Equals(candidate.Acceleration, preferred.Acceleration, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(candidate.Device ?? string.Empty, preferred.Device ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static int AccelerationPriority(string acceleration)
+    {
+        return acceleration.ToLowerInvariant() switch
+        {
+            "nvenc" => 0,
+            "amd_gpu" => 1,
+            "intel_gpu" => 2,
+            "amd_cpu" => 3,
+            "intel_cpu" => 4,
+            _ => 100
+        };
+    }
+
     private static IReadOnlyList<EncoderCandidate> GetAv1Candidates(HardwareInfo hardware)
     {
         var candidates = new List<EncoderCandidate>();
@@ -443,7 +500,7 @@ public static class HardwareAccelerationDetector
             }
         }
 
-        return UniqueCandidates(candidates);
+        return PrioritizeCandidates(candidates);
     }
 
     private static IReadOnlyList<EncoderCandidate> GetLiveCandidates(HardwareInfo hardware)
@@ -485,7 +542,7 @@ public static class HardwareAccelerationDetector
             }
         }
 
-        return UniqueCandidates(candidates);
+        return PrioritizeCandidates(candidates);
     }
 
     private static async Task<EncoderCandidate?> ResolveWithOptionalProbeAsync(
