@@ -24,6 +24,7 @@
                     <NativeMenu>
                         <NativeMenuItem Header="Show Logs" Click="OnShowLogsClicked"/>
                         <NativeMenuItem Header="Open in Browser" Click="OnOpenBrowserClicked" IsEnabled="False"/>
+                        <NativeMenuItem Header="Open Settings" Click="OnOpenSettingsClicked"/>
                         <NativeMenuItemSeparator/>
                         <NativeMenuItem Header="Stop Server &amp; Exit" Click="OnExitClicked"/>
                     </NativeMenu>

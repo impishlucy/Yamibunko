@@ -13,11 +13,14 @@ public partial class App : Application
     public static ServerManager ServerManager { get; } = new();
 
     private LogWindow? _logWindow;
+    private SetupWindow? _setupWindow;
     private NativeMenuItem? _openInBrowserTrayMenuItem;
+    private NativeMenuItem? _openSettingsTrayMenuItem;
     private NativeMenuItem? _stopServerTrayMenuItem;
     private bool _shutdownRequested;
     private bool _shutdownCompleted;
     private bool _crashShutdownScheduled;
+    private bool _isOpeningSettings;
 
     public override void Initialize()
     {
@@ -50,6 +53,7 @@ public partial class App : Application
             };
 
             _openInBrowserTrayMenuItem = FindTrayMenuItem("Open in Browser");
+            _openSettingsTrayMenuItem = FindTrayMenuItem("Open Settings");
             _stopServerTrayMenuItem = FindTrayMenuItem("Stop Server & Exit");
             ServerManager.LogsWindowRequested += ShowLogsWindow;
             ServerManager.ServerStopStateChanged += OnServerStopStateChanged;
@@ -63,14 +67,19 @@ public partial class App : Application
             var settings = AppSettings.Load();
             if (settings == null)
             {
-                var setupWindow = new SetupWindow();
-                setupWindow.OnSetupComplete += async (newSettings) =>
+                var setupWindow = CreateSetupWindow(null);
+                _setupWindow = setupWindow;
+                setupWindow.Closed += (_, _) =>
                 {
-                    setupWindow.Close();
-                    await ServerManager.StartServerAsync(newSettings);
+                    if (ReferenceEquals(_setupWindow, setupWindow))
+                    {
+                        _setupWindow = null;
+                        UpdateStopServerControls();
+                    }
                 };
                 desktop.MainWindow = setupWindow;
                 setupWindow.Show();
+                UpdateStopServerControls();
             }
             else
             {
@@ -116,6 +125,11 @@ public partial class App : Application
         OpenInBrowser();
     }
 
+    private async void OnOpenSettingsClicked(object? sender, EventArgs e)
+    {
+        await StopServerAndOpenSettingsAsync();
+    }
+
     private void OpenInBrowser()
     {
         if (_shutdownRequested || !ServerManager.CanOpenInBrowser)
@@ -131,6 +145,105 @@ public partial class App : Application
         }
 
         ServerManager.OpenUrl(settings.BaseUrl);
+    }
+
+    private async Task StopServerAndOpenSettingsAsync()
+    {
+        if (_shutdownRequested || _crashShutdownScheduled || _shutdownCompleted)
+        {
+            return;
+        }
+
+        if (_isOpeningSettings)
+        {
+            ActivateSetupWindow();
+            return;
+        }
+
+        if (ActivateSetupWindow())
+        {
+            return;
+        }
+
+        _isOpeningSettings = true;
+        DisableOpenInBrowserControls();
+        UpdateStopServerControls();
+
+        try
+        {
+            await ServerManager.StopServerAsync();
+            OpenSettingsWindow();
+        }
+        finally
+        {
+            _isOpeningSettings = false;
+            UpdateStopServerControls();
+        }
+    }
+
+    private void OpenSettingsWindow()
+    {
+        if (!Dispatcher.UIThread.CheckAccess())
+        {
+            Dispatcher.UIThread.Post(OpenSettingsWindow);
+            return;
+        }
+
+        if (ActivateSetupWindow())
+        {
+            return;
+        }
+
+        var settings = AppSettings.Load();
+        var setupWindow = CreateSetupWindow(settings);
+        _setupWindow = setupWindow;
+        setupWindow.Closed += (_, _) =>
+        {
+            if (ReferenceEquals(_setupWindow, setupWindow))
+            {
+                _setupWindow = null;
+                UpdateStopServerControls();
+            }
+        };
+
+        if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+        {
+            desktop.MainWindow = setupWindow;
+        }
+
+        setupWindow.Show();
+        setupWindow.Activate();
+        setupWindow.Focus();
+        UpdateStopServerControls();
+    }
+
+    private SetupWindow CreateSetupWindow(AppSettings? settings)
+    {
+        var setupWindow = settings == null ? new SetupWindow() : new SetupWindow(settings);
+        setupWindow.OnSetupComplete += async newSettings =>
+        {
+            setupWindow.Close();
+            await ServerManager.StartServerAsync(newSettings);
+        };
+
+        return setupWindow;
+    }
+
+    private bool ActivateSetupWindow()
+    {
+        if (_setupWindow == null || !_setupWindow.IsVisible)
+        {
+            return false;
+        }
+
+        if (_setupWindow.WindowState == WindowState.Minimized)
+        {
+            _setupWindow.WindowState = WindowState.Normal;
+        }
+
+        _setupWindow.Activate();
+        _setupWindow.Focus();
+        return true;
     }
 
     private async void OnExitClicked(object? sender, EventArgs e)
@@ -263,13 +376,21 @@ public partial class App : Application
 
     private void UpdateStopServerControls()
     {
-        var canStop = ServerManager.CanStopServer && !_shutdownRequested && !_crashShutdownScheduled;
-        var isStopping = ServerManager.IsStoppingServer || _shutdownRequested || _crashShutdownScheduled;
-        var canOpenInBrowser = ServerManager.CanOpenInBrowser && !_shutdownRequested && !_crashShutdownScheduled;
+        var hasOpenSetupWindow = _setupWindow != null && _setupWindow.IsVisible;
+        var canStop = ServerManager.CanStopServer && !_shutdownRequested && !_crashShutdownScheduled && !_isOpeningSettings;
+        var isStopping = ServerManager.IsStoppingServer || _shutdownRequested || _crashShutdownScheduled || _isOpeningSettings;
+        var canOpenInBrowser = ServerManager.CanOpenInBrowser && !_shutdownRequested && !_crashShutdownScheduled && !_isOpeningSettings;
+        var canOpenSettings = !_shutdownRequested && !_crashShutdownScheduled && !_isOpeningSettings && !hasOpenSetupWindow;
 
         if (_openInBrowserTrayMenuItem != null)
         {
             _openInBrowserTrayMenuItem.IsEnabled = canOpenInBrowser;
+        }
+
+        if (_openSettingsTrayMenuItem != null)
+        {
+            _openSettingsTrayMenuItem.IsEnabled = canOpenSettings;
+            _openSettingsTrayMenuItem.Header = _isOpeningSettings ? "Opening Settings..." : "Open Settings";
         }
 
         if (_stopServerTrayMenuItem != null)
