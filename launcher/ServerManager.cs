@@ -20,6 +20,7 @@ public class ServerManager
 {
     private static readonly TimeSpan DefaultCommandTimeout = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan InstallCommandTimeout = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan CrashShutdownDelay = TimeSpan.FromSeconds(30);
     private Process? _serverProcess;
     private Process? _activeManagedProcess;
     private Task? _stopServerTask;
@@ -34,6 +35,7 @@ public class ServerManager
 
     public event Action? LogsWindowRequested;
     public event Action? ServerStopStateChanged;
+    public event Action<TimeSpan>? ServerCrashShutdownRequested;
 
     public bool IsStoppingServer
     {
@@ -539,14 +541,18 @@ public class ServerManager
             ? detection.Av1ImportDevice ?? string.Empty
             : detection.LiveTranscodeDevice ?? string.Empty;
 
+        var selectedAccelerationLabel = HardwareAccelerationDetector.FormatAccelerationForDisplay(settings.TranscodeAccel);
+        var av1ImportAccelerationLabel = HardwareAccelerationDetector.FormatAccelerationForDisplay(detection.Av1ImportAcceleration);
+        var liveTranscodeAccelerationLabel = HardwareAccelerationDetector.FormatAccelerationForDisplay(detection.LiveTranscodeAcceleration);
+
         if (hadOutdatedAcceleration)
         {
-            Log($"Updated TRANSCODE_ACCEL from outdated value '{previousAcceleration}' to '{settings.TranscodeAccel}'. Suggested replacement for the old value was '{outdatedReplacement}'.");
+            Log($"Updated TRANSCODE_ACCEL from outdated value '{previousAcceleration}' to '{selectedAccelerationLabel}'. Suggested replacement for the old value was '{outdatedReplacement}'.");
         }
 
         Log(detection.Av1ImportAcceleration == null
-            ? $"AV1 hardware encoding unavailable. Live transcoding acceleration: {settings.TranscodeAccel}."
-            : $"AV1 hardware encoding acceleration: {detection.Av1ImportAcceleration}. Live transcoding acceleration: {detection.LiveTranscodeAcceleration}.");
+            ? $"AV1 hardware encoding unavailable. Live transcoding acceleration: {selectedAccelerationLabel}."
+            : $"AV1 hardware encoding acceleration: {av1ImportAccelerationLabel}. Live transcoding acceleration: {liveTranscodeAccelerationLabel}.");
 
         settings.Save();
     }
@@ -682,17 +688,7 @@ public class ServerManager
         process.OutputDataReceived += (_, e) => AppendProcessLine(null, e.Data, true);
         process.ErrorDataReceived += (_, e) => AppendProcessLine(null, e.Data, true);
         process.EnableRaisingEvents = true;
-        process.Exited += (_, _) =>
-        {
-            ClearActiveProcess(process);
-            var exitCode = process.ExitCode;
-            Log($"Server process exited with code {exitCode}.");
-
-            if (exitCode != 0 && !IsStoppingServer)
-            {
-                ShowLogsWindow();
-            }
-        };
+        process.Exited += (_, _) => OnServerProcessExited(process);
 
         try
         {
@@ -713,6 +709,55 @@ public class ServerManager
         process.BeginErrorReadLine();
 
         return process;
+    }
+
+    private void OnServerProcessExited(Process process)
+    {
+        var exitCode = 0;
+
+        try
+        {
+            exitCode = process.ExitCode;
+        }
+        catch (InvalidOperationException)
+        {
+        }
+
+        var isStopping = IsStoppingServer;
+        var isTrackedServer = false;
+
+        lock (_shutdownLock)
+        {
+            if (ReferenceEquals(_activeManagedProcess, process))
+            {
+                _activeManagedProcess = null;
+            }
+
+            if (!isStopping && ReferenceEquals(_serverProcess, process))
+            {
+                _serverProcess = null;
+                isTrackedServer = true;
+            }
+        }
+
+        if (isTrackedServer)
+        {
+            CloseServerJob();
+            TryDeleteFile(_pidFile);
+            process.Dispose();
+        }
+
+        NotifyServerStopStateChanged();
+        Log($"Server process exited with code {exitCode}.");
+
+        if (!isTrackedServer)
+        {
+            return;
+        }
+
+        Log($"Server process exited unexpectedly. Launcher will close automatically in {CrashShutdownDelay.TotalSeconds:N0} seconds.");
+        ShowLogsWindow();
+        ServerCrashShutdownRequested?.Invoke(CrashShutdownDelay);
     }
 
     private void MarkActiveProcess(Process process)

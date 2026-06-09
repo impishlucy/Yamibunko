@@ -17,6 +17,7 @@ public partial class App : Application
     private NativeMenuItem? _stopServerTrayMenuItem;
     private bool _shutdownRequested;
     private bool _shutdownCompleted;
+    private bool _crashShutdownScheduled;
 
     public override void Initialize()
     {
@@ -52,6 +53,7 @@ public partial class App : Application
             _stopServerTrayMenuItem = FindTrayMenuItem("Stop Server & Exit");
             ServerManager.LogsWindowRequested += ShowLogsWindow;
             ServerManager.ServerStopStateChanged += OnServerStopStateChanged;
+            ServerManager.ServerCrashShutdownRequested += OnServerCrashShutdownRequested;
             ServerManager.StartDailyLogCleanup(new TimeSpan(3, 0, 0));
             SingleInstanceManager.StartListening(ShowLogsWindow);
             UpdateStopServerControls();
@@ -179,6 +181,47 @@ public partial class App : Application
         UpdateStopServerControls();
     }
 
+    private void OnServerCrashShutdownRequested(TimeSpan delay)
+    {
+        if (!Dispatcher.UIThread.CheckAccess())
+        {
+            Dispatcher.UIThread.Post(() => OnServerCrashShutdownRequested(delay));
+            return;
+        }
+
+        _ = ShutdownAfterServerCrashAsync(delay);
+    }
+
+    private async Task ShutdownAfterServerCrashAsync(TimeSpan delay)
+    {
+        if (_crashShutdownScheduled || _shutdownRequested || _shutdownCompleted)
+        {
+            return;
+        }
+
+        _crashShutdownScheduled = true;
+        DisableOpenInBrowserControls();
+        UpdateStopServerControls();
+        ShowLogsWindow();
+
+        await Task.Delay(delay);
+
+        if (_shutdownCompleted)
+        {
+            return;
+        }
+
+        _shutdownRequested = true;
+        Environment.ExitCode = LauncherExitCodes.ServerProcessCrashed;
+        await ServerManager.StopServerAsync();
+        _shutdownCompleted = true;
+
+        if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+        {
+            desktop.Shutdown(LauncherExitCodes.ServerProcessCrashed);
+        }
+    }
+
     private void DisableOpenInBrowserControls()
     {
         if (_openInBrowserTrayMenuItem != null)
@@ -220,9 +263,9 @@ public partial class App : Application
 
     private void UpdateStopServerControls()
     {
-        var canStop = ServerManager.CanStopServer && !_shutdownRequested;
-        var isStopping = ServerManager.IsStoppingServer || _shutdownRequested;
-        var canOpenInBrowser = ServerManager.CanOpenInBrowser && !_shutdownRequested;
+        var canStop = ServerManager.CanStopServer && !_shutdownRequested && !_crashShutdownScheduled;
+        var isStopping = ServerManager.IsStoppingServer || _shutdownRequested || _crashShutdownScheduled;
+        var canOpenInBrowser = ServerManager.CanOpenInBrowser && !_shutdownRequested && !_crashShutdownScheduled;
 
         if (_openInBrowserTrayMenuItem != null)
         {

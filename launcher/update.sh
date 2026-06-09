@@ -60,7 +60,7 @@ is_yamibunko_process() {
   lower_name="$(printf "%s" "$name" | tr '[:upper:]' '[:lower:]')"
   lower_command="$(printf "%s" "$command" | tr '[:upper:]' '[:lower:]')"
 
-  if [ "$lower_name" = "yamibunko" ]; then
+  if [ "$lower_name" = "launcher" ]; then
     return 0
   fi
 

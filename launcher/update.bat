@@ -64,7 +64,7 @@ function Is-YamibunkoProcess($process) {
     $name = TextValue $process.Name
     $lowerName = $name.ToLowerInvariant()
 
-    if ($lowerName -eq "yamibunko.exe" -or $lowerName -eq "yamibunko") {
+    if ($lowerName -eq "launcher.exe" -or $lowerName -eq "launcher") {
         return $true
     }
 
