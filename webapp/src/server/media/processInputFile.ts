@@ -47,6 +47,10 @@ import {
 } from "@/server/media/mediaFiles"
 import { emitLibraryChange } from "@/server/media/libraryEvents"
 import {
+  registerActiveCacheJobDirectory,
+  removeCacheJobDirectory,
+} from "@/server/media/cacheMaintenance"
+import {
   findAnimeMetadata,
   isAniListMetadataLookupUnavailableError,
 } from "@/server/metadata/anilist"
@@ -1776,6 +1780,11 @@ export async function processInputFile(
     }
 
     async function runFfmpegProcessing() {
+      const jobTempDirectory = path.dirname(tempPath)
+      const releaseCacheJobDirectory = registerActiveCacheJobDirectory(
+        jobTempDirectory
+      )
+
       updateJob(jobId, {
         message: convertVideo
           ? videoTranscodeReason === "shrink"
@@ -1786,33 +1795,44 @@ export async function processInputFile(
             : "Remuxing media file to WebM.",
       })
 
-      await transcodeFile(filePath, tempPath, {
-        convertVideo,
-        inputVideoCodec,
-        audioOutputIndexesToOpus,
-        subtitleStreams,
-        sidecarSubtitle,
-        videoBitrateKbps,
-        maxVideoBitrateKbps: calculateVideoBitrateKbps(maxAv1BytesPerMinute),
-        jobId,
-      })
-      debugImport(jobId, "FFmpeg processing step completed successfully.")
+      try {
+        await transcodeFile(filePath, tempPath, {
+          convertVideo,
+          inputVideoCodec,
+          audioOutputIndexesToOpus,
+          subtitleStreams,
+          sidecarSubtitle,
+          videoBitrateKbps,
+          maxVideoBitrateKbps: calculateVideoBitrateKbps(maxAv1BytesPerMinute),
+          jobId,
+        })
+        debugImport(jobId, "FFmpeg processing step completed successfully.")
 
-      updateJob(jobId, {
-        message: "Moving processed output into the library.",
-      })
-      debugImport(jobId, "Queueing transcoded output move into the library.")
-      await moveLibraryFileThroughQueue(tempPath, finalPath, "transcode-output")
-      debugImport(jobId, "Transcoded output move completed.")
-      debugImport(jobId, "Removing temporary job directory.")
-      await rm(path.dirname(tempPath), { force: true, recursive: true })
-      debugImport(jobId, "Temporary job directory removed.")
-      debugImport(jobId, "Removing original input file after processed output move.")
-      await unlinkFileWithRetry(filePath, { jobId })
-      await removeInputSidecarIfUsed()
-      debugImport(jobId, "Cleaning input parent folders.")
-      await removeNonMediaOnlyInputParents(filePath, { jobId })
-      debugImport(jobId, "Input parent cleanup completed.")
+        updateJob(jobId, {
+          message: "Moving processed output into the library.",
+        })
+        debugImport(jobId, "Queueing transcoded output move into the library.")
+        await moveLibraryFileThroughQueue(tempPath, finalPath, "transcode-output")
+        debugImport(jobId, "Transcoded output move completed.")
+        debugImport(jobId, "Removing original input file after processed output move.")
+        await unlinkFileWithRetry(filePath, { jobId })
+        await removeInputSidecarIfUsed()
+        debugImport(jobId, "Cleaning input parent folders.")
+        await removeNonMediaOnlyInputParents(filePath, { jobId })
+        debugImport(jobId, "Input parent cleanup completed.")
+      } finally {
+        releaseCacheJobDirectory()
+        debugImport(jobId, "Removing temporary job directory.")
+        await removeCacheJobDirectory(jobTempDirectory)
+          .then((removed) => {
+            if (removed) {
+              debugImport(jobId, "Temporary job directory removed.")
+            }
+          })
+          .catch((error) => {
+            debugError(jobId, "Temporary job directory cleanup failed", error)
+          })
+      }
     }
 
     async function finishExistingOutputImport() {

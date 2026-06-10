@@ -4,6 +4,7 @@ import { access, mkdir, rm, stat } from "node:fs/promises"
 import path from "node:path"
 
 import { getServerConfig } from "@/server/config"
+import { registerActiveCachePreviewPath } from "@/server/media/cacheActivity"
 import { runFfmpeg } from "@/server/media/ffmpeg"
 
 export type ProbeStream = {
@@ -252,25 +253,31 @@ export async function generateEpisodeThumbnail(
   durationSeconds: number
 ) {
   const thumbnailPath = thumbnailPathForEpisode(filePath)
-  await mkdir(path.dirname(thumbnailPath), { recursive: true })
-  let lastError: unknown = null
+  const releaseActivePreviewPath = registerActiveCachePreviewPath(thumbnailPath)
 
-  for (const seekTime of thumbnailSeekTimes(durationSeconds)) {
-    try {
-      await rm(thumbnailPath, { force: true })
-      await runFfmpeg(thumbnailArgs(filePath, thumbnailPath, seekTime), {
-        protectFromParentSignals: true,
-      })
-      await assertThumbnailWritten(thumbnailPath)
+  try {
+    await mkdir(path.dirname(thumbnailPath), { recursive: true })
+    let lastError: unknown = null
 
-      return thumbnailPath
-    } catch (error) {
-      lastError = error
-      await rm(thumbnailPath, { force: true })
+    for (const seekTime of thumbnailSeekTimes(durationSeconds)) {
+      try {
+        await rm(thumbnailPath, { force: true })
+        await runFfmpeg(thumbnailArgs(filePath, thumbnailPath, seekTime), {
+          protectFromParentSignals: true,
+        })
+        await assertThumbnailWritten(thumbnailPath)
+
+        return thumbnailPath
+      } catch (error) {
+        lastError = error
+        await rm(thumbnailPath, { force: true })
+      }
     }
-  }
 
-  throw lastError instanceof Error
-    ? lastError
-    : new Error(`Thumbnail generation failed: ${filePath}`)
+    throw lastError instanceof Error
+      ? lastError
+      : new Error(`Thumbnail generation failed: ${filePath}`)
+  } finally {
+    releaseActivePreviewPath()
+  }
 }

@@ -1501,6 +1501,14 @@ export function listEpisodeFilePaths() {
     .map((row) => row.file_path)
 }
 
+export function listEpisodeThumbnailCacheReferences() {
+  return getDb()
+    .query<{ file_path: string; thumbnail_path: string | null }>(
+      "SELECT file_path, thumbnail_path FROM episodes"
+    )
+    .all()
+}
+
 export function deleteEpisodeByPath(filePath: string) {
   const episode = getEpisodeByPath(filePath)
 

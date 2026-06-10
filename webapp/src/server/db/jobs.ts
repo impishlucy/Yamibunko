@@ -83,3 +83,12 @@ export function updateJob(
       id
     )
 }
+
+export function listActiveJobIds() {
+  return getDb()
+    .query<{ id: string }>(
+      "SELECT id FROM jobs WHERE status IN ('queued', 'processing')"
+    )
+    .all()
+    .map((row) => row.id)
+}

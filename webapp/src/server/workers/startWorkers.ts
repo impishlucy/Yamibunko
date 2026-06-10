@@ -18,6 +18,7 @@ import { updateJob } from "@/server/db/jobs"
 import { listEpisodeFilePaths } from "@/server/db/library"
 import { resetAdminIgnoredAppUpdateVersions } from "@/server/db/users"
 import { getServerConfigResult } from "@/server/config"
+import { tryRunCacheMaintenance } from "@/server/media/cacheMaintenance"
 import { isMediaFile, pathExists } from "@/server/media/mediaFiles"
 import {
   isInputImportOutputActive,
@@ -1047,6 +1048,7 @@ export function startWorkers() {
         await checkForYamibunkoUpdate(reason)
       }
     } finally {
+      await tryRunCacheMaintenance()
       dailyAniListSyncRunning = false
     }
   }
