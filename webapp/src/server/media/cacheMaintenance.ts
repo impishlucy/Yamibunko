@@ -73,7 +73,10 @@ export function registerActiveCacheJobDirectory(directoryPath: string) {
   }
 }
 
-export async function removeCacheJobDirectory(directoryPath: string) {
+export async function removeCacheJobDirectory(
+  directoryPath: string,
+  options: { allowActive?: boolean } = {}
+) {
   const jobsDirectory = cacheJobsDirectoryPath()
   const resolvedDirectoryPath = path.resolve(directoryPath)
 
@@ -85,7 +88,10 @@ export async function removeCacheJobDirectory(directoryPath: string) {
 
   const activeDirectories = activeJobDirectoryKeys()
 
-  if (activeDirectories.has(normalizeCachePath(resolvedDirectoryPath))) {
+  if (
+    !options.allowActive &&
+    activeDirectories.has(normalizeCachePath(resolvedDirectoryPath))
+  ) {
     debugCache(`Skipped active job cache directory - ${resolvedDirectoryPath}`)
     return false
   }

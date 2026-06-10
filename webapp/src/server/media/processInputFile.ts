@@ -1821,9 +1821,8 @@ export async function processInputFile(
         await removeNonMediaOnlyInputParents(filePath, { jobId })
         debugImport(jobId, "Input parent cleanup completed.")
       } finally {
-        releaseCacheJobDirectory()
         debugImport(jobId, "Removing temporary job directory.")
-        await removeCacheJobDirectory(jobTempDirectory)
+        await removeCacheJobDirectory(jobTempDirectory, { allowActive: true })
           .then((removed) => {
             if (removed) {
               debugImport(jobId, "Temporary job directory removed.")
@@ -1832,6 +1831,7 @@ export async function processInputFile(
           .catch((error) => {
             debugError(jobId, "Temporary job directory cleanup failed", error)
           })
+          .finally(releaseCacheJobDirectory)
       }
     }
 
