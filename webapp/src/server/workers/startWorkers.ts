@@ -13,7 +13,11 @@ import {
   checkForYamibunkoUpdate,
   getCurrentAppVersion,
 } from "@/server/app/updateCheck"
-import { beginStreamServerShutdown } from "@/server/bandwidth/streamBandwidth"
+import {
+  beginStreamServerShutdown,
+  runUploadCapacityRecheckWithStreamHold,
+} from "@/server/bandwidth/streamBandwidth"
+import { startUploadCapacityMeasurement } from "@/server/bandwidth/uploadCapacity"
 import { updateJob } from "@/server/db/jobs"
 import { listEpisodeFilePaths } from "@/server/db/library"
 import { resetAdminIgnoredAppUpdateVersions } from "@/server/db/users"
@@ -45,6 +49,8 @@ import { debugLog } from "@/server/utils/debugLog"
 type WorkerRuntime = {
   activeWork: Set<Promise<void>>
   watchers: FSWatcher[]
+  startupChecksReady: Promise<void>
+  startImportProcessing: () => void
   stop: () => Promise<void>
 }
 
@@ -131,7 +137,7 @@ function formatImportFileActionKind(kind: ImportFileActionKind) {
     case "audio-transcode":
       return "audio transcode"
     case "container-remux":
-      return "WebM remux"
+      return "MP4 remux"
     case "direct-move":
     case "direct-import":
       return "direct import move"
@@ -186,6 +192,13 @@ function debugWorkers(message: string) {
 
 function yieldToEventLoop() {
   return new Promise<void>((resolve) => setImmediate(resolve))
+}
+
+function sleep(milliseconds: number) {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, milliseconds)
+    timer.unref?.()
+  })
 }
 
 const failedImportsFolderName = "_failed_imports"
@@ -271,12 +284,19 @@ export function startWorkers() {
   let stopPromise: Promise<void> | null = null
   let scanning = false
   let dailyAniListTimer: NodeJS.Timeout | undefined
+  let scanTimer: NodeJS.Timeout | undefined
   let dailyAniListSyncRunning = false
   let workStartScheduled = false
   let importFileActionStartScheduled = false
   let activeImportFileActionWork = 0
   let nextImportFileActionId = 1
   let nextImportFileActionSequence = 1
+  let importProcessingStarted = false
+  let importWorkBlockReason: string | null = "startup checks"
+  let startupChecksResolve: () => void = () => undefined
+  const startupChecksReady = new Promise<void>((resolve) => {
+    startupChecksResolve = resolve
+  })
 
   const inputWatcher = chokidar.watch(config.inputDir, {
     ignoreInitial: true,
@@ -355,6 +375,93 @@ export function startWorkers() {
         debugWorkers(`Work removed from active set - ${key}`)
       }
     )
+  }
+
+  function blockImportWork(reason: string) {
+    importWorkBlockReason = reason
+    debugWorkers(`Import work blocked - ${reason}`)
+  }
+
+  function unblockImportWork(reason: string) {
+    if (!importWorkBlockReason) {
+      return
+    }
+
+    debugWorkers(`Import work unblocked - ${reason}; previous block was ${importWorkBlockReason}`)
+    importWorkBlockReason = null
+    scheduleQueuedWorkStart()
+    scheduleImportFileActionStart()
+  }
+
+  function importWorkIsBlocked() {
+    return Boolean(importWorkBlockReason)
+  }
+
+  function hasActiveImportWork() {
+    return activeWorkByKind.input > 0 || activeImportFileActionWork > 0
+  }
+
+  async function waitForActiveImportWorkToFinish(reason: string) {
+    let logged = false
+
+    while (hasActiveImportWork()) {
+      if (!logged) {
+        logged = true
+        console.log(
+          `[Info] [Workers] Waiting for active import work to finish before ${reason}.`
+        )
+      }
+
+      await sleep(250)
+      await yieldToEventLoop()
+    }
+  }
+
+  function hasQueuedOrActiveWorkForKinds(kinds: Set<WorkKind>) {
+    if ([...kinds].some((kind) => activeWorkByKind[kind] > 0)) {
+      return true
+    }
+
+    return pendingWorkStarts.some(
+      (item) => kinds.has(item.kind) && queuedWork.has(item.key)
+    )
+  }
+
+  async function waitForQueuedWorkKindsToFinish(
+    kinds: WorkKind[],
+    reason: string
+  ) {
+    const kindSet = new Set(kinds)
+    let logged = false
+
+    while (hasQueuedOrActiveWorkForKinds(kindSet)) {
+      if (!logged) {
+        logged = true
+        console.log(
+          `[Info] [Workers] Waiting for ${kinds.join("/")} work to finish before ${reason}.`
+        )
+      }
+
+      scheduleQueuedWorkStart()
+      await sleep(250)
+      await yieldToEventLoop()
+    }
+  }
+
+  async function waitForDirectoryScanToFinish(reason: string) {
+    let logged = false
+
+    while (scanning) {
+      if (!logged) {
+        logged = true
+        console.log(
+          `[Info] [Workers] Waiting for active directory scan to finish before ${reason}.`
+        )
+      }
+
+      await sleep(250)
+      await yieldToEventLoop()
+    }
   }
 
   function startImmediateBackgroundInputWork(
@@ -523,11 +630,12 @@ export function startWorkers() {
     setImmediate(() => {
       importFileActionStartScheduled = false
 
-      if (shuttingDown) {
+      if (shuttingDown || importWorkIsBlocked()) {
         return
       }
 
       while (
+        !importWorkIsBlocked() &&
         activeImportFileActionWork < maxActiveImportFileActionWork &&
         pendingImportFileActionWork.length > 0
       ) {
@@ -611,10 +719,6 @@ export function startWorkers() {
           started = true
           processingHandle?.start()
           await startWork()
-        } catch (error) {
-          console.error(
-            `[Error] [Workers] Background input work failed - startWorkers.ts - ${deferredInfo.kind} - ${resolvedPath} - ${errorMessage(error)}`
-          )
         } finally {
           if (started) {
             processingHandle?.finish()
@@ -714,7 +818,7 @@ export function startWorkers() {
       return
     }
 
-    if (deferredInfo.kind === "catalog-only") {
+    if (deferredInfo.kind === "catalog-only" && !importWorkIsBlocked()) {
       startImmediateBackgroundInputWork(key, startWork, deferredInfo)
       return
     }
@@ -723,6 +827,10 @@ export function startWorkers() {
   }
 
   function canStartWork(kind: WorkKind) {
+    if (kind === "input" && importWorkIsBlocked()) {
+      return false
+    }
+
     return activeWorkByKind[kind] < maxActiveWorkByKind[kind]
   }
 
@@ -1019,37 +1127,91 @@ export function startWorkers() {
   }
 
   function startTrackedDirectoryScan(reason: string) {
+    if (reason === "interval" && dailyAniListSyncRunning) {
+      debugWorkers("Skipping interval directory scan while daily maintenance is running.")
+      return
+    }
+
     const work = scanAllDirectories()
     trackActiveWork(work, `directory-scan:${reason}`)
   }
 
-  async function runDailyAniListSync(
-    reason = "daily maintenance",
-    includeUpdateCheck = true
-  ) {
+  async function runAniListRefreshForMaintenance(label: string) {
+    console.log(`[Info] [Workers] Starting ${label} AniList sync.`)
+
+    try {
+      await runFullAniListRefresh()
+      console.log(`[Info] [Workers] ${label} AniList sync completed.`)
+    } catch (error) {
+      console.error(
+        `[Error] [Workers] ${label} AniList sync failed - startWorkers.ts - ${errorMessage(error)}`
+      )
+    }
+  }
+
+  async function runStartupChecks() {
+    blockImportWork("startup checks")
+    console.log(
+      "[Info] [Workers] Starting startup checks for AniList, database, and library files."
+    )
+
+    try {
+      await runAniListRefreshForMaintenance("startup")
+      await scanLibraryDirectory()
+      await waitForQueuedWorkKindsToFinish(
+        ["library-sync", "library-delete"],
+        "startup checks"
+      )
+      await checkForYamibunkoUpdate("startup")
+    } finally {
+      await tryRunCacheMaintenance()
+      console.log("[Info] [Workers] Startup checks completed.")
+      startupChecksResolve()
+    }
+  }
+
+  async function runDailyMaintenanceChecks() {
+    await waitForActiveImportWorkToFinish("daily checks")
+    await runAniListRefreshForMaintenance("daily")
+    await waitForDirectoryScanToFinish("daily checks")
+    await scanAllDirectories()
+    await waitForQueuedWorkKindsToFinish(
+      ["library-sync", "library-delete"],
+      "daily checks"
+    )
+    await checkForYamibunkoUpdate("daily maintenance")
+    await tryRunCacheMaintenance()
+  }
+
+  async function runDailyAniListSync() {
     if (shuttingDown || dailyAniListSyncRunning) {
       return
     }
 
     dailyAniListSyncRunning = true
-    console.log("[Info] [Workers] Starting daily AniList sync.")
+    blockImportWork("daily maintenance")
+    console.log(
+      "[Info] [Workers] Starting daily maintenance; new import jobs are paused."
+    )
 
     try {
-      await runFullAniListRefresh()
-      console.log("[Info] [Workers] Daily AniList sync completed.")
+      await runUploadCapacityRecheckWithStreamHold(
+        () => startUploadCapacityMeasurement("scheduled"),
+        {
+          initialCloseModes: ["transcode"],
+          beforeMeasurement: runDailyMaintenanceChecks,
+        }
+      )
     } catch (error) {
       console.error(
-        `[Error] [Workers] Daily AniList sync failed - startWorkers.ts - ${errorMessage(error)}`
+        `[Error] [Workers] Daily maintenance failed - startWorkers.ts - ${errorMessage(error)}`
       )
-    }
-
-    try {
-      if (includeUpdateCheck) {
-        await checkForYamibunkoUpdate(reason)
-      }
     } finally {
-      await tryRunCacheMaintenance()
       dailyAniListSyncRunning = false
+      unblockImportWork("daily maintenance completed")
+      console.log(
+        "[Info] [Workers] Daily maintenance completed; import jobs may resume."
+      )
     }
   }
 
@@ -1098,22 +1260,31 @@ export function startWorkers() {
     )
   })
 
-  const scanTimer = setInterval(() => {
-    startTrackedDirectoryScan("interval")
-  }, scanIntervalMs)
-  scanTimer.unref?.()
+  function startImportProcessing() {
+    if (importProcessingStarted || shuttingDown) {
+      return
+    }
 
-  const startupAniListSync = runDailyAniListSync("startup", false)
-  trackActiveWork(startupAniListSync, "startup-anilist-sync")
+    importProcessingStarted = true
+    unblockImportWork("startup checks and startup bandwidth test completed")
 
-  const startupUpdateCheck = checkForYamibunkoUpdate("startup").then(
-    () => undefined
-  )
-  trackActiveWork(startupUpdateCheck, "startup-update-check")
+    scanTimer = setInterval(() => {
+      startTrackedDirectoryScan("interval")
+    }, scanIntervalMs)
+    scanTimer.unref?.()
 
-  debugWorkers("Starting initial input/library scans.")
-  startTrackedDirectoryScan("startup")
-  scheduleDailyAniListSync()
+    debugWorkers("Starting initial input scan after startup checks.")
+    const inputScan = scanInputDirectory()
+    trackActiveWork(inputScan, "directory-scan:startup-input")
+    scheduleDailyAniListSync()
+  }
+
+  const startupChecks = runStartupChecks().catch((error) => {
+    console.error(
+      `[Error] [Workers] Startup checks failed - startWorkers.ts - ${errorMessage(error)}`
+    )
+  })
+  trackActiveWork(startupChecks, "startup-checks")
 
   function cancelQueuedFileWorkForShutdown() {
     const cancelled = pendingWorkStarts.splice(0)
@@ -1198,7 +1369,10 @@ export function startWorkers() {
     shutdownAbortController.abort()
     console.log("[Info] [Shutdown] Stopping background workers.")
 
-    clearInterval(scanTimer)
+    if (scanTimer) {
+      clearInterval(scanTimer)
+      scanTimer = undefined
+    }
 
     if (dailyAniListTimer) {
       clearTimeout(dailyAniListTimer)
@@ -1244,6 +1418,8 @@ export function startWorkers() {
   const runtime = {
     activeWork,
     watchers: [inputWatcher, ...(libraryWatcher ? [libraryWatcher] : [])],
+    startupChecksReady,
+    startImportProcessing,
     stop,
   }
   workerGlobal.__yamibunkoWorkerRuntime = runtime

@@ -15,7 +15,7 @@ public partial class SetupWindow : Window
 {
     private static readonly Regex BaseUrlRegex = new(@"^https?://\S+$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex ClientIdRegex = new(@"^\d+$", RegexOptions.Compiled);
-    private const string ForcedCatalogModeTooltipText = "HW encoding is not supported for AV1 on your device, encode mode is disabled";
+    private const string ForcedCatalogModeTooltipText = HardwareAccelerationDetector.ImportCatalogModeTooltip;
 
     public event Action<AppSettings>? OnSetupComplete;
     private readonly AppSettings? _initialSettings;
@@ -153,6 +153,7 @@ public partial class SetupWindow : Window
             InputFolderPath = GetTextBoxValue("InputFolderBox"),
             OutputFolderPath = GetTextBoxValue("OutputFolderBox"),
             ImportEnabled = importEnabled,
+            ImportEncoding = ResolveSavedImportEncoding(importEnabled),
             FfmpegDir = _initialSettings?.FfmpegDir ?? "",
             TranscodeAccel = ResolveSavedTranscodeAcceleration(importEnabled),
             AnilistClientId = GetTextBoxValue("ClientIdBox"),
@@ -181,6 +182,16 @@ public partial class SetupWindow : Window
         return _catalogModeForced || this.FindControl<CheckBox>("DisableFileProcessingBox")?.IsChecked == true;
     }
 
+    private string ResolveSavedImportEncoding(bool importEnabled)
+    {
+        if (_hardwareDetection != null)
+        {
+            return HardwareAccelerationDetector.SelectServerImportEncoding(_hardwareDetection, importEnabled);
+        }
+
+        return importEnabled ? AppSettings.NormalizeImportEncoding(_initialSettings?.ImportEncoding) : "none";
+    }
+
     private string ResolveSavedTranscodeAcceleration(bool importEnabled)
     {
         if (_hardwareDetection != null)
@@ -202,7 +213,7 @@ public partial class SetupWindow : Window
             _hardwareDetection = detection;
             UpdateHardwareAccelerationStatusText(detection);
             _hardwareDetectionComplete = true;
-            SetCatalogModeForced(!HardwareAccelerationDetector.SupportsAv1ImportAcceleration(detection));
+            SetCatalogModeForced(!HardwareAccelerationDetector.SupportsImportAcceleration(detection));
         }
         catch
         {
@@ -226,9 +237,9 @@ public partial class SetupWindow : Window
             return;
         }
 
-        var encodeAcceleration = !HardwareAccelerationDetector.SupportsAv1ImportAcceleration(detection)
+        var encodeAcceleration = !HardwareAccelerationDetector.SupportsImportAcceleration(detection)
             ? "unsupported"
-            : HardwareAccelerationDetector.FormatAccelerationForDisplay(detection.Av1ImportAcceleration);
+            : $"{detection.ImportEncoding.ToLower()} / {HardwareAccelerationDetector.FormatAccelerationForDisplay(detection.ImportAcceleration)}";
         var liveAcceleration = HardwareAccelerationDetector.FormatAccelerationForDisplay(detection.LiveTranscodeAcceleration);
 
         statusText.Text = $"Video Accelerator: Encoder: {encodeAcceleration} · Live transcoder: {liveAcceleration}";

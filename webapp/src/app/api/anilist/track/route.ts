@@ -1,5 +1,6 @@
 import { z } from "zod"
 
+import { isLocalNonAnimeId } from "@/lib/local-media"
 import { requireApiUser, requireSameOriginRequest } from "@/server/auth/api"
 import {
   saveAniListProgress,
@@ -35,6 +36,13 @@ export async function POST(request: Request) {
   if (!parsed.success) {
     return Response.json(
       { ok: false, error: "INVALID_TRACK_PAYLOAD" },
+      { status: 400 }
+    )
+  }
+
+  if (isLocalNonAnimeId(parsed.data.animeId)) {
+    return Response.json(
+      { ok: false, error: "LOCAL_MEDIA_NOT_ANILIST" },
       { status: 400 }
     )
   }

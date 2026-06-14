@@ -11,19 +11,18 @@ type ImportEncodingProcess = {
 }
 
 const importEncodingProcesses = new Map<number, ImportEncodingProcess>()
-let activeLiveTranscodes = 0
 
 function getPriorityValues() {
   const priority = os.constants.priority
 
   return process.platform === "win32"
     ? {
-        low: priority.PRIORITY_BELOW_NORMAL,
-        normal: priority.PRIORITY_NORMAL,
+        low: typeof priority.PRIORITY_LOW === "number"
+          ? priority.PRIORITY_LOW
+          : priority.PRIORITY_BELOW_NORMAL,
       }
     : {
         low: 10,
-        normal: 0,
       }
 }
 
@@ -48,13 +47,13 @@ function applyImportEncodingPriority(entry: ImportEncodingProcess) {
   }
 
   const values = getPriorityValues()
-  const shouldLower = activeLiveTranscodes > 0
+  const shouldLower = true
 
   if (shouldLower === entry.lowered) {
     return
   }
 
-  if (setProcessPriority(pid, shouldLower ? values.low : values.normal)) {
+  if (setProcessPriority(pid, values.low)) {
     entry.lowered = shouldLower
   }
 }
@@ -66,11 +65,9 @@ function refreshImportEncodingPriorities() {
 }
 
 export function registerLiveTranscodeProcessPriority() {
-  activeLiveTranscodes += 1
   refreshImportEncodingPriorities()
 
   return () => {
-    activeLiveTranscodes = Math.max(activeLiveTranscodes - 1, 0)
     refreshImportEncodingPriorities()
   }
 }

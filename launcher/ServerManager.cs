@@ -527,17 +527,18 @@ public class ServerManager
 
         var detection = await HardwareAccelerationDetector.DetectAsync(settings.FfmpegDir, true);
 
-        if (settings.ImportEnabled && !HardwareAccelerationDetector.SupportsAv1ImportAcceleration(detection))
+        if (settings.ImportEnabled && !HardwareAccelerationDetector.SupportsImportAcceleration(detection))
         {
-            Log(HardwareAccelerationDetector.Av1HardwareUnsupportedMessage);
-            Log("Catalog mode was enabled automatically because AV1 hardware encoding is unavailable.");
+            Log(HardwareAccelerationDetector.ImportHardwareUnsupportedMessage);
+            Log("Catalog mode was enabled automatically because AV1/HEVC hardware encoding is unavailable.");
             settings.ImportEnabled = false;
         }
 
+        settings.ImportEncoding = HardwareAccelerationDetector.SelectServerImportEncoding(detection, settings.ImportEnabled);
         settings.TranscodeAccel = HardwareAccelerationDetector.SelectServerTranscodeAcceleration(detection, settings.ImportEnabled);
 
         var selectedAccelerationLabel = HardwareAccelerationDetector.FormatAccelerationForDisplay(settings.TranscodeAccel);
-        var av1ImportAccelerationLabel = HardwareAccelerationDetector.FormatAccelerationForDisplay(detection.Av1ImportAcceleration);
+        var importAccelerationLabel = HardwareAccelerationDetector.FormatAccelerationForDisplay(detection.ImportAcceleration);
         var liveTranscodeAccelerationLabel = HardwareAccelerationDetector.FormatAccelerationForDisplay(detection.LiveTranscodeAcceleration);
 
         if (hadOutdatedAcceleration)
@@ -545,9 +546,14 @@ public class ServerManager
             Log($"Updated TRANSCODE_ACCEL from outdated value '{previousAcceleration}' to '{selectedAccelerationLabel}'. Suggested replacement for the old value was '{outdatedReplacement}'.");
         }
 
-        Log(!HardwareAccelerationDetector.SupportsAv1ImportAcceleration(detection)
-            ? $"AV1 hardware encoding unavailable. Live transcoding acceleration: {selectedAccelerationLabel}."
-            : $"AV1 hardware encoding acceleration: {av1ImportAccelerationLabel}. Live transcoding acceleration: {liveTranscodeAccelerationLabel}.");
+        if (HardwareAccelerationDetector.SupportsImportAcceleration(detection))
+        {
+            Log($"{detection.ImportEncoding.ToUpperInvariant()} hardware file encoding acceleration: {importAccelerationLabel}. Live transcoding acceleration: {liveTranscodeAccelerationLabel}.");
+        }
+        else
+        {
+            Log($"AV1/HEVC hardware encoding unavailable. Live transcoding acceleration: {selectedAccelerationLabel}.");
+        }
 
         settings.Save();
     }
@@ -586,7 +592,7 @@ public class ServerManager
 
     private Process StartBunServer(AppSettings settings, string workingDirectory)
     {
-        return StartBackgroundProcess(settings.BunPath, new[] { "run", "start" }, new CommandOptions
+        return StartBackgroundProcess(settings.BunPath, CreateServerArguments(), new CommandOptions
         {
             Environment = CreateServerEnvironment(settings),
             LogOutput = true,
@@ -1085,6 +1091,11 @@ public class ServerManager
         return int.TryParse(major, out version);
     }
 
+    private static string[] CreateServerArguments()
+    {
+        return new[] { "run", "start" };
+    }
+
     private static Dictionary<string, string> CreateServerEnvironment(AppSettings settings)
     {
         return new Dictionary<string, string>
@@ -1093,6 +1104,7 @@ public class ServerManager
             ["ANIME_INPUT_DIR"] = settings.InputFolderPath,
             ["ANIME_MEDIA_DIR"] = settings.OutputFolderPath,
             ["IMPORT_ENABLED"] = settings.ImportEnabled ? "true" : "false",
+            ["IMPORT_ENCODING"] = AppSettings.NormalizeImportEncoding(settings.ImportEncoding),
             ["FFMPEG_DIR"] = settings.FfmpegDir,
             ["TRANSCODE_ACCEL"] = settings.TranscodeAccel,
             ["ANILIST_CLIENT_ID"] = settings.AnilistClientId,

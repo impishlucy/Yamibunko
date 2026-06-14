@@ -10,7 +10,7 @@ import type { ProbeResult } from "@/server/media/mediaFiles"
 import { resolveEpisodeMedia } from "@/server/media/resolveMediaId"
 import { getMediaStreamMetadata } from "@/server/media/streamMetadata"
 import {
-  findSubtitleSidecar,
+  findPlaybackSubtitleSidecar,
   isWebVttSubtitleCodec,
   normalizeSubtitleCodecName,
   readWebVttSidecar,
@@ -582,18 +582,17 @@ export async function GET(request: Request, context: SubtitleContext) {
     return jsonError("Media file not found.", 404)
   }
 
-  const config = getServerConfig()
   let subtitleStream
   let sidecarSubtitle: SubtitleSidecar | null = null
 
   try {
+    const config = getServerConfig()
     const probe = (await ffprobe(media.file)) as ProbeResult
-    const hasEmbeddedSubtitles = (probe.streams ?? []).some(
-      (stream) => stream.codec_type === "subtitle"
-    )
-    sidecarSubtitle = config.importEnabled || hasEmbeddedSubtitles
-      ? null
-      : await findSubtitleSidecar(media.file)
+    sidecarSubtitle = await findPlaybackSubtitleSidecar({
+      mediaFilePath: media.file,
+      probe,
+      importEnabled: config.importEnabled,
+    })
     const metadata = getMediaStreamMetadata(probe, { sidecarSubtitle })
     subtitleStream = metadata.subtitleStreams.find(
       (stream) => stream.id === streamId && stream.isSupported

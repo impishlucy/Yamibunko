@@ -1,3 +1,4 @@
+import { isLocalNonAnimeId } from "@/lib/local-media"
 import { requireApiUser } from "@/server/auth/api"
 import { getAniListTrackingState } from "@/server/anilist/client"
 import { errorMessage, parsePositiveInt } from "@/server/utils/format"
@@ -21,6 +22,15 @@ export async function GET(request: Request) {
       { ok: false, error: "INVALID_ANIME_ID" },
       { status: 400 }
     )
+  }
+
+  if (isLocalNonAnimeId(animeId)) {
+    return Response.json({
+      configured: false,
+      connected: false,
+      ratingScale: 5,
+      entry: null,
+    })
   }
 
   try {

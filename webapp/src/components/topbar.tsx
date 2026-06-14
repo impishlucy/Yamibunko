@@ -124,7 +124,7 @@ function parseProcessingStateEvent(event: Event) {
 const processingActionLabels: Record<MediaImportProcessingItem["kind"], string> = {
   "direct-move": "moving",
   "audio-transcode": "audio transcode",
-  "container-remux": "WebM remux",
+  "container-remux": "MP4 remux",
   "video-transcode": "video transcode",
 }
 

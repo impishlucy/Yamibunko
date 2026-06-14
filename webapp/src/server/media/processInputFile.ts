@@ -23,10 +23,11 @@ import {
   ffprobe,
   getFileHardwareInputArgs,
   getFileSubtitleInputArgs,
-  getWebmFileArgs,
+  getMp4FileArgs,
+  getWebVttSidecarFileArgs,
+  mp4FileExtension,
   runFfmpeg,
-  webmFileExtension,
-  type WebmSubtitleOutputStream,
+  type FileSubtitleOutputStream,
 } from "@/server/media/ffmpeg"
 import {
   formatEpisodeFileName,
@@ -47,6 +48,11 @@ import {
 } from "@/server/media/mediaFiles"
 import { emitLibraryChange } from "@/server/media/libraryEvents"
 import {
+  createNonAnimeMetadata,
+  nonAnimeFolderName,
+  parseNonAnimeFilePath,
+} from "@/server/media/nonAnime"
+import {
   registerActiveCacheJobDirectory,
   removeCacheJobDirectory,
 } from "@/server/media/cacheMaintenance"
@@ -60,13 +66,14 @@ import {
   isConvertibleTextSubtitleCodec,
   isWebVttSubtitleCodec,
   normalizeSubtitleCodecName,
+  subtitleSidecarPathForMediaFile,
   type SubtitleSidecar,
 } from "@/server/media/subtitles"
 import { errorMessage, fileName } from "@/server/utils/format"
 import { debugLog } from "@/server/utils/debugLog"
 
 const targetAv1BytesPerMinute = 22 * 1024 * 1024
-const targetBytesPerMinute = targetAv1BytesPerMinute
+const targetHevcBytesPerMinute = 32 * 1024 * 1024
 const targetAudioKbps = 320
 const failedImportsFolderName = "_failed_imports"
 const activeInputImportOutputs = new Map<string, number>()
@@ -145,8 +152,67 @@ function debugImport(jobId: string, message: string) {
   debugLog(`[Debug] [MediaImport:${jobId}] ${message}`)
 }
 
+const importErrorMaxLogLength = 1200
+
+function compactImportErrorDetails(value: string) {
+  const normalized = value
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter(Boolean)
+
+  const deduped: string[] = []
+  let previous = ""
+  let repeated = 0
+
+  const flushRepeated = () => {
+    if (repeated > 0) {
+      deduped.push(`Previous line repeated ${repeated} time${repeated === 1 ? "" : "s"}.`)
+      repeated = 0
+    }
+  }
+
+  for (const line of normalized) {
+    if (line === previous) {
+      repeated += 1
+      continue
+    }
+
+    flushRepeated()
+    deduped.push(line)
+    previous = line
+  }
+
+  flushRepeated()
+
+  const compacted = deduped.join("\n")
+
+  if (compacted.length <= importErrorMaxLogLength) {
+    return compacted
+  }
+
+  return `${compacted.slice(0, importErrorMaxLogLength)}…`
+}
+
+function importErrorMessage(error: unknown) {
+  const message = errorMessage(error)
+  const stderr = error && typeof error === "object" && "stderr" in error
+    ? (error as { stderr?: unknown }).stderr
+    : undefined
+
+  if (typeof stderr === "string" && stderr.trim()) {
+    const exitLabel =
+      message.match(/Command failed with exit code [^:]+/)?.[0] ??
+      "FFmpeg command failed"
+
+    return compactImportErrorDetails(`${exitLabel}\n${stderr.trim()}`)
+  }
+
+  return compactImportErrorDetails(message)
+}
+
 function debugError(jobId: string, message: string, error: unknown) {
-  const details = error instanceof Error && error.stack ? error.stack : errorMessage(error)
+  const details = importErrorMessage(error)
   console.error(`[Error] [MediaImport:${jobId}] ${message} - ${details}`)
 }
 
@@ -238,7 +304,7 @@ async function runWithActiveInputImportOutput<T>(
 const deferredWorkKindLabels: Record<DeferredInputWorkKind, string> = {
   "video-transcode": "video transcode",
   "audio-transcode": "audio transcode",
-  "container-remux": "WebM remux",
+  "container-remux": "MP4 remux",
   "direct-move": "direct import move",
   "existing-output": "existing output finalization",
   "catalog-only": "catalog-only library registration",
@@ -279,11 +345,28 @@ function isInvalidMediaProbeError(error: unknown) {
   )
 }
 
-function hasAv1Video(probe: ProbeResult) {
+function normalizeVideoCodec(value: string | null | undefined) {
+  return (value ?? "").trim().toLowerCase().replace(/[^a-z0-9_]+/g, "_")
+}
+
+function isTargetVideoCodec(
+  codec: string | null | undefined,
+  importEncoding: "av1" | "hevc"
+) {
+  const normalized = normalizeVideoCodec(codec)
+
+  if (importEncoding === "av1") {
+    return normalized === "av1"
+  }
+
+  return normalized === "hevc" || normalized === "h265"
+}
+
+function hasTargetImportVideo(probe: ProbeResult, importEncoding: "av1" | "hevc") {
   return (probe.streams ?? []).some(
     (stream) =>
       stream.codec_type === "video" &&
-      (stream.codec_name ?? "").toLowerCase() === "av1"
+      isTargetVideoCodec(stream.codec_name, importEncoding)
   )
 }
 
@@ -295,7 +378,7 @@ function getPrimaryVideoCodec(probe: ProbeResult) {
   )
 }
 
-const webmContainerFormatNames = new Set(["matroska", "webm"])
+const mp4ContainerFormatNames = new Set(["mov", "mp4", "m4a", "3gp", "3g2", "mj2"])
 
 function getProbeFormatNames(probe: ProbeResult) {
   return (probe.format?.format_name ?? "")
@@ -304,8 +387,8 @@ function getProbeFormatNames(probe: ProbeResult) {
     .filter(Boolean)
 }
 
-function usesWebmOutputContainer(filePath: string, probe: ProbeResult) {
-  if (path.extname(filePath).toLowerCase() !== webmFileExtension) {
+function usesMp4OutputContainer(filePath: string, probe: ProbeResult) {
+  if (path.extname(filePath).toLowerCase() !== mp4FileExtension) {
     return false
   }
 
@@ -313,17 +396,21 @@ function usesWebmOutputContainer(filePath: string, probe: ProbeResult) {
 
   return (
     formatNames.length === 0 ||
-    formatNames.some((formatName) => webmContainerFormatNames.has(formatName))
+    formatNames.some((formatName) => mp4ContainerFormatNames.has(formatName))
   )
 }
 
-function assertValidWebmAv1Output(filePath: string, probe: ProbeResult) {
-  if (!usesWebmOutputContainer(filePath, probe)) {
-    throw new Error(`FFmpeg output is not a WebM container: ${filePath}`)
+function assertValidMp4ImportOutput(
+  filePath: string,
+  probe: ProbeResult,
+  importEncoding: "av1" | "hevc"
+) {
+  if (!usesMp4OutputContainer(filePath, probe)) {
+    throw new Error(`FFmpeg output is not an MP4 container: ${filePath}`)
   }
 
-  if (!hasAv1Video(probe)) {
-    throw new Error(`FFmpeg output is not AV1 video: ${filePath}`)
+  if (!hasTargetImportVideo(probe, importEncoding)) {
+    throw new Error(`FFmpeg output is not ${importEncoding.toUpperCase()} video: ${filePath}`)
   }
 
   const invalidAudioCodec = (probe.streams ?? []).find(
@@ -338,33 +425,29 @@ function assertValidWebmAv1Output(filePath: string, probe: ProbeResult) {
     )
   }
 
-  const invalidSubtitleCodec = (probe.streams ?? []).find(
-    (stream) =>
-      stream.codec_type === "subtitle" && !isWebVttSubtitleCodec(stream.codec_name)
+  const embeddedSubtitleCodec = (probe.streams ?? []).find(
+    (stream) => stream.codec_type === "subtitle"
   )?.codec_name
 
-  if (invalidSubtitleCodec) {
+  if (embeddedSubtitleCodec) {
     throw new Error(
-      `FFmpeg output has non-WebVTT subtitles (${invalidSubtitleCodec}): ${filePath}`
+      `FFmpeg output still has embedded subtitles (${embeddedSubtitleCodec}): ${filePath}`
     )
   }
 }
 
 function hasEmbeddedSubtitles(probe: ProbeResult) {
-  return (probe.streams ?? []).some((stream) => stream.codec_type === "subtitle")
-}
-
-function hasNonWebVttEmbeddedSubtitle(probe: ProbeResult) {
   return (probe.streams ?? []).some(
     (stream) =>
-      stream.codec_type === "subtitle" && !isWebVttSubtitleCodec(stream.codec_name)
+      stream.codec_type === "subtitle" &&
+      isConvertibleTextSubtitleCodec(stream.codec_name)
   )
 }
 
-function getWebmSubtitleOutputStreams(input: {
+function getFileSubtitleOutputStreams(input: {
   probe: ProbeResult
   sidecarSubtitle?: SubtitleSidecar | null
-}): WebmSubtitleOutputStream[] {
+}): FileSubtitleOutputStream[] {
   const embeddedStreams = (input.probe.streams ?? [])
     .map((stream) => {
       const codec = normalizeSubtitleCodecName(stream.codec_name)
@@ -391,7 +474,7 @@ function getWebmSubtitleOutputStreams(input: {
 
       return null
     })
-    .filter((stream): stream is WebmSubtitleOutputStream => stream !== null)
+    .filter((stream): stream is FileSubtitleOutputStream => stream !== null)
 
   if (embeddedStreams.length || !input.sidecarSubtitle) {
     return embeddedStreams
@@ -406,7 +489,11 @@ function getWebmSubtitleOutputStreams(input: {
   ]
 }
 
-function calculateVideoBitrateKbps(bytesPerMinute = targetBytesPerMinute) {
+function targetBytesPerMinuteForImportEncoding(importEncoding: "av1" | "hevc") {
+  return importEncoding === "av1" ? targetAv1BytesPerMinute : targetHevcBytesPerMinute
+}
+
+function calculateVideoBitrateKbps(bytesPerMinute: number) {
   const totalKbps = Math.floor((bytesPerMinute * 8) / 60 / 1000)
   return Math.max(totalKbps - targetAudioKbps, 500)
 }
@@ -436,7 +523,7 @@ function metadataTitle(metadata: {
     metadata.title.native
 
   if (!title) {
-    throw new Error(`AniList media ${metadata.id} did not include a usable title`)
+    throw new Error(`Media ${metadata.id} did not include a usable title`)
   }
 
   return title
@@ -834,13 +921,49 @@ async function removeNonMediaOnlyInputParents(
   }
 }
 
+async function extractSubtitleSidecar(input: {
+  inputPath: string
+  outputPath: string
+  sidecarSubtitle?: SubtitleSidecar | null
+  subtitleStream: FileSubtitleOutputStream
+  jobId?: string
+}) {
+  await mkdir(path.dirname(input.outputPath), { recursive: true })
+
+  const args = [
+    "-hide_banner",
+    "-nostdin",
+    "-loglevel",
+    "error",
+    ...getFileSubtitleInputArgs(),
+    "-i",
+    input.inputPath,
+    ...(input.sidecarSubtitle ? ["-i", input.sidecarSubtitle.filePath] : []),
+    ...getWebVttSidecarFileArgs(input.subtitleStream),
+    "-y",
+    input.outputPath,
+  ]
+
+  if (input.jobId) {
+    debugImport(input.jobId, `FFmpeg subtitle sidecar command - ${args.join(" ")}`)
+  }
+
+  await runFfmpeg(args, { protectFromParentSignals: true })
+
+  if (!(await pathExists(input.outputPath))) {
+    throw new Error(`FFmpeg completed but did not create subtitle sidecar: ${input.outputPath}`)
+  }
+}
+
 async function transcodeFile(
   inputPath: string,
   outputPath: string,
   options: {
+    importEncoding: "av1" | "hevc"
     convertVideo: boolean
     audioOutputIndexesToOpus: number[]
-    subtitleStreams: WebmSubtitleOutputStream[]
+    subtitleStream?: FileSubtitleOutputStream | null
+    subtitleOutputPath?: string | null
     videoBitrateKbps: number
     maxVideoBitrateKbps: number
     inputVideoCodec?: string | null
@@ -852,19 +975,19 @@ async function transcodeFile(
 
   const args = [
     "-hide_banner",
+    "-nostdin",
     "-loglevel",
-    "warning",
+    "error",
     ...(options.convertVideo
       ? getFileHardwareInputArgs({
           inputVideoCodec: options.inputVideoCodec,
-          keepFramesOnDevice: true,
+          keepFramesOnDevice: false,
         })
       : []),
     ...getFileSubtitleInputArgs(),
     "-i",
     inputPath,
-    ...(options.sidecarSubtitle ? ["-i", options.sidecarSubtitle.filePath] : []),
-    ...getWebmFileArgs(options),
+    ...getMp4FileArgs(options),
     "-y",
     outputPath,
   ]
@@ -877,24 +1000,27 @@ async function transcodeFile(
     debugImport(options.jobId, `FFmpeg file-processing command - ${args.join(" ")}`)
   }
 
-  try {
-    await runFfmpeg(args, {
-      priorityRole: options.convertVideo ? "import-encoding" : undefined,
-      protectFromParentSignals: true,
-    })
-  } catch (error) {
-    if (options.jobId) {
-      debugError(options.jobId, "FFmpeg file processing failed", error)
-    }
-    throw error
-  }
+  await runFfmpeg(args, {
+    priorityRole: options.convertVideo ? "import-encoding" : undefined,
+    protectFromParentSignals: true,
+  })
 
   if (!(await pathExists(outputPath))) {
     throw new Error(`FFmpeg completed but did not create output file: ${outputPath}`)
   }
 
   const outputProbe = (await ffprobe(outputPath)) as ProbeResult
-  assertValidWebmAv1Output(outputPath, outputProbe)
+  assertValidMp4ImportOutput(outputPath, outputProbe, options.importEncoding)
+
+  if (options.subtitleStream && options.subtitleOutputPath) {
+    await extractSubtitleSidecar({
+      inputPath,
+      outputPath: options.subtitleOutputPath,
+      sidecarSubtitle: options.sidecarSubtitle,
+      subtitleStream: options.subtitleStream,
+      jobId: options.jobId,
+    })
+  }
 
   if (options.jobId) {
     const outputStat = await stat(outputPath)
@@ -904,6 +1030,7 @@ async function transcodeFile(
     )
   }
 }
+
 
 export async function processInputFile(
   filePath: string,
@@ -948,10 +1075,18 @@ export async function processInputFile(
     await waitForStableFile(filePath)
     debugImport(jobId, "Input file is stable.")
 
-    debugImport(jobId, "Parsing anime filename.")
-    const parsed = parseAnimeFilePath(filePath, { rootDir: config.inputDir })
+    debugImport(jobId, "Parsing input filename.")
+    const nonAnimeInput = parseNonAnimeFilePath(filePath, config.inputDir)
+    const parsed =
+      nonAnimeInput?.parsed ?? parseAnimeFilePath(filePath, { rootDir: config.inputDir })
 
-    if (parsed?.titleSource === "folder") {
+    if (nonAnimeInput) {
+      const nonAnimeParsed = nonAnimeInput.parsed
+      debugImport(
+        jobId,
+        `Parsed ${nonAnimeFolderName} input file - Title ${nonAnimeInput.title}, Season ${nonAnimeParsed.season}${nonAnimeParsed.part ? `, Part ${nonAnimeParsed.part}` : ""}, Episode ${nonAnimeParsed.episode}`
+      )
+    } else if (parsed?.titleSource === "folder") {
       debugImport(
         jobId,
         `Parsed input file using folder title fallback - Title ${parsed.title}, Season ${parsed.season}${parsed.part ? `, Part ${parsed.part}` : ""}, Episode ${parsed.episode}`
@@ -1010,67 +1145,76 @@ export async function processInputFile(
     )
 
     updateJob(jobId, {
-      message: "Fetching AniList metadata.",
+      message: nonAnimeInput ? "Preparing local non-anime metadata." : "Fetching AniList metadata.",
     })
 
-    debugImport(jobId, "Starting AniList metadata lookup.")
-    let metadata: Awaited<ReturnType<typeof findAnimeMetadata>>
+    let metadata: Awaited<ReturnType<typeof findAnimeMetadata>> = null
     let resolvedParsed = parsed
 
-    try {
-      metadata = await findAnimeMetadata(
-        parsed.title,
-        getAnimeMetadataLookupSeason(parsed),
-        parsed.episode,
-        parsed.part
-      )
+    if (nonAnimeInput) {
+      metadata = createNonAnimeMetadata({
+        title: nonAnimeInput.title,
+        episodeNumber: nonAnimeInput.parsed.episode,
+      })
+      debugImport(jobId, `Prepared local non-anime metadata - Media id ${metadata.id}.`)
+    } else {
+      debugImport(jobId, "Starting AniList metadata lookup.")
 
-      if (!metadata) {
-        const fallbackTitles = getFolderTitleFallbackCandidates(
-          config.inputDir,
-          filePath,
-          parsed.title
+      try {
+        metadata = await findAnimeMetadata(
+          parsed.title,
+          getAnimeMetadataLookupSeason(parsed),
+          parsed.episode,
+          parsed.part
         )
 
-        for (const fallbackTitle of fallbackTitles) {
-          console.warn(
-            `[Warn] [Media] AniList could not match filename title "${parsed.title}"; trying folder title "${fallbackTitle}" - ${fileName(filePath)}`
-          )
-          debugImport(
-            jobId,
-            `Trying folder title fallback - Filename title ${parsed.title}, Folder title ${fallbackTitle}`
-          )
-          updateJob(jobId, {
-            message: `Fetching AniList metadata using folder title: ${fallbackTitle}.`,
-          })
-
-          const fallbackMetadata = await findAnimeMetadata(
-            fallbackTitle,
-            getAnimeMetadataLookupSeason(parsed),
-            parsed.episode,
-            parsed.part
+        if (!metadata) {
+          const fallbackTitles = getFolderTitleFallbackCandidates(
+            config.inputDir,
+            filePath,
+            parsed.title
           )
 
-          if (!fallbackMetadata) {
-            continue
+          for (const fallbackTitle of fallbackTitles) {
+            console.warn(
+              `[Warn] [Media] AniList could not match filename title "${parsed.title}"; trying folder title "${fallbackTitle}" - ${fileName(filePath)}`
+            )
+            debugImport(
+              jobId,
+              `Trying folder title fallback - Filename title ${parsed.title}, Folder title ${fallbackTitle}`
+            )
+            updateJob(jobId, {
+              message: `Fetching AniList metadata using folder title: ${fallbackTitle}.`,
+            })
+
+            const fallbackMetadata = await findAnimeMetadata(
+              fallbackTitle,
+              getAnimeMetadataLookupSeason(parsed),
+              parsed.episode,
+              parsed.part
+            )
+
+            if (!fallbackMetadata) {
+              continue
+            }
+
+            metadata = fallbackMetadata
+            resolvedParsed = { ...parsed, title: fallbackTitle, titleSource: "folder" }
+            debugImport(jobId, `Folder title fallback matched - ${fallbackTitle}.`)
+            break
           }
-
-          metadata = fallbackMetadata
-          resolvedParsed = { ...parsed, title: fallbackTitle, titleSource: "folder" }
-          debugImport(jobId, `Folder title fallback matched - ${fallbackTitle}.`)
-          break
         }
-      }
-    } catch (error) {
-      if (isAniListMetadataLookupUnavailableError(error)) {
-        return finishRetryableInputFailure(filePath, {
-          jobId,
-          error,
-          context: "AniList metadata lookup could not complete",
-        })
-      }
+      } catch (error) {
+        if (isAniListMetadataLookupUnavailableError(error)) {
+          return finishRetryableInputFailure(filePath, {
+            jobId,
+            error,
+            context: "AniList metadata lookup could not complete",
+          })
+        }
 
-      throw error
+        throw error
+      }
     }
 
     if (!metadata) {
@@ -1122,10 +1266,10 @@ export async function processInputFile(
     const inputParsed = resolvedParsed
     const inputMetadata: NonNullable<Awaited<ReturnType<typeof findAnimeMetadata>>> = metadata
 
-    debugImport(jobId, `AniList metadata lookup completed - Anime id ${inputMetadata.id}.`)
-    debugImport(jobId, "Saving AniList metadata before media processing.")
+    debugImport(jobId, `${nonAnimeInput ? "Local metadata prepared" : "AniList metadata lookup completed"} - Media id ${inputMetadata.id}.`)
+    debugImport(jobId, "Saving media metadata before media processing.")
     await runCooperativeSyncStep(() => upsertAnime(inputMetadata))
-    debugImport(jobId, "AniList metadata saved.")
+    debugImport(jobId, "Media metadata saved.")
 
     const librarySeason = await runCooperativeSyncStep(() =>
       resolveLibrarySeasonNumberForAnime({
@@ -1257,7 +1401,7 @@ export async function processInputFile(
           return input.work()
         })
       } catch (error) {
-        const message = errorMessage(error) || "Unknown media processing error"
+        const message = importErrorMessage(error) || "Unknown media processing error"
 
         if (isShutdownCancellation(error, options.shutdownSignal)) {
           const shutdownMessage = `Skipped queued ${label} because shutdown started.`
@@ -1280,7 +1424,6 @@ export async function processInputFile(
           console.error(
             `[Error] [Media] Deferred ${label} failed - processInputFile.ts - ${filePath} - ${failureMessage}`
           )
-          debugError(jobId, `Deferred ${label} failed`, error)
 
           updateJob(jobId, {
             status: "failed",
@@ -1288,18 +1431,25 @@ export async function processInputFile(
             message: failureMessage,
             finishedAt: new Date().toISOString(),
           })
-          return
+          throw new Error(failureMessage)
         }
 
         const inputStillExists = await pathExists(filePath)
-        const failureMessage = inputStillExists
-          ? `${message}; input file was left in the input folder for retry.`
-          : `${message}; input source was already moved or removed before the deferred failure.`
+        const failedPath = inputStillExists
+          ? await tryMoveFailedInputToFailedImports(filePath, {
+              jobId,
+              reason: message,
+            })
+          : null
+        const failureMessage = failedPath
+          ? `${message}; input moved to failed imports: ${failedPath}`
+          : inputStillExists
+            ? `${message}; input could not be moved to failed imports and remains in the input folder.`
+            : `${message}; input source was already moved or removed before the deferred failure.`
 
         console.error(
           `[Error] [Media] Deferred ${label} failed - processInputFile.ts - ${filePath} - ${failureMessage}`
         )
-        debugError(jobId, `Deferred ${label} failed`, error)
 
         updateJob(jobId, {
           status: "failed",
@@ -1307,6 +1457,7 @@ export async function processInputFile(
           message: failureMessage,
           finishedAt: new Date().toISOString(),
         })
+        throw new Error(failureMessage)
       }
     }
 
@@ -1487,47 +1638,45 @@ export async function processInputFile(
       })
     }
 
+    if (config.importEncoding === "none") {
+      throw new Error("Import encoding is disabled while import processing is enabled.")
+    }
+
+    const importEncoding = config.importEncoding
     const inputBytesPerMinute = calculateBytesPerMinute(
       inputStat.size,
       durationSeconds
     )
-    const maxAv1BytesPerMinute = targetAv1BytesPerMinute
+    const maxTargetBytesPerMinute = targetBytesPerMinuteForImportEncoding(importEncoding)
     const inputVideoCodec = getPrimaryVideoCodec(probe)
-    const inputHasAv1Video = hasAv1Video(probe)
-    const inputUsesWebmContainer = usesWebmOutputContainer(filePath, probe)
-    const subtitleStreams = getWebmSubtitleOutputStreams({
+    const inputHasTargetVideo = hasTargetImportVideo(probe, importEncoding)
+    const inputUsesMp4Container = usesMp4OutputContainer(filePath, probe)
+    const subtitleStreams = getFileSubtitleOutputStreams({
       probe,
       sidecarSubtitle,
     })
+    const subtitleStream = subtitleStreams[0] ?? null
     const inputHasSubtitleSource = embeddedSubtitles || Boolean(sidecarSubtitle)
-    const inputHasEmbeddedWebVttSubtitles = embeddedSubtitles
-      ? !hasNonWebVttEmbeddedSubtitle(probe)
-      : false
-    const inputHasWebVttSubtitles = inputHasSubtitleSource
-      ? inputHasEmbeddedWebVttSubtitles
-      : true
     const convertAudioToOpusOutputIndexes = getAudioOutputIndexesToOpus(probe)
     const convertAudioToOpus = convertAudioToOpusOutputIndexes.length > 0
-    const requiresWebmContainerRemux = inputHasAv1Video && !inputUsesWebmContainer
-    const requiresSubtitleWebVttConversion = inputHasSubtitleSource
-      ? !inputHasWebVttSubtitles || Boolean(sidecarSubtitle)
-      : false
-    const inputMatchesWebmAv1OpusWebVtt =
-      inputUsesWebmContainer &&
-      inputHasAv1Video &&
+    const requiresMp4ContainerRemux = inputHasTargetVideo && !inputUsesMp4Container
+    const requiresSubtitleSidecarExtraction = inputHasSubtitleSource
+    const inputMatchesMp4Target =
+      inputUsesMp4Container &&
+      inputHasTargetVideo &&
       !convertAudioToOpus &&
-      inputHasWebVttSubtitles
-    const requiresVideoShrink = inputMatchesWebmAv1OpusWebVtt
-      ? inputBytesPerMinute > maxAv1BytesPerMinute
+      !embeddedSubtitles
+    const requiresVideoShrink = inputMatchesMp4Target
+      ? inputBytesPerMinute > maxTargetBytesPerMinute
       : false
-    const requiredSingleStepEdits = inputHasAv1Video
+    const requiredSingleStepEdits = inputHasTargetVideo
       ? [
-          requiresWebmContainerRemux,
+          requiresMp4ContainerRemux,
           convertAudioToOpus,
-          requiresSubtitleWebVttConversion,
+          requiresSubtitleSidecarExtraction,
         ].filter(Boolean).length
       : 0
-    const videoTranscodeReason: VideoTranscodeReason = !inputHasAv1Video
+    const videoTranscodeReason: VideoTranscodeReason = !inputHasTargetVideo
       ? "full"
       : requiresVideoShrink
         ? "shrink"
@@ -1542,23 +1691,23 @@ export async function processInputFile(
       ? "video-transcode"
       : convertAudioToOpus
         ? "audio-transcode"
-        : requiresWebmContainerRemux || requiresSubtitleWebVttConversion
+        : requiresMp4ContainerRemux || requiresSubtitleSidecarExtraction
           ? "container-remux"
           : "direct-move"
     const needsFfmpegProcessing = importFileEditKind !== "direct-move"
-    const videoBitrateKbps = calculateVideoBitrateKbps()
-    const skippedDetailedEditChecks = !inputHasAv1Video
+    const videoBitrateKbps = calculateVideoBitrateKbps(maxTargetBytesPerMinute)
+    const skippedDetailedEditChecks = !inputHasTargetVideo
 
     debugImport(
       jobId,
       skippedDetailedEditChecks
-        ? `Processing decision - inputCodec ${inputVideoCodec ?? "unknown"}, av1 false, action ${importFileEditKind}, videoTranscodeReason ${videoTranscodeReason}, needsFfmpegProcessing ${needsFfmpegProcessing}; skipped WebM/audio/subtitle/shrink decision checks because full processing is required. Audio tracks to Opus for output [${audioOutputIndexesToOpus.join(", ")}], subtitleTracks [${subtitleStreams.map((stream) => `${stream.inputIndex}:${stream.streamIndex}:${stream.codec}`).join(", ")}]`
-        : `Processing decision - inputCodec ${inputVideoCodec ?? "unknown"}, av1 ${inputHasAv1Video}, webmContainer ${inputUsesWebmContainer}, opusAudio ${!convertAudioToOpus}, webVttSubtitles ${inputHasWebVttSubtitles}, conformsBeforeShrink ${inputMatchesWebmAv1OpusWebVtt}, belowMaxSize ${!requiresVideoShrink}, audioTracksToOpus [${audioOutputIndexesToOpus.join(", ")}], subtitleTracks [${subtitleStreams.map((stream) => `${stream.inputIndex}:${stream.streamIndex}:${stream.codec}`).join(", ")}], requiredFormatEdits ${requiredSingleStepEdits}, action ${importFileEditKind}, videoTranscodeReason ${videoTranscodeReason}, needsFfmpegProcessing ${needsFfmpegProcessing}`
+        ? `Processing decision - inputCodec ${inputVideoCodec ?? "unknown"}, target ${importEncoding}, targetVideo false, action ${importFileEditKind}, videoTranscodeReason ${videoTranscodeReason}, needsFfmpegProcessing ${needsFfmpegProcessing}; skipped MP4/audio/subtitle/shrink decision checks because full processing is required. Audio tracks to Opus for output [${audioOutputIndexesToOpus.join(", ")}], subtitleTrack ${subtitleStream ? `${subtitleStream.inputIndex}:${subtitleStream.streamIndex}:${subtitleStream.codec}` : "none"}`
+        : `Processing decision - inputCodec ${inputVideoCodec ?? "unknown"}, target ${importEncoding}, targetVideo ${inputHasTargetVideo}, mp4Container ${inputUsesMp4Container}, opusAudio ${!convertAudioToOpus}, sidecarSubtitleNeeded ${requiresSubtitleSidecarExtraction}, conformsBeforeShrink ${inputMatchesMp4Target}, belowMaxSize ${!requiresVideoShrink}, audioTracksToOpus [${audioOutputIndexesToOpus.join(", ")}], subtitleTrack ${subtitleStream ? `${subtitleStream.inputIndex}:${subtitleStream.streamIndex}:${subtitleStream.codec}` : "none"}, requiredFormatEdits ${requiredSingleStepEdits}, action ${importFileEditKind}, videoTranscodeReason ${videoTranscodeReason}, needsFfmpegProcessing ${needsFfmpegProcessing}`
     )
 
     const safeLibraryTitle = safePathSegment(libraryTitle, "Library title")
     const safeMediaTitle = safePathSegment(mediaTitle, "Media title")
-    const extension = webmFileExtension
+    const extension = mp4FileExtension
     const finalName = formatEpisodeFileName({
       title: safeMediaTitle,
       season: inputParsed.season,
@@ -1568,7 +1717,7 @@ export async function processInputFile(
     })
     const finalPath = path.resolve(
       config.mediaDir,
-      safeLibraryTitle,
+      ...(nonAnimeInput ? [nonAnimeFolderName, safeLibraryTitle] : [safeLibraryTitle]),
       ...mediaFolderSegments({
         format: inputMetadata.format,
         season: inputParsed.season,
@@ -1583,8 +1732,13 @@ export async function processInputFile(
       jobId,
       finalName
     )
+    const finalSubtitlePath = subtitleSidecarPathForMediaFile(finalPath)
+    const tempSubtitlePath = subtitleSidecarPathForMediaFile(tempPath)
     debugImport(jobId, `Resolved output path - ${finalPath}`)
     debugImport(jobId, `Resolved temp path - ${tempPath}`)
+    if (subtitleStream) {
+      debugImport(jobId, `Resolved subtitle sidecar path - ${finalSubtitlePath}`)
+    }
 
     const processingInfo = {
       id: jobId,
@@ -1605,6 +1759,41 @@ export async function processInputFile(
         episodeNumber: inputParsed.episode,
       }),
       fileName: finalName,
+    }
+
+    async function prepareExistingEpisodeReplacement() {
+      if (!replacingExistingEpisode || !existingEpisode || existingEpisodeCleanupDone) {
+        return
+      }
+
+      existingEpisodeCleanupDone = true
+      const oldPath = path.resolve(existingEpisode.filePath)
+      const resolvedFinalPath = path.resolve(finalPath)
+
+      updateJob(jobId, {
+        message: "Replacing existing episode file.",
+      })
+
+      if (oldPath !== resolvedFinalPath && (await pathExists(oldPath))) {
+        debugImport(jobId, `Removing old episode file before replacement move - ${oldPath}`)
+        await unlinkFileWithRetry(oldPath, { jobId })
+        await rm(subtitleSidecarPathForMediaFile(oldPath), { force: true }).catch((error) => {
+          debugError(jobId, "Old episode subtitle sidecar cleanup failed during replacement", error)
+        })
+      }
+
+      if (await pathExists(resolvedFinalPath)) {
+        debugImport(jobId, `Removing previous destination file before replacement move - ${resolvedFinalPath}`)
+        await unlinkFileWithRetry(resolvedFinalPath, { jobId })
+        await rm(finalSubtitlePath, { force: true }).catch((error) => {
+          debugError(jobId, "Destination subtitle sidecar cleanup failed during replacement", error)
+        })
+      }
+
+      await removeEpisodeThumbnails(oldPath).catch((error) => {
+        debugError(jobId, "Old episode thumbnail cleanup failed during replacement", error)
+      })
+      debugImport(jobId, "Existing episode replacement target prepared.")
     }
 
     async function moveLibraryFileThroughQueue(
@@ -1649,36 +1838,18 @@ export async function processInputFile(
     const existingEpisodeFileExists = existingEpisode
       ? await pathExists(existingEpisode.filePath)
       : false
+    const replacingExistingEpisode = Boolean(existingEpisode && existingEpisodeFileExists)
+    let existingEpisodeCleanupDone = false
     let finalPathExists = await pathExists(finalPath)
 
-    if (existingEpisodeFileExists && existingEpisode) {
-      const existingPath = path.resolve(existingEpisode.filePath)
-      const inputPath = path.resolve(filePath)
-      const message = `Episode already exists in the library: ${safeLibraryTitle} ${episodeBadgeLabel({ seasonNumber: inputParsed.season, partNumber: inputParsed.part, episodeNumber: inputParsed.episode }).replace(" ", "")}`
-
-      console.warn(
-        `[Warn] [Media] ${message}; cleaning duplicate input if needed - ${filePath}`
+    if (replacingExistingEpisode && existingEpisode) {
+      debugImport(
+        jobId,
+        `Existing episode will be replaced after the new output is ready - Old path ${path.resolve(existingEpisode.filePath)}, New path ${finalPath}`
       )
-      debugImport(jobId, `${message}; existing path ${existingPath}`)
-
-      if (existingPath !== inputPath && (await pathExists(filePath))) {
-        await unlinkFileWithRetry(filePath, { jobId })
-        await removeNonMediaOnlyInputParents(filePath, { jobId })
-      }
-
-      updateJob(jobId, {
-        status: "skipped",
-        outputPath: existingPath,
-        message,
-        finishedAt: new Date().toISOString(),
-      })
-
-      return {
-        ok: true,
-        filePath: existingPath,
-        planned: false,
-        message,
-      }
+      console.log(
+        `[Info] [Media] Replacement import detected - ${safeLibraryTitle} ${episodeBadgeLabel({ seasonNumber: inputParsed.season, partNumber: inputParsed.part, episodeNumber: inputParsed.episode }).replace(" ", "")} - ${fileName(filePath)}`
+      )
     }
 
     if (legacySeasonEpisode && (await pathExists(legacySeasonEpisode.filePath))) {
@@ -1708,7 +1879,7 @@ export async function processInputFile(
       debugImport(jobId, "Legacy parsed-season episode record removed.")
     }
 
-    const useExistingOutput = finalPathExists
+    const useExistingOutput = finalPathExists && !replacingExistingEpisode
 
     if (useExistingOutput) {
       console.warn(
@@ -1792,27 +1963,38 @@ export async function processInputFile(
             : "Transcoding media file."
           : convertAudioToOpus
             ? "Converting audio tracks to Opus."
-            : "Remuxing media file to WebM.",
+            : "Remuxing media file to MP4.",
       })
 
       try {
         await transcodeFile(filePath, tempPath, {
+          importEncoding,
           convertVideo,
           inputVideoCodec,
           audioOutputIndexesToOpus,
-          subtitleStreams,
+          subtitleStream,
+          subtitleOutputPath: subtitleStream ? tempSubtitlePath : null,
           sidecarSubtitle,
           videoBitrateKbps,
-          maxVideoBitrateKbps: calculateVideoBitrateKbps(maxAv1BytesPerMinute),
+          maxVideoBitrateKbps: calculateVideoBitrateKbps(maxTargetBytesPerMinute),
           jobId,
         })
         debugImport(jobId, "FFmpeg processing step completed successfully.")
 
+        await prepareExistingEpisodeReplacement()
         updateJob(jobId, {
           message: "Moving processed output into the library.",
         })
         debugImport(jobId, "Queueing transcoded output move into the library.")
         await moveLibraryFileThroughQueue(tempPath, finalPath, "transcode-output")
+        if (subtitleStream && (await pathExists(tempSubtitlePath))) {
+          await replaceFile(tempSubtitlePath, finalSubtitlePath, { jobId })
+          debugImport(jobId, "Subtitle sidecar move completed.")
+        } else {
+          await rm(finalSubtitlePath, { force: true }).catch((error) => {
+            debugError(jobId, "Unused destination subtitle sidecar cleanup failed", error)
+          })
+        }
         debugImport(jobId, "Transcoded output move completed.")
         debugImport(jobId, "Removing original input file after processed output move.")
         await unlinkFileWithRetry(filePath, { jobId })
@@ -1857,7 +2039,9 @@ export async function processInputFile(
 
       return finalizeImport({
         planned: true,
-        completedMessage: "Media processed and added to the library.",
+        completedMessage: replacingExistingEpisode
+          ? "Episode replaced after media processing."
+          : "Media processed and added to the library.",
       })
     }
 
@@ -1866,7 +2050,11 @@ export async function processInputFile(
         message: "Moving direct-import media file.",
       })
 
+      await prepareExistingEpisodeReplacement()
       await moveLibraryFileThroughQueue(filePath, finalPath, "direct-import")
+      await rm(finalSubtitlePath, { force: true }).catch((error) => {
+        debugError(jobId, "Direct-import destination subtitle sidecar cleanup failed", error)
+      })
 
       if (await pathExists(filePath)) {
         debugImport(jobId, "Source still exists after direct-import move; removing it.")
@@ -1881,7 +2069,9 @@ export async function processInputFile(
 
       return finalizeImport({
         planned: false,
-        completedMessage: "Media added to the library without transcoding.",
+        completedMessage: replacingExistingEpisode
+          ? "Episode replaced without transcoding."
+          : "Media added to the library without transcoding.",
       })
     }
 
@@ -1926,7 +2116,7 @@ export async function processInputFile(
     if (needsFfmpegProcessing && !convertVideo && options.deferAudioTranscodes) {
       const queueMessage = convertAudioToOpus
         ? "Queued for audio transcode."
-        : "Queued for WebM remux."
+        : "Queued for MP4 remux."
 
       updateJob(jobId, {
         message: queueMessage,
@@ -1972,7 +2162,7 @@ export async function processInputFile(
       },
     })
   } catch (error) {
-    const message = errorMessage(error) || "Unknown media processing error"
+    const message = importErrorMessage(error) || "Unknown media processing error"
 
     if (isShutdownCancellation(error, options.shutdownSignal)) {
       const shutdownMessage = "Skipped queued import file action because shutdown started."

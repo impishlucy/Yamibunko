@@ -36,7 +36,7 @@
                     <Border Width="310" Padding="4" Background="#18181B" BorderBrush="#7C3AED" BorderThickness="1" CornerRadius="8">
                         <StackPanel Spacing="6">
                             <TextBlock Text="Recommended: OFF !" FontSize="14" FontWeight="SemiBold" Foreground="#D8B4FE"/>
-                            <TextBlock FontSize="13" TextWrapping="Wrap" Foreground="#D4D4D8" Text="OFF: Default workflow. Picks up (new) vido files in the input folder, Converts non-HEVC to HEVC, compresses oversized HEVC and puts result in output folder, then deletes the input file."/>
+                            <TextBlock FontSize="13" TextWrapping="Wrap" Foreground="#D4D4D8" Text="OFF: Default workflow. Picks up (new) video files in the input folder, Converts files to AV1 when supported, falls back to HEVC, compresses oversized files and puts result in output folder, then deletes the input file."/>
                             <TextBlock FontSize="13" TextWrapping="Wrap" Foreground="#D4D4D8" Text="ON: Catalog mode for existing large / high-quality libraries. Serves input files in place; no converting, compressing, moving or deleting."/>
                         </StackPanel>
                     </Border>

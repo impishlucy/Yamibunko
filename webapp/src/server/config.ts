@@ -14,12 +14,14 @@ export type TranscodeAcceleration =
   | "amd_cpu"
   | "cpu"
 export type FileEncodeAcceleration = Exclude<TranscodeAcceleration, "cpu">
+export type ImportEncoding = "av1" | "hevc" | "none"
 
 const serverConfigSchema = z.object({
   FFMPEG_DIR: z.string().trim().min(1),
   ANIME_INPUT_DIR: z.string().trim().min(1),
   ANIME_MEDIA_DIR: z.string().trim().optional(),
   IMPORT_ENABLED: z.enum(["true", "false"]).default("true"),
+  IMPORT_ENCODING: z.enum(["av1", "hevc", "none"]).default("none"),
   TRANSCODE_ACCEL: z.enum([
     "nvenc",
     "intel_gpu",
@@ -39,6 +41,22 @@ const serverConfigSchema = z.object({
       message: "Required when IMPORT_ENABLED is true",
     })
   }
+
+  if (env.IMPORT_ENABLED === "true" && env.IMPORT_ENCODING === "none") {
+    context.addIssue({
+      code: "custom",
+      path: ["IMPORT_ENCODING"],
+      message: "Must be av1 or hevc when IMPORT_ENABLED is true",
+    })
+  }
+
+  if (env.IMPORT_ENABLED === "false" && env.IMPORT_ENCODING !== "none") {
+    context.addIssue({
+      code: "custom",
+      path: ["IMPORT_ENCODING"],
+      message: "Must be none when IMPORT_ENABLED is false",
+    })
+  }
 })
 
 export type ServerConfig = {
@@ -48,6 +66,7 @@ export type ServerConfig = {
   mediaDir: string
   tempDir: string
   importEnabled: boolean
+  importEncoding: ImportEncoding
   transcodeAccel: TranscodeAcceleration
   anilistClientId?: string
   anilistClientSecret?: string
@@ -117,6 +136,11 @@ function readEnvironment() {
     IMPORT_ENABLED: process.env.IMPORT_ENABLED
       ? process.env.IMPORT_ENABLED.trim().toLowerCase()
       : "true",
+    IMPORT_ENCODING: process.env.IMPORT_ENCODING
+      ? process.env.IMPORT_ENCODING.trim().toLowerCase()
+      : process.env.IMPORT_ENABLED?.trim().toLowerCase() === "false"
+        ? "none"
+        : undefined,
     TRANSCODE_ACCEL: process.env.TRANSCODE_ACCEL
       ? normalizeTranscodeAccelerationValue(process.env.TRANSCODE_ACCEL)
       : undefined,
@@ -136,6 +160,7 @@ function mapConfig(env: z.infer<typeof serverConfigSchema>): ServerConfig {
     mediaDir: env.ANIME_MEDIA_DIR ? cleanPath(env.ANIME_MEDIA_DIR) : "",
     tempDir: getDefaultTempDir(),
     importEnabled: env.IMPORT_ENABLED === "true",
+    importEncoding: env.IMPORT_ENCODING,
     transcodeAccel: env.TRANSCODE_ACCEL,
     anilistClientId: env.ANILIST_CLIENT_ID
       ? cleanPath(env.ANILIST_CLIENT_ID)

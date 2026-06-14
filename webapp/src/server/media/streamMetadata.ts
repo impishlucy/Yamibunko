@@ -326,8 +326,11 @@ export function getMediaStreamMetadata(
         isSupported: isConvertibleTextSubtitleCodec(codec),
       }
     })
+  const hasSupportedEmbeddedSubtitle = embeddedSubtitleStreams.some(
+    (stream) => stream.isSupported
+  )
   const sidecarSubtitleStream: SubtitleStreamInfo[] =
-    !embeddedSubtitleStreams.length && options.sidecarSubtitle
+    !hasSupportedEmbeddedSubtitle && options.sidecarSubtitle
       ? [
           {
             id: sidecarSubtitleStreamId,

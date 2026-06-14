@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react"
 
 import { Button } from "@/components/ui/button"
 import { clientLibraryRefreshEvent } from "@/lib/library-events"
+import { isLocalNonAnimeId } from "@/lib/local-media"
 
 type AniListTrackingState = {
   configured: boolean
@@ -31,10 +32,16 @@ function shouldShowProgress(status: string | null) {
 }
 
 export function AniListTracking({ animeId }: { animeId: number }) {
+  const isLocalMedia = isLocalNonAnimeId(animeId)
   const [state, setState] = useState<AniListTrackingState | null>(null)
   const [busy, setBusy] = useState(false)
 
   const loadTrackingState = useCallback(async (signal?: AbortSignal) => {
+    if (isLocalMedia) {
+      setState(null)
+      return
+    }
+
     const response = await fetch(`/api/anilist/status?animeId=${animeId}`, {
       cache: "no-store",
       signal,
@@ -51,7 +58,7 @@ export function AniListTracking({ animeId }: { animeId: number }) {
     if (payload) {
       setState(payload)
     }
-  }, [animeId])
+  }, [animeId, isLocalMedia])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -135,7 +142,7 @@ export function AniListTracking({ animeId }: { animeId: number }) {
     }
   }
 
-  if (!state?.connected) {
+  if (isLocalMedia || !state?.connected) {
     return null
   }
 

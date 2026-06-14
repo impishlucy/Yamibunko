@@ -3,6 +3,7 @@ import { access, open } from "node:fs/promises"
 import path from "node:path"
 
 export const subtitleSidecarExtensions = [".vtt", ".ass", ".ssa", ".srt"] as const
+export const subtitlesDirectoryName = "Subtitles"
 
 export const webVttSubtitleCodec = "webvtt"
 
@@ -172,25 +173,72 @@ async function pathExists(filePath: string) {
   }
 }
 
-export async function findSubtitleSidecar(mediaFilePath: string) {
+export function subtitleSidecarDirectoryForMediaFile(mediaFilePath: string) {
+  return path.join(path.dirname(mediaFilePath), subtitlesDirectoryName)
+}
+
+export function subtitleSidecarPathForMediaFile(
+  mediaFilePath: string,
+  extension: SubtitleSidecarExtension = ".vtt"
+) {
   const parsed = path.parse(mediaFilePath)
+  return path.join(subtitleSidecarDirectoryForMediaFile(mediaFilePath), `${parsed.name}${extension}`)
+}
 
-  for (const extension of subtitleSidecarExtensions) {
-    const candidate = path.format({
-      dir: parsed.dir,
-      base: `${parsed.name}${extension}`,
-    })
+export async function findSubtitleSidecar(
+  mediaFilePath: string,
+  options: { extensions?: readonly SubtitleSidecarExtension[] } = {}
+) {
+  const parsed = path.parse(mediaFilePath)
+  const extensions = options.extensions ?? subtitleSidecarExtensions
+  const sidecarDirectories = [
+    subtitleSidecarDirectoryForMediaFile(mediaFilePath),
+    parsed.dir,
+  ]
 
-    if (await pathExists(candidate)) {
-      return {
-        filePath: candidate,
-        extension,
-        codec: sidecarCodec(extension),
+  for (const directory of sidecarDirectories) {
+    for (const extension of extensions) {
+      const candidate = path.join(directory, `${parsed.name}${extension}`)
+
+      if (await pathExists(candidate)) {
+        return {
+          filePath: candidate,
+          extension,
+          codec: sidecarCodec(extension),
+        }
       }
     }
   }
 
   return null
+}
+
+export async function findWebVttSubtitleSidecar(mediaFilePath: string) {
+  return findSubtitleSidecar(mediaFilePath, { extensions: [".vtt"] })
+}
+
+export function hasSupportedEmbeddedSubtitles(probe: {
+  streams?: Array<{ codec_type?: string; codec_name?: string }>
+}) {
+  return (probe.streams ?? []).some(
+    (stream) =>
+      stream.codec_type === "subtitle" &&
+      isConvertibleTextSubtitleCodec(stream.codec_name)
+  )
+}
+
+export async function findPlaybackSubtitleSidecar(input: {
+  mediaFilePath: string
+  probe: { streams?: Array<{ codec_type?: string; codec_name?: string }> }
+  importEnabled: boolean
+}) {
+  if (input.importEnabled) {
+    return findWebVttSubtitleSidecar(input.mediaFilePath)
+  }
+
+  return hasSupportedEmbeddedSubtitles(input.probe)
+    ? null
+    : findSubtitleSidecar(input.mediaFilePath)
 }
 
 export async function readWebVttSidecar(sidecar: SubtitleSidecar) {

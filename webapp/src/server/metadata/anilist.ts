@@ -561,6 +561,12 @@ function relationRootScore(
   const relationIsRootFormat = isSeriesRootMedia(relation.media)
   const rootTitlePrefix = hasRootTitlePrefix(metadata, relation.media)
   const sharedRootTitle = hasSharedRootTitle(metadata, relation.media)
+  const trustedParentRelation = relation.relationType === "PARENT"
+
+  if (!trustedParentRelation && !rootTitlePrefix && !sharedRootTitle) {
+    return null
+  }
+
   let score = relationPriority * 100
 
   if (relationIsRootFormat) {

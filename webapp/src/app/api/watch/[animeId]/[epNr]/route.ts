@@ -1,5 +1,4 @@
 import { requireApiUser } from "@/server/auth/api"
-import { getServerConfig } from "@/server/config"
 import {
   getAnimeInfo,
   getEpisode,
@@ -8,11 +7,12 @@ import {
 import { joinBaseUrl } from "@/server/http/baseUrl"
 import { getPublicBaseUrl } from "@/server/http/request"
 import { createCastStreamToken } from "@/server/media/castTokens"
+import { getServerConfig } from "@/server/config"
 import { ffprobe } from "@/server/media/ffmpeg"
 import type { ProbeResult } from "@/server/media/mediaFiles"
 import { resolveEpisodeMedia } from "@/server/media/resolveMediaId"
 import { getMediaStreamMetadata } from "@/server/media/streamMetadata"
-import { findSubtitleSidecar } from "@/server/media/subtitles"
+import { findPlaybackSubtitleSidecar } from "@/server/media/subtitles"
 import { errorMessage, parsePositiveInt } from "@/server/utils/format"
 
 export const runtime = "nodejs"
@@ -55,21 +55,21 @@ export async function GET(request: Request, context: WatchContext) {
 
   const media = resolveEpisodeMedia(animeId, seasonNumber, episodeNumber)
 
+  const config = getServerConfig()
+
   if (!media) {
     return Response.json({ error: "Episode not found" }, { status: 404 })
   }
 
-  const config = getServerConfig()
   let streamMetadata
 
   try {
     const probe = (await ffprobe(media.file)) as ProbeResult
-    const hasEmbeddedSubtitles = (probe.streams ?? []).some(
-      (stream) => stream.codec_type === "subtitle"
-    )
-    const sidecarSubtitle = config.importEnabled || hasEmbeddedSubtitles
-      ? null
-      : await findSubtitleSidecar(media.file)
+    const sidecarSubtitle = await findPlaybackSubtitleSidecar({
+      mediaFilePath: media.file,
+      probe,
+      importEnabled: config.importEnabled,
+    })
 
     streamMetadata = getMediaStreamMetadata(probe, { sidecarSubtitle })
   } catch (error) {
@@ -85,7 +85,7 @@ export async function GET(request: Request, context: WatchContext) {
     }
   }
 
-  const liveTranscodeEnabled = config.transcodeAccel !== "cpu"
+  const liveTranscodeEnabled = true
   const neighbors = getEpisodeNeighbors({
     animeId: anime.id,
     seasonNr: seasonNumber,

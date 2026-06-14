@@ -86,6 +86,9 @@ type AnimePlayerProps = {
 }
 
 type PlaybackStatusState = "checking" | "direct" | "transcoding" | "blocked"
+type DirectAudioMode = "copy" | "aac"
+type DirectContainerMode = "source" | "mp4"
+type LocalDirectStreamMode = "plain" | "source-remux" | "mp4-remux" | "audio-transcode"
 
 type SwitchSourceOptions = {
   preservePosition?: boolean
@@ -280,11 +283,27 @@ type PlaybackStatsSnapshot = {
   preloadedMegabytes: number | null
 }
 
-const hevcMp4Checks = [
-  'video/mp4; codecs="hvc1.1.6.L93.B0"',
-  'video/mp4; codecs="hev1.1.6.L93.B0"',
-  'video/mp4; codecs="hvc1"',
-  'video/mp4; codecs="hev1"',
+const h264CodecChecks = [
+  "avc1.640034",
+  "avc1.64002A",
+  "avc1.640028",
+  "avc1.64001F",
+  "avc1.4D402A",
+  "avc1.4D4028",
+  "avc1.4D401F",
+  "avc1.42E01E",
+  "avc1",
+]
+
+const hevcMatroskaCodecChecks = ["hevc", "hvc1", "hev1"]
+const hevcCodecChecks = [
+  "hvc1.2.4.L153.B0",
+  "hev1.2.4.L153.B0",
+  "hvc1.1.6.L123.B0",
+  "hev1.1.6.L123.B0",
+  "hvc1.1.6.L93.B0",
+  "hev1.1.6.L93.B0",
+  ...hevcMatroskaCodecChecks,
 ]
 
 const mediaErrorDecodeCode = 3
@@ -314,15 +333,15 @@ function createClientStreamId() {
   return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`
 }
 
-function canPlayAny(video: HTMLVideoElement, checks: string[]) {
+function canPlayAny(mediaElement: HTMLMediaElement | null, checks: string[]) {
+  if (!mediaElement || !checks.length) {
+    return false
+  }
+
   return checks.some((codec) => {
-    const result = video.canPlayType(codec)
+    const result = mediaElement.canPlayType(codec)
     return result === "probably" || result === "maybe"
   })
-}
-
-function supportsHevcDecode(video: HTMLVideoElement) {
-  return canPlayAny(video, hevcMp4Checks)
 }
 
 function normalizeCodecName(codec: string | undefined) {
@@ -348,24 +367,73 @@ const containerByExtension = new Map<string, string>([
   ["mp4", "mp4"],
   ["m4v", "mp4"],
   ["mov", "mov"],
+  ["qt", "mov"],
+  ["3gp", "3gpp"],
+  ["3g2", "3gpp2"],
   ["mkv", "matroska"],
+  ["mka", "matroska"],
   ["webm", "webm"],
   ["avi", "avi"],
+  ["ts", "mpegts"],
+  ["m2ts", "mpegts"],
+  ["mts", "mpegts"],
+  ["mpg", "mpeg"],
+  ["mpeg", "mpeg"],
+  ["mpe", "mpeg"],
+  ["ogg", "ogg"],
+  ["ogm", "ogg"],
+  ["ogv", "ogg"],
+  ["flv", "flv"],
+  ["asf", "asf"],
+  ["wmv", "asf"],
 ])
 
 const directMimeTypesByContainer: Record<string, string[]> = {
   mp4: ["video/mp4"],
   mov: ["video/quicktime", "video/mp4"],
+  "3gpp": ["video/3gpp"],
+  "3gpp2": ["video/3gpp2"],
   webm: ["video/webm"],
   matroska: ["video/x-matroska"],
   avi: ["video/x-msvideo"],
+  mpegts: ["video/mp2t", "video/MP2T"],
+  mpeg: ["video/mpeg"],
+  ogg: ["video/ogg", "application/ogg"],
+  flv: ["video/x-flv"],
+  asf: ["video/x-ms-asf", "video/x-ms-wmv"],
 }
 
-const fallbackDirectMimeTypes = ["video/mp4", "video/webm", "video/x-matroska"]
+const directAudioMimeTypesByContainer: Record<string, string[]> = {
+  mp4: ["audio/mp4"],
+  mov: ["audio/mp4", "audio/quicktime"],
+  "3gpp": ["audio/3gpp"],
+  "3gpp2": ["audio/3gpp2"],
+  webm: ["audio/webm"],
+  matroska: ["audio/x-matroska"],
+  mpeg: ["audio/mpeg"],
+  ogg: ["audio/ogg", "application/ogg"],
+  asf: ["audio/x-ms-wma", "audio/x-ms-asf"],
+}
 
-const h264CodecChecks = ["avc1.640028", "avc1.4D401F", "avc1.42E01E", "avc1"]
-const hevcMatroskaCodecChecks = ["hvc1", "hev1", "hevc"]
-const hevcCodecChecks = ["hvc1.1.6.L93.B0", "hev1.1.6.L93.B0", "hvc1", "hev1"]
+const fallbackDirectMimeTypes = [
+  "video/mp4",
+  "video/webm",
+  "video/x-matroska",
+  "video/ogg",
+  "video/mp2t",
+  "video/mpeg",
+]
+
+const fallbackDirectAudioMimeTypes = [
+  "audio/mp4",
+  "audio/webm",
+  "audio/ogg",
+  "audio/mpeg",
+]
+
+function normalizeContainerName(container: string | undefined) {
+  return container?.trim().toLowerCase().replace(/[._\s-]+/g, "") ?? ""
+}
 
 function getMediaContainer(fileName: string, container: string | undefined) {
   const extension = fileName.split(".").at(-1)?.toLowerCase() ?? ""
@@ -375,13 +443,22 @@ function getMediaContainer(fileName: string, container: string | undefined) {
     return extensionContainer
   }
 
-  const normalizedContainer = container?.trim().toLowerCase() ?? ""
+  const normalizedContainer = normalizeContainerName(container)
 
-  if (normalizedContainer.includes("mp4") || normalizedContainer.includes("mov")) {
+  if (
+    normalizedContainer.includes("mp4") ||
+    normalizedContainer.includes("mov") ||
+    normalizedContainer.includes("m4v") ||
+    normalizedContainer.includes("quicktime")
+  ) {
     return "mp4"
   }
 
-  if (normalizedContainer.includes("matroska")) {
+  if (normalizedContainer.includes("3gp") || normalizedContainer.includes("3gpp")) {
+    return "3gpp"
+  }
+
+  if (normalizedContainer.includes("matroska") || normalizedContainer.includes("mkv")) {
     return "matroska"
   }
 
@@ -393,6 +470,26 @@ function getMediaContainer(fileName: string, container: string | undefined) {
     return "avi"
   }
 
+  if (normalizedContainer.includes("mpegts") || normalizedContainer === "mpegts") {
+    return "mpegts"
+  }
+
+  if (normalizedContainer.includes("mpeg") || normalizedContainer.includes("mpg")) {
+    return "mpeg"
+  }
+
+  if (normalizedContainer.includes("ogg") || normalizedContainer.includes("ogv")) {
+    return "ogg"
+  }
+
+  if (normalizedContainer.includes("flv")) {
+    return "flv"
+  }
+
+  if (normalizedContainer.includes("asf") || normalizedContainer.includes("wmv")) {
+    return "asf"
+  }
+
   return "unknown"
 }
 
@@ -400,26 +497,80 @@ function getDirectMimeTypes(container: string) {
   return directMimeTypesByContainer[container] ?? fallbackDirectMimeTypes
 }
 
-function getVideoCodecChecks(codec: string | undefined, mimeType: string) {
+function getDirectAudioMimeTypes(container: string) {
+  return directAudioMimeTypesByContainer[container] ?? fallbackDirectAudioMimeTypes
+}
+
+function getPlaybackProbeVideo(video?: HTMLVideoElement | null) {
+  if (video) {
+    return video
+  }
+
+  if (typeof document === "undefined") {
+    return null
+  }
+
+  return document.createElement("video")
+}
+
+function getPlaybackProbeAudio() {
+  if (typeof document === "undefined") {
+    return null
+  }
+
+  return document.createElement("audio")
+}
+
+function getVideoCodecChecks(codec: string | undefined) {
   switch (normalizeCodecName(codec)) {
     case "h264":
+    case "avc":
     case "avc1":
       return h264CodecChecks
     case "hevc":
     case "h265":
     case "hvc1":
     case "hev1":
-      return mimeType === "video/x-matroska"
-        ? hevcMatroskaCodecChecks
-        : hevcCodecChecks
+      return hevcCodecChecks
     case "vp9":
     case "vp09":
-      return ["vp09.00.10.08", "vp9"]
+      return [
+        "vp09.00.10.08",
+        "vp09.00.10.10",
+        "vp09.02.10.10",
+        "vp09",
+        "vp9",
+      ]
     case "vp8":
       return ["vp8"]
     case "av1":
     case "av01":
-      return ["av01.0.05M.08", "av01"]
+      return [
+        "av01.0.05M.08",
+        "av01.0.05M.10",
+        "av01.0.08M.08",
+        "av01.0.08M.10",
+        "av01.0.12M.10",
+        "av01",
+      ]
+    case "mpeg4":
+    case "mp4v":
+    case "xvid":
+    case "divx":
+      return ["mp4v.20.8", "mp4v.20.240", "mp4v"]
+    case "mpeg2video":
+    case "mpeg2":
+      return ["mp4v.61", "mpeg2", "mp2v"]
+    case "mpeg1video":
+    case "mpeg1":
+      return ["mpeg1", "mpgv"]
+    case "theora":
+      return ["theora"]
+    case "wmv3":
+    case "wmv2":
+    case "wmv1":
+    case "vc1":
+      return ["wmv3", "wmv2", "wmv1", "vc-1"]
     default:
       return []
   }
@@ -446,57 +597,66 @@ function getAudioCodecChecks(audioStream: MediaStreamInfo | undefined) {
 
   switch (normalizeCodecName(audioStream.codec)) {
     case "aac":
+    case "mp4a":
       return getAacCodecChecks(audioStream.profile)
     case "mp3":
-    case "mp2":
-    case "mp1":
       return ["mp4a.40.34", "mp4a.69", "mp4a.6B", "mp3"]
+    case "mp2":
+      return ["mp4a.69", "mp2"]
+    case "mp1":
+      return ["mp4a.6B", "mp1"]
     case "opus":
-      return ["opus"]
+      return ["opus", "Opus"]
     case "vorbis":
       return ["vorbis"]
     case "flac":
-      return ["flac"]
+      return ["flac", "fLaC"]
+    case "alac":
+      return ["alac"]
     case "ac3":
       return ["ac-3"]
     case "eac3":
       return ["ec-3"]
+    case "pcm":
+    case "pcms16le":
+    case "pcms16be":
+    case "pcms24le":
+    case "pcms24be":
+    case "pcms32le":
+    case "pcms32be":
+    case "pcmf32le":
+    case "pcmf32be":
+      return ["lpcm"]
     default:
       return []
   }
 }
 
-function buildDirectPlaybackChecks(input: {
-  fileName: string
+function buildPlaybackChecks(input: {
   media: WatchPayload["media"]
+  mimeTypes: string[]
   selectedAudioStream: MediaStreamInfo | undefined
 }) {
-  const container = getMediaContainer(input.fileName, input.media.container)
-  const mimeTypes = getDirectMimeTypes(container)
+  const videoCodecChecks = getVideoCodecChecks(input.media.videoCodec)
   const hasAudio = input.media.audioStreams.length > 0
-  const videoCodec = input.media.videoCodec
-  const audioCodecChecks = getAudioCodecChecks(input.selectedAudioStream)
+  const audioCodecChecks = hasAudio
+    ? getAudioCodecChecks(input.selectedAudioStream)
+    : []
   const checks: string[] = []
 
-  if (hasAudio && !audioCodecChecks.length) {
+  if (!videoCodecChecks.length || (hasAudio && !audioCodecChecks.length)) {
     return []
   }
 
-  for (const mimeType of mimeTypes) {
-    const videoCodecChecks = getVideoCodecChecks(videoCodec, mimeType)
-
-    if (!videoCodecChecks.length) {
-      checks.push(mimeType)
-      continue
-    }
-
+  for (const mimeType of input.mimeTypes) {
     for (const videoCodecCheck of videoCodecChecks) {
-      if (audioCodecChecks.length) {
-        for (const audioCodecCheck of audioCodecChecks) {
-          checks.push(`${mimeType}; codecs="${videoCodecCheck}, ${audioCodecCheck}"`)
-        }
-      } else {
+      if (!hasAudio) {
         checks.push(`${mimeType}; codecs="${videoCodecCheck}"`)
+        continue
+      }
+
+      for (const audioCodecCheck of audioCodecChecks) {
+        checks.push(`${mimeType}; codecs="${videoCodecCheck}, ${audioCodecCheck}"`)
       }
     }
   }
@@ -504,22 +664,18 @@ function buildDirectPlaybackChecks(input: {
   return checks
 }
 
-function buildDirectVideoPlaybackChecks(input: {
-  fileName: string
+function buildVideoPlaybackChecks(input: {
   media: WatchPayload["media"]
+  mimeTypes: string[]
 }) {
-  const container = getMediaContainer(input.fileName, input.media.container)
-  const mimeTypes = getDirectMimeTypes(container)
+  const videoCodecChecks = getVideoCodecChecks(input.media.videoCodec)
   const checks: string[] = []
 
-  for (const mimeType of mimeTypes) {
-    const videoCodecChecks = getVideoCodecChecks(input.media.videoCodec, mimeType)
+  if (!videoCodecChecks.length) {
+    return []
+  }
 
-    if (!videoCodecChecks.length) {
-      checks.push(mimeType)
-      continue
-    }
-
+  for (const mimeType of input.mimeTypes) {
     for (const videoCodecCheck of videoCodecChecks) {
       checks.push(`${mimeType}; codecs="${videoCodecCheck}"`)
     }
@@ -528,43 +684,19 @@ function buildDirectVideoPlaybackChecks(input: {
   return checks
 }
 
-function getDirectAudioMimeTypes(container: string) {
-  if (container === "webm") {
-    return ["audio/webm", "video/webm"]
-  }
-
-  if (container === "matroska") {
-    return ["video/x-matroska"]
-  }
-
-  return ["audio/mp4", "video/mp4"]
-}
-
-function buildDirectAudioPlaybackChecks(input: {
-  fileName: string
-  media: WatchPayload["media"]
+function buildAudioPlaybackChecks(input: {
+  mimeTypes: string[]
   selectedAudioStream: MediaStreamInfo | undefined
 }) {
-  if (!input.media.audioStreams.length) {
-    return []
-  }
-
-  const container = getMediaContainer(input.fileName, input.media.container)
   const audioCodecChecks = getAudioCodecChecks(input.selectedAudioStream)
+  const checks: string[] = []
 
   if (!audioCodecChecks.length) {
     return []
   }
 
-  const mimeTypes = getDirectAudioMimeTypes(container)
-  const checks: string[] = []
-
-  for (const audioCodecCheck of audioCodecChecks) {
-    if (audioCodecCheck === "mp3") {
-      checks.push('audio/mpeg')
-    }
-
-    for (const mimeType of mimeTypes) {
+  for (const mimeType of input.mimeTypes) {
+    for (const audioCodecCheck of audioCodecChecks) {
       checks.push(`${mimeType}; codecs="${audioCodecCheck}"`)
     }
   }
@@ -572,186 +704,326 @@ function buildDirectAudioPlaybackChecks(input: {
   return checks
 }
 
-function isOptimisticDirectVideoCandidate(input: {
-  fileName: string
-  media: WatchPayload["media"]
-}) {
-  const container = getMediaContainer(input.fileName, input.media.container)
-  const videoCodec = normalizeCodecName(input.media.videoCodec)
-
-  if (container !== "mp4" && container !== "mov") {
-    return false
-  }
-
-  return (
-    videoCodec === "h264" ||
-    videoCodec === "avc1" ||
-    videoCodec === "hevc" ||
-    videoCodec === "h265" ||
-    videoCodec === "hvc1" ||
-    videoCodec === "hev1"
-  )
-}
-
-function supportsDirectVideoTrack(input: {
-  video: HTMLVideoElement
-  fileName: string
-  media: WatchPayload["media"]
-}) {
-  const videoCodec = normalizeCodecName(input.media.videoCodec)
-  const isHevcVideo =
-    videoCodec === "hevc" ||
-    videoCodec === "h265" ||
-    videoCodec === "hvc1" ||
-    videoCodec === "hev1"
-
-  if (isHevcVideo && supportsHevcDecode(input.video)) {
-    return true
-  }
-
-  const checks = buildDirectVideoPlaybackChecks(input)
-
-  if (checks.length > 0 && canPlayAny(input.video, checks)) {
-    return true
-  }
-
-  return isOptimisticDirectVideoCandidate(input)
-}
-
-function isOptimisticDirectAudioCandidate(input: {
+function buildDirectPlaybackChecks(input: {
   fileName: string
   media: WatchPayload["media"]
   selectedAudioStream: MediaStreamInfo | undefined
 }) {
-  if (!input.media.audioStreams.length) {
-    return true
-  }
-
   const container = getMediaContainer(input.fileName, input.media.container)
-  const audioCodec = normalizeCodecName(input.selectedAudioStream?.codec)
 
-  if (!audioCodec) {
-    return false
-  }
-
-  if (container === "mp4" || container === "mov") {
-    return (
-      audioCodec === "aac" ||
-      audioCodec === "mp3" ||
-      audioCodec === "mp2" ||
-      audioCodec === "mp1" ||
-      audioCodec === "ac3" ||
-      audioCodec === "eac3"
-    )
-  }
-
-  if (container === "webm") {
-    return audioCodec === "opus" || audioCodec === "vorbis"
-  }
-
-  return false
+  return buildPlaybackChecks({
+    media: input.media,
+    mimeTypes: getDirectMimeTypes(container),
+    selectedAudioStream: input.selectedAudioStream,
+  })
 }
 
-function supportsDirectAudioTrack(input: {
-  video: HTMLVideoElement
+function buildDirectVideoPlaybackChecks(input: {
+  fileName: string
+  media: WatchPayload["media"]
+}) {
+  const container = getMediaContainer(input.fileName, input.media.container)
+
+  return buildVideoPlaybackChecks({
+    media: input.media,
+    mimeTypes: getDirectMimeTypes(container),
+  })
+}
+
+function buildDirectAudioPlaybackChecks(input: {
   fileName: string
   media: WatchPayload["media"]
   selectedAudioStream: MediaStreamInfo | undefined
 }) {
-  if (!input.media.audioStreams.length) {
-    return true
-  }
+  const container = getMediaContainer(input.fileName, input.media.container)
 
-  if (!input.selectedAudioStream) {
-    return false
-  }
+  return buildAudioPlaybackChecks({
+    mimeTypes: getDirectAudioMimeTypes(container),
+    selectedAudioStream: input.selectedAudioStream,
+  })
+}
 
-  const checks = buildDirectAudioPlaybackChecks(input)
+function buildDirectMp4PlaybackChecks(input: {
+  media: WatchPayload["media"]
+  selectedAudioStream: MediaStreamInfo | undefined
+}) {
+  return buildPlaybackChecks({
+    media: input.media,
+    mimeTypes: ["video/mp4"],
+    selectedAudioStream: input.selectedAudioStream,
+  })
+}
 
-  if (checks.length > 0 && canPlayAny(input.video, checks)) {
-    return true
-  }
+function buildDirectMp4VideoPlaybackChecks(input: {
+  media: WatchPayload["media"]
+}) {
+  return buildVideoPlaybackChecks({
+    media: input.media,
+    mimeTypes: ["video/mp4"],
+  })
+}
 
-  return isOptimisticDirectAudioCandidate(input)
+function buildDirectMp4AudioPlaybackChecks(input: {
+  selectedAudioStream: MediaStreamInfo | undefined
+}) {
+  return buildAudioPlaybackChecks({
+    mimeTypes: ["audio/mp4"],
+    selectedAudioStream: input.selectedAudioStream,
+  })
+}
+
+function canPlayContainer(video: HTMLVideoElement | null, mimeTypes: string[]) {
+  return canPlayAny(video, mimeTypes)
 }
 
 function supportsDirectPlayback(input: {
-  video: HTMLVideoElement
+  video?: HTMLVideoElement | null
   fileName: string
   media: WatchPayload["media"]
   selectedAudioStream: MediaStreamInfo | undefined
 }) {
-  const checks = buildDirectPlaybackChecks(input)
+  const video = getPlaybackProbeVideo(input.video)
 
-  if (checks.length && canPlayAny(input.video, checks)) {
-    return true
-  }
-
-  return (
-    supportsDirectVideoTrack(input) &&
-    supportsDirectAudioTrack(input)
-  )
+  return canPlayAny(video, buildDirectPlaybackChecks(input))
 }
 
-function getDirectAudioRemuxContainer(fileName: string) {
-  return getMediaContainer(fileName, undefined) === "webm" ? "webm" : "mp4"
+function supportsDirectVideoTrack(input: {
+  video?: HTMLVideoElement | null
+  fileName: string
+  media: WatchPayload["media"]
+}) {
+  const video = getPlaybackProbeVideo(input.video)
+
+  return canPlayAny(video, buildDirectVideoPlaybackChecks(input))
 }
 
-function isOptimisticLocalDirectPlaybackCandidate(input: {
+function supportsDirectAudioTrack(input: {
   fileName: string
   media: WatchPayload["media"]
   selectedAudioStream: MediaStreamInfo | undefined
-  directAudioRemuxActive: boolean
 }) {
-  const container = input.directAudioRemuxActive
-    ? getDirectAudioRemuxContainer(input.fileName)
-    : getMediaContainer(input.fileName, input.media.container)
-
-  if (container !== "mp4" && container !== "mov") {
-    return false
-  }
-
-  const videoCodec = normalizeCodecName(input.media.videoCodec)
-  const videoSupported =
-    videoCodec === "h264" ||
-    videoCodec === "avc1" ||
-    videoCodec === "hevc" ||
-    videoCodec === "h265" ||
-    videoCodec === "hvc1" ||
-    videoCodec === "hev1"
-
-  if (!videoSupported) {
-    return false
-  }
-
   if (!input.media.audioStreams.length) {
     return true
   }
 
-  const audioCodec = normalizeCodecName(input.selectedAudioStream?.codec)
-
-  return (
-    audioCodec === "aac" ||
-    audioCodec === "mp3" ||
-    audioCodec === "mp2" ||
-    audioCodec === "mp1" ||
-    audioCodec === "ac3" ||
-    audioCodec === "eac3"
-  )
+  return canPlayAny(getPlaybackProbeAudio(), buildDirectAudioPlaybackChecks(input))
 }
 
-function supportsLocalDirectPlayback(input: {
-  video: HTMLVideoElement
+function supportsDirectCompatibleMp4Playback(input: {
+  video?: HTMLVideoElement | null
+  media: WatchPayload["media"]
+  selectedAudioStream: MediaStreamInfo | undefined
+}) {
+  const video = getPlaybackProbeVideo(input.video)
+
+  return canPlayAny(video, buildDirectMp4PlaybackChecks(input))
+}
+
+function supportsDirectCompatibleMp4VideoTrack(input: {
+  video?: HTMLVideoElement | null
+  media: WatchPayload["media"]
+}) {
+  const video = getPlaybackProbeVideo(input.video)
+
+  return canPlayAny(video, buildDirectMp4VideoPlaybackChecks(input))
+}
+
+function supportsDirectCompatibleMp4AudioTrack(input: {
+  media: WatchPayload["media"]
+  selectedAudioStream: MediaStreamInfo | undefined
+}) {
+  if (!input.media.audioStreams.length) {
+    return true
+  }
+
+  return canPlayAny(getPlaybackProbeAudio(), buildDirectMp4AudioPlaybackChecks(input))
+}
+
+function getLocalPlaybackSupport(input: {
+  video?: HTMLVideoElement | null
+  fileName: string
+  media: WatchPayload["media"]
+  selectedAudioStream: MediaStreamInfo | undefined
+}) {
+  const video = getPlaybackProbeVideo(input.video)
+  const sourceContainer = getMediaContainer(input.fileName, input.media.container)
+  const sourceMimeTypes = getDirectMimeTypes(sourceContainer)
+
+  return {
+    source: {
+      container: canPlayContainer(video, sourceMimeTypes),
+      video: supportsDirectVideoTrack({
+        video,
+        fileName: input.fileName,
+        media: input.media,
+      }),
+      audio: supportsDirectAudioTrack({
+        fileName: input.fileName,
+        media: input.media,
+        selectedAudioStream: input.selectedAudioStream,
+      }),
+      playback: supportsDirectPlayback({
+        video,
+        fileName: input.fileName,
+        media: input.media,
+        selectedAudioStream: input.selectedAudioStream,
+      }),
+    },
+    mp4: {
+      container: canPlayContainer(video, ["video/mp4"]),
+      video: supportsDirectCompatibleMp4VideoTrack({
+        video,
+        media: input.media,
+      }),
+      audio: supportsDirectCompatibleMp4AudioTrack({
+        media: input.media,
+        selectedAudioStream: input.selectedAudioStream,
+      }),
+      playback: supportsDirectCompatibleMp4Playback({
+        video,
+        media: input.media,
+        selectedAudioStream: input.selectedAudioStream,
+      }),
+    },
+  }
+}
+
+function canTryOptimisticMp4AudioCopy(input: {
+  media: WatchPayload["media"]
+  selectedAudioStream: MediaStreamInfo | undefined
+}) {
+  if (!input.media.audioStreams.length) {
+    return true
+  }
+
+  switch (normalizeCodecName(input.selectedAudioStream?.codec)) {
+    case "aac":
+    case "mp4a":
+    case "mp3":
+    case "ac3":
+    case "eac3":
+    case "alac":
+    case "opus":
+      return true
+    default:
+      return false
+  }
+}
+
+function shouldPreferMp4Remux(input: {
+  sourceContainer: string
+  mp4ContainerSupported: boolean
+  mp4VideoSupported: boolean
+  canCopyAudioToMp4: boolean
+}) {
+  if (
+    !input.mp4ContainerSupported ||
+    !input.mp4VideoSupported ||
+    !input.canCopyAudioToMp4
+  ) {
+    return false
+  }
+
+  switch (input.sourceContainer) {
+    case "mp4":
+    case "mov":
+    case "3gpp":
+    case "3gpp2":
+      return false
+    case "webm":
+    case "matroska":
+    case "avi":
+    case "mpegts":
+    case "mpeg":
+    case "ogg":
+    case "flv":
+    case "asf":
+    case "unknown":
+      return true
+    default:
+      return false
+  }
+}
+
+function getLocalDirectStreamMode(input: {
+  video?: HTMLVideoElement | null
   fileName: string
   media: WatchPayload["media"]
   selectedAudioStream: MediaStreamInfo | undefined
   directAudioRemuxActive: boolean
 }) {
-  if (supportsDirectPlayback(input)) {
-    return true
+  const support = getLocalPlaybackSupport(input)
+  const sourceContainer = getMediaContainer(input.fileName, input.media.container)
+  const canCopyAudioToMp4 = canTryOptimisticMp4AudioCopy({
+    media: input.media,
+    selectedAudioStream: input.selectedAudioStream,
+  })
+  const canUseMp4AudioCopy =
+    support.mp4.playback ||
+    (support.mp4.container && support.mp4.video && canCopyAudioToMp4)
+  const prefersMp4Remux = shouldPreferMp4Remux({
+    sourceContainer,
+    mp4ContainerSupported: support.mp4.container,
+    mp4VideoSupported: support.mp4.video,
+    canCopyAudioToMp4,
+  })
+  const decision = prefersMp4Remux
+    ? "mp4-remux"
+    : !input.directAudioRemuxActive && support.source.playback
+      ? "plain"
+      : input.directAudioRemuxActive && support.source.playback
+        ? "source-remux"
+        : canUseMp4AudioCopy
+          ? "mp4-remux"
+          : support.mp4.container && support.mp4.video
+            ? "audio-transcode"
+            : "transcode"
+
+  switch (decision) {
+    case "plain":
+    case "source-remux":
+    case "mp4-remux":
+    case "audio-transcode":
+      return decision
+    case "transcode":
+      return null
+  }
+}
+
+function getLocalDirectAudioMode(mode: LocalDirectStreamMode | null): DirectAudioMode | null {
+  if (mode === "audio-transcode") {
+    return "aac"
   }
 
-  return isOptimisticLocalDirectPlaybackCandidate(input)
+  if (mode === "source-remux" || mode === "mp4-remux") {
+    return "copy"
+  }
+
+  return null
+}
+
+function getLocalDirectContainerMode(
+  mode: LocalDirectStreamMode | null
+): DirectContainerMode | null {
+  if (mode === "source-remux") {
+    return "source"
+  }
+
+  if (mode === "mp4-remux" || mode === "audio-transcode") {
+    return "mp4"
+  }
+
+  return null
+}
+
+function supportsLocalDirectPlayback(input: {
+  video?: HTMLVideoElement | null
+  fileName: string
+  media: WatchPayload["media"]
+  selectedAudioStream: MediaStreamInfo | undefined
+  directAudioRemuxActive: boolean
+}) {
+  return getLocalDirectStreamMode(input) !== null
 }
 
 function isAndroidBrowser() {
@@ -1095,6 +1367,8 @@ function withStreamParams(
     audioStreamId?: string | null
     startTime?: number | null
     clientId?: string | null
+    directAudioMode?: DirectAudioMode | null
+    directContainerMode?: DirectContainerMode | null
   }
 ) {
   const url = new URL(sourceUrl, getUrlBase())
@@ -1103,6 +1377,18 @@ function withStreamParams(
     url.searchParams.set("audio", input.audioStreamId)
   } else {
     url.searchParams.delete("audio")
+  }
+
+  if (input.directAudioMode) {
+    url.searchParams.set("audioMode", input.directAudioMode)
+  } else {
+    url.searchParams.delete("audioMode")
+  }
+
+  if (input.directContainerMode) {
+    url.searchParams.set("containerMode", input.directContainerMode)
+  } else {
+    url.searchParams.delete("containerMode")
   }
 
   if (input.clientId) {
@@ -1670,7 +1956,7 @@ function statusLabel(status: PlaybackStatusState) {
   }
 
   if (status === "blocked") {
-    return "Blocked"
+    return "Playback failed"
   }
 
   return "Checking"
@@ -1690,15 +1976,13 @@ function formatContainerForStats(input: {
   status: PlaybackStatusState
   fileName: string
   media: WatchPayload["media"]
-  directAudioRemuxActive: boolean
+  directContainerMode: DirectContainerMode | null
 }) {
-  if (input.status === "transcoding") {
+  if (input.status === "transcoding" || input.directContainerMode === "mp4") {
     return "MP4"
   }
 
-  const container = input.directAudioRemuxActive
-    ? getDirectAudioRemuxContainer(input.fileName)
-    : getMediaContainer(input.fileName, input.media.container)
+  const container = getMediaContainer(input.fileName, input.media.container)
 
   if (container === "mp4") {
     return "MP4"
@@ -1764,8 +2048,13 @@ function formatVideoCodecForStats(input: {
 function formatAudioCodecForStats(input: {
   status: PlaybackStatusState
   audioStream: MediaStreamInfo | undefined
+  directAudioMode: DirectAudioMode | null
 }) {
   if (input.status === "transcoding") {
+    return "Opus"
+  }
+
+  if (input.directAudioMode === "aac") {
     return "AAC-LC"
   }
 
@@ -2087,6 +2376,7 @@ export function AnimePlayer({
   const handledPriorityActionsRef = useRef<Set<string>>(new Set())
   const seekPreviewFrameTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const subtitleAnimationFrameRef = useRef<number | null>(null)
+  const subtitleRequestIdRef = useRef(0)
   const streamStatsSampleRef = useRef<{
     bufferedEnd: number
     sampledAt: number
@@ -2204,6 +2494,15 @@ export function AnimePlayer({
     media.directAudioStreamId
   )
   const localDirectAudioRemuxActive = directAudioRemuxActive
+  const localDirectStreamMode = getLocalDirectStreamMode({
+    fileName,
+    media,
+    selectedAudioStream: playbackAudioStream,
+    directAudioRemuxActive: localDirectAudioRemuxActive,
+  })
+  const localDirectAudioMode = getLocalDirectAudioMode(localDirectStreamMode)
+  const localDirectContainerMode = getLocalDirectContainerMode(localDirectStreamMode)
+  const localDirectTransformActive = localDirectAudioMode !== null
   const supportedSubtitleStreams = useMemo(
     () => media.subtitleStreams.filter((stream) => stream.isSupported),
     [media.subtitleStreams]
@@ -2235,7 +2534,7 @@ export function AnimePlayer({
         status,
         fileName,
         media,
-        directAudioRemuxActive,
+        directContainerMode: localDirectContainerMode,
       }),
       videoCodec: formatVideoCodecForStats({
         status,
@@ -2244,6 +2543,7 @@ export function AnimePlayer({
       audioCodec: formatAudioCodecForStats({
         status,
         audioStream: playbackAudioStream,
+        directAudioMode: localDirectAudioMode,
       }),
       subtitleFormat: formatSubtitleFormatForStats(selectedSubtitleStream),
       downloadBitrateMbps: currentDownloadBitrateMbps,
@@ -2257,7 +2557,8 @@ export function AnimePlayer({
       bufferedTime,
       currentDownloadBitrateMbps,
       currentTime,
-      directAudioRemuxActive,
+      localDirectAudioMode,
+      localDirectContainerMode,
       displayMethod,
       fileName,
       media,
@@ -2609,7 +2910,7 @@ export function AnimePlayer({
     if (
       !sourceUrl ||
       statusRef.current !== "direct" ||
-      localDirectAudioRemuxActive ||
+      localDirectTransformActive ||
       preloadRangeFetchingRef.current
     ) {
       return
@@ -2620,7 +2921,7 @@ export function AnimePlayer({
         !probe?.rangeable ||
         sourceUrlRef.current !== sourceUrl ||
         statusRef.current !== "direct" ||
-        localDirectAudioRemuxActive ||
+        localDirectTransformActive ||
         isAnyCastingRef() ||
         preloadRangeFetchingRef.current
       ) {
@@ -3096,7 +3397,7 @@ export function AnimePlayer({
     isCasting,
     isNativeRemoteCasting,
     isServerCasting,
-    localDirectAudioRemuxActive,
+    localDirectTransformActive,
     sourceUrl,
     status,
   ])
@@ -3274,6 +3575,14 @@ export function AnimePlayer({
   }, [])
 
   const getPlaybackPosition = useCallback(() => {
+    if (
+      isCastingRef.current ||
+      isServerCastingRef.current ||
+      isNativeRemoteCastingRef.current
+    ) {
+      return currentTimeRef.current
+    }
+
     return getPlaybackClockPosition(videoRef.current)
   }, [getPlaybackClockPosition])
 
@@ -3346,11 +3655,25 @@ export function AnimePlayer({
   const getDirectUrl = useCallback(
     (startTime?: number) =>
       withStreamParams(playback.directUrl, {
-        audioStreamId: selectedAudioStreamId,
-        startTime: directAudioRemuxActive ? startTime : null,
+        audioStreamId: localDirectTransformActive
+          ? selectedAudioStreamId
+          : isIosDevice
+            ? null
+            : selectedAudioStreamId,
+        startTime: localDirectTransformActive ? startTime : null,
         clientId: stableClientStreamId,
+        directAudioMode: localDirectAudioMode,
+        directContainerMode: localDirectContainerMode,
       }),
-    [directAudioRemuxActive, playback.directUrl, selectedAudioStreamId, stableClientStreamId]
+    [
+      localDirectAudioMode,
+      localDirectContainerMode,
+      localDirectTransformActive,
+      isIosDevice,
+      playback.directUrl,
+      selectedAudioStreamId,
+      stableClientStreamId,
+    ]
   )
 
   const getTranscodeUrl = useCallback(
@@ -3403,7 +3726,7 @@ export function AnimePlayer({
     const useWebVideoCasterSourceList = canExposeWebVideoCasterSources
     const sourceUsesOffset =
       nextStatus === "transcoding" ||
-      (!useWebVideoCasterSourceList && localDirectAudioRemuxActive)
+      (!useWebVideoCasterSourceList && localDirectTransformActive)
     const sourceStartTime = sourceUsesOffset
       ? options.transcodeStartTime ?? previousPosition
       : 0
@@ -3412,7 +3735,7 @@ export function AnimePlayer({
         ? selectedAudioStreamId
         : useWebVideoCasterSourceList
           ? null
-          : sourceUsesOffset
+          : localDirectTransformActive
             ? selectedAudioStreamId
             : isIosDevice
               ? null
@@ -3422,11 +3745,15 @@ export function AnimePlayer({
           audioStreamId: sourceAudioStreamId,
           startTime: sourceStartTime,
           clientId: clientStreamIdRef.current,
+          directAudioMode: nextStatus === "direct" ? localDirectAudioMode : null,
+          directContainerMode: nextStatus === "direct" ? localDirectContainerMode : null,
         })
       : withStreamParams(nextSourceUrl, {
           audioStreamId: sourceAudioStreamId,
           startTime: null,
           clientId: clientStreamIdRef.current,
+          directAudioMode: nextStatus === "direct" ? localDirectAudioMode : null,
+          directContainerMode: nextStatus === "direct" ? localDirectContainerMode : null,
         })
     const shouldResume =
       Boolean(video && !video.paused) ||
@@ -3675,26 +4002,48 @@ export function AnimePlayer({
   }, [beginMediaWait, sourceUrl])
 
   useEffect(() => {
-    let cancelled = false
+    const requestId = subtitleRequestIdRef.current + 1
+    const controller = new AbortController()
+    let clearStateTimer: number | null = null
 
-    subtitleCuesRef.current = []
-    activeSubtitleKeyRef.current = ""
-
-    const resetTimer = window.setTimeout(() => {
-      if (!cancelled) {
-        setSubtitleCues([])
-        setActiveSubtitleTexts([])
-      }
-    }, 0)
-
-    if (!selectedSubtitleStream || !subtitleTrackUrl) {
-      return () => {
-        cancelled = true
-        window.clearTimeout(resetTimer)
+    const clearPendingSubtitleState = () => {
+      if (clearStateTimer !== null) {
+        window.clearTimeout(clearStateTimer)
+        clearStateTimer = null
       }
     }
 
-    void fetch(subtitleTrackUrl, { cache: "no-store" })
+    const scheduleSubtitleStateClear = () => {
+      clearPendingSubtitleState()
+
+      clearStateTimer = window.setTimeout(() => {
+        clearStateTimer = null
+
+        if (controller.signal.aborted || subtitleRequestIdRef.current !== requestId) {
+          return
+        }
+
+        setSubtitleCues([])
+        setActiveSubtitleTexts([])
+      }, 0)
+    }
+
+    subtitleRequestIdRef.current = requestId
+    subtitleCuesRef.current = []
+    activeSubtitleKeyRef.current = ""
+    scheduleSubtitleStateClear()
+
+    if (!selectedSubtitleStream || !subtitleTrackUrl) {
+      return () => {
+        clearPendingSubtitleState()
+        controller.abort()
+      }
+    }
+
+    void fetch(subtitleTrackUrl, {
+      cache: "no-store",
+      signal: controller.signal,
+    })
       .then(async (response) => {
         if (!response.ok) {
           throw new Error(`Subtitle request failed with status ${response.status}`)
@@ -3703,35 +4052,35 @@ export function AnimePlayer({
         return response.text()
       })
       .then((text) => {
-        if (!cancelled) {
-          const cues = parseWebVtt(text)
-
-          if (!cues.length && subtitleCuesRef.current.length) {
-            return
-          }
-
-          subtitleCuesRef.current = cues
-          setSubtitleCues(cues)
-          syncSubtitleOverlay()
+        if (controller.signal.aborted || subtitleRequestIdRef.current !== requestId) {
+          return
         }
+
+        clearPendingSubtitleState()
+
+        const cues = parseWebVtt(text)
+        subtitleCuesRef.current = cues
+        setSubtitleCues(cues)
+        syncSubtitleOverlay(getPlaybackPosition())
       })
       .catch((error) => {
-        if (!cancelled) {
-          if (!subtitleCuesRef.current.length) {
-            activeSubtitleKeyRef.current = ""
-            setSubtitleCues([])
-            setActiveSubtitleTexts([])
-          }
-
-          console.error(error)
+        if (controller.signal.aborted || subtitleRequestIdRef.current !== requestId) {
+          return
         }
+
+        clearPendingSubtitleState()
+        activeSubtitleKeyRef.current = ""
+        subtitleCuesRef.current = []
+        setSubtitleCues([])
+        setActiveSubtitleTexts([])
+        console.error(error)
       })
 
     return () => {
-      cancelled = true
-      window.clearTimeout(resetTimer)
+      clearPendingSubtitleState()
+      controller.abort()
     }
-  }, [selectedSubtitleStream, subtitleTrackUrl, syncSubtitleOverlay])
+  }, [getPlaybackPosition, selectedSubtitleStream, subtitleTrackUrl, syncSubtitleOverlay])
 
   useEffect(() => {
     subtitleCuesRef.current = subtitleCues
@@ -3749,7 +4098,7 @@ export function AnimePlayer({
   useEffect(() => {
     clearSubtitleAnimationFrame()
 
-    if (!subtitleCues.length || isCasting) {
+    if (!subtitleCues.length || isCasting || isServerCasting || isNativeRemoteCasting) {
       activeSubtitleKeyRef.current = ""
       const timer = window.setTimeout(() => {
         setActiveSubtitleTexts([])
@@ -3769,6 +4118,8 @@ export function AnimePlayer({
   }, [
     clearSubtitleAnimationFrame,
     isCasting,
+    isNativeRemoteCasting,
+    isServerCasting,
     sourceUrl,
     subtitleCues,
     syncSubtitleOverlay,
@@ -4217,6 +4568,39 @@ export function AnimePlayer({
     )
   }
 
+  function sourceUrlUsesDirectTransform(sourceUrl: string | null) {
+    if (!sourceUrl) {
+      return false
+    }
+
+    try {
+      const url = new URL(sourceUrl, getUrlBase())
+
+      return (
+        url.searchParams.has("audioMode") ||
+        url.searchParams.has("containerMode")
+      )
+    } catch {
+      return sourceUrl.includes("audioMode=") || sourceUrl.includes("containerMode=")
+    }
+  }
+
+  function fallbackDirectToCompatibilityStream() {
+    if (
+      !localDirectTransformActive ||
+      sourceUrlUsesDirectTransform(sourceUrlRef.current)
+    ) {
+      return false
+    }
+
+    switchSourceRef.current(getDirectUrl(getPlaybackPosition()), "direct", {
+      preservePosition: true,
+      waitForMedia: isPlaying || autoPlay || isPlayingRef.current,
+    })
+
+    return true
+  }
+
   function fallbackDirectToTranscode() {
     directFallbackAttemptedRef.current = true
 
@@ -4241,12 +4625,30 @@ export function AnimePlayer({
     setIsPlaying(false)
     endMediaWait()
 
-    if (!shouldFallbackDirectPlaybackFailure()) {
-      return false
+    if (shouldFallbackDirectPlaybackFailure()) {
+      if (fallbackDirectToCompatibilityStream()) {
+        return true
+      }
+
+      fallbackDirectToTranscode()
+      return true
     }
 
-    fallbackDirectToTranscode()
-    return true
+    if (
+      statusRef.current === "direct" &&
+      quality === "original" &&
+      liveTranscodeEnabled &&
+      !canExposeWebVideoCasterSources
+    ) {
+      if (fallbackDirectToCompatibilityStream()) {
+        return true
+      }
+
+      fallbackDirectToTranscode()
+      return true
+    }
+
+    return false
   }
 
   function isCurrentLocalVideoSource(video: HTMLVideoElement) {
@@ -4435,7 +4837,7 @@ export function AnimePlayer({
 
     const target = clampTime(seconds, duration)
 
-    if (statusRef.current === "transcoding" || directAudioRemuxActive) {
+    if (statusRef.current === "transcoding" || localDirectTransformActive) {
       const wasPlaying = !video.paused || isPlayingRef.current
       const nextStatus = statusRef.current === "transcoding" ? "transcoding" : "direct"
       const nextSourceUrl =
@@ -4632,6 +5034,10 @@ export function AnimePlayer({
     return new URL(castUrl, window.location.href).toString()
   }
 
+  function getCastSubtitleTrackId(stream: WatchPayload["media"]["subtitleStreams"][number]) {
+    return stream.index >= 0 ? stream.index + 1 : 10000
+  }
+
   function getSelectedCastTextTrack(offsetSeconds = 0) {
     if (!selectedSubtitleStream) {
       return undefined
@@ -4644,7 +5050,7 @@ export function AnimePlayer({
     )
 
     return {
-      id: selectedSubtitleStream.index + 1,
+      id: getCastSubtitleTrackId(selectedSubtitleStream),
       language: selectedSubtitleStream.language,
       label: subtitleLanguageLabel(selectedSubtitleStream.language),
       url: trackUrl,
@@ -5831,10 +6237,19 @@ export function AnimePlayer({
       nextAudioStreamId,
       media.directAudioStreamId
     )
+    const nextLocalDirectStreamMode = getLocalDirectStreamMode({
+      video,
+      fileName,
+      media,
+      selectedAudioStream: nextAudioStream,
+      directAudioRemuxActive: nextDirectAudioRemuxActive,
+    })
+    const nextLocalDirectTransformActive =
+      getLocalDirectAudioMode(nextLocalDirectStreamMode) !== null
     const sourceWillReload =
       statusRef.current === "transcoding" ||
       (statusRef.current === "direct" &&
-        (directAudioRemuxActive || nextDirectAudioRemuxActive))
+        (localDirectTransformActive || nextLocalDirectTransformActive))
 
     shouldAutoPlaySourceRef.current = wasPlaying
 
@@ -5852,7 +6267,7 @@ export function AnimePlayer({
         media.audioStreams
       )
 
-      if (!switchedTrack && nextDirectAudioRemuxActive && wasPlaying) {
+      if (!switchedTrack && nextLocalDirectTransformActive && wasPlaying) {
         beginMediaWait(false)
       }
     }
@@ -6156,6 +6571,11 @@ export function AnimePlayer({
             }
 
             if (handleLocalPlaybackFailure()) {
+              return
+            }
+
+            if (statusRef.current !== "transcoding" && liveTranscodeEnabled) {
+              fallbackDirectToTranscode()
               return
             }
 
@@ -6691,7 +7111,7 @@ export function AnimePlayer({
               <Loader2 className="size-12 animate-spin text-white/80" />
               {showHardwareWait ? (
                 <div className="rounded-lg border border-orange-400/40 bg-orange-500/15 px-3 py-2 text-sm font-medium text-orange-100">
-                  Waiting for available Hardware Slot
+                  Waiting for live transcode slot
                 </div>
               ) : null}
             </div>

@@ -9,6 +9,7 @@ import type { PlaybackProfile } from "@/lib/types"
 import {
   getServerConfig,
   type FileEncodeAcceleration,
+  type ImportEncoding,
   type TranscodeAcceleration,
 } from "@/server/config"
 
@@ -16,9 +17,11 @@ let cachedAmdVaapiDevice: string | undefined
 let cachedQsvDevice: string | undefined
 
 const targetAacBitrate = "320k"
+const targetOpusBitrate = "320k"
 
+export const mp4FileExtension = ".mp4"
+export const mp4OutputFormat = "mp4"
 export const webmFileExtension = ".webm"
-export const webmOutputFormat = "webm"
 
 function isHardwareAcceleration(acceleration: TranscodeAcceleration) {
   return acceleration !== "cpu"
@@ -34,6 +37,19 @@ export function getLcAacStereoArgs() {
     targetAacBitrate,
     "-ac",
     "2",
+  ]
+}
+
+export function getOpusStereoArgs() {
+  return [
+    "-c:a",
+    "libopus",
+    "-b:a",
+    targetOpusBitrate,
+    "-ac",
+    "2",
+    "-vbr",
+    "on",
   ]
 }
 
@@ -56,6 +72,9 @@ export async function ffprobe(file: string) {
   return JSON.parse(stdout) as unknown
 }
 
+const ffmpegFatalStderrPatterns = [/cannot allocate memory/i]
+const ffmpegStderrTailMaxLength = 8000
+
 export function runFfmpeg(
   args: string[],
   options: {
@@ -68,8 +87,61 @@ export function runFfmpeg(
   const child = execa(config.ffmpegPath, args, {
     windowsHide: true,
     stdin: "ignore",
+    stdout: "ignore",
+    stderr: "pipe",
+    buffer: false,
     cleanup: !options.protectFromParentSignals,
     detached: options.protectFromParentSignals,
+  })
+  let stderrTail = ""
+  let fatalStderrDetected = false
+  let processExited = false
+
+  const terminateFfmpeg = () => {
+    if (processExited) {
+      return
+    }
+
+    child.kill("SIGTERM")
+    setTimeout(() => {
+      if (!processExited) {
+        child.kill("SIGKILL")
+      }
+    }, 1000)
+  }
+
+  child.once("exit", () => {
+    processExited = true
+  })
+
+  child.stderr?.on("data", (chunk: Buffer | string) => {
+    const text = chunk.toString()
+    stderrTail = `${stderrTail}${text}`.slice(-ffmpegStderrTailMaxLength)
+
+    if (fatalStderrDetected) {
+      return
+    }
+
+    if (!ffmpegFatalStderrPatterns.some((pattern) => pattern.test(text))) {
+      return
+    }
+
+    fatalStderrDetected = true
+    terminateFfmpeg()
+  })
+
+  void child.catch((error: unknown) => {
+    if (
+      error &&
+      typeof error === "object" &&
+      !("stderr" in error) &&
+      stderrTail.trim()
+    ) {
+      Object.defineProperty(error, "stderr", {
+        value: stderrTail,
+        configurable: true,
+      })
+    }
   })
 
   if (options.priorityRole === "import-encoding") {
@@ -106,17 +178,18 @@ function getQsvDevice() {
 }
 
 function getAmdBackend() {
-  if (process.platform === "win32") {
-    return "amf"
-  }
+  switch (process.platform) {
+    case "win32":
+      return "amf"
 
-  if (process.platform === "linux") {
-    return "vaapi"
-  }
+    case "linux":
+      return "vaapi"
 
-  throw new Error(
-    `AMD transcoding is only supported on Windows or Linux. Current platform: ${process.platform}`
-  )
+    default:
+      throw new Error(
+        `AMD transcoding is only supported on Windows or Linux. Current platform: ${process.platform}`
+      )
+  }
 }
 
 export function getHardwareInputArgs(
@@ -132,7 +205,8 @@ export function getHardwareInputArgs(
 
     case "intel_gpu":
     case "intel_cpu": {
-      const deviceArgs = process.platform === "linux" ? ["-qsv_device", getQsvDevice()] : []
+      const deviceArgs =
+        process.platform === "linux" ? ["-qsv_device", getQsvDevice()] : []
 
       return options.keepFramesOnDevice
         ? [...deviceArgs, "-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
@@ -140,26 +214,25 @@ export function getHardwareInputArgs(
     }
 
     case "amd_gpu":
-    case "amd_cpu": {
-      const backend = getAmdBackend()
+    case "amd_cpu":
+      switch (getAmdBackend()) {
+        case "amf":
+          return options.keepFramesOnDevice
+            ? ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"]
+            : ["-hwaccel", "d3d11va"]
 
-      if (backend === "amf") {
-        return options.keepFramesOnDevice
-          ? ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"]
-          : ["-hwaccel", "d3d11va"]
+        case "vaapi":
+          return options.keepFramesOnDevice
+            ? [
+                "-vaapi_device",
+                getAmdVaapiDevice(),
+                "-hwaccel",
+                "vaapi",
+                "-hwaccel_output_format",
+                "vaapi",
+              ]
+            : ["-vaapi_device", getAmdVaapiDevice(), "-hwaccel", "vaapi"]
       }
-
-      return options.keepFramesOnDevice
-        ? [
-            "-vaapi_device",
-            getAmdVaapiDevice(),
-            "-hwaccel",
-            "vaapi",
-            "-hwaccel_output_format",
-            "vaapi",
-          ]
-        : ["-vaapi_device", getAmdVaapiDevice(), "-hwaccel", "vaapi"]
-    }
 
     case "cpu":
       return []
@@ -242,7 +315,34 @@ export function getFileHardwareInputArgs(input: {
   inputVideoCodec?: string | null
   keepFramesOnDevice?: boolean
 }) {
-  return getHardwareInputArgsForCodec(input)
+  const config = getServerConfig()
+
+  switch (config.transcodeAccel) {
+    case "nvenc":
+    case "intel_gpu":
+    case "intel_cpu":
+      return getHardwareInputArgsForCodec({
+        inputVideoCodec: input.inputVideoCodec,
+        keepFramesOnDevice: input.keepFramesOnDevice,
+      })
+
+    case "amd_gpu":
+    case "amd_cpu":
+      switch (getAmdBackend()) {
+        case "amf":
+          return getHardwareInputArgs({
+            keepFramesOnDevice: input.keepFramesOnDevice,
+          })
+
+        case "vaapi":
+          return getHardwareInputArgs({ keepFramesOnDevice: true })
+      }
+
+    case "cpu":
+      return getHardwareInputArgs({
+        keepFramesOnDevice: input.keepFramesOnDevice,
+      })
+  }
 }
 
 export function getLiveTranscodeInputArgs(input: {
@@ -260,9 +360,13 @@ export function getLiveTranscodeInputArgs(input: {
 
     case "amd_gpu":
     case "amd_cpu":
-      return getAmdBackend() === "vaapi"
-        ? ["-vaapi_device", getAmdVaapiDevice()]
-        : getHardwareInputArgs()
+      switch (getAmdBackend()) {
+        case "amf":
+          return getHardwareInputArgs()
+
+        case "vaapi":
+          return getHardwareInputArgs({ keepFramesOnDevice: true })
+      }
 
     case "cpu":
       return getHardwareInputArgs()
@@ -280,9 +384,13 @@ export function getHardwareInputLabel() {
       return process.platform === "linux" ? `qsv:${getQsvDevice()}` : "qsv"
     case "amd_gpu":
     case "amd_cpu":
-      return getAmdBackend() === "amf"
-        ? "d3d11va/amf"
-        : `vaapi:${getAmdVaapiDevice()}`
+      switch (getAmdBackend()) {
+        case "amf":
+          return "d3d11va/amf"
+
+        case "vaapi":
+          return `vaapi:${getAmdVaapiDevice()}`
+      }
     case "cpu":
       return "none"
   }
@@ -318,8 +426,9 @@ function getLiveAvcEncoderArgs(acceleration: TranscodeAcceleration) {
 
     case "amd_gpu":
     case "amd_cpu":
-      return getAmdBackend() === "amf"
-        ? [
+      switch (getAmdBackend()) {
+        case "amf":
+          return [
             "-c:v",
             "h264_amf",
             "-usage",
@@ -327,7 +436,10 @@ function getLiveAvcEncoderArgs(acceleration: TranscodeAcceleration) {
             "-quality",
             "balanced",
           ]
-        : ["-c:v", "h264_vaapi"]
+
+        case "vaapi":
+          return ["-c:v", "h264_vaapi"]
+      }
 
     case "cpu":
       return ["-c:v", "libx264", "-preset", "superfast"]
@@ -354,8 +466,9 @@ function getAmdAv1EncoderArgs(input: {
 }) {
   const bitrateArgs = getFileVideoBitrateArgs(input)
 
-  return getAmdBackend() === "amf"
-    ? [
+  switch (getAmdBackend()) {
+    case "amf":
+      return [
         "-c:v",
         "av1_amf",
         "-usage",
@@ -366,7 +479,9 @@ function getAmdAv1EncoderArgs(input: {
         "vbr_peak",
         ...bitrateArgs,
       ]
-    : [
+
+    case "vaapi":
+      return [
         "-c:v",
         "av1_vaapi",
         "-rc_mode",
@@ -375,9 +490,43 @@ function getAmdAv1EncoderArgs(input: {
         "3",
         ...bitrateArgs,
       ]
+  }
 }
 
-export function getLiveMp4AvcAacLcArgs(
+function getAmdHevcEncoderArgs(input: {
+  videoBitrateKbps: number
+  maxVideoBitrateKbps: number
+}) {
+  const bitrateArgs = getFileVideoBitrateArgs(input)
+
+  switch (getAmdBackend()) {
+    case "amf":
+      return [
+        "-c:v",
+        "hevc_amf",
+        "-usage",
+        "high_quality",
+        "-quality",
+        "balanced",
+        "-rc",
+        "vbr_peak",
+        ...bitrateArgs,
+      ]
+
+    case "vaapi":
+      return [
+        "-c:v",
+        "hevc_vaapi",
+        "-rc_mode",
+        "VBR",
+        "-compression_level",
+        "3",
+        ...bitrateArgs,
+      ]
+  }
+}
+
+export function getLiveMp4AvcOpusArgs(
   _profile: PlaybackProfile,
   options: { audioStreamIndex?: number; sourceBitrateKbps?: number } = {}
 ) {
@@ -409,7 +558,9 @@ export function getLiveMp4AvcAacLcArgs(
     ...getLiveBrowserAvcArgs(config.transcodeAccel),
     "-tag:v",
     "avc1",
-    ...getLcAacStereoArgs(),
+    ...getOpusStereoArgs(),
+    "-strict",
+    "-2",
   ]
 }
 
@@ -451,32 +602,51 @@ function getLiveOriginalQualityArgs(
 }
 
 function getAmdLiveQualityArgs() {
-  if (getAmdBackend() === "amf") {
-    return ["-rc", "qvbr", "-qvbr_quality_level", "20"]
-  }
+  switch (getAmdBackend()) {
+    case "amf":
+      return ["-rc", "qvbr", "-qvbr_quality_level", "20"]
 
-  return ["-rc_mode", "VBR"]
+    case "vaapi":
+      return ["-rc_mode", "VBR"]
+  }
 }
 
 function getLiveAvcFormatArgs(acceleration: TranscodeAcceleration) {
   switch (acceleration) {
     case "nvenc":
       return ["-vf", "format=yuv420p"]
+
     case "intel_gpu":
     case "intel_cpu":
       return ["-vf", "format=nv12"]
+
     case "amd_gpu":
     case "amd_cpu":
-      return getAmdBackend() === "amf"
-        ? ["-vf", "format=yuv420p"]
-        : ["-vf", "format=nv12,hwupload"]
+      switch (getAmdBackend()) {
+        case "amf":
+          return ["-vf", "format=yuv420p"]
+
+        case "vaapi":
+          return ["-vf", "scale_vaapi=format=nv12"]
+      }
+
     case "cpu":
       return []
   }
 }
 
 function getLivePixelFormatArgs(acceleration: TranscodeAcceleration) {
-  return acceleration === "cpu" ? ["-pix_fmt", "yuv420p"] : []
+  switch (acceleration) {
+    case "cpu":
+      return ["-pix_fmt", "yuv420p"]
+
+    case "nvenc":
+    case "intel_gpu":
+    case "intel_cpu":
+    case "amd_gpu":
+    case "amd_cpu":
+      return []
+  }
 }
 
 function getLiveBrowserAvcArgs(acceleration: TranscodeAcceleration) {
@@ -505,9 +675,9 @@ function getAv1FileEncoderArgs(input: {
   videoBitrateKbps: number
   maxVideoBitrateKbps: number
 }) {
-  const config = getServerConfig()
+  const { transcodeAccel } = getServerConfig()
 
-  if (!isFileEncodeAcceleration(config.transcodeAccel)) {
+  if (!isFileEncodeAcceleration(transcodeAccel)) {
     throw new Error(
       "AV1 file encoding requires hardware acceleration. CPU AV1 encoding is deprecated."
     )
@@ -515,7 +685,7 @@ function getAv1FileEncoderArgs(input: {
 
   const bitrateArgs = getFileVideoBitrateArgs(input)
 
-  switch (config.transcodeAccel) {
+  switch (transcodeAccel) {
     case "nvenc":
       return [
         "-c:v",
@@ -563,7 +733,117 @@ function getAv1FileEncoderArgs(input: {
   }
 }
 
-export type WebmSubtitleOutputStream = {
+function getHevcFileEncoderArgs(input: {
+  videoBitrateKbps: number
+  maxVideoBitrateKbps: number
+}) {
+  const { transcodeAccel } = getServerConfig()
+
+  if (!isFileEncodeAcceleration(transcodeAccel)) {
+    throw new Error("HEVC file encoding requires hardware acceleration.")
+  }
+
+  const bitrateArgs = getFileVideoBitrateArgs(input)
+
+  switch (transcodeAccel) {
+    case "nvenc":
+      return [
+        "-c:v",
+        "hevc_nvenc",
+        "-preset",
+        "p4",
+        "-tune",
+        "hq",
+        "-rc:v",
+        "vbr",
+        "-cq:v",
+        "24",
+        ...bitrateArgs,
+        "-multipass",
+        "fullres",
+        "-spatial-aq",
+        "1",
+        "-temporal-aq",
+        "1",
+        "-aq-strength",
+        "8",
+        "-rc-lookahead",
+        "32",
+        "-bf",
+        "4",
+      ]
+
+    case "intel_gpu":
+    case "intel_cpu":
+      return [
+        "-c:v",
+        "hevc_qsv",
+        "-preset",
+        "medium",
+        "-async_depth",
+        "6",
+        "-global_quality:v",
+        "24",
+        ...bitrateArgs,
+      ]
+
+    case "amd_gpu":
+    case "amd_cpu":
+      return getAmdHevcEncoderArgs(input)
+  }
+}
+
+function getFileVideoEncoderArgs(input: {
+  importEncoding: ImportEncoding
+  videoBitrateKbps: number
+  maxVideoBitrateKbps: number
+}) {
+  switch (input.importEncoding) {
+    case "av1":
+      return getAv1FileEncoderArgs(input)
+    case "hevc":
+      return getHevcFileEncoderArgs(input)
+    case "none":
+      throw new Error("File encoding is disabled.")
+  }
+}
+
+function getFileVideoTagArgs(importEncoding: ImportEncoding) {
+  switch (importEncoding) {
+    case "av1":
+      return ["-tag:v", "av01"]
+    case "hevc":
+      return ["-tag:v", "hvc1"]
+    case "none":
+      return []
+  }
+}
+
+function getFileVideoFilterArgs(acceleration: TranscodeAcceleration) {
+  switch (acceleration) {
+    case "nvenc":
+      return []
+
+    case "intel_gpu":
+    case "intel_cpu":
+      return ["-vf", "format=nv12"]
+
+    case "amd_gpu":
+    case "amd_cpu":
+      switch (getAmdBackend()) {
+        case "amf":
+          return []
+
+        case "vaapi":
+          return ["-vf", "scale_vaapi=format=nv12"]
+      }
+
+    case "cpu":
+      return []
+  }
+}
+
+export type FileSubtitleOutputStream = {
   inputIndex: number
   streamIndex: number
   codec: "copy" | "webvtt"
@@ -573,16 +853,22 @@ export function getFileSubtitleInputArgs() {
   return ["-analyzeduration", "100M", "-probesize", "100M"]
 }
 
-export function getWebmFileArgs(input: {
+export function getMp4FileArgs(input: {
+  importEncoding: ImportEncoding
   videoBitrateKbps: number
   maxVideoBitrateKbps: number
   convertVideo: boolean
   audioOutputIndexesToOpus: number[]
-  subtitleStreams: WebmSubtitleOutputStream[]
+  fastStart?: boolean
 }) {
+  const config = getServerConfig()
   const videoArgs = input.convertVideo
-    ? getAv1FileEncoderArgs(input)
-    : ["-c:v", "copy"]
+    ? [
+        ...getFileVideoFilterArgs(config.transcodeAccel),
+        ...getFileVideoEncoderArgs(input),
+        ...getFileVideoTagArgs(input.importEncoding),
+      ]
+    : ["-c:v", "copy", ...getFileVideoTagArgs(input.importEncoding)]
   const audioArgs = [
     "-c:a",
     "copy",
@@ -591,40 +877,41 @@ export function getWebmFileArgs(input: {
       "libopus",
       `-b:a:${outputAudioIndex}`,
       "320k",
+      `-ac:a:${outputAudioIndex}`,
+      "2",
       `-vbr:a:${outputAudioIndex}`,
       "on",
     ]),
   ]
-  const subtitleMapArgs = input.subtitleStreams.flatMap((stream) => [
-    "-map",
-    `${stream.inputIndex}:${stream.streamIndex}`,
-  ])
-  const subtitleArgs = input.subtitleStreams.length
-    ? input.subtitleStreams.flatMap((stream, outputSubtitleIndex) => [
-        `-c:s:${outputSubtitleIndex}`,
-        stream.codec,
-      ])
-    : ["-sn"]
 
   return [
     "-map",
     "0:V:0",
     "-map",
     "0:a?",
-    ...subtitleMapArgs,
     "-map_metadata",
     "0",
     "-map_chapters",
     "0",
     ...videoArgs,
     ...audioArgs,
-    ...subtitleArgs,
+    "-sn",
     "-dn",
-    "-max_interleave_delta",
-    "1000000",
-    "-flush_packets",
-    "1",
+    ...(input.fastStart === false ? [] : ["-movflags", "+faststart"]),
+    "-strict",
+    "-2",
     "-f",
-    webmOutputFormat,
+    mp4OutputFormat,
+  ]
+}
+
+export function getWebVttSidecarFileArgs(stream: FileSubtitleOutputStream) {
+  return [
+    "-map",
+    `${stream.inputIndex}:${stream.streamIndex}`,
+    "-c:s",
+    stream.codec,
+    "-f",
+    "webvtt",
   ]
 }

@@ -20,7 +20,8 @@ import { getServerConfig } from "@/server/config"
 import { isLocalStreamBandwidthBypassRequest } from "@/server/http/request"
 import {
   ffprobe,
-  getLiveMp4AvcAacLcArgs,
+  getLcAacStereoArgs,
+  getLiveMp4AvcOpusArgs,
   getLiveTranscodeInputArgs,
 } from "@/server/media/ffmpeg"
 import { validateCastStreamToken } from "@/server/media/castTokens"
@@ -47,6 +48,9 @@ type ByteRange =
       end: number
     }
   | "invalid"
+
+type DirectAudioMode = "copy" | "aac" | null
+type DirectContainerMode = "source" | "mp4" | null
 
 const streamLogTtlMs = 30 * 60 * 1000
 const maxStreamPreloadCacheSeconds = 10 * 60
@@ -95,6 +99,10 @@ export async function HEAD(request: Request, context: StreamContext) {
   const url = new URL(request.url)
   const seasonNumber = parsePositiveInt(url.searchParams.get("season") ?? "1")
   const mode = getMode(url.searchParams.get("mode"))
+  const directAudioMode = mode === "direct" ? getDirectAudioMode(url.searchParams.get("audioMode")) : null
+  const directContainerMode = mode === "direct"
+    ? getDirectContainerMode(url.searchParams.get("containerMode"))
+    : null
   const clientId = parseClientId(url.searchParams.get("clientId"))
 
   if (!clientId) {
@@ -140,19 +148,28 @@ export async function HEAD(request: Request, context: StreamContext) {
     return jsonError("Media file not found.", 404)
   }
 
+  const directResponseContentType =
+    mode === "direct" && directAudioMode
+      ? getDirectRemuxTarget({
+          file: resolved.file,
+          audioMode: directAudioMode,
+          containerMode: directContainerMode,
+          inputVideoCodec: null,
+        }).contentType
+      : getDirectContentType(resolved.file)
   const headers = new Headers({
     ...streamCorsHeaders(),
-    "accept-ranges": mode === "direct" ? "bytes" : "none",
+    "accept-ranges": mode === "direct" && !directAudioMode ? "bytes" : "none",
     "cache-control": streamCacheControl,
     "content-disposition": getInlineContentDispositionForRequest(request, resolved.file, mode),
-    "content-type": mode === "direct" ? getDirectContentType(resolved.file) : "video/mp4",
+    "content-type": mode === "direct" ? directResponseContentType : "video/mp4",
     "x-content-type-options": "nosniff",
   })
 
   setDurationHeaders(headers, resolved.durationSeconds)
   setStreamSourceHeaders(headers, request, mode)
 
-  if (mode === "direct") {
+  if (mode === "direct" && !directAudioMode) {
     headers.set("content-length", String(resolved.size))
   }
 
@@ -170,8 +187,24 @@ function getProfile(): PlaybackProfile {
   return "original"
 }
 
+function getDirectAudioMode(value: string | null): DirectAudioMode {
+  if (value === "copy" || value === "aac") {
+    return value
+  }
+
+  return null
+}
+
+function getDirectContainerMode(value: string | null): DirectContainerMode {
+  if (value === "source" || value === "mp4") {
+    return value
+  }
+
+  return null
+}
+
 function liveTranscodingEnabled() {
-  return getServerConfig().transcodeAccel !== "cpu"
+  return true
 }
 
 function yieldToEventLoop() {
@@ -342,7 +375,7 @@ async function resolveStreamUser(input: {
 
 function logStreamStartOnce(input: {
   username: string
-  type: "direct" | "direct-remux" | "transcode"
+  type: "direct" | "direct-remux" | "direct-audio-transcode" | "transcode"
   animeId: string
   seasonNumber: number
   episodeNumber: number
@@ -507,6 +540,12 @@ function setDurationHeaders(headers: Headers, durationSeconds?: number) {
 
 function getInlineContentDisposition(file: string) {
   return getInlineContentDispositionForName(fileName(file))
+}
+
+function getInlineContentDispositionForGeneratedFile(file: string, extension: string) {
+  const baseName = fileName(file).replace(/\.[^.]+$/, "") || "Yamibunko"
+
+  return getInlineContentDispositionForName(`${baseName}${extension}`)
 }
 
 function getInlineContentDispositionForRequest(
@@ -714,19 +753,53 @@ async function handleDirect(input: StreamProgressTarget & {
   )
 }
 
-function getDirectRemuxTarget(file: string) {
-  const extension = path.extname(file).toLowerCase()
+function getDirectRemuxVideoTagArgs(inputVideoCodec?: string | null) {
+  const normalizedCodec = inputVideoCodec?.trim().toLowerCase().replace(/[._-]+/g, "") ?? ""
 
-  if (extension === ".webm") {
+  if (normalizedCodec === "av1" || normalizedCodec === "av01") {
+    return ["-tag:v", "av01"]
+  }
+
+  if (normalizedCodec === "h264" || normalizedCodec === "avc" || normalizedCodec === "avc1") {
+    return ["-tag:v", "avc1"]
+  }
+
+  if (
+    normalizedCodec === "hevc" ||
+    normalizedCodec === "h265" ||
+    normalizedCodec === "hvc1" ||
+    normalizedCodec === "hev1"
+  ) {
+    return ["-tag:v", "hvc1"]
+  }
+
+  return []
+}
+
+function getDirectRemuxTarget(input: {
+  file: string
+  audioMode: Exclude<DirectAudioMode, null>
+  containerMode?: DirectContainerMode
+  inputVideoCodec?: string | null
+}) {
+  const extension = path.extname(input.file).toLowerCase()
+  const useSourceContainer =
+    input.containerMode === "source" && input.audioMode !== "aac" && extension === ".webm"
+
+  if (useSourceContainer) {
     return {
       contentType: "video/webm",
+      extension: ".webm",
       args: ["-f", "webm"],
     }
   }
 
   return {
     contentType: "video/mp4",
+    extension: ".mp4",
     args: [
+      ...getDirectRemuxVideoTagArgs(input.inputVideoCodec),
+      ...(input.audioMode === "copy" ? ["-strict", "-2"] : []),
       "-movflags",
       "frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
       "-frag_duration",
@@ -758,21 +831,38 @@ async function handleDirectAudioRemux(input: StreamProgressTarget & {
   username: string
   profile: PlaybackProfile
   startSeconds: number
-  audioStreamIndex: number
+  audioStreamIndex?: number
+  audioMode: Exclude<DirectAudioMode, null>
+  containerMode: DirectContainerMode
+  inputVideoCodec?: string | null
   uploadLease: StreamUploadLease
 }) {
   const config = getServerConfig()
-  const target = getDirectRemuxTarget(input.file)
+  const target = getDirectRemuxTarget({
+    file: input.file,
+    audioMode: input.audioMode,
+    containerMode: input.containerMode,
+    inputVideoCodec: input.inputVideoCodec,
+  })
 
   logStreamStartOnce({
     username: input.username,
-    type: "direct-remux",
+    type: input.audioMode === "aac" ? "direct-audio-transcode" : "direct-remux",
     animeId: input.animeId,
     seasonNumber: input.seasonNumber,
     episodeNumber: input.episodeNumber,
     profile: input.profile,
     file: input.file,
   })
+
+  const audioMapArgs = Number.isInteger(input.audioStreamIndex)
+    ? ["-map", `0:${input.audioStreamIndex}`]
+    : []
+  const audioCodecArgs = audioMapArgs.length
+    ? input.audioMode === "aac"
+      ? getLcAacStereoArgs()
+      : ["-c:a", "copy"]
+    : []
 
   const child = spawn(
     config.ffmpegPath,
@@ -789,14 +879,12 @@ async function handleDirectAudioRemux(input: StreamProgressTarget & {
       input.file,
       "-map",
       "0:V:0",
-      "-map",
-      `0:${input.audioStreamIndex}`,
+      ...audioMapArgs,
       "-sn",
       "-dn",
       "-c:v",
       "copy",
-      "-c:a",
-      "copy",
+      ...audioCodecArgs,
       "-map_chapters",
       "-1",
       "-avoid_negative_ts",
@@ -956,8 +1044,9 @@ async function handleDirectAudioRemux(input: StreamProgressTarget & {
   const headers = new Headers({
     ...streamCorsHeaders(),
     "cache-control": streamCacheControl,
-    "content-disposition": getInlineContentDispositionForRequest(input.request, input.file, "direct"),
+    "content-disposition": getInlineContentDispositionForGeneratedFile(input.file, target.extension),
     "content-type": target.contentType,
+    "x-content-type-options": "nosniff",
   })
   setDurationHeaders(headers, input.durationSeconds)
   setStreamSourceHeaders(headers, input.request, "direct")
@@ -1012,7 +1101,7 @@ async function handleTranscode(
   const waitLogTimer = setTimeout(() => {
     waitLogged = true
     console.warn(
-      `[Warn] [Stream] Waiting for live transcode hardware slot - User ${username} - ${fileName(file)}`
+      `[Warn] [Stream] Waiting for live transcode slot - User ${username} - ${fileName(file)}`
     )
   }, 2_000)
   waitLogTimer.unref?.()
@@ -1036,7 +1125,7 @@ async function handleTranscode(
 
   if (waitLogged) {
     console.log(
-      `[Info] [Stream] Live transcode hardware slot acquired - User ${username} - ${fileName(file)}`
+      `[Info] [Stream] Live transcode slot acquired - User ${username} - ${fileName(file)}`
     )
   }
 
@@ -1069,7 +1158,7 @@ async function handleTranscode(
       ...(startSeconds > 0 ? ["-ss", startSeconds.toFixed(3)] : []),
       "-i",
       file,
-      ...getLiveMp4AvcAacLcArgs(profile, {
+      ...getLiveMp4AvcOpusArgs(profile, {
         audioStreamIndex,
         sourceBitrateKbps,
       }),
@@ -1324,6 +1413,10 @@ export async function GET(request: Request, context: StreamContext) {
   const url = new URL(request.url)
   const seasonNumber = parsePositiveInt(url.searchParams.get("season") ?? "1")
   const mode = getMode(url.searchParams.get("mode"))
+  const directAudioMode = mode === "direct" ? getDirectAudioMode(url.searchParams.get("audioMode")) : null
+  const directContainerMode = mode === "direct"
+    ? getDirectContainerMode(url.searchParams.get("containerMode"))
+    : null
   const profile = getProfile()
   const startSeconds = parseStartSeconds(url.searchParams.get("start"))
   const clientId = parseClientId(url.searchParams.get("clientId"))
@@ -1397,7 +1490,9 @@ export async function GET(request: Request, context: StreamContext) {
   let inputVideoCodec: string | null = null
 
   const shouldInspectStreams =
-    mode === "transcode" || typeof requestedAudioStreamIndex === "number"
+    mode === "transcode" ||
+    typeof requestedAudioStreamIndex === "number" ||
+    directAudioMode !== null
 
   if (shouldInspectStreams) {
     try {
@@ -1419,11 +1514,12 @@ export async function GET(request: Request, context: StreamContext) {
   const selectedDirectAudioStreamIndex = audioSelection.requestedAudioStreamIndex
   const directAudioRemuxRequested =
     mode === "direct" &&
-    shouldUseDirectAudioRemux({
-      requestedAudioStreamIndex: selectedDirectAudioStreamIndex,
-      defaultDirectAudioStreamIndex: audioSelection.defaultDirectAudioStreamIndex,
-    }) &&
-    typeof selectedDirectAudioStreamIndex === "number"
+    (directAudioMode !== null ||
+      (typeof selectedDirectAudioStreamIndex === "number" &&
+        shouldUseDirectAudioRemux({
+          requestedAudioStreamIndex: selectedDirectAudioStreamIndex,
+          defaultDirectAudioStreamIndex: audioSelection.defaultDirectAudioStreamIndex,
+        })))
   const requestedUploadKbps = estimateUploadKbps({
     sourceBitrateKbps,
     profile,
@@ -1484,10 +1580,7 @@ export async function GET(request: Request, context: StreamContext) {
   }
 
   if (effectiveMode === "direct") {
-    if (
-      directAudioRemuxRequested &&
-      typeof selectedDirectAudioStreamIndex === "number"
-    ) {
+    if (directAudioRemuxRequested) {
       return await handleDirectAudioRemux({
         ...streamProgressTarget,
         request,
@@ -1500,6 +1593,9 @@ export async function GET(request: Request, context: StreamContext) {
         profile: effectiveProfile,
         startSeconds,
         audioStreamIndex: selectedDirectAudioStreamIndex,
+        audioMode: directAudioMode ?? "copy",
+        containerMode: directContainerMode,
+        inputVideoCodec,
         uploadLease,
       })
     }

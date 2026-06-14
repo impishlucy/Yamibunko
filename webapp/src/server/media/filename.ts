@@ -93,7 +93,17 @@ export function cleanAnimeTitleCandidate(
 }
 
 function cleanSeriesTitleSegment(value: string, season?: number, part?: number) {
-  return cleanAnimeTitleCandidate(value, { season, part })
+  let title = cleanAnimeTitleCandidate(value, { season, part })
+
+  if (season && season > 0) {
+    title = title
+      .replace(/\s+(?:season\s*\d{1,2}|s\s*\d{1,2})$/i, "")
+      .replace(/\s+\d{1,2}(?:st|nd|rd|th)?\s+season$/i, "")
+      .replace(/\s+(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+season$/i, "")
+      .trim()
+  }
+
+  return cleanTitleSegment(title)
 }
 
 function cleanEpisodeTitleSegment(value: string | undefined) {

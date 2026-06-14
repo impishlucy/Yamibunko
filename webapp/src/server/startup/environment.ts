@@ -1,15 +1,9 @@
-import { existsSync, readFileSync, statSync } from "node:fs"
+import { existsSync, rmSync, statSync } from "node:fs"
 import path from "node:path"
 
 import {
-  av1HardwareUnsupportedMessage,
-  detectHardwareAcceleration,
-  type HardwareAcceleration,
-} from "@/server/startup/hardwareAcceleration"
-import {
-  getOutdatedTranscodeAccelerationReplacement,
   normalizeTranscodeAccelerationValue,
-  type TranscodeAcceleration,
+  type ImportEncoding,
 } from "@/server/config"
 import { normalizeBaseUrl } from "@/server/http/baseUrl"
 
@@ -18,6 +12,8 @@ const baseRequiredEnvironmentKeys = [
   "ANIME_INPUT_DIR",
   "TRANSCODE_ACCEL",
   "BASE_URL",
+  "IMPORT_ENABLED",
+  "IMPORT_ENCODING",
 ] as const
 
 const importRequiredEnvironmentKeys = ["ANIME_MEDIA_DIR"] as const
@@ -28,6 +24,7 @@ const pathEnvironmentKeys = [
   "ANIME_MEDIA_DIR",
 ] as const
 
+const staleEnvironmentFileNames = [".env", ".env.local"] as const
 const launcherAliases = new Map<string, string>([
   ["INPUT_FOLDER_PATH", "ANIME_INPUT_DIR"],
   ["ANIME_INPUT_DIR", "ANIME_INPUT_DIR"],
@@ -37,6 +34,7 @@ const launcherAliases = new Map<string, string>([
   ["FFMPEG_BIN_DIR", "FFMPEG_DIR"],
   ["TRANSCODE_ACCEL", "TRANSCODE_ACCEL"],
   ["IMPORT_ENABLED", "IMPORT_ENABLED"],
+  ["IMPORT_ENCODING", "IMPORT_ENCODING"],
   ["ANILIST_CLIENT_ID", "ANILIST_CLIENT_ID"],
   ["ANILIST_CLIENT_SECRET", "ANILIST_CLIENT_SECRET"],
   ["BASE_URL", "BASE_URL"],
@@ -50,11 +48,9 @@ const requiredCanonicalKeys = new Set<string>([
 const loggedEnvironmentKeys = [
   ...baseRequiredEnvironmentKeys,
   ...importRequiredEnvironmentKeys,
-  "IMPORT_ENABLED",
   "ANILIST_CLIENT_ID",
   "ANILIST_CLIENT_SECRET",
 ] as const
-
 let bootstrapped = false
 
 function cleanValue(value: string) {
@@ -69,18 +65,48 @@ function normalizeParameterName(value: string) {
     .toUpperCase()
 }
 
-function setKnownEnvironmentValue(rawKey: string, rawValue: string) {
+function setKnownEnvironmentValue(
+  rawKey: string,
+  rawValue: string,
+  options: { overwrite: boolean }
+) {
   const key = launcherAliases.get(normalizeParameterName(rawKey))
 
   if (!key) {
     return false
   }
 
+  if (!options.overwrite && process.env[key]) {
+    return requiredCanonicalKeys.has(key)
+  }
+
   process.env[key] = cleanValue(rawValue)
   return requiredCanonicalKeys.has(key)
 }
 
-function applyLauncherParameters(argv = process.argv.slice(1)) {
+function applyRuntimeEnvironmentValues() {
+  let applied = false
+
+  for (const [rawKey, canonicalKey] of launcherAliases) {
+    const value = process.env[rawKey]
+
+    if (!value) {
+      continue
+    }
+
+    if (!process.env[canonicalKey]) {
+      process.env[canonicalKey] = cleanValue(value)
+    } else if (rawKey === canonicalKey) {
+      process.env[canonicalKey] = cleanValue(process.env[canonicalKey])
+    }
+
+    applied = requiredCanonicalKeys.has(canonicalKey) || applied
+  }
+
+  return applied
+}
+
+function applyManualStartupParameters(argv = process.argv.slice(1)) {
   let applied = false
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -95,7 +121,8 @@ function applyLauncherParameters(argv = process.argv.slice(1)) {
     if (equalsIndex > 0) {
       const key = arg.slice(0, equalsIndex)
       const value = arg.slice(equalsIndex + 1)
-      applied = setKnownEnvironmentValue(key, value) || applied
+      applied =
+        setKnownEnvironmentValue(key, value, { overwrite: false }) || applied
       continue
     }
 
@@ -103,7 +130,10 @@ function applyLauncherParameters(argv = process.argv.slice(1)) {
     const nextValue = argv[index + 1]
 
     if (canonical && nextValue && !nextValue.startsWith("--")) {
-      process.env[canonical] = cleanValue(nextValue)
+      if (!process.env[canonical]) {
+        process.env[canonical] = cleanValue(nextValue)
+      }
+
       applied = requiredCanonicalKeys.has(canonical) || applied
       index += 1
     }
@@ -112,65 +142,24 @@ function applyLauncherParameters(argv = process.argv.slice(1)) {
   return applied
 }
 
-function loadDotEnv(dotEnvPath: string) {
-  if (!existsSync(dotEnvPath)) {
-    return false
-  }
+function deleteStaleEnvironmentFiles() {
+  let deleted = false
 
-  const content = readFileSync(dotEnvPath, "utf8")
+  for (const fileName of staleEnvironmentFileNames) {
+    const filePath = path.resolve(/* turbopackIgnore: true */ process.cwd(), fileName)
 
-  for (const line of content.split(/\r?\n/)) {
-    const trimmed = line.trim()
-
-    if (!trimmed || trimmed.startsWith("#")) {
+    if (!existsSync(filePath)) {
       continue
     }
 
-    const equalsIndex = trimmed.indexOf("=")
-
-    if (equalsIndex <= 0) {
-      continue
-    }
-
-    const key = trimmed.slice(0, equalsIndex).trim()
-    const value = cleanValue(trimmed.slice(equalsIndex + 1))
-    const canonical = launcherAliases.get(normalizeParameterName(key)) ?? key
-
-    if (!process.env[canonical]) {
-      process.env[canonical] = value
-    }
+    rmSync(filePath, { force: true })
+    deleted = true
+    console.warn(
+      `[Warn] [Startup] Removed unsupported startup config file - ${filePath}`
+    )
   }
 
-  return true
-}
-
-function applyEnvironmentAliases() {
-  for (const [alias, canonical] of launcherAliases) {
-    const value = process.env[alias]
-
-    if (value && !process.env[canonical]) {
-      process.env[canonical] = cleanValue(value)
-    }
-  }
-}
-
-function logOutdatedDotEnvTranscodeAcceleration() {
-  const value = process.env.TRANSCODE_ACCEL
-
-  if (!value) {
-    return
-  }
-
-  const cleanedValue = cleanValue(value)
-  const replacement = getOutdatedTranscodeAccelerationReplacement(cleanedValue)
-
-  if (!replacement) {
-    return
-  }
-
-  console.log(
-    `[Warning] [Startup] Selected TRANSCODE_ACCEL value '${cleanedValue}' is outdated. Use TRANSCODE_ACCEL=${replacement} in .env.`
-  )
+  return deleted
 }
 
 function normalizeTranscodeAcceleration() {
@@ -185,47 +174,34 @@ function normalizeImportEnabled() {
   const value = process.env.IMPORT_ENABLED
 
   if (!value) {
-    process.env.IMPORT_ENABLED = "true"
     return
   }
 
   process.env.IMPORT_ENABLED = cleanValue(value).toLowerCase()
 }
 
-function isImportEnabled() {
-  return process.env.IMPORT_ENABLED !== "false"
-}
+function normalizeImportEncoding() {
+  const value = process.env.IMPORT_ENCODING
 
-function getSelectedAv1HardwareAcceleration(): HardwareAcceleration | null {
-  const value = process.env.TRANSCODE_ACCEL
-
-  if (
-    value === "nvenc" ||
-    value === "intel_gpu" ||
-    value === "intel_cpu" ||
-    value === "amd_gpu" ||
-    value === "amd_cpu"
-  ) {
-    return value as Exclude<TranscodeAcceleration, "cpu">
+  if (!value) {
+    return
   }
 
-  return null
+  process.env.IMPORT_ENCODING = cleanValue(value).toLowerCase()
+}
+
+function hasRuntimeEnvironment() {
+  return [...requiredCanonicalKeys].some((key) => Boolean(process.env[key]))
+}
+
+function isImportEnabled() {
+  return process.env.IMPORT_ENABLED !== "false"
 }
 
 function getRequiredEnvironmentKeys() {
   return isImportEnabled()
     ? [...baseRequiredEnvironmentKeys, ...importRequiredEnvironmentKeys]
     : [...baseRequiredEnvironmentKeys]
-}
-
-function hasAnyRequiredEnvironmentValue() {
-  for (const [alias, canonical] of launcherAliases) {
-    if (requiredCanonicalKeys.has(canonical) && process.env[alias]) {
-      return true
-    }
-  }
-
-  return false
 }
 
 function formatKnownEnvironmentSnapshot() {
@@ -247,10 +223,10 @@ function resolveRequiredPath(envVarName: string) {
 
   if (!rawPath) {
     console.error(
-      `[Error] [Startup] Required path variable is missing - environment.ts - ${envVarName}`
+      `[Error] [Startup] Required startup argument is missing - environment.ts - ${envVarName}`
     )
     throw new Error(
-      `CRITICAL INITIALIZATION FAILURE: Environment variable '${envVarName}' is missing. Ensure the launcher is passing parameters or the local .env file contains this variable.`
+      `CRITICAL INITIALIZATION FAILURE: Startup argument '${envVarName}' is missing. Start Yamibunko through the launcher or pass the required arguments manually.`
     )
   }
 
@@ -285,7 +261,7 @@ function assertValidBaseUrl(value: string | undefined) {
   if (!value) {
     console.error("[Error] [Startup] BASE_URL is missing - environment.ts")
     throw new Error(
-      "CRITICAL INITIALIZATION FAILURE: Environment variable 'BASE_URL' is missing. Ensure the launcher is passing parameters or the local .env file contains this variable."
+      "CRITICAL INITIALIZATION FAILURE: Startup argument 'BASE_URL' is missing. Start Yamibunko through the launcher or pass the required arguments manually."
     )
   }
 
@@ -305,44 +281,46 @@ function executableName(name: "ffmpeg" | "ffprobe") {
   return process.platform === "win32" ? `${name}.exe` : name
 }
 
+function assertValidImportEncoding(value: string | undefined): asserts value is ImportEncoding {
+  if (value === "av1" || value === "hevc" || value === "none") {
+    return
+  }
+
+  console.error(
+    `[Error] [Startup] IMPORT_ENCODING validation failed - environment.ts - ${value}`
+  )
+  throw new Error(
+    "CRITICAL STARTUP ERROR: IMPORT_ENCODING must be one of av1, hevc, or none."
+  )
+}
+
 export function bootstrapEnvironment() {
   if (bootstrapped) {
     return
   }
 
-  applyEnvironmentAliases()
-  const hadRuntimeEnvironment = hasAnyRequiredEnvironmentValue()
-  const appliedLauncherParameters = applyLauncherParameters()
-  const dotEnvPath = path.resolve(process.cwd(), ".env")
-  const hasDotEnv = existsSync(dotEnvPath)
+  deleteStaleEnvironmentFiles()
+  const appliedRuntimeEnvironment = applyRuntimeEnvironmentValues()
+  const appliedManualParameters = applyManualStartupParameters()
+  const hasExistingRuntimeEnvironment = hasRuntimeEnvironment()
 
-  if (!hadRuntimeEnvironment && !appliedLauncherParameters && !hasDotEnv) {
+  if (
+    !appliedRuntimeEnvironment &&
+    !appliedManualParameters &&
+    !hasExistingRuntimeEnvironment
+  ) {
     console.error(
-      `[Error] [Startup] no parameters found, can't start - environment.ts - Checked .env: ${dotEnvPath}`
+      "[Error] [Startup] no startup arguments found, can't start - environment.ts"
     )
-    throw new Error("no parameters found, can't start")
-  }
-
-  const loadedDotEnv = loadDotEnv(dotEnvPath)
-  applyEnvironmentAliases()
-
-  if (loadedDotEnv && !hadRuntimeEnvironment && !appliedLauncherParameters) {
-    logOutdatedDotEnvTranscodeAcceleration()
+    throw new Error("no startup arguments found, can't start")
   }
 
   normalizeTranscodeAcceleration()
   normalizeImportEnabled()
-
-  const sources = [
-    ...(hadRuntimeEnvironment ? ["process environment"] : []),
-    ...(appliedLauncherParameters ? ["launcher parameters"] : []),
-    ...(loadedDotEnv ? [".env"] : []),
-  ].join(", ")
+  normalizeImportEncoding()
 
   console.log(
-    `[Info] [Startup] Loaded startup configuration - Sources: ${sources || "none"} - ${formatKnownEnvironmentSnapshot()}${
-      hasDotEnv ? ` - .env: ${dotEnvPath}` : ""
-    }`
+    `[Info] [Startup] Loaded startup configuration - ${formatKnownEnvironmentSnapshot()}`
   )
 
   for (const key of pathEnvironmentKeys) {
@@ -354,12 +332,16 @@ export function bootstrapEnvironment() {
   for (const key of getRequiredEnvironmentKeys()) {
     if (!process.env[key]) {
       console.error(
-        `[Error] [Startup] Required environment variable is missing - environment.ts - ${key}`
+        `[Error] [Startup] Required startup argument is missing - environment.ts - ${key}`
       )
       throw new Error(
-        `CRITICAL INITIALIZATION FAILURE: Environment variable '${key}' is missing. Ensure the launcher is passing parameters or the local .env file contains this variable.`
+        `CRITICAL INITIALIZATION FAILURE: Startup argument '${key}' is missing. Start Yamibunko through the launcher or pass the required arguments manually.`
       )
     }
+  }
+
+  if (!isImportEnabled()) {
+    process.env.IMPORT_ENCODING = "none"
   }
 
   if (!["true", "false"].includes(process.env.IMPORT_ENABLED ?? "")) {
@@ -368,6 +350,17 @@ export function bootstrapEnvironment() {
     )
     throw new Error(
       "CRITICAL STARTUP ERROR: IMPORT_ENABLED must be true or false."
+    )
+  }
+
+  assertValidImportEncoding(process.env.IMPORT_ENCODING)
+
+  if (isImportEnabled() && process.env.IMPORT_ENCODING === "none") {
+    console.error(
+      "[Error] [Startup] IMPORT_ENCODING=none is invalid while import mode is enabled - environment.ts"
+    )
+    throw new Error(
+      "CRITICAL STARTUP ERROR: IMPORT_ENCODING must be av1 or hevc when IMPORT_ENABLED is true."
     )
   }
 
@@ -423,43 +416,12 @@ export function bootstrapEnvironment() {
   assertExistingFile("FFmpeg", path.join(ffmpegDir, executableName("ffmpeg")))
   assertExistingFile("FFprobe", path.join(ffmpegDir, executableName("ffprobe")))
 
-  if (loadedDotEnv && !hadRuntimeEnvironment && !appliedLauncherParameters) {
-    const acceleration = detectHardwareAcceleration({
-      ffmpegDir,
-      probeEncoders: true,
-      av1AccelerationFilter: isImportEnabled()
-        ? getSelectedAv1HardwareAcceleration()
-        : undefined,
-    })
-
-    if (isImportEnabled()) {
-      if (!acceleration.av1ImportAcceleration) {
-        console.error(`[Error] [Startup] ${av1HardwareUnsupportedMessage}`)
-        throw new Error(av1HardwareUnsupportedMessage)
-      }
-
-      process.env.TRANSCODE_ACCEL = acceleration.av1ImportAcceleration
-    } else {
-      process.env.TRANSCODE_ACCEL = acceleration.liveTranscodeAcceleration
-    }
-
-    console.log(
-      `[Info] [Startup] Hardware acceleration selected - Requested: ${
-        process.env.TRANSCODE_ACCEL ?? "unknown"
-      }, Import AV1: ${acceleration.av1ImportAcceleration ?? "unsupported"}${
-        acceleration.av1ImportDevice ? ` (${acceleration.av1ImportDevice})` : ""
-      }, Live transcode: ${acceleration.liveTranscodeAcceleration}${
-        acceleration.liveTranscodeDevice ? ` (${acceleration.liveTranscodeDevice})` : ""
-      }`
-    )
-  }
-
   if (isImportEnabled() && process.env.TRANSCODE_ACCEL === "cpu") {
     console.error(
-      "[Error] [Startup] CPU AV1 encoding is unsupported while import mode is enabled - environment.ts"
+      "[Error] [Startup] CPU file encoding is unsupported while import mode is enabled - environment.ts"
     )
     throw new Error(
-      "CRITICAL STARTUP ERROR: CPU AV1 encoding is not supported. Use hardware AV1 encoding or disable import mode."
+      "CRITICAL STARTUP ERROR: CPU file encoding is not supported. Use hardware AV1/HEVC encoding or disable import mode."
     )
   }
 

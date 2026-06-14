@@ -1,16 +1,21 @@
+import { mkdir, readdir, rename, rmdir } from "node:fs/promises"
 import path from "node:path"
 
 import {
   deleteEpisodeByPath,
+  deleteEpisodeRecord,
   getEpisodeByPath,
   getLibraryEventTargetForAnime,
+  getStoredEpisode,
   resolveLibrarySeasonNumberForAnime,
   upsertAnime,
   upsertEpisode,
+  type AnimeMetadataInput,
 } from "@/server/db/library"
 import { getServerConfig } from "@/server/config"
 import { ffprobe } from "@/server/media/ffmpeg"
 import {
+  formatEpisodeFileName,
   getAnimeMetadataLookupSeason,
   formatSeasonFolderName,
   getFolderTitleFallbackCandidates,
@@ -28,6 +33,11 @@ import {
   waitForStableFile,
 } from "@/server/media/mediaFiles"
 import { emitLibraryChange } from "@/server/media/libraryEvents"
+import {
+  createNonAnimeMetadata,
+  nonAnimeFolderName,
+  parseNonAnimeFilePath,
+} from "@/server/media/nonAnime"
 import { isInputImportOutputActive } from "@/server/media/processInputFile"
 import { findAnimeMetadata } from "@/server/metadata/anilist"
 import { errorMessage, fileName } from "@/server/utils/format"
@@ -39,6 +49,7 @@ type ParsedLibraryPath = {
   episode: number
   part?: number
   metadataLookupSeason?: number
+  isNonAnime?: boolean
 }
 
 function debugLibrarySync(message: string) {
@@ -170,6 +181,132 @@ function formatDeletedEpisodeLabel(input: {
   return `Season ${input.seasonNumber}, Episode ${input.episodeNumber}`
 }
 
+function metadataTitle(metadata: AnimeMetadataInput) {
+  const title =
+    metadata.title.english ??
+    metadata.title.userPreferred ??
+    metadata.title.romaji ??
+    metadata.title.native
+
+  if (!title) {
+    throw new Error(`Media ${metadata.id} did not include a usable title`)
+  }
+
+  return title
+}
+
+function safePathSegment(value: string, label: string) {
+  const safeValue = sanitizeExportPathPart(value)
+
+  if (!safeValue) {
+    throw new Error(`${label} resolved to an empty path segment`)
+  }
+
+  return safeValue
+}
+
+function mediaFolderSegments(input: {
+  format: string | null | undefined
+  season: number
+  mediaTitle: string
+  part?: number
+}) {
+  if (input.format === "MOVIE") {
+    return ["Movies"]
+  }
+
+  if (input.format === "SPECIAL" || input.format === "OVA") {
+    return ["Specials", input.mediaTitle]
+  }
+
+  return [formatSeasonFolderName(input.season, input.part)]
+}
+
+function canonicalLibraryPath(input: {
+  metadata: AnimeMetadataInput
+  parsed: ParsedLibraryPath
+  sourcePath: string
+}) {
+  const library = input.metadata.library
+
+  if (!library?.title) {
+    throw new Error(`Media ${input.metadata.id} did not resolve a library root`)
+  }
+
+  const safeLibraryTitle = safePathSegment(library.title, "Library title")
+  const safeMediaTitle = safePathSegment(metadataTitle(input.metadata), "Media title")
+  const extension = path.extname(input.sourcePath) || ".mp4"
+  const fileName = formatEpisodeFileName({
+    title: safeMediaTitle,
+    season: input.parsed.season,
+    part: input.parsed.part,
+    episode: input.parsed.episode,
+    extension,
+  })
+
+  return path.resolve(
+    getServerConfig().mediaDir,
+    ...(input.parsed.isNonAnime ? [nonAnimeFolderName, safeLibraryTitle] : [safeLibraryTitle]),
+    ...mediaFolderSegments({
+      format: input.metadata.format,
+      season: input.parsed.season,
+      part: input.parsed.part,
+      mediaTitle: safeMediaTitle,
+    }),
+    fileName
+  )
+}
+
+function samePath(left: string, right: string) {
+  const leftPath = path.resolve(left)
+  const rightPath = path.resolve(right)
+
+  return process.platform === "win32"
+    ? leftPath.toLowerCase() === rightPath.toLowerCase()
+    : leftPath === rightPath
+}
+
+function isInsideDirectory(root: string, targetPath: string) {
+  const relative = path.relative(path.resolve(root), path.resolve(targetPath))
+
+  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative)
+}
+
+async function removeEmptyLibraryParents(startDirectory: string) {
+  const mediaRoot = path.resolve(getServerConfig().mediaDir)
+  let current = path.resolve(startDirectory)
+
+  while (isInsideDirectory(mediaRoot, current)) {
+    const entries = await readdir(current).catch(() => null)
+
+    if (!entries || entries.length > 0) {
+      return
+    }
+
+    await rmdir(current).catch(() => undefined)
+    current = path.dirname(current)
+  }
+}
+
+async function moveLibraryFileIfNeeded(sourcePath: string, destinationPath: string) {
+  const source = path.resolve(sourcePath)
+  const destination = path.resolve(destinationPath)
+
+  if (samePath(source, destination)) {
+    return source
+  }
+
+  if (await pathExists(destination)) {
+    throw new Error(`Cannot repair library path because destination already exists: ${destination}`)
+  }
+
+  await mkdir(path.dirname(destination), { recursive: true })
+  await rename(source, destination)
+  await removeEmptyLibraryParents(path.dirname(source))
+
+  return destination
+}
+
 function parseLibraryPath(filePath: string): ParsedLibraryPath | null {
   const root = path.resolve(getServerConfig().mediaDir)
   const resolved = path.resolve(filePath)
@@ -180,6 +317,26 @@ function parseLibraryPath(filePath: string): ParsedLibraryPath | null {
   }
 
   const parts = relative.split(path.sep).filter(Boolean)
+  const nonAnimeParsed = parseNonAnimeFilePath(resolved, root)
+
+  if (nonAnimeParsed) {
+    const parsedFileName = nonAnimeParsed.parsed
+    const season = parsedFileName.season
+    const part = parsedFileName.part
+
+    return {
+      animeTitle: nonAnimeParsed.title,
+      season,
+      episode: parsedFileName.episode,
+      part,
+      metadataLookupSeason: getAnimeMetadataLookupSeason({
+        ...parsedFileName,
+        season,
+        part,
+      }),
+      isNonAnime: true,
+    }
+  }
 
   if (parts.length < 3) {
     return null
@@ -232,6 +389,194 @@ function parseLibraryPath(filePath: string): ParsedLibraryPath | null {
   }
 }
 
+async function resolveParsedLibraryMetadata(parsed: ParsedLibraryPath, filePath: string) {
+  if (parsed.isNonAnime) {
+    return createNonAnimeMetadata({
+      title: parsed.animeTitle,
+      episodeNumber: parsed.episode,
+    })
+  }
+
+  let metadata = await findAnimeMetadata(
+    parsed.animeTitle,
+    parsed.metadataLookupSeason,
+    parsed.episode,
+    parsed.part
+  )
+
+  if (!metadata) {
+    const fallbackTitles = getFolderTitleFallbackCandidates(
+      getServerConfig().mediaDir,
+      filePath,
+      parsed.animeTitle
+    )
+
+    for (const fallbackTitle of fallbackTitles) {
+      metadata = await findAnimeMetadata(
+        fallbackTitle,
+        parsed.metadataLookupSeason,
+        parsed.episode,
+        parsed.part
+      )
+
+      if (metadata) {
+        break
+      }
+    }
+  }
+
+  return metadata
+}
+
+async function repairExistingLibraryEpisodeIfNeeded(
+  resolvedPath: string,
+  existingEpisode: NonNullable<ReturnType<typeof getEpisodeByPath>>
+) {
+  const parsed = parseLibraryPath(resolvedPath)
+
+  if (!parsed) {
+    return {
+      animeId: existingEpisode.animeId,
+      seasonNr: existingEpisode.seasonNumber,
+      epNr: existingEpisode.episodeNumber,
+      filePath: resolvedPath,
+    }
+  }
+
+  const metadata = await resolveParsedLibraryMetadata(parsed, resolvedPath)
+
+  if (!metadata) {
+    console.warn(
+      `[Warn] [Media] Existing library episode could not be revalidated against AniList - ${resolvedPath}`
+    )
+    return {
+      animeId: existingEpisode.animeId,
+      seasonNr: existingEpisode.seasonNumber,
+      epNr: existingEpisode.episodeNumber,
+      filePath: resolvedPath,
+    }
+  }
+
+  await runCooperativeSyncStep(() => upsertAnime(metadata))
+  const librarySeason = await runCooperativeSyncStep(() =>
+    resolveLibrarySeasonNumberForAnime({
+      animeId: metadata.id,
+      parsedSeason: parsed.season,
+      parsedPart: parsed.part,
+    })
+  )
+  const targetPath = canonicalLibraryPath({
+    metadata,
+    parsed,
+    sourcePath: resolvedPath,
+  })
+  const needsDbRepair =
+    existingEpisode.animeId !== metadata.id ||
+    existingEpisode.seasonNumber !== librarySeason ||
+    existingEpisode.episodeNumber !== parsed.episode
+  const needsPathRepair = !samePath(resolvedPath, targetPath)
+
+  if (!needsDbRepair && !needsPathRepair) {
+    return {
+      animeId: existingEpisode.animeId,
+      seasonNr: existingEpisode.seasonNumber,
+      epNr: existingEpisode.episodeNumber,
+      filePath: resolvedPath,
+    }
+  }
+
+  console.warn(
+    `[Warn] [Media] Repairing library episode mismatch - ${resolvedPath} -> ${targetPath}`
+  )
+
+  const oldEventTarget = await runCooperativeSyncStep(() =>
+    getLibraryEventTargetForAnime(existingEpisode.animeId)
+  )
+  const repairedPath = await moveLibraryFileIfNeeded(resolvedPath, targetPath)
+  const targetEpisode = await runCooperativeSyncStep(() =>
+    getStoredEpisode(metadata.id, librarySeason, parsed.episode)
+  )
+
+  if (targetEpisode && !samePath(targetEpisode.filePath, resolvedPath)) {
+    await runCooperativeSyncStep(() =>
+      deleteEpisodeRecord({
+        animeId: metadata.id,
+        seasonNr: librarySeason,
+        epNr: parsed.episode,
+      })
+    )
+  }
+
+  await runCooperativeSyncStep(() => deleteEpisodeByPath(resolvedPath))
+
+  if (oldEventTarget) {
+    emitLibraryChange({
+      type: "episode-removed",
+      animeId: oldEventTarget.animeId,
+      rootAnimeId: oldEventTarget.rootAnimeId,
+      librarySlug: oldEventTarget.librarySlug,
+      seasonNumber: existingEpisode.seasonNumber,
+      episodeNumber: existingEpisode.episodeNumber,
+    })
+  }
+
+  await removeEpisodeThumbnails(resolvedPath).catch(() => undefined)
+
+  const probe = await runWithTemporaryFileAccessRetry(
+    "ffprobe",
+    repairedPath,
+    async () => (await ffprobe(repairedPath)) as ProbeResult
+  )
+
+  if (probe === null) {
+    return null
+  }
+
+  const durationSeconds = parseDurationSeconds(probe)
+  const thumbnailPath = await runWithTemporaryFileAccessRetry(
+    "thumbnail generation",
+    repairedPath,
+    () => generateEpisodeThumbnail(repairedPath, durationSeconds)
+  )
+
+  if (thumbnailPath === null) {
+    return null
+  }
+
+  await runCooperativeSyncStep(() =>
+    upsertEpisode({
+      animeId: metadata.id,
+      seasonNr: librarySeason,
+      epNr: parsed.episode,
+      filePath: repairedPath,
+      thumbnailPath,
+      durationSeconds,
+    })
+  )
+
+  if (metadata.library) {
+    emitLibraryChange({
+      type: "episode-added",
+      animeId: metadata.id,
+      rootAnimeId: metadata.library.primaryAnimeId,
+      librarySlug: metadata.library.slug,
+      seasonNumber: librarySeason,
+      episodeNumber: parsed.episode,
+    })
+  }
+
+  console.log(
+    `[Info] [Media] Library episode mismatch repaired - Anime: ${metadataTitle(metadata)}, ${formatLibraryEpisodeLabel({ season: parsed.season, part: parsed.part, episode: parsed.episode })} - ${fileName(repairedPath)}`
+  )
+
+  return {
+    animeId: metadata.id,
+    seasonNr: librarySeason,
+    epNr: parsed.episode,
+    filePath: repairedPath,
+  }
+}
+
 export async function syncLibraryFile(filePath: string) {
   const resolvedPath = path.resolve(filePath)
   debugLibrarySync(`Sync requested - ${resolvedPath}`)
@@ -269,16 +614,11 @@ export async function syncLibraryFile(filePath: string) {
   )
 
   if (existingEpisode) {
-    return {
-      animeId: existingEpisode.animeId,
-      seasonNr: existingEpisode.seasonNumber,
-      epNr: existingEpisode.episodeNumber,
-      filePath: resolvedPath,
-    }
+    return repairExistingLibraryEpisodeIfNeeded(resolvedPath, existingEpisode)
   }
 
   debugLibrarySync("Parsing library path.")
-  let parsed = parseLibraryPath(resolvedPath)
+  const parsed = parseLibraryPath(resolvedPath)
 
   if (!parsed) {
     console.warn(
@@ -287,61 +627,72 @@ export async function syncLibraryFile(filePath: string) {
     return null
   }
 
+  let resolvedParsed = parsed
+
   console.log(
-    `[Info] [Media] Detected library episode - Anime: ${parsed.animeTitle}, ${formatLibraryEpisodeLabel({ season: parsed.season, part: parsed.part, episode: parsed.episode })} - ${fileName(resolvedPath)}`
+    `[Info] [Media] Detected library episode - Anime: ${resolvedParsed.animeTitle}, ${formatLibraryEpisodeLabel({ season: resolvedParsed.season, part: resolvedParsed.part, episode: resolvedParsed.episode })} - ${fileName(resolvedPath)}`
   )
 
-  debugLibrarySync("Starting AniList metadata lookup for library file.")
-  let metadata = await findAnimeMetadata(
-    parsed.animeTitle,
-    parsed.metadataLookupSeason,
-    parsed.episode,
-    parsed.part
-  )
+  const metadata = resolvedParsed.isNonAnime
+    ? createNonAnimeMetadata({
+        title: resolvedParsed.animeTitle,
+        episodeNumber: resolvedParsed.episode,
+      })
+    : await (async () => {
+        debugLibrarySync("Starting AniList metadata lookup for library file.")
+        let animeMetadata = await findAnimeMetadata(
+          resolvedParsed.animeTitle,
+          resolvedParsed.metadataLookupSeason,
+          resolvedParsed.episode,
+          resolvedParsed.part
+        )
+
+        if (!animeMetadata) {
+          const fallbackTitles = getFolderTitleFallbackCandidates(
+            getServerConfig().mediaDir,
+            resolvedPath,
+            resolvedParsed.animeTitle
+          )
+
+          for (const fallbackTitle of fallbackTitles) {
+            debugLibrarySync(
+              `Trying library folder title fallback - Filename title ${resolvedParsed.animeTitle}, Folder title ${fallbackTitle}`
+            )
+
+            const fallbackMetadata = await findAnimeMetadata(
+              fallbackTitle,
+              resolvedParsed.metadataLookupSeason,
+              resolvedParsed.episode,
+              resolvedParsed.part
+            )
+
+            if (!fallbackMetadata) {
+              continue
+            }
+
+            animeMetadata = fallbackMetadata
+            resolvedParsed = { ...resolvedParsed, animeTitle: fallbackTitle }
+            break
+          }
+        }
+
+        return animeMetadata
+      })()
 
   if (!metadata) {
-    const fallbackTitles = getFolderTitleFallbackCandidates(
-      getServerConfig().mediaDir,
-      resolvedPath,
-      parsed.animeTitle
-    )
-
-    for (const fallbackTitle of fallbackTitles) {
-      debugLibrarySync(
-        `Trying library folder title fallback - Filename title ${parsed.animeTitle}, Folder title ${fallbackTitle}`
-      )
-
-      const fallbackMetadata = await findAnimeMetadata(
-        fallbackTitle,
-        parsed.metadataLookupSeason,
-        parsed.episode,
-        parsed.part
-      )
-
-      if (!fallbackMetadata) {
-        continue
-      }
-
-      metadata = fallbackMetadata
-      parsed = { ...parsed, animeTitle: fallbackTitle }
-      break
-    }
+    throw new Error(`AniList could not match "${resolvedParsed.animeTitle}"`)
   }
 
-  if (!metadata) {
-    throw new Error(`AniList could not match "${parsed.animeTitle}"`)
-  }
-
-  debugLibrarySync(`AniList metadata lookup completed - Anime id ${metadata.id}.`)
-  debugLibrarySync("Saving AniList metadata for library file.")
+  debugLibrarySync(`${resolvedParsed.isNonAnime ? "Local metadata prepared" : "AniList metadata lookup completed"} - Anime id ${metadata.id}.`)
+  debugLibrarySync("Saving media metadata for library file.")
   await runCooperativeSyncStep(() => upsertAnime(metadata))
-  debugLibrarySync("AniList metadata saved for library file.")
+  debugLibrarySync("Media metadata saved for library file.")
   const animeId = metadata.id
   const librarySeason = await runCooperativeSyncStep(() =>
     resolveLibrarySeasonNumberForAnime({
       animeId,
-      parsedSeason: parsed.season,
-      parsedPart: parsed.part,
+      parsedSeason: resolvedParsed.season,
+      parsedPart: resolvedParsed.part,
     })
   )
 
@@ -385,7 +736,7 @@ export async function syncLibraryFile(filePath: string) {
     upsertEpisode({
       animeId,
       seasonNr: librarySeason,
-      epNr: parsed.episode,
+      epNr: resolvedParsed.episode,
       filePath: resolvedPath,
       thumbnailPath,
       durationSeconds,
@@ -399,19 +750,19 @@ export async function syncLibraryFile(filePath: string) {
       rootAnimeId: metadata.library.primaryAnimeId,
       librarySlug: metadata.library.slug,
       seasonNumber: librarySeason,
-      episodeNumber: parsed.episode,
+      episodeNumber: resolvedParsed.episode,
     })
   }
 
   console.log(
-    `[Info] [Media] Library database import completed - Anime: ${parsed.animeTitle}, ${formatLibraryEpisodeLabel({ season: parsed.season, part: parsed.part, episode: parsed.episode })} - ${fileName(resolvedPath)}`
+    `[Info] [Media] Library database import completed - Anime: ${resolvedParsed.animeTitle}, ${formatLibraryEpisodeLabel({ season: resolvedParsed.season, part: resolvedParsed.part, episode: resolvedParsed.episode })} - ${fileName(resolvedPath)}`
   )
   debugLibrarySync("Library file sync completed.")
 
   return {
     animeId,
     seasonNr: librarySeason,
-    epNr: parsed.episode,
+    epNr: resolvedParsed.episode,
     filePath: resolvedPath,
   }
 }

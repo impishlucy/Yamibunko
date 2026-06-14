@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { existsSync, readdirSync, readFileSync } from "node:fs"
 import os from "node:os"
@@ -65,6 +66,7 @@ const pressureCacheMs = 2000
 
 const hardwarePressureLimit = 0.9
 const queueRetryMs = 2000
+const maxActiveImportTranscodes = 1
 let pendingSequence = 0
 let queueRetryTimer: ReturnType<typeof setTimeout> | null = null
 let drainingQueue = false
@@ -313,6 +315,232 @@ function intelLinuxPressureSnapshot(): HardwarePressureSnapshot | null {
   }
 }
 
+type AutomaticLiveLimit = {
+  acceleration: TranscodeAcceleration
+  value: number
+}
+
+let cachedAutomaticLiveLimit: AutomaticLiveLimit | undefined
+
+function cleanHardwareName(value: string) {
+  return value.toLowerCase().replace(/[\s_-]+/g, " ").trim()
+}
+
+function runHardwareInfoCommand(command: string, args: string[]) {
+  try {
+    const result = spawnSync(command, args, {
+      encoding: "utf8",
+      timeout: 1800,
+      windowsHide: true,
+    })
+
+    return result.status === 0 ? (result.stdout ?? "").trim() : ""
+  } catch {
+    return ""
+  }
+}
+
+function getWindowsGpuNames() {
+  if (process.platform !== "win32") {
+    return []
+  }
+
+  return runHardwareInfoCommand("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+  ])
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+}
+
+function getNvidiaGpuNames() {
+  return runHardwareInfoCommand("nvidia-smi", [
+    "--query-gpu=name",
+    "--format=csv,noheader",
+  ])
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+}
+
+function getLinuxGpuInfoLines() {
+  if (process.platform !== "linux") {
+    return []
+  }
+
+  return [
+    runHardwareInfoCommand("lspci", []),
+    ...safeLinuxRenderDeviceDescriptions(),
+  ]
+    .join("\n")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+}
+
+function safeLinuxRenderDeviceDescriptions() {
+  try {
+    return readdirSync("/sys/class/drm")
+      .filter((entry) => /^renderD\d+$/.test(entry))
+      .map((entry) => {
+        const root = `/sys/class/drm/${entry}/device`
+        const vendor = readOptionalUtf8(`${root}/vendor`)
+        const device = readOptionalUtf8(`${root}/device`)
+        const uevent = readOptionalUtf8(`${root}/uevent`)
+        return [entry, vendor, device, uevent].filter(Boolean).join(" ")
+      })
+      .filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+function readOptionalUtf8(filePath: string) {
+  try {
+    return existsSync(filePath) ? readFileSync(filePath, "utf8").trim() : ""
+  } catch {
+    return ""
+  }
+}
+
+function getGpuInfoLines(acceleration: TranscodeAcceleration) {
+  switch (acceleration) {
+    case "nvenc":
+      return getNvidiaGpuNames()
+    case "intel_gpu":
+    case "amd_gpu":
+    case "intel_cpu":
+    case "amd_cpu":
+      return [...getWindowsGpuNames(), ...getLinuxGpuInfoLines()]
+    case "cpu":
+      return []
+  }
+}
+
+function getCpuLiveTranscodeLimit() {
+  return Math.max(1, Math.floor(availableParallelism() / 2))
+}
+
+function getNvidiaLiveLimitFromName(name: string) {
+  const normalized = cleanHardwareName(name)
+
+  switch (true) {
+    case /\brtx\s*50\d{2}\b/.test(normalized):
+    case /\bblackwell\b/.test(normalized):
+    case /\brtx\s*4090\b/.test(normalized):
+    case /\brtx\s*4080\b/.test(normalized):
+    case /\brtx\s*4070\b/.test(normalized):
+    case /\brtx\s*6000\b.*\bada\b/.test(normalized):
+    case /\bl40s?\b/.test(normalized):
+      return 4
+    case /\brtx\s*4060\b/.test(normalized):
+    case /\brtx\s*4050\b/.test(normalized):
+    case /\bada\b/.test(normalized):
+    case /\bl4\b/.test(normalized):
+      return 3
+    case /\brtx\s*30\d{2}\b/.test(normalized):
+    case /\brtx\s*20\d{2}\b/.test(normalized):
+    case /\bgtx\s*16\d{2}\b/.test(normalized):
+    case /\bturing\b/.test(normalized):
+    case /\bampere\b/.test(normalized):
+      return 2
+    case /\bgtx\s*10\d{2}\b/.test(normalized):
+    case /\bpascal\b/.test(normalized):
+    case /\bquadro\s*p\d{3,4}\b/.test(normalized):
+      return 1
+    default:
+      return 1
+  }
+}
+
+function getIntelLiveLimitFromName(name: string) {
+  const normalized = cleanHardwareName(name)
+
+  switch (true) {
+    case /\barc\s*(a|b)\d{3}\b/.test(normalized):
+    case /\bintel\s*arc\b/.test(normalized):
+    case /\blunar\s*lake\b/.test(normalized):
+      return 2
+    default:
+      return 1
+  }
+}
+
+function getAmdLiveLimitFromName(name: string) {
+  const normalized = cleanHardwareName(name)
+
+  switch (true) {
+    case /\bradeon\b.*\brx\s*7900\b/.test(normalized):
+    case /\brx\s*7900\b/.test(normalized):
+      return 3
+    case /\bradeon\b.*\brx\s*[78]\d{3}\b/.test(normalized):
+    case /\brx\s*[78]\d{3}\b/.test(normalized):
+    case /\b880m\b/.test(normalized):
+    case /\b890m\b/.test(normalized):
+      return 2
+    default:
+      return 1
+  }
+}
+
+function getModelLiveLimit(acceleration: TranscodeAcceleration, name: string) {
+  switch (acceleration) {
+    case "nvenc":
+      return getNvidiaLiveLimitFromName(name)
+    case "intel_gpu":
+    case "intel_cpu":
+      return getIntelLiveLimitFromName(name)
+    case "amd_gpu":
+    case "amd_cpu":
+      return getAmdLiveLimitFromName(name)
+    case "cpu":
+      return getCpuLiveTranscodeLimit()
+  }
+}
+
+function getAutomaticLiveTranscodeLimit(acceleration: TranscodeAcceleration) {
+  const cached = cachedAutomaticLiveLimit
+
+  if (cached?.acceleration === acceleration) {
+    return cached.value
+  }
+
+  const hardwareLines = getGpuInfoLines(acceleration)
+  const modelLimits = hardwareLines.map((line) =>
+    getModelLiveLimit(acceleration, line)
+  )
+  const value =
+    acceleration === "cpu"
+      ? getCpuLiveTranscodeLimit()
+      : Math.max(1, ...modelLimits)
+
+  cachedAutomaticLiveLimit = {
+    acceleration,
+    value,
+  }
+
+  console.log(
+    `[Info] [Transcode] Automatic live transcode limit is ${value} for ${acceleration}${
+      hardwareLines.length > 0
+        ? ` (${hardwareLines.slice(0, 3).join("; ")})`
+        : " (hardware model not detected)"
+    }.`
+  )
+
+  return value
+}
+
+function getLiveTranscodeLimit(acceleration: TranscodeAcceleration) {
+  return getAutomaticLiveTranscodeLimit(acceleration)
+}
+
+function hasPendingLiveTranscodes() {
+  return pendingTranscodes.some((request) => request.kind === "live")
+}
+
 function getTranscodeCost(
   acceleration: TranscodeAcceleration,
   kind: TranscodeKind
@@ -366,6 +594,21 @@ function scheduleQueueDrain() {
   queueRetryTimer.unref?.()
 }
 
+function getCanFitLiveTranscode(acceleration: TranscodeAcceleration) {
+  const liveLimit = getLiveTranscodeLimit(acceleration)
+  const activeLiveCount = getActiveLiveCount()
+
+  if (activeLiveCount >= liveLimit) {
+    return false
+  }
+
+  if (activeLiveCount === 0 && getActiveImportCount() > 0) {
+    return true
+  }
+
+  return activeLiveCount + getActiveImportCount() < liveLimit
+}
+
 async function getCanFitTranscode(kind: TranscodeKind) {
   const result = getServerConfigResult()
 
@@ -375,22 +618,39 @@ async function getCanFitTranscode(kind: TranscodeKind) {
 
   const acceleration = result.config.transcodeAccel
 
-  if (acceleration === "cpu" && kind === "import-video") {
+  switch (kind) {
+    case "live":
+      return getCanFitLiveTranscode(acceleration)
+
+    case "import-video":
+      if (acceleration === "cpu") {
+        return false
+      }
+
+      return await getCanFitImportTranscode(acceleration, kind)
+
+    case "import-remux":
+      return await getCanFitImportTranscode(acceleration, kind)
+  }
+}
+
+async function getCanFitImportTranscode(
+  acceleration: TranscodeAcceleration,
+  kind: Exclude<TranscodeKind, "live">
+) {
+  if (getActiveLiveCount() > 0 || hasPendingLiveTranscodes()) {
     return false
   }
 
-  const hasActiveImports = getActiveImportCount() > 0
+  if (getActiveImportCount() >= maxActiveImportTranscodes) {
+    return false
+  }
+
   const snapshot = await getHardwarePressureSnapshot(acceleration)
   const candidateCost = getTranscodeCost(acceleration, kind)
-  const activeCost = getActiveCost({
-    includeImportTranscodes: kind !== "live",
-  })
-  const effectivePressure =
-    kind === "live" && hasActiveImports
-      ? activeCost
-      : Math.max(snapshot.pressure, activeCost)
+  const activeCost = getActiveCost({ includeImportTranscodes: true })
 
-  return effectivePressure + candidateCost <= hardwarePressureLimit
+  return Math.max(snapshot.pressure, activeCost) + candidateCost <= hardwarePressureLimit
 }
 
 function removePendingRequest(id: string) {
@@ -473,28 +733,24 @@ async function drainPendingTranscodes() {
   }
 }
 
-async function getDynamicLiveCapacity() {
+function getStaticLiveCapacity() {
   const result = getServerConfigResult()
 
   if (!result.ok) {
-    return 0
+    return { available: 0, max: 0 }
   }
 
-  const acceleration = result.config.transcodeAccel
+  const max = getLiveTranscodeLimit(result.config.transcodeAccel)
+  const activeLiveCount = getActiveLiveCount()
+  const activeImportCount = getActiveImportCount()
+  const available =
+    activeLiveCount >= max
+      ? 0
+      : activeLiveCount === 0 && activeImportCount > 0
+        ? 1
+        : Math.max(max - activeLiveCount - activeImportCount, 0)
 
-  const hasActiveImports = getActiveImportCount() > 0
-  const snapshot = await getHardwarePressureSnapshot(acceleration)
-  const liveCost = getTranscodeCost(acceleration, "live")
-  const activeCost = getActiveCost({ includeImportTranscodes: false })
-  const effectivePressure = hasActiveImports
-    ? activeCost
-    : Math.max(snapshot.pressure, activeCost)
-  const remainingPressure = Math.max(
-    hardwarePressureLimit - effectivePressure,
-    0
-  )
-
-  return Math.floor(remainingPressure / liveCost)
+  return { available, max }
 }
 
 function createLease(
@@ -544,12 +800,12 @@ export function acquireImportTranscodeCapacity(
 }
 
 export async function getLiveTranscodeStatus(): Promise<TranscodeStatus> {
-  const available = await getDynamicLiveCapacity()
+  const { available, max } = getStaticLiveCapacity()
   const active = getActiveLiveCount()
   const queued = pendingTranscodes.filter((request) => request.kind === "live").length
 
   return {
-    max: active + available,
+    max,
     active,
     available,
     queued,

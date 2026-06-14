@@ -720,15 +720,15 @@ function setClientActionByKey(key: string, action: StreamPriorityAction) {
 }
 
 function getBandwidthRecheckStartedMessage() {
-  return "Server upload bandwidth is being rechecked. Playback is paused until the test completes."
+  return "Server maintenance or upload bandwidth recheck is running. Playback is paused until it completes."
 }
 
 function getBandwidthRecheckFinishedMessage() {
-  return "Server upload bandwidth recheck finished. Playback can continue."
+  return "Server maintenance and upload bandwidth recheck finished. Playback can continue."
 }
 
 function getBandwidthRecheckFailedMessage() {
-  return "Server upload bandwidth recheck finished, but the new measurement failed. Playback can continue with the previous bandwidth state."
+  return "Server maintenance finished, but the upload bandwidth measurement failed. Playback can continue with the previous bandwidth state."
 }
 
 function createBandwidthRecheckStartedAction(): StreamPriorityAction {
@@ -779,13 +779,19 @@ function publishServerShutdownAction() {
   }
 }
 
-function closeAllActiveStreams() {
+function closeActiveStreamsMatching(predicate: (stream: ActiveStream) => boolean) {
   for (const stream of [...activeStreams.values()]) {
-    closeActiveStream(stream)
+    if (predicate(stream)) {
+      closeActiveStream(stream)
+    }
   }
 
   notifyCapacityWaiters()
   notifyThrottleWaiters()
+}
+
+function closeAllActiveStreams() {
+  closeActiveStreamsMatching(() => true)
 }
 
 async function waitForServerShutdownStreamsToDrain() {
@@ -990,22 +996,76 @@ export function closeActiveStreamsForUser(username: string) {
   notifyThrottleWaiters()
 }
 
-async function waitForActiveStreamsToDrain() {
+async function waitForActiveStreamsToDrain(
+  predicate: (stream: ActiveStream) => boolean = () => true,
+  label = "scheduled upload capacity recheck"
+) {
   const deadline = Date.now() + bandwidthRecheckStreamDrainTimeoutMs
 
-  while (activeStreams.size > 0 && Date.now() < deadline) {
-    await sleep(bandwidthRecheckStreamDrainPollMs)
+  function remaining() {
+    return [...activeStreams.values()].filter(predicate).length
   }
 
-  if (activeStreams.size > 0) {
+  let remainingStreams = remaining()
+
+  while (remainingStreams > 0 && Date.now() < deadline) {
+    await sleep(bandwidthRecheckStreamDrainPollMs)
+    remainingStreams = remaining()
+  }
+
+  if (remainingStreams > 0) {
     console.warn(
-      `[Warn] [Bandwidth] Continuing scheduled upload capacity recheck while ${activeStreams.size} stream(s) are still closing.`
+      `[Warn] [Bandwidth] Continuing ${label} while ${remainingStreams} stream(s) are still closing.`
     )
   }
 }
 
+type UploadCapacityRecheckHoldOptions = {
+  beforeMeasurement?: () => Promise<void>
+  initialCloseModes?: PlaybackMode[]
+}
+
+function getActiveClientKeys(
+  predicate: (stream: ActiveStream) => boolean = () => true
+) {
+  return new Set(
+    [...activeStreams.values()]
+      .filter(predicate)
+      .map((stream) => stream.clientKey)
+      .filter((clientKey): clientKey is string => Boolean(clientKey))
+  )
+}
+
+async function pauseStreamsForBandwidthRecheck(input: {
+  action: StreamPriorityAction
+  predicate: (stream: ActiveStream) => boolean
+  label: string
+}) {
+  const activeClientKeys = getActiveClientKeys(input.predicate)
+  const activeStreamCount = [...activeStreams.values()].filter(input.predicate).length
+
+  if (activeStreamCount <= 0) {
+    return
+  }
+
+  console.log(
+    `[Info] [Bandwidth] Pausing ${activeStreamCount} ${input.label} stream(s) before scheduled maintenance.`
+  )
+
+  for (const clientKey of activeClientKeys) {
+    markBandwidthRecheckClient(clientKey)
+    setClientActionByKey(clientKey, input.action)
+  }
+
+  await sleep(bandwidthRecheckClientPauseGraceMs)
+
+  closeActiveStreamsMatching(input.predicate)
+  await waitForActiveStreamsToDrain(input.predicate, input.label)
+}
+
 export async function runUploadCapacityRecheckWithStreamHold(
-  measure: () => Promise<void>
+  measure: () => Promise<void>,
+  options: UploadCapacityRecheckHoldOptions = {}
 ) {
   if (bandwidthRecheckActive) {
     await waitForBandwidthRecheck()
@@ -1014,39 +1074,29 @@ export async function runUploadCapacityRecheckWithStreamHold(
 
   bandwidthRecheckActive = true
   const startedAction = createBandwidthRecheckStartedAction()
-  const activeClientKeys = new Set(
-    [...activeStreams.values()]
-      .map((stream) => stream.clientKey)
-      .filter((clientKey): clientKey is string => Boolean(clientKey))
-  )
-  const hadActiveStreams = activeStreams.size > 0
-
-  if (hadActiveStreams) {
-    console.log(
-      `[Info] [Bandwidth] Pausing ${activeStreams.size} active stream(s) before scheduled upload capacity recheck.`
-    )
-  }
-
-  for (const clientKey of activeClientKeys) {
-    markBandwidthRecheckClient(clientKey)
-    setClientActionByKey(clientKey, startedAction)
-  }
-
-  if (hadActiveStreams) {
-    await sleep(bandwidthRecheckClientPauseGraceMs)
-  }
-
-  for (const stream of [...activeStreams.values()]) {
-    stream.forceClose?.()
-  }
-
-  if (hadActiveStreams) {
-    await waitForActiveStreamsToDrain()
-  }
-
   let failed = false
 
   try {
+    const initialCloseModes = new Set(options.initialCloseModes ?? [])
+
+    if (initialCloseModes.size > 0) {
+      await pauseStreamsForBandwidthRecheck({
+        action: startedAction,
+        predicate: (stream) => initialCloseModes.has(stream.mode),
+        label: [...initialCloseModes].join("/") || "selected",
+      })
+    }
+
+    if (options.beforeMeasurement) {
+      await options.beforeMeasurement()
+    }
+
+    await pauseStreamsForBandwidthRecheck({
+      action: startedAction,
+      predicate: () => true,
+      label: "active",
+    })
+
     await measure()
   } catch (error) {
     failed = true
@@ -1064,7 +1114,7 @@ export async function runUploadCapacityRecheckWithStreamHold(
     notifyBandwidthRecheckWaiters()
     notifyCapacityWaiters()
     notifyThrottleWaiters()
-    }
+  }
 }
 
 

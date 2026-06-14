@@ -3,20 +3,23 @@ export async function register() {
     const { bootstrapEnvironment } =
       await import("./src/server/startup/environment")
     const { startWorkers } = await import("./src/server/workers/startWorkers")
+    const { getDb } = await import("./src/server/db/sqlite")
+    const { runStartupFileMigrations } = await import("./src/server/media/fileMigration")
     const { startUploadCapacityMeasurement } = await import(
       "./src/server/bandwidth/uploadCapacity"
-    )
-    const { startScheduledUploadCapacityRechecks } = await import(
-      "./src/server/bandwidth/uploadCapacityRechecks"
     )
     const { startParentProcessMonitor } = await import(
       "./src/server/startup/parentProcessMonitor"
     )
 
     bootstrapEnvironment()
-    await startUploadCapacityMeasurement("startup")
-    startScheduledUploadCapacityRechecks()
+    getDb()
+    await runStartupFileMigrations()
     const workerRuntime = startWorkers()
+
+    await workerRuntime?.startupChecksReady
+    await startUploadCapacityMeasurement("startup")
+    workerRuntime?.startImportProcessing()
 
     startParentProcessMonitor(async () => {
       await workerRuntime?.stop()

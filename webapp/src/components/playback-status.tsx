@@ -12,7 +12,7 @@ const labels: Record<PlaybackStatusState, string> = {
   direct: "Direct play",
   transcoding: "Transcoding",
   waiting: "Waiting for transcoding resources...",
-  blocked: "Transcoding not possible right now.",
+  blocked: "Playback unavailable",
 }
 
 export function PlaybackStatus({ state }: { state: PlaybackStatusState }) {

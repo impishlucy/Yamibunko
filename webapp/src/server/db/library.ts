@@ -1,3 +1,4 @@
+import { isLocalNonAnimeId } from "@/lib/local-media"
 import type { AnimeInfo, AnimeSummary, AnimeVariant, Episode } from "@/lib/types"
 import { getStoredEpisodeWatchedSeconds } from "@/lib/watch-progress"
 import { getDb, nowIso } from "@/server/db/sqlite"
@@ -998,29 +999,26 @@ export function resolveLibrarySeasonNumberForAnime(input: {
       "SELECT slug, title, primary_anime_id FROM library_entries WHERE slug = ?"
     )
     .get(row.library_slug)
-  const variantSeason = getCachedSeriesVariantSeasonNumber(row.library_slug, row.id)
   const requestedPart =
     input.parsedPart && input.parsedPart > 1
       ? input.parsedPart
       : titlePartMarker(row)
 
   if (requestedPart && requestedPart > 1) {
-    const minimumPartSeason = input.parsedSeason + requestedPart - 1
-
-    return Math.max(variantSeason ?? 0, minimumPartSeason)
+    return input.parsedSeason + requestedPart - 1
   }
 
   const markerSeason = titleSeasonMarker(row)
 
   if (markerSeason) {
-    return Math.max(markerSeason, variantSeason ?? 0)
+    return markerSeason
   }
 
   if (!library || row.id === library.primary_anime_id) {
     return input.parsedSeason
   }
 
-  return variantSeason ?? input.parsedSeason
+  return getCachedSeriesVariantSeasonNumber(row.library_slug, row.id) ?? input.parsedSeason
 }
 
 export function upsertEpisode(input: {
@@ -1078,6 +1076,19 @@ export function upsertEpisode(input: {
     )
 
   syncEpisodeTitlesFromCachedStreaming(input.animeId, now)
+
+  if (isLocalNonAnimeId(input.animeId)) {
+    getDb()
+      .query(
+        `
+        UPDATE anime
+        SET episodes = MAX(COALESCE(episodes, 0), ?),
+            updated_at = ?
+        WHERE id = ?
+      `
+      )
+      .run(input.epNr, now, input.animeId)
+  }
 
   debugLog(
     `[Debug] [Library] Episode row upsert completed - Anime id ${input.animeId}, Season ${input.seasonNr}, Episode ${input.epNr}`
@@ -1509,6 +1520,24 @@ export function listEpisodeThumbnailCacheReferences() {
     .all()
 }
 
+function refreshLocalNonAnimeEpisodeCount(animeId: number) {
+  if (!isLocalNonAnimeId(animeId)) {
+    return
+  }
+
+  const now = nowIso()
+  const maxEpisode =
+    getDb()
+      .query<{ max_ep_nr: number | null }>(
+        "SELECT MAX(ep_nr) AS max_ep_nr FROM episodes WHERE anime_id = ?"
+      )
+      .get(animeId)?.max_ep_nr ?? null
+
+  getDb()
+    .query("UPDATE anime SET episodes = ?, updated_at = ? WHERE id = ?")
+    .run(maxEpisode, now, animeId)
+}
+
 export function deleteEpisodeByPath(filePath: string) {
   const episode = getEpisodeByPath(filePath)
 
@@ -1522,6 +1551,7 @@ export function deleteEpisodeByPath(filePath: string) {
     )
     .run(episode.animeId, episode.seasonNumber, episode.episodeNumber)
 
+  refreshLocalNonAnimeEpisodeCount(episode.animeId)
   pruneAnimeIfEmpty(episode.animeId)
   return episode
 }
@@ -1541,6 +1571,8 @@ export function deleteEpisodeRecord(input: {
       "DELETE FROM episodes WHERE anime_id = ? AND season_nr = ? AND ep_nr = ?"
     )
     .run(input.animeId, input.seasonNr, input.epNr)
+
+  refreshLocalNonAnimeEpisodeCount(input.animeId)
 }
 
 export function pruneAnimeIfEmpty(animeId: number) {
@@ -2040,6 +2072,7 @@ function listCachedAnimeCandidates() {
     `
     )
     .all()
+    .filter((row) => !isLocalNonAnimeId(row.id))
 }
 
 function findLibraryRootMatch(title: string) {
@@ -2062,6 +2095,24 @@ function findSeasonVariant(librarySlug: string, season?: number, part?: number) 
   const seriesVariants = listCachedAnimeVariants(librarySlug).filter((row) =>
     seriesFormats.has(row.format ?? "")
   )
+  const explicitSeasonVariants = seriesVariants.filter((row) =>
+    Boolean(titleSeasonMarker(row))
+  )
+  const exactSeasonVariants = explicitSeasonVariants.filter((row) =>
+    rowHasSeasonMarker(row, season)
+  )
+
+  if (exactSeasonVariants.length > 0) {
+    if (part && part > 1) {
+      return exactSeasonVariants.find((row) => rowHasPartMarker(row, part)) ?? null
+    }
+
+    return exactSeasonVariants[0] ?? null
+  }
+
+  if (explicitSeasonVariants.length > 0) {
+    return null
+  }
 
   if (part && part > 1) {
     return (
@@ -2143,4 +2194,5 @@ export function listAnimeIdsForAniListRefresh() {
     )
     .all()
     .map((row) => row.id)
+    .filter((id) => !isLocalNonAnimeId(id))
 }
