@@ -591,7 +591,7 @@ export async function runStartupFileMigrations() {
   }
 
   console.log(
-    "[Info] [Migration] Running File Migration, this can take a couple of minutes, depending on how many files you have and how strong your Hardware is. This can't be skipped"
+    "[Info] [Migration] Running File Migration, the app is not useable while this is running. The migration can take a couple of minutes, depending on how many files you have and how strong your Hardware is. This is mandatory to comply with V5 and can't be skipped."
   )
 
   const outputStat = await stat(config.mediaDir).catch(() => null)
