@@ -53,35 +53,26 @@ type EpisodeWebmPathRow = {
   file_path: string
 }
 
-async function moveFileFromTemp(source: string, destination: string) {
-  const destinationDirectory = path.dirname(destination)
-  const destinationTempPath = path.join(
-    destinationDirectory,
-    `.${path.basename(destination)}.migration-${process.pid}.tmp`
-  )
-
-  await mkdir(destinationDirectory, { recursive: true })
-  await rm(destinationTempPath, { force: true })
+async function moveFileReplacingDestination(source: string, destination: string) {
+  await mkdir(path.dirname(destination), { recursive: true })
+  await rm(destination, { force: true })
 
   try {
-    try {
-      await rename(source, destinationTempPath)
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code
+    await rename(source, destination)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
 
-      if (code !== "EXDEV") {
-        throw error
-      }
-
-      await copyFile(source, destinationTempPath)
-      await rm(source, { force: true })
+    if (code !== "EXDEV") {
+      throw error
     }
 
-    await rm(destination, { force: true })
-    await rename(destinationTempPath, destination)
-  } catch (error) {
-    await rm(destinationTempPath, { force: true }).catch(() => undefined)
-    throw error
+    try {
+      await copyFile(source, destination)
+      await rm(source, { force: true })
+    } catch (copyError) {
+      await rm(destination, { force: true }).catch(() => undefined)
+      throw copyError
+    }
   }
 }
 
@@ -129,6 +120,38 @@ async function pathExists(filePath: string) {
   }
 }
 
+function isMigrationOutputTempFileName(name: string) {
+  return /^\..+\.migration-\d+\.tmp$/u.test(name)
+}
+
+async function removeStaleMigrationOutputTempFiles(directory: string): Promise<number> {
+  const entries = await readdir(directory, { withFileTypes: true }).catch(() => null)
+
+  if (!entries) {
+    return 0
+  }
+
+  let removedCount = 0
+
+  for (const entry of entries) {
+    const entryPath = path.join(directory, entry.name)
+
+    if (entry.isDirectory()) {
+      removedCount += await removeStaleMigrationOutputTempFiles(entryPath)
+      continue
+    }
+
+    if (!entry.isFile() || !isMigrationOutputTempFileName(entry.name)) {
+      continue
+    }
+
+    await rm(entryPath, { force: true })
+    removedCount += 1
+  }
+
+  return removedCount
+}
+
 async function restoreMovedMigrationInput(manifest: MigrationWorkManifest) {
   if (!(await pathExists(manifest.tempInputPath))) {
     return false
@@ -141,7 +164,7 @@ async function restoreMovedMigrationInput(manifest: MigrationWorkManifest) {
     return true
   }
 
-  await moveFileFromTemp(manifest.tempInputPath, manifest.originalWebmPath)
+  await moveFileReplacingDestination(manifest.tempInputPath, manifest.originalWebmPath)
   return true
 }
 
@@ -402,7 +425,7 @@ async function recoverStaleMigrationWorkDirectories() {
 
       if (await pathExists(manifest.finalMp4Path)) {
         if (await pathExists(manifest.tempSubtitlePath)) {
-          await moveFileFromTemp(manifest.tempSubtitlePath, manifest.finalSubtitlePath)
+          await moveFileReplacingDestination(manifest.tempSubtitlePath, manifest.finalSubtitlePath)
         }
 
         await updateEpisodePath(manifest.originalWebmPath, manifest.finalMp4Path)
@@ -506,7 +529,7 @@ async function migrateWebmFile(webmPath: string) {
     await rm(tempSubtitlePath, { force: true })
     await writeMigrationManifest(migrationTempDirectory, manifest)
 
-    await moveFileFromTemp(webmPath, tempInputPath)
+    await moveFileReplacingDestination(webmPath, tempInputPath)
 
     const probe = (await ffprobe(tempInputPath)) as ProbeResult
     const subtitleStream = firstConvertibleSubtitleStream(probe)
@@ -545,10 +568,10 @@ async function migrateWebmFile(webmPath: string) {
       await assertFileExists(tempSubtitlePath, "WebVTT subtitle sidecar")
     }
 
-    await moveFileFromTemp(tempMp4Path, mp4Path)
+    await moveFileReplacingDestination(tempMp4Path, mp4Path)
 
     if (hasSubtitleOutput) {
-      await moveFileFromTemp(tempSubtitlePath, finalSubtitlePath)
+      await moveFileReplacingDestination(tempSubtitlePath, finalSubtitlePath)
     } else {
       await rm(finalSubtitlePath, { force: true })
     }
@@ -608,6 +631,14 @@ export async function runStartupFileMigrations() {
   }
 
   await recoverStaleMigrationWorkDirectories()
+
+  const staleOutputTempFiles = await removeStaleMigrationOutputTempFiles(config.mediaDir)
+
+  if (staleOutputTempFiles > 0) {
+    console.log(
+      `[Info] [Migration] Removed ${staleOutputTempFiles} stale migration temp file(s) from the output directory.`
+    )
+  }
 
   const shutdown = installMigrationShutdownHandlers()
 
