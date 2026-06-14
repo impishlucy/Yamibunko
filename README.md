@@ -29,7 +29,8 @@ Yamibunko is a all in one local anime library and file processor, with a desktop
 * VIP priority streaming so selected users can get better access when the server is under load.
 
 ### File Processing
-* If enabled it can convert input files for smaller, more consistent files, using HEVC conversion when needed.
+* If enabled it can convert input files for smaller, more consistent MP4 files, using AV1 when supported and HEVC as fallback.
+* Subtitles are saved as WebVTT sidecar files next to the converted videos.
 * If disabled it only servers your existing files and does not edit them.
 
 ## Install
@@ -75,7 +76,7 @@ http://192.168.178.10:3000/api/anilist/oauth/callback
 https://your-domain.example/api/anilist/oauth/callback
 ```
 
-Use the same base URL in the launcher or `.env` file.<br/>
+Use the same base URL in the launcher or in the manual startup arguments.<br/>
 If you host Yamibunko behind a path prefix, the callback path is appended behind that base URL.
 
 - - - - - -
@@ -86,21 +87,41 @@ The webapp can run without the launcher, but you must provide the runtime yourse
 
 * [Node.js 20 or newer](https://nodejs.org/)
 * [Bun](https://bun.sh/)
-* [FFmpeg and FFprobe with HEVC support](https://github.com/btbn/ffmpeg-builds/)
+* [FFmpeg and FFprobe with AV1/HEVC support](https://github.com/btbn/ffmpeg-builds/)
 
 #### Steps
 
-1. Edit the .env files and fill all fields. <br/>
- - Supported `TRANSCODE_ACCEL` values in env are nvenc, qsv, amd, or cpu.
- - Nvidia GPU = nvenc, AMD GPU = amd, Intel GPU & CPU with Quicksync = qsv.
+Run following commands from the cloned `webapp` directory:
 
-2. Start the app:
-From the `webapp` directory:
+1. Setup commands
 ```bash
 bun install
 bun run build
-bun run start
 ```
+2. Run the WebApp (Configure the parameters)
+```bash
+bun run start -- \
+  --BASE_URL=http://localhost:3000 \
+  --ANIME_INPUT_DIR=/path/to/input \
+  --ANIME_MEDIA_DIR=/path/to/output \
+  --IMPORT_ENABLED=true \
+  --IMPORT_ENCODING=av1 \
+  --FFMPEG_DIR=/path/to/ffmpeg/bin \
+  --TRANSCODE_ACCEL=nvenc \
+  --ANILIST_CLIENT_ID=optional-client-id \
+  --ANILIST_CLIENT_SECRET=optional-client-secret
+```
+
+Minimal argument notes:
+
+* `BASE_URL`: the URL users open in their browser, also used for the AniList callback.
+* `ANIME_INPUT_DIR`: folder watched for new files.
+* `ANIME_MEDIA_DIR`: output library folder, required when `IMPORT_ENABLED=true`.
+* `IMPORT_ENABLED`: `true` processes/moves files, `false` only catalogs existing input files.
+* `IMPORT_ENCODING`: `av1` or `hevc` based on hardware support, `none` when using unsupported hardware.
+* `FFMPEG_DIR`: folder containing `ffmpeg` and `ffprobe`.
+* `TRANSCODE_ACCEL`: `nvenc`, `intel_gpu`, `intel_cpu`, `amd_gpu`, `amd_cpu`, or `cpu`. Use `cpu` only when `IMPORT_ENABLED=false` and your hardware does not support `av1` or `hevc`.
+* `ANILIST_CLIENT_ID` and `ANILIST_CLIENT_SECRET`: optional, only needed for AniList tracking.
 
 ### Manual Webapp Update
 
