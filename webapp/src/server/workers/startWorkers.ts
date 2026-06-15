@@ -23,6 +23,7 @@ import { listEpisodeFilePaths } from "@/server/db/library"
 import { resetAdminIgnoredAppUpdateVersions } from "@/server/db/users"
 import { getServerConfigResult } from "@/server/config"
 import { tryRunCacheMaintenance } from "@/server/media/cacheMaintenance"
+import { repairLibraryPathMismatches } from "@/server/media/libraryPathRepair"
 import { isMediaFile, pathExists } from "@/server/media/mediaFiles"
 import {
   isInputImportOutputActive,
@@ -201,6 +202,12 @@ function sleep(milliseconds: number) {
   })
 }
 
+function normalizeFilePathKey(filePath: string) {
+  const resolvedPath = path.resolve(filePath)
+
+  return process.platform === "win32" ? resolvedPath.toLowerCase() : resolvedPath
+}
+
 const failedImportsFolderName = "_failed_imports"
 const failedImportsFolderNames = new Set([failedImportsFolderName])
 
@@ -298,34 +305,10 @@ export function startWorkers() {
     startupChecksResolve = resolve
   })
 
-  const inputWatcher = chokidar.watch(config.inputDir, {
-    ignoreInitial: true,
-    ignored: (watchPath) =>
-      isInsideNamedDirectory(
-        config.inputDir,
-        watchPath.toString(),
-        failedImportsFolderNames
-      ),
-    awaitWriteFinish: {
-      stabilityThreshold: 3000,
-      pollInterval: 1000,
-    },
-  })
-  const libraryWatcher = config.importEnabled
-    ? chokidar.watch(config.mediaDir, {
-        ignoreInitial: true,
-        awaitWriteFinish: {
-          stabilityThreshold: 3000,
-          pollInterval: 1000,
-        },
-      })
-    : null
-
-  console.log(
-    config.importEnabled
-      ? "[Info] [File Import] Watching input and library folders."
-      : "[Info] [File Import] Watching input folder with import processing disabled."
-  )
+  const runtimeWatchers: FSWatcher[] = []
+  let inputWatcher: FSWatcher | null = null
+  let libraryWatcher: FSWatcher | null = null
+  let watchersStarted = false
 
   async function pruneNonMediaOnlyDirectories(
     directory: string,
@@ -1082,15 +1065,21 @@ export function startWorkers() {
     try {
       const files = await walkFiles(config.mediaDir)
       const mediaFiles = files.filter(isMediaFile)
+      const knownLibraryPaths = new Set(
+        listEpisodeFilePaths().map((filePath) => normalizeFilePathKey(filePath))
+      )
 
       debugWorkers(
         `Library folder scan found ${files.length} files, ${mediaFiles.length} media files.`
       )
 
       let queuedLibraryFiles = 0
+      let knownLibraryFiles = 0
 
       for (const [index, filePath] of mediaFiles.entries()) {
-        if (enqueue("library-sync", filePath, { log: false })) {
+        if (knownLibraryPaths.has(normalizeFilePathKey(filePath))) {
+          knownLibraryFiles += 1
+        } else if (enqueue("library-sync", filePath, { log: false })) {
           queuedLibraryFiles += 1
         }
 
@@ -1099,9 +1088,13 @@ export function startWorkers() {
         }
       }
 
+      debugWorkers(
+        `Library folder scan skipped ${knownLibraryFiles} already indexed media file(s).`
+      )
+
       if (queuedLibraryFiles > 0) {
         console.log(
-          `[Info] [File Import] Found ${queuedLibraryFiles} library media file(s) to sync from scan.`
+          `[Info] [File Import] Found ${queuedLibraryFiles} unknown library media file(s) to sync from scan.`
         )
       }
 
@@ -1136,6 +1129,44 @@ export function startWorkers() {
     trackActiveWork(work, `directory-scan:${reason}`)
   }
 
+  async function runLibraryPathRepairForMaintenance(label: string) {
+    if (!config.importEnabled) {
+      return null
+    }
+
+    console.log(`[Info] [Workers] Starting ${label} library path repair.`)
+
+    try {
+      const result = await repairLibraryPathMismatches()
+      console.log(
+        `[Info] [Workers] ${label} library path repair completed - Scanned: ${result.scanned}, Repaired: ${result.repaired}, Missing: ${result.missing}, Skipped: ${result.skipped}.`
+      )
+      return result
+    } catch (error) {
+      console.error(
+        `[Error] [Workers] ${label} library path repair failed - startWorkers.ts - ${errorMessage(error)}`
+      )
+      return null
+    }
+  }
+
+  function queueRepairedLibrarySyncPaths(paths: string[], label: string) {
+    const uniquePaths = [...new Set(paths.map((filePath) => path.resolve(filePath)))]
+    let queued = 0
+
+    for (const filePath of uniquePaths) {
+      if (enqueue("library-sync", filePath, { log: false })) {
+        queued += 1
+      }
+    }
+
+    if (queued > 0) {
+      console.log(
+        `[Info] [Workers] Queued ${queued} repaired library media file(s) for ${label} resync.`
+      )
+    }
+  }
+
   async function runAniListRefreshForMaintenance(label: string) {
     console.log(`[Info] [Workers] Starting ${label} AniList sync.`)
 
@@ -1152,14 +1183,16 @@ export function startWorkers() {
   async function runStartupChecks() {
     blockImportWork("startup checks")
     console.log(
-      "[Info] [Workers] Starting startup checks for AniList, database, and library files."
+      "[Info] [Workers] Starting startup checks for database, library files, and AniList."
     )
 
     try {
+      const repairResult = await runLibraryPathRepairForMaintenance("startup")
       await runAniListRefreshForMaintenance("startup")
-      await scanLibraryDirectory()
+      queueRepairedLibrarySyncPaths(repairResult?.repairedPaths ?? [], "startup repair")
+      await scanKnownDeletedFiles()
       await waitForQueuedWorkKindsToFinish(
-        ["library-sync", "library-delete"],
+        ["library-delete"],
         "startup checks"
       )
       await checkForYamibunkoUpdate("startup")
@@ -1172,11 +1205,13 @@ export function startWorkers() {
 
   async function runDailyMaintenanceChecks() {
     await waitForActiveImportWorkToFinish("daily checks")
+    const repairResult = await runLibraryPathRepairForMaintenance("daily")
     await runAniListRefreshForMaintenance("daily")
+    queueRepairedLibrarySyncPaths(repairResult?.repairedPaths ?? [], "daily repair")
     await waitForDirectoryScanToFinish("daily checks")
-    await scanAllDirectories()
+    await scanKnownDeletedFiles()
     await waitForQueuedWorkKindsToFinish(
-      ["library-sync", "library-delete"],
+      ["library-delete"],
       "daily checks"
     )
     await checkForYamibunkoUpdate("daily maintenance")
@@ -1226,39 +1261,78 @@ export function startWorkers() {
     dailyAniListTimer.unref?.()
   }
 
-  inputWatcher.on("add", (filePath) => {
-    debugWorkers(`Input watcher add event - ${filePath}`)
-    enqueue("input", filePath)
-  })
-
-  inputWatcher.on("error", (error) => {
-    console.error(
-      `[Error] [Workers] Input watcher failed - startWorkers.ts - ${errorMessage(error)}`
-    )
-  })
-
-  inputWatcher.on("unlink", (filePath) => {
-    if (!config.importEnabled) {
-      debugWorkers(`Input watcher unlink event with import disabled - ${filePath}`)
-      enqueue("library-delete", filePath)
+  function startFileWatchers() {
+    if (watchersStarted || shuttingDown) {
+      return
     }
-  })
 
-  libraryWatcher?.on("add", (filePath) => {
-    debugWorkers(`Library watcher add event - ${filePath}`)
-    enqueue("library-sync", filePath)
-  })
+    watchersStarted = true
+    inputWatcher = chokidar.watch(config.inputDir, {
+      ignoreInitial: true,
+      ignored: (watchPath) =>
+        isInsideNamedDirectory(
+          config.inputDir,
+          watchPath.toString(),
+          failedImportsFolderNames
+        ),
+      awaitWriteFinish: {
+        stabilityThreshold: 3000,
+        pollInterval: 1000,
+      },
+    })
+    runtimeWatchers.push(inputWatcher)
 
-  libraryWatcher?.on("unlink", (filePath) => {
-    debugWorkers(`Library watcher unlink event - ${filePath}`)
-    enqueue("library-delete", filePath)
-  })
+    inputWatcher.on("add", (filePath) => {
+      debugWorkers(`Input watcher add event - ${filePath}`)
+      enqueue("input", filePath)
+    })
 
-  libraryWatcher?.on("error", (error) => {
-    console.error(
-      `[Error] [Workers] Library watcher failed - startWorkers.ts - ${errorMessage(error)}`
+    inputWatcher.on("error", (error) => {
+      console.error(
+        `[Error] [Workers] Input watcher failed - startWorkers.ts - ${errorMessage(error)}`
+      )
+    })
+
+    inputWatcher.on("unlink", (filePath) => {
+      if (!config.importEnabled) {
+        debugWorkers(`Input watcher unlink event with import disabled - ${filePath}`)
+        enqueue("library-delete", filePath)
+      }
+    })
+
+    if (config.importEnabled) {
+      libraryWatcher = chokidar.watch(config.mediaDir, {
+        ignoreInitial: true,
+        awaitWriteFinish: {
+          stabilityThreshold: 3000,
+          pollInterval: 1000,
+        },
+      })
+      runtimeWatchers.push(libraryWatcher)
+
+      libraryWatcher.on("add", (filePath) => {
+        debugWorkers(`Library watcher add event - ${filePath}`)
+        enqueue("library-sync", filePath)
+      })
+
+      libraryWatcher.on("unlink", (filePath) => {
+        debugWorkers(`Library watcher unlink event - ${filePath}`)
+        enqueue("library-delete", filePath)
+      })
+
+      libraryWatcher.on("error", (error) => {
+        console.error(
+          `[Error] [Workers] Library watcher failed - startWorkers.ts - ${errorMessage(error)}`
+        )
+      })
+    }
+
+    console.log(
+      config.importEnabled
+        ? "[Info] [File Import] Watching input and library folders."
+        : "[Info] [File Import] Watching input folder with import processing disabled."
     )
-  })
+  }
 
   function startImportProcessing() {
     if (importProcessingStarted || shuttingDown) {
@@ -1266,6 +1340,7 @@ export function startWorkers() {
     }
 
     importProcessingStarted = true
+    startFileWatchers()
     unblockImportWork("startup checks and startup bandwidth test completed")
 
     scanTimer = setInterval(() => {
@@ -1273,9 +1348,16 @@ export function startWorkers() {
     }, scanIntervalMs)
     scanTimer.unref?.()
 
-    debugWorkers("Starting initial input scan after startup checks.")
-    const inputScan = scanInputDirectory()
-    trackActiveWork(inputScan, "directory-scan:startup-input")
+    debugWorkers("Starting non-blocking initial directory scan after startup checks.")
+    const startupScan = (async () => {
+      await scanInputDirectory()
+
+      if (config.importEnabled) {
+        await scanLibraryDirectory()
+      }
+    })()
+    trackActiveWork(startupScan, "directory-scan:startup")
+
     scheduleDailyAniListSync()
   }
 
@@ -1395,10 +1477,7 @@ export function startWorkers() {
     )
 
     await beginStreamServerShutdown()
-    await Promise.all([
-      inputWatcher.close(),
-      ...(libraryWatcher ? [libraryWatcher.close()] : []),
-    ])
+    await Promise.all(runtimeWatchers.map((watcher) => watcher.close()))
 
     await waitForActiveShutdownWork()
 
@@ -1417,7 +1496,7 @@ export function startWorkers() {
 
   const runtime = {
     activeWork,
-    watchers: [inputWatcher, ...(libraryWatcher ? [libraryWatcher] : [])],
+    watchers: runtimeWatchers,
     startupChecksReady,
     startImportProcessing,
     stop,

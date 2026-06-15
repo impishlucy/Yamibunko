@@ -98,10 +98,6 @@ const libraryRelationTypes = new Set([
   "CONTAINS",
 ])
 
-function isLibraryRelationType(relationType: string | null | undefined) {
-  return Boolean(relationType && libraryRelationTypes.has(relationType))
-}
-
 function animeTitle(metadata: Pick<AnimeMetadataInput, "id" | "title">) {
   const title =
     metadata.title.english ??
@@ -757,45 +753,6 @@ function stripLibraryInfo(media: AnimeMetadataInput): AnimeMetadataInput {
   }
 }
 
-function unlinkExternalRelationsFromLibrary(input: {
-  librarySlug: string
-  primaryAnimeId: number
-  selectedAnimeId: number
-  relations: NonNullable<AnimeMetadataInput["relations"]>
-}) {
-  const externalRelationIds = input.relations
-    .filter((relation) => !isLibraryRelationType(relation.relationType))
-    .map((relation) => relation.media.id)
-    .filter(
-      (animeId) =>
-        animeId !== input.primaryAnimeId && animeId !== input.selectedAnimeId
-    )
-
-  if (externalRelationIds.length === 0) {
-    return
-  }
-
-  const placeholders = externalRelationIds.map(() => "?").join(", ")
-  const result = getDb()
-    .query(
-      `
-      UPDATE anime
-      SET library_slug = NULL,
-          relation_kind = NULL,
-          updated_at = ?
-      WHERE library_slug = ?
-        AND id IN (${placeholders})
-    `
-    )
-    .run(nowIso(), input.librarySlug, ...externalRelationIds)
-
-  if (result.changes > 0) {
-    console.warn(
-      `[Warn] [Library] Detached ${result.changes} external AniList relation(s) from library ${input.librarySlug}`
-    )
-  }
-}
-
 export function upsertAnime(metadata: AnimeMetadataInput) {
   const library = requireLibrary(metadata)
   const relations = metadata.relations ?? []
@@ -837,13 +794,6 @@ export function upsertAnime(metadata: AnimeMetadataInput) {
         : stripLibraryInfo(relation.media)
     )
   }
-
-  unlinkExternalRelationsFromLibrary({
-    librarySlug,
-    primaryAnimeId: normalizedLibrary.primaryAnimeId,
-    selectedAnimeId: metadata.id,
-    relations,
-  })
 
   debugLog(
     `[Debug] [Library] Related anime rows upserted - Count ${relations.length}`
@@ -2183,11 +2133,14 @@ export function listAnimeIdsForAniListRefresh() {
       `
       SELECT DISTINCT a.id
       FROM anime a
-      WHERE EXISTS (SELECT 1 FROM episodes e WHERE e.anime_id = a.id)
-        OR EXISTS (
-          SELECT 1
-          FROM library_entries le
-          WHERE le.primary_anime_id = a.id
+      WHERE (a.status IS NULL OR UPPER(a.status) NOT IN ('FINISHED', 'CANCELLED'))
+        AND (
+          EXISTS (SELECT 1 FROM episodes e WHERE e.anime_id = a.id)
+          OR EXISTS (
+            SELECT 1
+            FROM library_entries le
+            WHERE le.primary_anime_id = a.id
+          )
         )
       ORDER BY a.id ASC
     `
