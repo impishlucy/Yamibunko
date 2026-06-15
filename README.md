@@ -18,10 +18,10 @@ Yamibunko is a all in one local anime library and file processor, with a desktop
 
 ### General
 
-* Custom player designed for animes, with the usual controls, skip intro button and Google casting.
+* Custom player designed for animes, with custom subtitles, skip intro/outro button and Google casting.
 * Responsive layouts for all pages, on desktop, tablets, and phones.
-* Direct-File play and transcoding are possible.
-* Per-series library grouping, no more searching, its all grouped together.
+* Direct-File play and transcoding for older devices are possible.
+* Per-series library grouping, no more specific searching, its grouped together per series.
 * AniList integration for metadata, tracking, watching progress and watching status.
 * Desktop launcher that prepares the runtime, starts the webapp, and keeps setup easier to use.
 * Bandwidth-aware streaming, uses a server limit and helps avoid overloading the host connection.
@@ -29,8 +29,7 @@ Yamibunko is a all in one local anime library and file processor, with a desktop
 * VIP priority streaming so selected users can get better access when the server is under load.
 
 ### File Processing
-* If enabled it can convert input files for smaller, more consistent MP4 files, using AV1 when supported and HEVC as fallback.
-* Subtitles are saved as WebVTT sidecar files next to the converted videos.
+* If enabled it can convert input files for smaller, more consistent MP4 files, using AV1 with HEVC as fallback.
 * If disabled it only servers your existing files and does not edit them.
 
 ## Install
@@ -54,7 +53,6 @@ The only required things are an 64bit OS and .NET 10.
 6. Save the setup and wait for the launcher to start the web UI.
 
 The launcher prepares the local runtime, downloads whats needed and starts the webapp.<br/>
-If the web UI does not open automatically, check the launcher log window.<br/>
 You can close the Logs if you want, the app runs in the backround and has right clickable tray icon.
 
 ### Update (with Launcher)
@@ -77,7 +75,7 @@ https://your-domain.example/api/anilist/oauth/callback
 ```
 
 Use the same base URL in the launcher or in the manual startup arguments.<br/>
-If you host Yamibunko behind a path prefix, the callback path is appended behind that base URL.
+If you host Yamibunko behind a path prefix (.e.g https://your.url/anime/), the callback path is appended behind that path.
 
 - - - - - -
 
