@@ -16,7 +16,12 @@ import {
   pathExists,
   removeEpisodeThumbnails,
 } from "@/server/media/mediaFiles"
-import { subtitleSidecarPathForMediaFile } from "@/server/media/subtitles"
+import {
+  isSubtitleSidecarFile,
+  subtitleSidecarDirectoryForMediaFile,
+  subtitleSidecarExtensions,
+  subtitlesDirectoryName,
+} from "@/server/media/subtitles"
 import { errorMessage, fileName } from "@/server/utils/format"
 import { debugLog } from "@/server/utils/debugLog"
 
@@ -846,7 +851,39 @@ async function walkLibraryMediaFiles(directory: string) {
   return files
 }
 
-async function directoryHasMediaFiles(directory: string): Promise<boolean> {
+function isSubtitleFolderPath(directory: string) {
+  return path.basename(directory).toLowerCase() === subtitlesDirectoryName.toLowerCase()
+}
+
+function isLibrarySubtitlePayloadFile(filePath: string) {
+  return isSubtitleSidecarFile(filePath) || isSubtitleFolderPath(path.dirname(filePath))
+}
+
+async function walkLibrarySubtitleSidecarFiles(directory: string) {
+  const entries = await readdir(directory, { withFileTypes: true }).catch(() => [])
+  const files: string[] = []
+
+  for (const [index, entry] of entries.entries()) {
+    if (index > 0 && index % 50 === 0) {
+      await yieldToEventLoop()
+    }
+
+    const entryPath = path.join(directory, entry.name)
+
+    if (entry.isDirectory()) {
+      files.push(...(await walkLibrarySubtitleSidecarFiles(entryPath)))
+      continue
+    }
+
+    if (entry.isFile() && isLibrarySubtitlePayloadFile(entryPath)) {
+      files.push(entryPath)
+    }
+  }
+
+  return files
+}
+
+async function directoryHasLibraryPayloadFiles(directory: string): Promise<boolean> {
   const entries = await readdir(directory, { withFileTypes: true }).catch(() => null)
 
   if (!entries) {
@@ -860,11 +897,11 @@ async function directoryHasMediaFiles(directory: string): Promise<boolean> {
 
     const entryPath = path.join(directory, entry.name)
 
-    if (entry.isFile() && isMediaFile(entryPath)) {
+    if (entry.isFile() && (isMediaFile(entryPath) || isLibrarySubtitlePayloadFile(entryPath))) {
       return true
     }
 
-    if (entry.isDirectory() && (await directoryHasMediaFiles(entryPath))) {
+    if (entry.isDirectory() && (await directoryHasLibraryPayloadFiles(entryPath))) {
       return true
     }
   }
@@ -872,7 +909,7 @@ async function directoryHasMediaFiles(directory: string): Promise<boolean> {
   return false
 }
 
-async function removeDirectoryTreeIfNoMedia(directory: string) {
+async function removeDirectoryTreeIfNoLibraryPayload(directory: string) {
   const mediaRoot = path.resolve(getServerConfig().mediaDir)
   const resolvedDirectory = path.resolve(directory)
 
@@ -880,7 +917,7 @@ async function removeDirectoryTreeIfNoMedia(directory: string) {
     return false
   }
 
-  if (await directoryHasMediaFiles(resolvedDirectory)) {
+  if (await directoryHasLibraryPayloadFiles(resolvedDirectory)) {
     return false
   }
 
@@ -969,6 +1006,29 @@ function targetPathForRepair(input: {
   )
 }
 
+function targetSubtitlePathForRepair(input: {
+  target: LibraryPathRepairTarget
+  sourcePath: string
+  season: number
+  part?: number
+}) {
+  const mediaRoot = path.resolve(getServerConfig().mediaDir)
+  const safeLibraryTitle = sanitizeExportPathPart(input.target.title)
+  const sourceFileName = path.basename(input.sourcePath)
+
+  if (!safeLibraryTitle || !sourceFileName) {
+    return null
+  }
+
+  return path.join(
+    mediaRoot,
+    safeLibraryTitle,
+    formatSeasonFolderName(input.season, input.part),
+    subtitlesDirectoryName,
+    sourceFileName
+  )
+}
+
 function samePath(left: string, right: string) {
   const leftPath = path.resolve(left)
   const rightPath = path.resolve(right)
@@ -1019,28 +1079,123 @@ async function moveFile(sourcePath: string, destinationPath: string) {
   }
 }
 
-async function moveSubtitleSidecarIfNeeded(sourcePath: string, destinationPath: string) {
-  const sourceSidecar = subtitleSidecarPathForMediaFile(sourcePath)
+function uniqueExistingPaths(paths: string[]) {
+  const seen = new Set<string>()
+  const unique: string[] = []
 
-  if (!(await fileExists(sourceSidecar))) {
-    return
+  for (const filePath of paths) {
+    const key = process.platform === "win32"
+      ? path.resolve(filePath).toLowerCase()
+      : path.resolve(filePath)
+
+    if (seen.has(key)) {
+      continue
+    }
+
+    seen.add(key)
+    unique.push(filePath)
   }
 
-  const destinationSidecar = subtitleSidecarPathForMediaFile(destinationPath)
+  return unique
+}
 
-  if (samePath(sourceSidecar, destinationSidecar)) {
-    return
+function isSubtitleFileNameForMedia(mediaBaseName: string, subtitleFileName: string) {
+  const normalizedMediaBaseName = mediaBaseName.toLowerCase()
+  const normalizedSubtitleBaseName = path
+    .basename(subtitleFileName, path.extname(subtitleFileName))
+    .toLowerCase()
+
+  return (
+    normalizedSubtitleBaseName === normalizedMediaBaseName ||
+    normalizedSubtitleBaseName.startsWith(`${normalizedMediaBaseName}.`) ||
+    normalizedSubtitleBaseName.startsWith(`${normalizedMediaBaseName} `)
+  )
+}
+
+async function listSubtitleSidecarsForMediaFile(mediaFilePath: string) {
+  const parsed = path.parse(mediaFilePath)
+  const subtitleDirectory = subtitleSidecarDirectoryForMediaFile(mediaFilePath)
+  const candidates = [
+    ...[subtitleDirectory, parsed.dir].flatMap((directory) =>
+      subtitleSidecarExtensions.map((extension) =>
+        path.join(directory, `${parsed.name}${extension}`)
+      )
+    ),
+  ]
+  const subtitleEntries = await readdir(subtitleDirectory, { withFileTypes: true }).catch(
+    () => []
+  )
+
+  for (const entry of subtitleEntries) {
+    if (entry.isFile() && isSubtitleFileNameForMedia(parsed.name, entry.name)) {
+      candidates.push(path.join(subtitleDirectory, entry.name))
+    }
   }
 
-  if (await pathExists(destinationSidecar)) {
-    console.warn(
-      `[Warn] [Library] Skipped subtitle sidecar relocation because destination already exists - ${destinationSidecar}`
+  const existing: string[] = []
+
+  for (const candidate of uniqueExistingPaths(candidates)) {
+    if (await fileExists(candidate)) {
+      existing.push(candidate)
+    }
+  }
+
+  return existing
+}
+
+function subtitleSidecarDestinationForMediaFile(
+  sourceMediaPath: string,
+  sourceSidecarPath: string,
+  destinationMediaPath: string
+) {
+  const sourceMediaBaseName = path.parse(sourceMediaPath).name
+  const destinationMediaBaseName = path.parse(destinationMediaPath).name
+  const sourceSidecarFileName = path.basename(sourceSidecarPath)
+  const sourceSidecarExtension = path.extname(sourceSidecarFileName)
+  const sourceSidecarBaseName = path.basename(
+    sourceSidecarFileName,
+    sourceSidecarExtension
+  )
+  const preservedSuffix = sourceSidecarBaseName.startsWith(sourceMediaBaseName)
+    ? sourceSidecarBaseName.slice(sourceMediaBaseName.length)
+    : ""
+
+  return path.join(
+    subtitleSidecarDirectoryForMediaFile(destinationMediaPath),
+    `${destinationMediaBaseName}${preservedSuffix}${sourceSidecarExtension}`
+  )
+}
+
+async function moveSubtitleSidecarsIfNeeded(sourcePath: string, destinationPath: string) {
+  const sourceSidecars = await listSubtitleSidecarsForMediaFile(sourcePath)
+
+  for (const sourceSidecar of sourceSidecars) {
+    const destinationSidecar = subtitleSidecarDestinationForMediaFile(
+      sourcePath,
+      sourceSidecar,
+      destinationPath
     )
-    return
-  }
 
-  await moveFile(sourceSidecar, destinationSidecar)
-  await removeEmptyLibraryParents(path.dirname(sourceSidecar))
+    if (samePath(sourceSidecar, destinationSidecar)) {
+      continue
+    }
+
+    if (await pathExists(destinationSidecar)) {
+      if (await filesHaveSameSize(sourceSidecar, destinationSidecar)) {
+        await rm(sourceSidecar, { force: true })
+        await removeEmptyLibraryParents(path.dirname(sourceSidecar))
+        continue
+      }
+
+      console.warn(
+        `[Warn] [Library] Preserved subtitle sidecar because destination already exists with different size - ${sourceSidecar} -> ${destinationSidecar}`
+      )
+      continue
+    }
+
+    await moveFile(sourceSidecar, destinationSidecar)
+    await removeEmptyLibraryParents(path.dirname(sourceSidecar))
+  }
 }
 
 async function filesHaveSameSize(leftPath: string, rightPath: string) {
@@ -1057,7 +1212,7 @@ async function removeDuplicateSourceFile(sourcePath: string, destinationPath: st
     return false
   }
 
-  await moveSubtitleSidecarIfNeeded(sourcePath, destinationPath)
+  await moveSubtitleSidecarsIfNeeded(sourcePath, destinationPath)
   await rm(sourcePath, { force: true })
   return true
 }
@@ -1156,13 +1311,75 @@ async function repairPhysicalLibraryFile(
   )
 
   await moveFile(sourcePath, destinationPath)
-  await moveSubtitleSidecarIfNeeded(sourcePath, destinationPath)
+  await moveSubtitleSidecarsIfNeeded(sourcePath, destinationPath)
   deleteEpisodeByPath(sourcePath)
   await removeEpisodeThumbnails(sourcePath).catch(() => undefined)
   await removeEmptyLibraryParents(path.dirname(sourcePath))
 
   console.log(
     `[Info] [Library] Moved misplaced physical library file for resync - ${destinationPath}`
+  )
+
+  return { status: "repaired", destinationPath }
+}
+
+async function repairPhysicalSubtitleSidecarFile(
+  sourcePath: string,
+  sourceDirectory: PhysicalLibraryDirectory,
+  target: LibraryPathRepairTarget
+): Promise<EpisodePathRepairResult> {
+  if (!(await pathExists(sourcePath))) {
+    return { status: "skipped" }
+  }
+
+  const parsed = parseAnimeFilePath(sourcePath, {
+    rootDir: getServerConfig().mediaDir,
+    fallbackTitles: [sourceDirectory.name],
+  })
+
+  if (!parsed?.title || !parsed.season || !parsed.episode) {
+    return { status: "skipped" }
+  }
+
+  const targetLocation = targetLocationFromParsedTitle(parsed)
+  const destinationPath = targetSubtitlePathForRepair({
+    target,
+    sourcePath,
+    season: targetLocation.season,
+    part: targetLocation.part,
+  })
+
+  if (!destinationPath || samePath(sourcePath, destinationPath)) {
+    return { status: "skipped" }
+  }
+
+  if (await pathExists(destinationPath)) {
+    if (await filesHaveSameSize(sourcePath, destinationPath)) {
+      await rm(sourcePath, { force: true })
+      await removeEmptyLibraryParents(path.dirname(sourcePath))
+
+      console.warn(
+        `[Warn] [Library] Removed duplicate misplaced subtitle sidecar because the corrected destination already exists - ${fileName(sourcePath)} -> ${destinationPath}`
+      )
+
+      return { status: "repaired", destinationPath }
+    }
+
+    console.warn(
+      `[Warn] [Library] Preserved misplaced subtitle sidecar because destination already exists with different size - ${fileName(sourcePath)} -> ${destinationPath}`
+    )
+    return { status: "skipped" }
+  }
+
+  console.warn(
+    `[Warn] [Library] Repairing misplaced subtitle sidecar without AniList lookup - ${fileName(sourcePath)}: ${sourceDirectory.name} -> ${target.title}`
+  )
+
+  await moveFile(sourcePath, destinationPath)
+  await removeEmptyLibraryParents(path.dirname(sourcePath))
+
+  console.log(
+    `[Info] [Library] Moved misplaced subtitle sidecar for resync - ${destinationPath}`
   )
 
   return { status: "repaired", destinationPath }
@@ -1224,7 +1441,61 @@ async function repairPhysicalDirectoryMismatchedFiles(
     }
   }
 
-  await removeDirectoryTreeIfNoMedia(directory.path).catch(() => false)
+  const subtitleFiles = await walkLibrarySubtitleSidecarFiles(directory.path)
+  result.scanned += subtitleFiles.length
+
+  for (const [index, subtitleFile] of subtitleFiles.entries()) {
+    try {
+      if (!(await pathExists(subtitleFile))) {
+        result.skipped += 1
+        continue
+      }
+
+      const parsed = parseAnimeFilePath(subtitleFile, {
+        rootDir: getServerConfig().mediaDir,
+        fallbackTitles: [directory.name],
+      })
+
+      if (!parsed?.title || !parsed.season || !parsed.episode) {
+        result.skipped += 1
+        continue
+      }
+
+      const target = findPhysicalFileRepairTarget(
+        parsed.title,
+        directory,
+        directories,
+        entries
+      )
+
+      if (!target) {
+        result.skipped += 1
+        continue
+      }
+
+      const repair = await repairPhysicalSubtitleSidecarFile(
+        subtitleFile,
+        directory,
+        target
+      )
+      result[repair.status] += 1
+
+      if (repair.status === "repaired") {
+        result.repairedPaths.push(repair.destinationPath)
+      }
+    } catch (error) {
+      result.skipped += 1
+      console.error(
+        `[Error] [Library] Physical subtitle sidecar mismatch repair failed - ${subtitleFile} - ${errorMessage(error)}`
+      )
+    }
+
+    if (index % 25 === 24) {
+      await yieldToEventLoop()
+    }
+  }
+
+  await removeDirectoryTreeIfNoLibraryPayload(directory.path).catch(() => false)
 
   return result
 }
@@ -1262,23 +1533,11 @@ async function consolidatePhysicalLibraryFolders(
     const mediaFiles = await walkLibraryMediaFiles(directory.path)
     result.scanned += mediaFiles.length
 
-    if (mediaFiles.length === 0) {
-      const removed = await removeDirectoryTreeIfNoMedia(directory.path).catch(() => false)
-
-      if (removed) {
-        console.warn(
-          `[Warn] [Library] Removed empty misplaced library folder without AniList lookup - ${directory.name} -> ${target.title}`
-        )
-      } else {
-        result.skipped += 1
-      }
-
-      continue
+    if (mediaFiles.length > 0) {
+      console.warn(
+        `[Warn] [Library] Consolidating misplaced library folder without AniList lookup - ${directory.name} -> ${target.title}`
+      )
     }
-
-    console.warn(
-      `[Warn] [Library] Consolidating misplaced library folder without AniList lookup - ${directory.name} -> ${target.title}`
-    )
 
     for (const [fileIndex, mediaFile] of mediaFiles.entries()) {
       try {
@@ -1300,12 +1559,47 @@ async function consolidatePhysicalLibraryFolders(
       }
     }
 
-    const removed = await removeDirectoryTreeIfNoMedia(directory.path).catch(() => false)
+    const subtitleFiles = await walkLibrarySubtitleSidecarFiles(directory.path)
+    result.scanned += subtitleFiles.length
+
+    if (mediaFiles.length === 0 && subtitleFiles.length > 0) {
+      console.warn(
+        `[Warn] [Library] Consolidating misplaced library subtitle folder without AniList lookup - ${directory.name} -> ${target.title}`
+      )
+    }
+
+    for (const [fileIndex, subtitleFile] of subtitleFiles.entries()) {
+      try {
+        const repair = await repairPhysicalSubtitleSidecarFile(
+          subtitleFile,
+          directory,
+          target
+        )
+        result[repair.status] += 1
+
+        if (repair.status === "repaired") {
+          result.repairedPaths.push(repair.destinationPath)
+        }
+      } catch (error) {
+        result.skipped += 1
+        console.error(
+          `[Error] [Library] Physical library subtitle folder repair failed - ${subtitleFile} - ${errorMessage(error)}`
+        )
+      }
+
+      if (fileIndex % 25 === 24) {
+        await yieldToEventLoop()
+      }
+    }
+
+    const removed = await removeDirectoryTreeIfNoLibraryPayload(directory.path).catch(() => false)
 
     if (removed) {
       console.warn(
         `[Warn] [Library] Removed empty misplaced library folder after consolidation - ${directory.name}`
       )
+    } else if (mediaFiles.length === 0 && subtitleFiles.length === 0) {
+      result.skipped += 1
     }
 
     if (directoryIndex % 10 === 9) {
@@ -1444,7 +1738,7 @@ async function repairEpisodePath(
   )
 
   await moveFile(sourcePath, destinationPath)
-  await moveSubtitleSidecarIfNeeded(sourcePath, destinationPath)
+  await moveSubtitleSidecarsIfNeeded(sourcePath, destinationPath)
   deleteEpisodeByPath(row.file_path)
   await removeEpisodeThumbnails(row.file_path).catch(() => undefined)
   await removeEmptyLibraryParents(path.dirname(sourcePath))
