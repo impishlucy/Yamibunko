@@ -148,6 +148,29 @@ const recentMetadataLookups = new Map<
   { metadata: AnimeMetadataInput | null; createdAt: number }
 >()
 
+type MetadataLookupOptions = {
+  mediaKind?: "episode" | "movie"
+}
+
+function metadataLookupKindKey(options?: MetadataLookupOptions) {
+  return options?.mediaKind ?? ""
+}
+
+function isStandaloneMetadataLookup(options?: MetadataLookupOptions) {
+  return options?.mediaKind === "movie"
+}
+
+function isLookupCompatibleMediaFormat(
+  format: string | null | undefined,
+  options?: MetadataLookupOptions
+) {
+  if (!isStandaloneMetadataLookup(options)) {
+    return true
+  }
+
+  return format !== "TV" && format !== "TV_SHORT"
+}
+
 export class AniListMetadataLookupUnavailableError extends Error {
   constructor(message: string) {
     super(message)
@@ -301,14 +324,119 @@ function uniqueCandidates(candidates: string[]) {
 
   return candidates.filter((candidate) => {
     const normalized = candidate.trim().replace(/\s+/g, " ")
+    const key = normalized.toLowerCase()
 
-    if (!normalized || seen.has(normalized.toLowerCase())) {
+    if (!normalized || seen.has(key)) {
       return false
     }
 
-    seen.add(normalized.toLowerCase())
+    seen.add(key)
     return true
   })
+}
+
+function isAsciiAlphaNumeric(value: string) {
+  return /^[A-Za-z0-9]$/.test(value)
+}
+
+function isSearchPunctuation(value: string) {
+  return value === "?" ||
+    value === "!" ||
+    value === "*" ||
+    value === "'" ||
+    value === '"' ||
+    value === "~" ||
+    value === "`" ||
+    value === "’" ||
+    value === "´"
+}
+
+function normalizeSearchUnicode(value: string) {
+  return value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+}
+
+function normalizeSearchPunctuation(value: string) {
+  const normalizedValue = normalizeSearchUnicode(value)
+  let output = ""
+
+  for (let index = 0; index < normalizedValue.length; index += 1) {
+    const char = normalizedValue[index] ?? ""
+
+    if (!isSearchPunctuation(char)) {
+      output += char
+      continue
+    }
+
+    const previous = normalizedValue[index - 1] ?? ""
+    const next = normalizedValue[index + 1] ?? ""
+
+    if (isAsciiAlphaNumeric(previous) && isAsciiAlphaNumeric(next)) {
+      output += "_"
+    }
+  }
+
+  return output.replace(/\s+/g, " ").trim()
+}
+
+function getPossessiveSearchVariants(title: string) {
+  const words = title.split(/\s+/).filter(Boolean)
+  const variants: string[] = []
+
+  for (let index = 0; index < words.length && variants.length < 6; index += 1) {
+    const word = words[index] ?? ""
+
+    if (!/^[A-Za-z]{3,}s$/.test(word)) {
+      continue
+    }
+
+    if (!word.endsWith("ss")) {
+      const singularPossessive = [...words]
+      singularPossessive[index] = `${word.slice(0, -1)}_s`
+      variants.push(singularPossessive.join(" "))
+    }
+
+    const pluralPossessive = [...words]
+    pluralPossessive[index] = `${word}_`
+    variants.push(pluralPossessive.join(" "))
+  }
+
+  return variants
+}
+
+function getRebuildVersionSearchVariants(title: string) {
+  const normalized = normalizeSearchUnicode(title)
+  const variants = [
+    normalized.replace(/\b(\d)\.\d{1,2}\b/g, "$1.0"),
+    normalized.replace(/\b(\d)\.\d{1,2}\s*\+\s*(\d)\.\d{1,2}\b/g, "$1.0+$2.0"),
+  ]
+
+  return variants.filter((variant) => variant !== normalized)
+}
+
+function getSearchTitleVariants(title: string) {
+  const unicodeTitle = normalizeSearchUnicode(title)
+
+  return uniqueCandidates([
+    normalizeSearchPunctuation(unicodeTitle),
+    unicodeTitle,
+    ...getRebuildVersionSearchVariants(unicodeTitle),
+    ...getPossessiveSearchVariants(unicodeTitle),
+  ])
+}
+
+function getStandaloneTitleSearchVariants(title: string) {
+  const withoutMovieLabel = title
+    .replace(/\b(?:the\s+)?movie(?:\s+\d{1,2})?\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+
+  if (!withoutMovieLabel || withoutMovieLabel === title.trim()) {
+    return []
+  }
+
+  return getSearchTitleVariants(withoutMovieLabel)
 }
 
 function stripParsedSeasonPartFromTitle(
@@ -361,56 +489,72 @@ function stripParsedSeasonPartFromTitle(
   return normalizedTitle.trim().replace(/\s+/g, " ")
 }
 
-function getSearchCandidates(title: string, season?: number, part?: number) {
+function getSearchCandidates(
+  title: string,
+  season?: number,
+  part?: number,
+  options?: MetadataLookupOptions
+) {
   const normalizedTitle = stripParsedSeasonPartFromTitle(title, season, part)
 
   if (!normalizedTitle) {
     return []
   }
 
+  const titleVariants = uniqueCandidates([
+    ...getSearchTitleVariants(normalizedTitle),
+    ...(isStandaloneMetadataLookup(options)
+      ? getStandaloneTitleSearchVariants(normalizedTitle)
+      : []),
+  ])
+
   if (!season || season <= 1) {
-    return [normalizedTitle]
+    return titleVariants
   }
 
-  const seasonCandidates = [
-    `${normalizedTitle} Season ${season}`,
-    `${normalizedTitle} S${season}`,
-    normalizedTitle,
-  ]
+  const seasonCandidates = titleVariants.flatMap((titleVariant) => [
+    `${titleVariant} Season ${season}`,
+    `${titleVariant} S${season}`,
+    titleVariant,
+  ])
 
   if (!part || part <= 1) {
-    return seasonCandidates
+    return uniqueCandidates(seasonCandidates)
   }
 
   const ordinalPart = getOrdinalPartLabel(part)
   const wordPart = getWordPartLabel(part)
   const romanPart = getRomanPartLabel(part)
-  const partCandidates = [
-    `${normalizedTitle} Season ${season} Part ${part}`,
-    `${normalizedTitle} Season ${season} Cour ${part}`,
-    `${normalizedTitle} Season ${season} ${ordinalPart} Cour`,
-    `${normalizedTitle} S${season} Part ${part}`,
-    `${normalizedTitle} S${season} Cour ${part}`,
-    `${normalizedTitle} S${season} ${ordinalPart} Cour`,
-  ]
+  const partCandidates = titleVariants.flatMap((titleVariant) => {
+    const candidates = [
+      `${titleVariant} Season ${season} Part ${part}`,
+      `${titleVariant} Season ${season} Cour ${part}`,
+      `${titleVariant} Season ${season} ${ordinalPart} Cour`,
+      `${titleVariant} S${season} Part ${part}`,
+      `${titleVariant} S${season} Cour ${part}`,
+      `${titleVariant} S${season} ${ordinalPart} Cour`,
+    ]
 
-  if (romanPart) {
-    partCandidates.push(
-      `${normalizedTitle} Season ${season} Part ${romanPart}`,
-      `${normalizedTitle} S${season} Part ${romanPart}`
-    )
-  }
+    if (romanPart) {
+      candidates.push(
+        `${titleVariant} Season ${season} Part ${romanPart}`,
+        `${titleVariant} S${season} Part ${romanPart}`
+      )
+    }
 
-  if (wordPart) {
-    partCandidates.push(
-      `${normalizedTitle} Season ${season} ${wordPart} Cour`,
-      `${normalizedTitle} Season ${season} ${wordPart} Half`,
-      `${normalizedTitle} S${season} ${wordPart} Cour`,
-      `${normalizedTitle} S${season} ${wordPart} Half`
-    )
-  }
+    if (wordPart) {
+      candidates.push(
+        `${titleVariant} Season ${season} ${wordPart} Cour`,
+        `${titleVariant} Season ${season} ${wordPart} Half`,
+        `${titleVariant} S${season} ${wordPart} Cour`,
+        `${titleVariant} S${season} ${wordPart} Half`
+      )
+    }
 
-  return uniqueCandidates(partCandidates)
+    return candidates
+  })
+
+  return uniqueCandidates([...partCandidates, ...seasonCandidates])
 }
 
 function isAllowedLibraryMedia(media: AnimeMetadataInput) {
@@ -434,10 +578,28 @@ function normalizedTitleValuesForRootResolution(metadata: AnimeMetadataInput) {
   return titleValuesForRootResolution(metadata).map(normalizeComparableTitle)
 }
 
+function stripRootResolutionSeasonMarkers(value: string) {
+  return value
+    .replace(/\b(?:season|part|cour|pt\.?|half)\s*\d+\b/gi, " ")
+    .replace(/\bs\s*\d+\b/gi, " ")
+    .replace(/\b\d+(?:st|nd|rd|th)\s+(?:season|part|cour|half)\b/gi, " ")
+    .replace(/\b(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(?:season|part|cour|half)\b/gi, " ")
+    .replace(/\b(?:part|pt\.?|cour)\s+(?:i|ii|iii|iv|v|vi|vii|viii|ix|x)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
 function titleRootValuesForRootResolution(metadata: AnimeMetadataInput) {
-  return titleValuesForRootResolution(metadata)
-    .map((title) => normalizeComparableTitle(title.split(/[:：]/)[0] ?? title))
-    .filter((title) => titleTokens(title).length >= 2)
+  return uniqueCandidates(
+    titleValuesForRootResolution(metadata).flatMap((title) => {
+      const titleHead = title.split(/[:：]/)[0] ?? title
+
+      return [
+        normalizeComparableTitle(titleHead),
+        normalizeComparableTitle(stripRootResolutionSeasonMarkers(titleHead)),
+      ]
+    })
+  ).filter((title) => titleTokens(title).length >= 2)
 }
 
 function hasSharedTitleTokenPrefix(title: string, candidateTitle: string) {
@@ -591,6 +753,29 @@ function relationRootScore(
   }
 }
 
+function compareRootRelations(
+  left: {
+    relation: NonNullable<AnimeMetadataInput["relations"]>[number]
+    rootScore: { score: number; yearSort: number }
+  },
+  right: {
+    relation: NonNullable<AnimeMetadataInput["relations"]>[number]
+    rootScore: { score: number; yearSort: number }
+  }
+) {
+  const scoreDelta = left.rootScore.score - right.rootScore.score
+
+  if (scoreDelta !== 0) {
+    return scoreDelta
+  }
+
+  if (left.rootScore.yearSort !== right.rootScore.yearSort) {
+    return left.rootScore.yearSort - right.rootScore.yearSort
+  }
+
+  return left.relation.media.id - right.relation.media.id
+}
+
 function pickBestRootRelation(
   metadata: AnimeMetadataInput,
   relationTypes: string[]
@@ -605,24 +790,61 @@ function pickBestRootRelation(
       } => Boolean(item.rootScore)
     )
 
-  return (
-    scoredRelations.sort((left, right) => {
-      const scoreDelta = left.rootScore.score - right.rootScore.score
+  return scoredRelations.sort(compareRootRelations)[0]?.relation ?? null
+}
 
-      if (scoreDelta !== 0) {
-        return scoreDelta
+function isTrustedTelevisionRootRelation(
+  metadata: AnimeMetadataInput,
+  relation: NonNullable<AnimeMetadataInput["relations"]>[number]
+) {
+  if (
+    !isSeriesRootMedia(relation.media) ||
+    !isAllowedLibraryMedia(relation.media) ||
+    !relationHasValidYearDirection(metadata, relation)
+  ) {
+    return false
+  }
+
+  if (relation.relationType === "PARENT" || relation.relationType === "PREQUEL") {
+    return true
+  }
+
+  if (relation.relationType === "SEQUEL") {
+    return !isSeriesRootMedia(metadata)
+  }
+
+  return hasRootTitlePrefix(metadata, relation.media) || hasSharedRootTitle(metadata, relation.media)
+}
+
+function pickBestTelevisionRootRelation(
+  metadata: AnimeMetadataInput,
+  relationTypes: string[]
+) {
+  const scoredRelations = (metadata.relations ?? [])
+    .filter((relation) => relationTypes.includes(relation.relationType))
+    .filter((relation) => isTrustedTelevisionRootRelation(metadata, relation))
+    .map((relation) => {
+      const rootScore = relationRootScore(metadata, relation) ?? {
+        score: relationRootPriority(relation) * 100 - 120,
+        yearSort: relation.media.seasonYear ?? Number.MAX_SAFE_INTEGER,
       }
 
-      if (left.rootScore.yearSort !== right.rootScore.yearSort) {
-        return left.rootScore.yearSort - right.rootScore.yearSort
-      }
+      return { relation, rootScore }
+    })
 
-      return left.relation.media.id - right.relation.media.id
-    })[0]?.relation ?? null
-  )
+  return scoredRelations.sort(compareRootRelations)[0]?.relation ?? null
 }
 
 function pickRootCandidate(metadata: AnimeMetadataInput) {
+  const televisionParentOrPrequel = pickBestTelevisionRootRelation(metadata, [
+    "PARENT",
+    "PREQUEL",
+  ])
+
+  if (televisionParentOrPrequel) {
+    return televisionParentOrPrequel
+  }
+
   const primaryRelation = pickBestRootRelation(metadata, ["PARENT", "PREQUEL"])
 
   if (primaryRelation) {
@@ -630,11 +852,30 @@ function pickRootCandidate(metadata: AnimeMetadataInput) {
   }
 
   if (!isSeriesRootMedia(metadata)) {
+    const televisionSequel = pickBestTelevisionRootRelation(metadata, ["SEQUEL"])
+
+    if (televisionSequel) {
+      return televisionSequel
+    }
+
     const sequelRelation = pickBestRootRelation(metadata, ["SEQUEL"])
 
     if (sequelRelation) {
       return sequelRelation
     }
+  }
+
+  const relatedTelevisionRoot = pickBestTelevisionRootRelation(metadata, [
+    "SIDE_STORY",
+    "SUMMARY",
+    "SPIN_OFF",
+    "ALTERNATIVE",
+    "COMPILATION",
+    "CONTAINS",
+  ])
+
+  if (relatedTelevisionRoot) {
+    return relatedTelevisionRoot
   }
 
   return pickBestRootRelation(metadata, [
@@ -739,8 +980,9 @@ async function attachLibraryInfo(metadata: AnimeMetadataInput) {
 }
 
 function normalizeComparableTitle(value: string) {
-  return value
+  return normalizeSearchPunctuation(value)
     .toLowerCase()
+    .replace(/_/g, " ")
     .replace(/[^a-z0-9]+/g, " ")
     .replace(/\s+/g, " ")
     .trim()
@@ -773,6 +1015,22 @@ function hasUnrequestedTitleSuffix(normalizedTitle: string, normalizedSearch: st
   }
 
   return normalizedTitle.startsWith(`${normalizedSearch} `)
+}
+
+function isTooGenericForSearch(normalizedTitle: string, normalizedSearch: string) {
+  if (!normalizedTitle || !normalizedSearch || normalizedTitle === normalizedSearch) {
+    return false
+  }
+
+  if (!normalizedSearch.startsWith(`${normalizedTitle} `)) {
+    return false
+  }
+
+  const titleTokens = normalizedTitle.split(" ").filter(Boolean)
+  const searchTokens = normalizedSearch.split(" ").filter(Boolean)
+  const extraTokens = searchTokens.slice(titleTokens.length)
+
+  return extraTokens.some((token) => token.length > 2)
 }
 
 function hasPartMarker(value: string, part: number) {
@@ -889,12 +1147,16 @@ function scoreTitleGroup(titles: string[], normalizedSearch: string) {
     return hasUnrequestedTitleSuffix(bestContainingTitle, normalizedSearch) ? 3 : 1
   }
 
+  if (normalizedTitles.some((title) => isTooGenericForSearch(title, normalizedSearch))) {
+    return 3
+  }
+
   const bestOverlap = Math.max(
     ...normalizedTitles.map((title) => tokenOverlap(normalizedSearch, title)),
     0
   )
 
-  return bestOverlap >= 0.7 ? 2 : 3
+  return bestOverlap >= 0.65 ? 2 : 3
 }
 
 function isAcceptableCandidateScore(score: number) {
@@ -964,6 +1226,10 @@ function needsFullCachedRefresh(metadata: AnimeMetadataInput, episode?: number) 
     return true
   }
 
+  if ((metadata.relations ?? []).length === 0) {
+    return true
+  }
+
   if (!episode || episode <= 0) {
     return false
   }
@@ -977,10 +1243,11 @@ export async function findAnimeMetadata(
   title: string,
   season?: number,
   episode?: number,
-  part?: number
+  part?: number,
+  options?: MetadataLookupOptions
 ) {
   const normalizedTitle = stripParsedSeasonPartFromTitle(title, season, part)
-  const key = metadataLookupKey(normalizedTitle, season, part)
+  const key = [metadataLookupKey(normalizedTitle, season, part), metadataLookupKindKey(options)].join("|")
   const recentLookup = recentMetadataLookups.get(key)
 
   if (recentLookup && Date.now() - recentLookup.createdAt < metadataLookupCacheMs) {
@@ -995,7 +1262,7 @@ export async function findAnimeMetadata(
     return inFlightLookup
   }
 
-  const lookup = findAnimeMetadataUncached(normalizedTitle, season, episode, part)
+  const lookup = findAnimeMetadataUncached(normalizedTitle, season, episode, part, options)
   inFlightMetadataLookups.set(key, lookup)
 
   try {
@@ -1013,11 +1280,12 @@ async function findAnimeMetadataUncached(
   title: string,
   season?: number,
   episode?: number,
-  part?: number
+  part?: number,
+  options?: MetadataLookupOptions
 ) {
   const cached = findCachedAnimeMetadataForFile(title, season, part)
 
-  if (cached) {
+  if (cached && isLookupCompatibleMediaFormat(cached.format, options)) {
     if (needsFullCachedRefresh(cached, episode)) {
       const refreshed = await fetchAnimeMetadataById(cached.id).catch((error) => {
         console.warn(
@@ -1040,7 +1308,7 @@ async function findAnimeMetadataUncached(
 
   const lookupErrors: string[] = []
 
-  for (const candidate of getSearchCandidates(title, season, part)) {
+  for (const candidate of getSearchCandidates(title, season, part, options)) {
     console.log(`[Info] [Anilist] Searching anime metadata - ${candidate}`)
 
     let result: {
@@ -1067,11 +1335,15 @@ async function findAnimeMetadataUncached(
       continue
     }
 
-    const requirePartMarker = Boolean(part && part > 1)
+    const requirePartMarker = Boolean(
+      part && part > 1 && hasPartMarker(candidate, part)
+    )
     const rankedMedia = ((result.Page?.media ?? []) as Array<
       AniListMediaNode | null
     >)
-      .filter((item): item is AniListMediaNode => Boolean(item))
+      .filter((item): item is AniListMediaNode =>
+        Boolean(item) && isLookupCompatibleMediaFormat(item?.format, options)
+      )
       .map((item) => ({
         item,
         score: scoreMediaCandidate(item, candidate, {
@@ -1097,6 +1369,13 @@ async function findAnimeMetadataUncached(
           return null
         })) ?? toMetadata(media, false)
 
+      if (!isLookupCompatibleMediaFormat(metadata.format, options)) {
+        debugLog(
+          `[Debug] [Anilist] Ignored metadata match with incompatible format ${metadata.format ?? "unknown"} for ${candidate} - id ${metadata.id}`
+        )
+        continue
+      }
+
       console.log(
         `[Info] [Anilist] Found match ${
           media.title?.english ??
@@ -1117,6 +1396,13 @@ async function findAnimeMetadataUncached(
           )
           return null
         })) ?? toMetadata(onlyMedia, false)
+      if (!isLookupCompatibleMediaFormat(metadata.format, options)) {
+        debugLog(
+          `[Debug] [Anilist] Ignored single search result with incompatible format ${metadata.format ?? "unknown"} for ${candidate} - id ${metadata.id}`
+        )
+        continue
+      }
+
       const fullScore = scoreMetadataCandidate(metadata, candidate, {
         part,
         requirePartMarker,
@@ -1167,11 +1453,23 @@ export async function findAnimeMetadataById(id: number) {
   return metadata ? attachLibraryInfo(metadata) : null
 }
 
-export async function refreshCachedAniListMetadata() {
-  const animeIds = listAnimeIdsForAniListRefresh()
+type CachedAniListRefreshMode = "startup" | "daily" | "manual"
+
+function yieldAniListMaintenanceTurn() {
+  return new Promise<void>((resolve) => setImmediate(resolve))
+}
+
+export async function refreshCachedAniListMetadata(
+  mode: CachedAniListRefreshMode = "daily"
+) {
+  const animeIds = listAnimeIdsForAniListRefresh(mode)
   let refreshed = 0
 
-  for (const animeId of animeIds) {
+  console.log(
+    `[Info] [Anilist] Cached metadata sync started - Mode: ${mode}; Candidates: ${animeIds.length}.`
+  )
+
+  for (const [index, animeId] of animeIds.entries()) {
     try {
       const metadata = await fetchAnimeMetadataById(animeId)
 
@@ -1186,10 +1484,18 @@ export async function refreshCachedAniListMetadata() {
         `[Warn] [Anilist] Cached metadata sync failed - ${animeId} - ${errorMessage(error)}`
       )
     }
+
+    if (animeIds.length > 0 && ((index + 1) % 10 === 0 || index + 1 === animeIds.length)) {
+      console.log(
+        `[Info] [Anilist] Cached metadata sync progress - ${index + 1}/${animeIds.length} checked, ${refreshed} refreshed.`
+      )
+    }
+
+    await yieldAniListMaintenanceTurn()
   }
 
   console.log(
-    `[Info] [Anilist] Cached metadata sync completed - Refreshed: ${refreshed}/${animeIds.length}`
+    `[Info] [Anilist] Cached metadata sync completed - Mode: ${mode}; Refreshed: ${refreshed}/${animeIds.length}.`
   )
 
   return { refreshed, total: animeIds.length }

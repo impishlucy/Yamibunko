@@ -2,11 +2,15 @@ import { randomUUID } from "node:crypto"
 
 import { syncAniListLibraryProgress } from "@/server/anilist/client"
 import { listAniListConnections } from "@/server/db/anilistConnections"
+import { repairLibraryIntegrity } from "@/server/db/library"
 import { refreshCachedAniListMetadata } from "@/server/metadata/anilist"
 import { errorMessage } from "@/server/utils/format"
 
+type AniListRefreshMode = "startup" | "daily" | "manual"
+
 let fullRefreshPromise: Promise<{
   metadata: Awaited<ReturnType<typeof refreshCachedAniListMetadata>>
+  repair: ReturnType<typeof repairLibraryIntegrity>
   users: Array<{
     username: string
     synced: boolean
@@ -45,13 +49,14 @@ export async function refreshAniListTrackingData(username: string) {
   )
 }
 
-export async function runFullAniListRefresh() {
+export async function runFullAniListRefresh(mode: AniListRefreshMode = "daily") {
   if (fullRefreshPromise) {
     return fullRefreshPromise
   }
 
   const refresh = (async () => {
-    const metadata = await refreshCachedAniListMetadata()
+    const metadata = await refreshCachedAniListMetadata(mode)
+    const repair = repairLibraryIntegrity(`${mode} AniList metadata sync`)
     const users: Array<{
       username: string
       synced: boolean
@@ -71,7 +76,7 @@ export async function runFullAniListRefresh() {
       }
     }
 
-    return { metadata, users }
+    return { metadata, repair, users }
   })()
 
   fullRefreshPromise = trackAniListRefresh("full", refresh).finally(() => {

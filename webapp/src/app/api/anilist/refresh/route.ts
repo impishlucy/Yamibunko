@@ -104,7 +104,7 @@ export async function POST(request: Request) {
     if (parsed.data.action === "user") {
       await refreshAniListTrackingData(auth.user.username)
     } else {
-      await runFullAniListRefresh()
+      await runFullAniListRefresh("manual")
     }
   } catch (error) {
     console.error(

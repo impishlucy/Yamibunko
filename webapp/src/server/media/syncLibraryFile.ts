@@ -14,9 +14,11 @@ import {
   getAnimeMetadataLookupSeason,
   formatSeasonFolderName,
   getFolderTitleFallbackCandidates,
+  getStandaloneMediaTitleFallbackCandidates,
   parseAnimeFilePath,
   parseSeasonPartMarker,
   sanitizeExportPathPart,
+  type ParsedAnimeFileName,
 } from "@/server/media/filename"
 import {
   generateEpisodeThumbnail,
@@ -43,6 +45,7 @@ type ParsedLibraryPath = {
   episode: number
   part?: number
   metadataLookupSeason?: number
+  mediaKind?: ParsedAnimeFileName["mediaKind"]
   isNonAnime?: boolean
 }
 
@@ -147,12 +150,45 @@ function parseSeasonFolder(value: string) {
   return marker
 }
 
+function standaloneMediaKindLabel(format?: string | null) {
+  if (format === "MOVIE") {
+    return "Movie"
+  }
+
+  if (format === "SPECIAL") {
+    return "Special"
+  }
+
+  if (format === "OVA") {
+    return "OVA"
+  }
+
+  return "Standalone media"
+}
+
 function formatLibraryEpisodeLabel(input: {
   season: number
   episode: number
   part?: number
+  mediaKind?: ParsedAnimeFileName["mediaKind"]
+  format?: string | null
 }) {
+  if (input.mediaKind === "movie") {
+    return standaloneMediaKindLabel(input.format)
+  }
+
   return `${formatSeasonFolderName(input.season, input.part)}, Episode ${input.episode}`
+}
+
+function isSeriesMetadataFormat(format?: string | null) {
+  return format === "TV" || format === "TV_SHORT"
+}
+
+function isParsedMediaCompatibleWithMetadata(
+  parsed: Pick<ParsedLibraryPath, "mediaKind" | "animeTitle">,
+  metadata: { format?: string | null }
+) {
+  return parsed.mediaKind !== "movie" || !isSeriesMetadataFormat(metadata.format)
 }
 
 function formatDeletedEpisodeLabel(input: {
@@ -167,6 +203,7 @@ function formatDeletedEpisodeLabel(input: {
       season: parsed.season,
       part: parsed.part,
       episode: parsed.episode,
+      mediaKind: parsed.mediaKind,
     })
   }
 
@@ -246,6 +283,7 @@ function parseLibraryPath(filePath: string): ParsedLibraryPath | null {
     season,
     episode: parsedFileName.episode,
     part,
+    mediaKind: parsedFileName.mediaKind,
     metadataLookupSeason: getAnimeMetadataLookupSeason({
       ...parsedFileName,
       season,
@@ -320,7 +358,7 @@ export async function syncLibraryFile(filePath: string) {
   let resolvedParsed = parsed
 
   console.log(
-    `[Info] [Media] Detected library episode - Anime: ${resolvedParsed.animeTitle}, ${formatLibraryEpisodeLabel({ season: resolvedParsed.season, part: resolvedParsed.part, episode: resolvedParsed.episode })} - ${fileName(resolvedPath)}`
+    `[Info] [Media] Detected library media - Anime: ${resolvedParsed.animeTitle}, ${formatLibraryEpisodeLabel({ season: resolvedParsed.season, part: resolvedParsed.part, episode: resolvedParsed.episode, mediaKind: resolvedParsed.mediaKind })} - ${fileName(resolvedPath)}`
   )
 
   const metadata = resolvedParsed.isNonAnime
@@ -330,19 +368,38 @@ export async function syncLibraryFile(filePath: string) {
       })
     : await (async () => {
         debugLibrarySync("Starting AniList metadata lookup for library file.")
-        let animeMetadata = await findAnimeMetadata(
+        const directMetadata = await findAnimeMetadata(
           resolvedParsed.animeTitle,
           resolvedParsed.metadataLookupSeason,
           resolvedParsed.episode,
-          resolvedParsed.part
+          resolvedParsed.part,
+          { mediaKind: resolvedParsed.mediaKind }
         )
+        let animeMetadata = directMetadata && isParsedMediaCompatibleWithMetadata(resolvedParsed, directMetadata)
+          ? directMetadata
+          : null
+
+        if (directMetadata && !animeMetadata) {
+          console.warn(
+            `[Warn] [Media] Ignored unsafe standalone library media AniList match - Filename title "${resolvedParsed.animeTitle}" matched ${directMetadata.format ?? "unknown format"} media - ${fileName(resolvedPath)}`
+          )
+          debugLibrarySync(
+            `Ignored unsafe standalone library media AniList match - Parsed title ${resolvedParsed.animeTitle}, matched format ${directMetadata.format ?? "unknown"}.`
+          )
+        }
 
         if (!animeMetadata) {
-          const fallbackTitles = getFolderTitleFallbackCandidates(
-            getServerConfig().mediaDir,
-            resolvedPath,
-            resolvedParsed.animeTitle
-          )
+          const fallbackTitles = resolvedParsed.mediaKind === "movie"
+            ? getStandaloneMediaTitleFallbackCandidates(
+                getServerConfig().mediaDir,
+                resolvedPath,
+                resolvedParsed.animeTitle
+              )
+            : getFolderTitleFallbackCandidates(
+                getServerConfig().mediaDir,
+                resolvedPath,
+                resolvedParsed.animeTitle
+              )
 
           for (const fallbackTitle of fallbackTitles) {
             debugLibrarySync(
@@ -353,10 +410,21 @@ export async function syncLibraryFile(filePath: string) {
               fallbackTitle,
               resolvedParsed.metadataLookupSeason,
               resolvedParsed.episode,
-              resolvedParsed.part
+              resolvedParsed.part,
+              { mediaKind: resolvedParsed.mediaKind }
             )
 
             if (!fallbackMetadata) {
+              continue
+            }
+
+            if (!isParsedMediaCompatibleWithMetadata(resolvedParsed, fallbackMetadata)) {
+              console.warn(
+                `[Warn] [Media] Ignored unsafe library folder fallback AniList match - Filename title "${resolvedParsed.animeTitle}" matched ${fallbackMetadata.format ?? "unknown format"} media through folder title "${fallbackTitle}" - ${fileName(resolvedPath)}`
+              )
+              debugLibrarySync(
+                `Ignored unsafe library folder fallback AniList match - Parsed title ${resolvedParsed.animeTitle}, Folder title ${fallbackTitle}, matched format ${fallbackMetadata.format ?? "unknown"}.`
+              )
               continue
             }
 
@@ -445,7 +513,7 @@ export async function syncLibraryFile(filePath: string) {
   }
 
   console.log(
-    `[Info] [Media] Library database import completed - Anime: ${resolvedParsed.animeTitle}, ${formatLibraryEpisodeLabel({ season: resolvedParsed.season, part: resolvedParsed.part, episode: resolvedParsed.episode })} - ${fileName(resolvedPath)}`
+    `[Info] [Media] Library database import completed - Anime: ${resolvedParsed.animeTitle}, ${formatLibraryEpisodeLabel({ season: resolvedParsed.season, part: resolvedParsed.part, episode: resolvedParsed.episode, mediaKind: resolvedParsed.mediaKind, format: metadata.format })} - ${fileName(resolvedPath)}`
   )
   debugLibrarySync("Library file sync completed.")
 

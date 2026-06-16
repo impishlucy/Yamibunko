@@ -1,6 +1,6 @@
 import chokidar, { type FSWatcher } from "chokidar"
 import { AsyncLocalStorage } from "node:async_hooks"
-import { readdir, rm } from "node:fs/promises"
+import { mkdir, readdir, rm } from "node:fs/promises"
 import path from "node:path"
 
 import {
@@ -19,7 +19,7 @@ import {
 } from "@/server/bandwidth/streamBandwidth"
 import { startUploadCapacityMeasurement } from "@/server/bandwidth/uploadCapacity"
 import { updateJob } from "@/server/db/jobs"
-import { listEpisodeFilePaths } from "@/server/db/library"
+import { listEpisodeFilePaths, repairLibraryIntegrity } from "@/server/db/library"
 import { resetAdminIgnoredAppUpdateVersions } from "@/server/db/users"
 import { getServerConfigResult } from "@/server/config"
 import { tryRunCacheMaintenance } from "@/server/media/cacheMaintenance"
@@ -164,6 +164,13 @@ function formatProcessingInfoLabel(processing: DeferredInputProcessingInfo) {
 }
 
 const scanIntervalMs = 5 * 60 * 1000
+
+type DirectoryScanOptions = {
+  reason: string
+  visible?: boolean
+  allowWhenPaused?: boolean
+}
+
 const maxActiveWorkByKind: Record<WorkKind, number> = {
   input: 2,
   "library-sync": 1,
@@ -210,6 +217,14 @@ function normalizeFilePathKey(filePath: string) {
 const failedImportsFolderName = "_failed_imports"
 const failedImportsFolderNames = new Set([failedImportsFolderName])
 
+function normalizeDirectoryName(value: string) {
+  return value.trim().toLowerCase()
+}
+
+function isNamedDirectorySegment(value: string, directoryNames: Set<string>) {
+  return directoryNames.has(normalizeDirectoryName(value))
+}
+
 function isInsideNamedDirectory(
   root: string,
   targetPath: string,
@@ -221,7 +236,9 @@ function isInsideNamedDirectory(
     return false
   }
 
-  return relative.split(path.sep).some((part) => directoryNames.has(part))
+  return relative
+    .split(path.sep)
+    .some((part) => isNamedDirectorySegment(part, directoryNames))
 }
 
 async function walkFiles(
@@ -239,7 +256,10 @@ async function walkFiles(
     const entryPath = path.join(directory, entry.name)
 
     if (entry.isDirectory()) {
-      if (options.ignoredDirectoryNames?.has(entry.name)) {
+      if (
+        options.ignoredDirectoryNames &&
+        isNamedDirectorySegment(entry.name, options.ignoredDirectoryNames)
+      ) {
         continue
       }
 
@@ -289,6 +309,9 @@ export function startWorkers() {
   let shuttingDown = false
   let stopPromise: Promise<void> | null = null
   let scanning = false
+  let directoryScansPaused = false
+  let watcherEventsPaused = false
+  let deferredWatcherEvents = new Map<string, { kind: WorkKind; filePath: string }>()
   let dailyAniListTimer: NodeJS.Timeout | undefined
   let scanTimer: NodeJS.Timeout | undefined
   let dailyAniListSyncRunning = false
@@ -309,10 +332,33 @@ export function startWorkers() {
   let libraryWatcher: FSWatcher | null = null
   let watchersStarted = false
 
+  async function ensureFailedImportsDirectory() {
+    if (!config.importEnabled) {
+      return
+    }
+
+    await mkdir(path.join(config.inputDir, failedImportsFolderName), {
+      recursive: true,
+    })
+  }
+
   async function pruneNonMediaOnlyDirectories(
     directory: string,
     root: string
   ): Promise<boolean> {
+    const resolvedDirectory = path.resolve(directory)
+    const resolvedRoot = path.resolve(root)
+
+    if (
+      resolvedDirectory !== resolvedRoot &&
+      isInsideNamedDirectory(root, resolvedDirectory, failedImportsFolderNames)
+    ) {
+      debugWorkers(
+        `Skipping protected failed-imports folder during input cleanup - ${directory}`
+      )
+      return true
+    }
+
     const entries = await readdir(directory, { withFileTypes: true }).catch(() => null)
 
     if (!entries) {
@@ -325,6 +371,14 @@ export function startWorkers() {
       const entryPath = path.join(directory, entry.name)
 
       if (entry.isDirectory()) {
+        if (isNamedDirectorySegment(entry.name, failedImportsFolderNames)) {
+          debugWorkers(
+            `Skipping protected failed-imports folder during input cleanup - ${entryPath}`
+          )
+          containsMedia = true
+          continue
+        }
+
         containsMedia = (await pruneNonMediaOnlyDirectories(entryPath, root)) || containsMedia
         continue
       }
@@ -334,7 +388,7 @@ export function startWorkers() {
       }
     }
 
-    if (path.resolve(directory) !== path.resolve(root) && !containsMedia) {
+    if (resolvedDirectory !== resolvedRoot && !containsMedia) {
       debugWorkers(`Removing input folder with only non-media leftovers - ${directory}`)
       await rm(directory, { force: true, recursive: true })
     }
@@ -444,6 +498,73 @@ export function startWorkers() {
       await sleep(250)
       await yieldToEventLoop()
     }
+  }
+
+  function pauseDirectoryScans(reason: string) {
+    directoryScansPaused = true
+    debugWorkers(`Directory scanners paused - ${reason}`)
+  }
+
+  function resumeDirectoryScans(reason: string) {
+    if (!directoryScansPaused) {
+      return
+    }
+
+    directoryScansPaused = false
+    debugWorkers(`Directory scanners resumed - ${reason}`)
+  }
+
+  function getDeferredWatcherEventKey(kind: WorkKind, filePath: string) {
+    return `${kind}:${normalizeFilePathKey(filePath)}`
+  }
+
+  function queueDeferredWatcherEvent(kind: WorkKind, filePath: string) {
+    const resolvedPath = path.resolve(filePath)
+    const key = getDeferredWatcherEventKey(kind, resolvedPath)
+
+    if (kind === "library-sync") {
+      deferredWatcherEvents.delete(
+        getDeferredWatcherEventKey("library-delete", resolvedPath)
+      )
+    } else if (kind === "library-delete") {
+      deferredWatcherEvents.delete(
+        getDeferredWatcherEventKey("library-sync", resolvedPath)
+      )
+    }
+
+    deferredWatcherEvents.set(key, { kind, filePath: resolvedPath })
+  }
+
+  function pauseWatcherEvents(reason: string) {
+    watcherEventsPaused = true
+    debugWorkers(`File watcher event processing paused - ${reason}`)
+  }
+
+  function resumeWatcherEvents(reason: string) {
+    if (!watcherEventsPaused) {
+      return
+    }
+
+    watcherEventsPaused = false
+    const deferredEvents = [...deferredWatcherEvents.values()]
+    deferredWatcherEvents = new Map()
+    debugWorkers(
+      `File watcher event processing resumed - ${reason}; replaying ${deferredEvents.length} deferred event(s).`
+    )
+
+    for (const event of deferredEvents) {
+      enqueue(event.kind, event.filePath)
+    }
+  }
+
+  function handleWatcherFileEvent(kind: WorkKind, filePath: string) {
+    if (watcherEventsPaused) {
+      queueDeferredWatcherEvent(kind, filePath)
+      debugWorkers(`Deferred paused watcher event - ${kind} - ${filePath}`)
+      return
+    }
+
+    enqueue(kind, filePath)
   }
 
   function startImmediateBackgroundInputWork(
@@ -994,14 +1115,57 @@ export function startWorkers() {
     return true
   }
 
-  async function scanInputDirectory() {
-    if (shuttingDown || scanning) {
+  function formatScanReason(reason: string) {
+    return reason.trim() || "directory"
+  }
+
+  async function scanInputDirectory(
+    options: DirectoryScanOptions = { reason: "scheduled" }
+  ) {
+    const scanReason = formatScanReason(options.reason)
+
+    if (shuttingDown) {
+      debugWorkers(`Skipping ${scanReason} input folder scan during shutdown.`)
+      return
+    }
+
+    if (directoryScansPaused && !options.allowWhenPaused) {
+      const message =
+        `Skipped ${scanReason} input folder scan because directory scanners are paused.`
+
+      if (options.visible) {
+        console.log(`[Info] [File Import] ${message}`)
+      } else {
+        debugWorkers(message)
+      }
+
+      return
+    }
+
+    if (scanning) {
+      const message =
+        `Skipped ${scanReason} input folder scan because another directory scan is already running.`
+
+      if (options.visible) {
+        console.log(`[Info] [File Import] ${message}`)
+      } else {
+        debugWorkers(message)
+      }
+
       return
     }
 
     scanning = true
 
     try {
+      if (options.visible) {
+        console.log(
+          `[Info] [File Import] Running ${scanReason} input folder scan - ${config.inputDir}`
+        )
+      }
+
+      await ensureFailedImportsDirectory()
+
       const files = await walkFiles(config.inputDir, {
         ignoredDirectoryNames: failedImportsFolderNames,
       })
@@ -1023,9 +1187,9 @@ export function startWorkers() {
         }
       }
 
-      if (queuedInputFiles > 0) {
+      if (queuedInputFiles > 0 || options.visible) {
         console.log(
-          `[Info] [File Import] Found ${queuedInputFiles} input media file(s) to inspect from scan.`
+          `[Info] [File Import] ${scanReason} input folder scan found ${mediaFiles.length} media file(s), queued ${queuedInputFiles} new file(s).`
         )
       }
 
@@ -1041,27 +1205,105 @@ export function startWorkers() {
     }
   }
 
-  async function scanKnownDeletedFiles() {
-    for (const filePath of listEpisodeFilePaths()) {
+  async function scanKnownDeletedFiles(
+    options: DirectoryScanOptions = { reason: "scheduled" }
+  ) {
+    const scanReason = formatScanReason(options.reason)
+    const knownFilePaths = listEpisodeFilePaths()
+    let missingLibraryFiles = 0
+    let queuedDeletedFiles = 0
+
+    for (const [index, filePath] of knownFilePaths.entries()) {
       if (!(await pathExists(filePath))) {
-        enqueue("library-delete", filePath)
+        missingLibraryFiles += 1
+
+        if (enqueue("library-delete", filePath, { log: false })) {
+          queuedDeletedFiles += 1
+        }
       }
+
+      if (index % 25 === 24) {
+        await yieldToEventLoop()
+      }
+    }
+
+    const repair = repairLibraryIntegrity(`${scanReason} library database cleanup`)
+
+    if (
+      queuedDeletedFiles > 0 ||
+      repair.repairedAssignments > 0 ||
+      repair.repairedRootRows > 0 ||
+      repair.removedStaleEntries > 0 ||
+      options.visible
+    ) {
+      console.log(
+        `[Info] [File Import] ${scanReason} library database cleanup checked ${knownFilePaths.length} indexed file(s), found ${missingLibraryFiles} missing file(s), queued ${queuedDeletedFiles} database removal(s), reassigned ${repair.repairedAssignments} anime row(s), removed ${repair.removedStaleEntries} stale library entr${repair.removedStaleEntries === 1 ? "y" : "ies"}.`
+      )
+    }
+
+    debugWorkers(
+      `${scanReason} library database cleanup checked ${knownFilePaths.length} indexed file(s), found ${missingLibraryFiles} missing file(s), queued ${queuedDeletedFiles} database removal(s), reassigned ${repair.repairedAssignments} anime row(s), removed ${repair.removedStaleEntries} stale library entries.`
+    )
+
+    return {
+      checkedFiles: knownFilePaths.length,
+      missingFiles: missingLibraryFiles,
+      queuedRemovals: queuedDeletedFiles,
+      repairedAssignments: repair.repairedAssignments,
+      removedStaleEntries: repair.removedStaleEntries,
     }
   }
 
-  async function scanLibraryDirectory() {
+  async function scanLibraryDirectory(
+    options: DirectoryScanOptions = { reason: "scheduled" }
+  ) {
+    const scanReason = formatScanReason(options.reason)
+
     if (!config.importEnabled) {
-      await scanKnownDeletedFiles()
+      await scanKnownDeletedFiles(options)
       return
     }
 
-    if (shuttingDown || scanning) {
+    if (shuttingDown) {
+      debugWorkers(`Skipping ${scanReason} library folder scan during shutdown.`)
+      return
+    }
+
+    if (directoryScansPaused && !options.allowWhenPaused) {
+      const message =
+        `Skipped ${scanReason} library folder scan because directory scanners are paused.`
+
+      if (options.visible) {
+        console.log(`[Info] [File Import] ${message}`)
+      } else {
+        debugWorkers(message)
+      }
+
+      return
+    }
+
+    if (scanning) {
+      const message =
+        `Skipped ${scanReason} library folder scan because another directory scan is already running.`
+
+      if (options.visible) {
+        console.log(`[Info] [File Import] ${message}`)
+      } else {
+        debugWorkers(message)
+      }
+
       return
     }
 
     scanning = true
 
     try {
+      if (options.visible) {
+        console.log(
+          `[Info] [File Import] Running ${scanReason} library folder scan - ${config.mediaDir}`
+        )
+      }
+
       const files = await walkFiles(config.mediaDir)
       const mediaFiles = files.filter(isMediaFile)
       const knownLibraryPaths = new Set(
@@ -1091,13 +1333,16 @@ export function startWorkers() {
         `Library folder scan skipped ${knownLibraryFiles} already indexed media file(s).`
       )
 
-      if (queuedLibraryFiles > 0) {
+      if (queuedLibraryFiles > 0 || options.visible) {
         console.log(
-          `[Info] [File Import] Found ${queuedLibraryFiles} unknown library media file(s) to sync from scan.`
+          `[Info] [File Import] ${scanReason} library folder scan found ${mediaFiles.length} media file(s), skipped ${knownLibraryFiles} known file(s), queued ${queuedLibraryFiles} new sync file(s).`
         )
       }
 
-      await scanKnownDeletedFiles()
+      await scanKnownDeletedFiles({
+        reason: `${scanReason} library`,
+        visible: options.visible,
+      })
 
     } catch (error) {
       console.error(
@@ -1108,31 +1353,37 @@ export function startWorkers() {
     }
   }
 
-  async function scanAllDirectories() {
-    await scanInputDirectory()
-
-    if (config.importEnabled) {
-      await scanLibraryDirectory()
-    } else {
-      await scanKnownDeletedFiles()
-    }
+  async function scanAllDirectories(
+    options: DirectoryScanOptions = { reason: "scheduled" }
+  ) {
+    await scanLibraryDirectory(options)
+    await waitForQueuedWorkKindsToFinish(
+      ["library-delete", "library-sync"],
+      `${formatScanReason(options.reason)} library folder reconciliation`
+    )
+    await scanInputDirectory(options)
   }
 
   function startTrackedDirectoryScan(reason: string) {
+    if (directoryScansPaused) {
+      debugWorkers(`Skipping ${reason} directory scan because directory scanners are paused.`)
+      return
+    }
+
     if (reason === "interval" && dailyAniListSyncRunning) {
       debugWorkers("Skipping interval directory scan while daily maintenance is running.")
       return
     }
 
-    const work = scanAllDirectories()
+    const work = scanAllDirectories({ reason })
     trackActiveWork(work, `directory-scan:${reason}`)
   }
 
-  async function runAniListRefreshForMaintenance(label: string) {
+  async function runAniListRefreshForMaintenance(label: "startup" | "daily") {
     console.log(`[Info] [Workers] Starting ${label} AniList sync.`)
 
     try {
-      await runFullAniListRefresh()
+      await runFullAniListRefresh(label)
       console.log(`[Info] [Workers] ${label} AniList sync completed.`)
     } catch (error) {
       console.error(
@@ -1148,31 +1399,47 @@ export function startWorkers() {
     )
 
     try {
-      await runAniListRefreshForMaintenance("startup")
-      await scanKnownDeletedFiles()
+      await scanKnownDeletedFiles({
+        reason: "startup reconciliation",
+        visible: true,
+      })
       await waitForQueuedWorkKindsToFinish(
         ["library-delete"],
-        "startup checks"
+        "startup library reconciliation"
       )
-      await checkForYamibunkoUpdate("startup")
+      await scanLibraryDirectory({ reason: "startup force", visible: true })
+      await waitForQueuedWorkKindsToFinish(
+        ["library-delete", "library-sync"],
+        "startup forced library check"
+      )
+      await runAniListRefreshForMaintenance("startup")
     } finally {
-      await tryRunCacheMaintenance()
       console.log("[Info] [Workers] Startup checks completed.")
       startupChecksResolve()
     }
   }
 
-  async function runDailyMaintenanceChecks() {
-    await waitForActiveImportWorkToFinish("daily checks")
-    await runAniListRefreshForMaintenance("daily")
-    await waitForDirectoryScanToFinish("daily checks")
-    await scanKnownDeletedFiles()
-    await waitForQueuedWorkKindsToFinish(
-      ["library-delete"],
-      "daily checks"
-    )
+  async function runDeferredStartupMaintenance() {
+    await checkForYamibunkoUpdate("startup")
+    await tryRunCacheMaintenance()
+  }
+
+  async function runDeferredDailyMaintenance() {
     await checkForYamibunkoUpdate("daily maintenance")
     await tryRunCacheMaintenance()
+  }
+
+  async function runDailyMaintenanceBeforeUploadTest() {
+    await runAniListRefreshForMaintenance("daily")
+    await scanLibraryDirectory({
+      reason: "daily reconciliation",
+      visible: true,
+      allowWhenPaused: true,
+    })
+    await waitForQueuedWorkKindsToFinish(
+      ["library-delete", "library-sync"],
+      "daily library reconciliation"
+    )
   }
 
   async function runDailyAniListSync() {
@@ -1182,16 +1449,20 @@ export function startWorkers() {
 
     dailyAniListSyncRunning = true
     blockImportWork("daily maintenance")
+    pauseDirectoryScans("daily maintenance")
+    pauseWatcherEvents("daily maintenance")
     console.log(
-      "[Info] [Workers] Starting daily maintenance; new import jobs are paused."
+      "[Info] [Workers] Starting daily maintenance; import queues, scanners, and watcher events are paused."
     )
 
     try {
+      await waitForDirectoryScanToFinish("daily maintenance")
+      await waitForActiveImportWorkToFinish("daily maintenance")
       await runUploadCapacityRecheckWithStreamHold(
         () => startUploadCapacityMeasurement("scheduled"),
         {
           initialCloseModes: ["transcode"],
-          beforeMeasurement: runDailyMaintenanceChecks,
+          beforeMeasurement: runDailyMaintenanceBeforeUploadTest,
         }
       )
     } catch (error) {
@@ -1201,9 +1472,16 @@ export function startWorkers() {
     } finally {
       dailyAniListSyncRunning = false
       unblockImportWork("daily maintenance completed")
+      resumeDirectoryScans("daily maintenance completed")
+      resumeWatcherEvents("daily maintenance completed")
       console.log(
-        "[Info] [Workers] Daily maintenance completed; import jobs may resume."
+        "[Info] [Workers] Daily maintenance completed; import queues, scanners, and watcher events may resume."
       )
+      void runDeferredDailyMaintenance().catch((error) => {
+        console.error(
+          `[Error] [Workers] Deferred daily maintenance failed - startWorkers.ts - ${errorMessage(error)}`
+        )
+      })
     }
   }
 
@@ -1241,7 +1519,7 @@ export function startWorkers() {
 
     inputWatcher.on("add", (filePath) => {
       debugWorkers(`Input watcher add event - ${filePath}`)
-      enqueue("input", filePath)
+      handleWatcherFileEvent("input", filePath)
     })
 
     inputWatcher.on("error", (error) => {
@@ -1253,7 +1531,7 @@ export function startWorkers() {
     inputWatcher.on("unlink", (filePath) => {
       if (!config.importEnabled) {
         debugWorkers(`Input watcher unlink event with import disabled - ${filePath}`)
-        enqueue("library-delete", filePath)
+        handleWatcherFileEvent("library-delete", filePath)
       }
     })
 
@@ -1269,12 +1547,12 @@ export function startWorkers() {
 
       libraryWatcher.on("add", (filePath) => {
         debugWorkers(`Library watcher add event - ${filePath}`)
-        enqueue("library-sync", filePath)
+        handleWatcherFileEvent("library-sync", filePath)
       })
 
       libraryWatcher.on("unlink", (filePath) => {
         debugWorkers(`Library watcher unlink event - ${filePath}`)
-        enqueue("library-delete", filePath)
+        handleWatcherFileEvent("library-delete", filePath)
       })
 
       libraryWatcher.on("error", (error) => {
@@ -1297,25 +1575,29 @@ export function startWorkers() {
     }
 
     importProcessingStarted = true
-    startFileWatchers()
-    unblockImportWork("startup checks and startup bandwidth test completed")
 
-    scanTimer = setInterval(() => {
-      startTrackedDirectoryScan("interval")
-    }, scanIntervalMs)
-    scanTimer.unref?.()
-
-    debugWorkers("Starting non-blocking initial directory scan after startup checks.")
     const startupScan = (async () => {
-      await scanInputDirectory()
+      try {
+        await scanInputDirectory({ reason: "startup force", visible: true })
+        await startUploadCapacityMeasurement("startup")
+      } finally {
+        startFileWatchers()
+        unblockImportWork("startup checks, startup input scan, and startup upload capacity test completed")
 
-      if (config.importEnabled) {
-        await scanLibraryDirectory()
+        scanTimer = setInterval(() => {
+          startTrackedDirectoryScan("interval")
+        }, scanIntervalMs)
+        scanTimer.unref?.()
+
+        scheduleDailyAniListSync()
+        void runDeferredStartupMaintenance().catch((error) => {
+          console.error(
+            `[Error] [Workers] Deferred startup maintenance failed - startWorkers.ts - ${errorMessage(error)}`
+          )
+        })
       }
     })()
-    trackActiveWork(startupScan, "directory-scan:startup")
-
-    scheduleDailyAniListSync()
+    trackActiveWork(startupScan, "directory-scan:startup-force")
   }
 
   const startupChecks = runStartupChecks().catch((error) => {

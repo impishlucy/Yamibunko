@@ -2,9 +2,19 @@ import path from "node:path"
 
 import { parsePositiveInt } from "@/server/utils/format"
 
-const releaseGroupPattern = /^\[[^\]]+\]\s*/
-const bracketPattern = /\[[^\]]*\]|\([^)]*\)/g
+const leadingBracketSegmentPattern = /^\s*(?:\[[^\]]*\]|\{[^}]*\}|\([^)]*\))[\s._-]*/
+const squareOrCurlyBracketPattern = /\[[^\]]*\]|\{[^}]*\}/g
+const parentheticalPattern = /\(([^)]*)\)/g
 const hashPattern = /\b[A-F0-9]{8,}\b/gi
+const ignoredLeadingStrings = [
+  "Anime Time",
+  "Erai-raws",
+  "Judas",
+  "EMBER",
+  "TRC",
+  "DKB",
+  "sam",
+].sort((left, right) => right.length - left.length)
 
 export type ParsedAnimeFileName = {
   title: string
@@ -14,21 +24,144 @@ export type ParsedAnimeFileName = {
   episodeTitle?: string | null
   hasExplicitSeason?: boolean
   titleSource?: "filename" | "folder"
+  mediaKind?: "episode" | "movie"
 }
 
 type ParsedAnimeEpisodeIdentifier = Omit<ParsedAnimeFileName, "title">
 
 const fileInfoPattern = /\b(?:480p|576p|720p|1080p|1440p|2160p|4k|uhd|hdr|hdr10|sdr|bluray|blu[-\s]?ray|bdremux|bdrip|bd|web[-\s]?dl|webdl|webrip|remux|hdtv|dvd|dvdrip|x264|x265|h\.?264|h\.?265|hevc|avc|av1|aac|flac|opus|mp3|ac3|eac3|dd|ddp|dts|truehd|atmos|audio|dual[-\s]*audio|multi[-\s]*audio|multi[-\s]*subs?|dubbed|subbed|subs?|\d{1,2}[-\s]*bits?|hi10p|proper|repack|batch)\b/gi
-const releaseSuffixPattern = /\s*[-–—]\s*[A-Z0-9][A-Z0-9._-]{1,}$/g
+const releaseSuffixPattern = /\s*[-–—]\s*[A-Z0-9][A-Z0-9._-]{1,}$/gi
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function toCaseFold(value: string) {
+  return value.toLowerCase()
+}
+
+function normalizeUnicode(value: string) {
+  return value.normalize("NFKC")
+}
+
+function releaseGroupPatternFor(value: string) {
+  const normalized = toCaseFold(value.trim())
+  const pattern = normalized
+    .split(/[\s._-]+/)
+    .filter(Boolean)
+    .map((part) => escapeRegExp(part))
+    .join("[\\s._-]+")
+
+  return pattern
+    ? new RegExp(String.raw`^${pattern}(?=$|[\s._-]+)`, "i")
+    : /^$/
+}
+
+const ignoredLeadingReleaseGroupPatterns = ignoredLeadingStrings.map((releaseGroup) =>
+  releaseGroupPatternFor(releaseGroup)
+)
+
+function stripLeadingIgnoredReleaseGroups(value: string) {
+  let title = value.trim()
+
+  for (;;) {
+    const previous = title
+
+    for (const releaseGroupPattern of ignoredLeadingReleaseGroupPatterns) {
+      title = title
+        .replace(releaseGroupPattern, "")
+        .replace(/^[\s._-]+/, "")
+        .trim()
+    }
+
+    if (title === previous) {
+      return title
+    }
+  }
+}
+
+function isIgnoredReleaseGroupName(value: string) {
+  const normalized = toCaseFold(value).replace(/[\s._-]+/g, " ").trim()
+
+  return ignoredLeadingStrings.some(
+    (releaseGroup) =>
+      normalized === toCaseFold(releaseGroup).replace(/[\s._-]+/g, " ").trim()
+  )
+}
+
+function isTitleDisambiguationYear(value: string) {
+  return /^(?:19|20)\d{2}$/.test(value.trim())
+}
+
+function shouldStripParentheticalSegment(value: string) {
+  const segment = value.trim()
+
+  if (!segment) {
+    return true
+  }
+
+  if (isTitleDisambiguationYear(segment)) {
+    return false
+  }
+
+  if (isIgnoredReleaseGroupName(segment)) {
+    return true
+  }
+
+  if (/^\d{1,3}$/.test(segment)) {
+    return true
+  }
+
+  if (/^(?:v\d+|vol\.?\s*\d+|disc\s*\d+|cd\s*\d+)$/i.test(segment)) {
+    return true
+  }
+
+  if (/^[A-F0-9]{8,}$/i.test(segment)) {
+    return true
+  }
+
+  fileInfoPattern.lastIndex = 0
+
+  if (fileInfoPattern.test(segment)) {
+    fileInfoPattern.lastIndex = 0
+    return true
+  }
+
+  fileInfoPattern.lastIndex = 0
+
+  return false
+}
+
+function stripLeadingBracketSegments(value: string) {
+  let title = value
+
+  for (;;) {
+    const strippedTitle = title.replace(leadingBracketSegmentPattern, "")
+
+    if (strippedTitle === title) {
+      return title
+    }
+
+    title = strippedTitle
+  }
+}
+
+function stripIgnoredBracketSegments(value: string) {
+  return stripLeadingIgnoredReleaseGroups(stripLeadingBracketSegments(value))
+    .replace(squareOrCurlyBracketPattern, " ")
+    .replace(parentheticalPattern, (match, segment: string) =>
+      shouldStripParentheticalSegment(segment) ? " " : match
+    )
+}
 
 function normalizeTitle(value: string) {
-  return value
-    .replace(releaseGroupPattern, "")
-    .replace(bracketPattern, " ")
-    .replace(hashPattern, " ")
-    .replace(/[._]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
+  return stripLeadingIgnoredReleaseGroups(
+    stripIgnoredBracketSegments(normalizeUnicode(value))
+      .replace(hashPattern, " ")
+      .replace(/[._]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+  )
 }
 
 function cleanTitleSegment(value: string) {
@@ -92,15 +225,53 @@ export function cleanAnimeTitleCandidate(
   return cleanTitleSegment(title)
 }
 
+function romanNumeralForSeason(season: number) {
+  switch (season) {
+    case 1:
+      return "i"
+    case 2:
+      return "ii"
+    case 3:
+      return "iii"
+    case 4:
+      return "iv"
+    case 5:
+      return "v"
+    case 6:
+      return "vi"
+    case 7:
+      return "vii"
+    case 8:
+      return "viii"
+    case 9:
+      return "ix"
+    case 10:
+      return "x"
+    default:
+      return null
+  }
+}
+
 function cleanSeriesTitleSegment(value: string, season?: number, part?: number) {
   let title = cleanAnimeTitleCandidate(value, { season, part })
 
   if (season && season > 0) {
+    const seasonRoman = romanNumeralForSeason(season)
+
     title = title
       .replace(/\s+(?:season\s*\d{1,2}|s\s*\d{1,2})$/i, "")
       .replace(/\s+\d{1,2}(?:st|nd|rd|th)?\s+season$/i, "")
-      .replace(/\s+(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+season$/i, "")
+      .replace(
+        /\s+(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+season$/i,
+        ""
+      )
       .trim()
+
+    if (seasonRoman) {
+      title = title
+        .replace(new RegExp(String.raw`\s+${seasonRoman}$`, "i"), "")
+        .trim()
+    }
   }
 
   return cleanTitleSegment(title)
@@ -200,11 +371,11 @@ const wordNumberValues: Record<string, number> = {
 }
 
 function parseRomanNumeral(value: string) {
-  return romanNumberValues[value.toLowerCase()] ?? null
+  return romanNumberValues[toCaseFold(value)] ?? null
 }
 
 function parseWordNumber(value: string) {
-  return wordNumberValues[value.toLowerCase()] ?? null
+  return wordNumberValues[toCaseFold(value)] ?? null
 }
 
 function parsePartNumber(value: string | undefined) {
@@ -324,7 +495,7 @@ function applySeasonPartMarker(
   parsed: ParsedAnimeFileName,
   marker: SeasonPartMarker | null
 ): ParsedAnimeFileName {
-  if (!marker) {
+  if (!marker || parsed.mediaKind === "movie") {
     return parsed
   }
 
@@ -445,13 +616,95 @@ function getTitleBeforeEpisodeMarker(value: string, marker: EpisodeMarkerMatch) 
   return cleanSeriesTitleSegment(titleSegment, marker.season, marker.part)
 }
 
-function getTitleBeforeNoSeasonEpisodeMarker(
-  value: string,
-  marker: NoSeasonEpisodeMarkerMatch
-) {
-  const titleSegment = value.slice(0, marker.index)
+type InferredSeriesTitle = {
+  title: string
+  season: number
+  hasExplicitSeason: boolean
+}
 
-  return cleanSeriesTitleSegment(titleSegment)
+function inferTrailingSeasonTitleMarker(
+  value: string
+): { title: string; season: number } | null {
+  const title = cleanTitleSegment(value)
+
+  if (!title) {
+    return null
+  }
+
+  const labeledSeason = /^(.+?)\s+(?:season|s)\s*0*(\d{1,2})$/i.exec(title)
+
+  if (labeledSeason) {
+    const season = toPositiveInteger(labeledSeason[2])
+    const cleanedTitle = cleanSeriesTitleSegment(
+      labeledSeason[1] ?? "",
+      season ?? undefined
+    )
+
+    if (season && cleanedTitle) {
+      return { title: cleanedTitle, season }
+    }
+  }
+
+  const ordinalSeason = new RegExp(
+    String.raw`^(.+?)\s+(${partNumberPattern})\s+season$`,
+    "i"
+  ).exec(title)
+
+  if (ordinalSeason) {
+    const season = parsePartNumber(ordinalSeason[2])
+    const cleanedTitle = cleanSeriesTitleSegment(
+      ordinalSeason[1] ?? "",
+      season ?? undefined
+    )
+
+    if (season && cleanedTitle) {
+      return { title: cleanedTitle, season }
+    }
+  }
+
+  const romanSeason = /^(.+?)\s+(ii|iii|iv|v|vi|vii|viii|ix|x)$/i.exec(title)
+
+  if (romanSeason) {
+    const season = parseRomanNumeral(romanSeason[2] ?? "")
+    const cleanedTitle = cleanSeriesTitleSegment(
+      romanSeason[1] ?? "",
+      season ?? undefined
+    )
+
+    if (season && season > 1 && cleanedTitle) {
+      return { title: cleanedTitle, season }
+    }
+  }
+
+  return null
+}
+
+function cleanSeriesTitleSegmentWithInferredSeason(
+  value: string,
+  fallbackSeason = 1,
+  part?: number
+): InferredSeriesTitle | null {
+  const inferred = inferTrailingSeasonTitleMarker(value)
+
+  if (inferred) {
+    return {
+      title: inferred.title,
+      season: inferred.season,
+      hasExplicitSeason: true,
+    }
+  }
+
+  const title = cleanSeriesTitleSegment(value, fallbackSeason, part)
+
+  if (!title) {
+    return null
+  }
+
+  return {
+    title,
+    season: fallbackSeason,
+    hasExplicitSeason: false,
+  }
 }
 
 export function parseAnimeEpisodeIdentifier(
@@ -587,19 +840,30 @@ export function parseAnimeFileNameWithFallbackTitle(
   title: string
 ): ParsedAnimeFileName | null {
   const episode = parseAnimeEpisodeIdentifier(filePath)
-  const cleanedTitle = cleanSeriesTitleSegment(title, episode?.season, episode?.part)
 
-  if (!episode || !cleanedTitle) {
+  if (!episode) {
+    return null
+  }
+
+  const titleWithSeason = episode.hasExplicitSeason
+    ? {
+        title: cleanSeriesTitleSegment(title, episode.season, episode.part),
+        season: episode.season,
+        hasExplicitSeason: true,
+      }
+    : cleanSeriesTitleSegmentWithInferredSeason(title, episode.season, episode.part)
+
+  if (!titleWithSeason?.title) {
     return null
   }
 
   return {
-    title: cleanedTitle,
-    season: episode.season,
+    title: titleWithSeason.title,
+    season: titleWithSeason.season,
     episode: episode.episode,
     part: episode.part,
     episodeTitle: episode.episodeTitle,
-    hasExplicitSeason: episode.hasExplicitSeason,
+    hasExplicitSeason: episode.hasExplicitSeason || titleWithSeason.hasExplicitSeason,
     titleSource: "folder",
   }
 }
@@ -615,6 +879,8 @@ export function cleanFolderTitleCandidate(value: string) {
     part: marker?.part,
     removeLooseSeasonMarkers: !marker?.season,
   })
+    .replace(/\b(?:movies|films)\b$/i, " ")
+    .replace(/\b(?:complete\s+series|complete\s+collection|complete|batch)\b$/i, " ")
     .replace(/[-–—]+/g, " ")
     .replace(/\s+/g, " ")
     .trim()
@@ -638,7 +904,7 @@ const ignoredFolderTitleCandidates = new Set([
 ])
 
 function isIgnoredFolderTitleCandidate(value: string) {
-  const normalized = value.trim().toLowerCase()
+  const normalized = toCaseFold(value.trim())
   const marker = parseSeasonPartMarker(normalized)
   const markerOnly = marker
     ? !cleanAnimeTitleCandidate(normalized, {
@@ -657,6 +923,256 @@ function isIgnoredFolderTitleCandidate(value: string) {
   )
 }
 
+function hasMovieMarker(value: string) {
+  const normalized = toCaseFold(value)
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+
+  return /\b(?:movies?|films?|specials?|ovas?|onas?)\b/i.test(normalized)
+}
+
+function isMoviePathContext(filePath: string) {
+  return path
+    .normalize(filePath)
+    .split(/[\\/]+/)
+    .filter(Boolean)
+    .some((segment) => hasMovieMarker(segment))
+}
+
+function comparableTitleTokens(value: string) {
+  return toCaseFold(normalizeTitle(value))
+    .replace(/\b(?:a|an|the)\b/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .filter((token) => token.length > 0)
+}
+
+function hasSharedLeadingTitleTokens(title: string, prefix: string) {
+  const titleTokens = comparableTitleTokens(title)
+  const prefixTokens = comparableTitleTokens(prefix)
+
+  if (titleTokens.length === 0 || prefixTokens.length === 0) {
+    return false
+  }
+
+  const requiredMatches = Math.min(4, titleTokens.length, prefixTokens.length)
+
+  if (requiredMatches < 2) {
+    return false
+  }
+
+  for (let index = 0; index < requiredMatches; index += 1) {
+    if (titleTokens[index] !== prefixTokens[index]) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function titleHasPrefix(title: string, prefix: string) {
+  const normalizedTitle = toCaseFold(normalizeTitle(title))
+  const normalizedPrefix = toCaseFold(normalizeTitle(prefix))
+
+  return (
+    Boolean(normalizedTitle) &&
+    Boolean(normalizedPrefix) &&
+    (normalizedTitle === normalizedPrefix ||
+      normalizedTitle.startsWith(`${normalizedPrefix} `) ||
+      hasSharedLeadingTitleTokens(title, prefix))
+  )
+}
+
+function createParsedMovieFileName(title: string): ParsedAnimeFileName | null {
+  const cleanedTitle = cleanTitleSegment(title)
+
+  if (!cleanedTitle || /^\d+$/.test(cleanedTitle)) {
+    return null
+  }
+
+  return {
+    title: cleanedTitle,
+    season: 1,
+    episode: 1,
+    episodeTitle: null,
+    hasExplicitSeason: false,
+    titleSource: "filename",
+    mediaKind: "movie",
+  }
+}
+
+function formatExplicitMovieTitle(
+  prefix: string | undefined,
+  movieLabel: string | undefined,
+  suffix: string | undefined
+) {
+  const titlePrefix = prefix ?? ""
+  const label = movieLabel ?? ""
+  const titleSuffix = suffix ?? ""
+  const shouldKeepMovieLabel = /^the\s+movie/i.test(label.trim())
+
+  return shouldKeepMovieLabel
+    ? `${titlePrefix} ${label} ${titleSuffix}`
+    : `${titlePrefix} ${titleSuffix}`
+}
+
+function parseExplicitMovieFileName(filePath: string): ParsedAnimeFileName | null {
+  const baseName = path.basename(filePath, path.extname(filePath))
+  const mainName = baseName.split("|")[0] ?? baseName
+  const normalized = normalizeTitle(mainName)
+  const movieTitle = /^(.+?)\s+((?:the\s+)?movie(?:\s+\d{1,2})?)\s*[-–—:]\s*(.+)$/i.exec(
+    normalized
+  )
+
+  if (movieTitle) {
+    return createParsedMovieFileName(
+      formatExplicitMovieTitle(movieTitle[1], movieTitle[2], movieTitle[3])
+    )
+  }
+
+  const movieTitleWithoutSeparator = /^(.+?)\s+((?:the\s+)?movie(?:\s+\d{1,2})?)\s+(.+)$/i.exec(
+    normalized
+  )
+
+  if (movieTitleWithoutSeparator) {
+    return createParsedMovieFileName(
+      formatExplicitMovieTitle(
+        movieTitleWithoutSeparator[1],
+        movieTitleWithoutSeparator[2],
+        movieTitleWithoutSeparator[3]
+      )
+    )
+  }
+
+  const titledMovie = /^(.+?)\s*[-–—:]\s*((?:the\s+)?movie(?:\s+.+)?)$/i.exec(
+    normalized
+  )
+
+  if (titledMovie) {
+    return createParsedMovieFileName(
+      `${titledMovie[1] ?? ""} ${titledMovie[2] ?? ""}`
+    )
+  }
+
+  return null
+}
+
+function rawComparableMovieName(filePath: string) {
+  const baseName = path.basename(filePath, path.extname(filePath))
+  const mainName = baseName.split("|")[0] ?? baseName
+
+  return stripLeadingIgnoredReleaseGroups(
+    stripIgnoredBracketSegments(normalizeUnicode(mainName))
+      .replace(hashPattern, " ")
+      .replace(/_/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+  )
+}
+
+function parseDecimalMovieFileName(filePath: string): ParsedAnimeFileName | null {
+  const rawName = rawComparableMovieName(filePath)
+  const decimalMovie = /^(.+?)\s+(\d(?:\.\d{1,2})(?:\s*\+?\s*\d(?:\.\d{1,2}))?)(?:\s*[-–—]?\s*(.+))?$/i.exec(
+    rawName
+  )
+
+  if (!decimalMovie) {
+    return null
+  }
+
+  return createParsedMovieFileName(
+    `${decimalMovie[1] ?? ""} ${decimalMovie[2] ?? ""} ${decimalMovie[3] ?? ""}`
+  )
+}
+
+function parseStandaloneMovieFileName(filePath: string): ParsedAnimeFileName | null {
+  const baseName = path.basename(filePath, path.extname(filePath))
+  const mainName = baseName.split("|")[0] ?? baseName
+  const normalized = normalizeTitle(mainName)
+  const dashTitle = /^(.+?)\s*[-–—:]\s*(.+)$/i.exec(normalized)
+
+  if (dashTitle) {
+    const titlePrefix = cleanTitleSegment(dashTitle[1] ?? "")
+    const titleSuffix = cleanTitleSegment(dashTitle[2] ?? "")
+    const numericSpecialSuffix = /^\d{1,4}['’′]+$/u.test(titleSuffix.trim())
+
+    if (
+      titlePrefix &&
+      titleSuffix &&
+      (numericSpecialSuffix || !/^\d{1,4}\b/.test(titleSuffix))
+    ) {
+      return createParsedMovieFileName(`${titlePrefix} ${titleSuffix}`)
+    }
+  }
+
+  if (!isMoviePathContext(filePath)) {
+    return null
+  }
+
+  return createParsedMovieFileName(normalized)
+}
+
+function parseMovieFileNameWithFallbackTitle(
+  filePath: string,
+  fallbackTitle?: string
+): ParsedAnimeFileName | null {
+  const parsedMovie =
+    parseDecimalMovieFileName(filePath) ??
+    parseExplicitMovieFileName(filePath) ??
+    parseStandaloneMovieFileName(filePath)
+
+  if (parsedMovie) {
+    return parsedMovie
+  }
+
+  if (!isMoviePathContext(filePath)) {
+    return null
+  }
+
+  const baseName = path.basename(filePath, path.extname(filePath))
+  const mainName = baseName.split("|")[0] ?? baseName
+  const baseTitle = cleanTitleSegment(mainName)
+
+  if (!baseTitle) {
+    return null
+  }
+
+  const title = fallbackTitle && !titleHasPrefix(baseTitle, fallbackTitle)
+    ? `${fallbackTitle} ${baseTitle}`
+    : baseTitle
+
+  return createParsedMovieFileName(title)
+}
+
+export function getStandaloneMediaTitleFallbackCandidates(
+  rootDir: string,
+  filePath: string,
+  parsedTitle: string
+) {
+  const candidates: string[] = []
+  const seen = new Set<string>()
+
+  for (const fallbackTitle of getFolderTitleFallbackCandidates(rootDir, filePath, parsedTitle)) {
+    const combinedTitle = titleHasPrefix(parsedTitle, fallbackTitle)
+      ? parsedTitle
+      : `${fallbackTitle} ${parsedTitle}`
+    const cleaned = cleanTitleSegment(combinedTitle)
+    const key = toCaseFold(cleaned)
+
+    if (!cleaned || key === toCaseFold(parsedTitle) || seen.has(key)) {
+      continue
+    }
+
+    seen.add(key)
+    candidates.push(cleaned)
+  }
+
+  return candidates
+}
+
 export function getFolderTitleFallbackCandidates(
   rootDir: string,
   filePath: string,
@@ -670,21 +1186,28 @@ export function getFolderTitleFallbackCandidates(
     return []
   }
 
-  const parsedTitleNormalized = parsedTitle?.trim().toLowerCase()
+  const parsedTitleNormalized = parsedTitle ? toCaseFold(parsedTitle.trim()) : undefined
   const candidates: string[] = []
   const seen = new Set<string>()
   const parts = relativeDirectory.split(path.sep).filter(Boolean)
 
   for (let index = parts.length - 1; index >= 0; index -= 1) {
     const cleaned = cleanFolderTitleCandidate(parts[index] ?? "")
-    const key = cleaned.toLowerCase()
+    const key = toCaseFold(cleaned)
 
     if (cleaned.length < 2 || isIgnoredFolderTitleCandidate(cleaned)) {
       continue
     }
 
-    if (parsedTitleNormalized && key === parsedTitleNormalized) {
-      continue
+    if (parsedTitleNormalized) {
+      const cleanedTokenCount = comparableTitleTokens(cleaned).length
+
+      if (
+        key === parsedTitleNormalized ||
+        (cleanedTokenCount <= 3 && titleHasPrefix(parsedTitleNormalized, cleaned))
+      ) {
+        continue
+      }
     }
 
     if (seen.has(key)) {
@@ -705,20 +1228,43 @@ export function parseAnimeFilePath(
   const directoryMarker = options?.rootDir
     ? getDirectorySeasonPartMarker(options.rootDir, filePath)
     : null
+  const fallbackTitles = [
+    ...(options?.fallbackTitles ?? []),
+    ...(options?.rootDir ? getFolderTitleFallbackCandidates(options.rootDir, filePath) : []),
+  ]
+
+  if (isMoviePathContext(filePath)) {
+    const contextMovieParsed = parseMovieFileNameWithFallbackTitle(filePath)
+
+    if (contextMovieParsed) {
+      return applySeasonPartMarker(contextMovieParsed, directoryMarker)
+    }
+
+    for (const fallbackTitle of fallbackTitles) {
+      const fallbackMovieParsed = parseMovieFileNameWithFallbackTitle(
+        filePath,
+        fallbackTitle
+      )
+
+      if (fallbackMovieParsed) {
+        return applySeasonPartMarker(
+          { ...fallbackMovieParsed, titleSource: "folder" },
+          directoryMarker
+        )
+      }
+    }
+  }
+
   const parsed = parseAnimeFileName(filePath)
 
   if (parsed) {
     return applySeasonPartMarker(parsed, directoryMarker)
   }
 
-  const fallbackTitles = [
-    ...(options?.fallbackTitles ?? []),
-    ...(options?.rootDir ? getFolderTitleFallbackCandidates(options.rootDir, filePath) : []),
-  ]
   const seen = new Set<string>()
 
   for (const fallbackTitle of fallbackTitles) {
-    const key = fallbackTitle.trim().toLowerCase()
+    const key = toCaseFold(fallbackTitle.trim())
 
     if (!key || seen.has(key)) {
       continue
@@ -730,9 +1276,23 @@ export function parseAnimeFilePath(
     if (fallbackParsed) {
       return applySeasonPartMarker(fallbackParsed, directoryMarker)
     }
+
+    const fallbackMovieParsed = parseMovieFileNameWithFallbackTitle(
+      filePath,
+      fallbackTitle
+    )
+
+    if (fallbackMovieParsed) {
+      return applySeasonPartMarker(
+        { ...fallbackMovieParsed, titleSource: "folder" },
+        directoryMarker
+      )
+    }
   }
 
-  return null
+  const movieParsed = parseMovieFileNameWithFallbackTitle(filePath)
+
+  return movieParsed ? applySeasonPartMarker(movieParsed, directoryMarker) : null
 }
 
 export function getAnimeMetadataLookupSeason(parsed: ParsedAnimeFileName) {
@@ -751,21 +1311,20 @@ export function parseAnimeFileName(
   )
 
   if (movieDashEpisode) {
-    const episode = toPositiveInteger(movieDashEpisode[2])
     const titlePrefix = cleanTitleSegment(
       (movieDashEpisode[1] ?? "").replace(/\bMovie$/i, "")
     )
     const titleSuffix = cleanTitleSegment(movieDashEpisode[3] ?? "")
 
-    if (episode && titlePrefix && titleSuffix) {
-      return {
-        title: `${titlePrefix} ${titleSuffix}`,
-        season: 1,
-        episode,
-        hasExplicitSeason: false,
-        titleSource: "filename",
-      }
+    if (titlePrefix && titleSuffix) {
+      return createParsedMovieFileName(`${titlePrefix} ${titleSuffix}`)
     }
+  }
+
+  const movieParsed = parseExplicitMovieFileName(filePath)
+
+  if (movieParsed) {
+    return movieParsed
   }
 
   const marker = findEpisodeMarker(normalized)
@@ -789,15 +1348,16 @@ export function parseAnimeFileName(
   const noSeasonMarker = findNoSeasonEpisodeMarker(normalized)
 
   if (noSeasonMarker) {
-    const title = getTitleBeforeNoSeasonEpisodeMarker(normalized, noSeasonMarker)
+    const titleSegment = normalized.slice(0, noSeasonMarker.index)
+    const titleWithSeason = cleanSeriesTitleSegmentWithInferredSeason(titleSegment)
 
-    if (title) {
+    if (titleWithSeason) {
       return {
-        title,
-        season: 1,
+        title: titleWithSeason.title,
+        season: titleWithSeason.season,
         episode: noSeasonMarker.episode,
         episodeTitle: cleanEpisodeTitleSegment(noSeasonMarker.suffix),
-        hasExplicitSeason: false,
+        hasExplicitSeason: titleWithSeason.hasExplicitSeason,
         titleSource: "filename",
       }
     }
@@ -874,21 +1434,50 @@ export function parseAnimeFileName(
 
   if (dashEpisode) {
     const episode = toPositiveInteger(dashEpisode[2])
+    const titleWithSeason = cleanSeriesTitleSegmentWithInferredSeason(
+      dashEpisode[1] ?? ""
+    )
 
-    const title = cleanSeriesTitleSegment(dashEpisode[1] ?? "", 1)
-
-    if (episode && title) {
+    if (episode && titleWithSeason) {
       return {
-        title,
-        season: 1,
+        title: titleWithSeason.title,
+        season: titleWithSeason.season,
         episode,
-        hasExplicitSeason: false,
+        hasExplicitSeason: titleWithSeason.hasExplicitSeason,
         titleSource: "filename",
       }
     }
   }
 
-  return null
+  const decimalMovieParsed = parseDecimalMovieFileName(filePath)
+
+  if (decimalMovieParsed) {
+    return decimalMovieParsed
+  }
+
+  const trailingEpisode = /^(.+?)\s+(\d{1,3})(?:v\d+)?(?:\s*[-–—]\s*(.+))?$/i.exec(
+    normalized
+  )
+
+  if (trailingEpisode) {
+    const episode = toPositiveInteger(trailingEpisode[2])
+    const titleWithSeason = cleanSeriesTitleSegmentWithInferredSeason(
+      trailingEpisode[1] ?? ""
+    )
+
+    if (episode && titleWithSeason) {
+      return {
+        title: titleWithSeason.title,
+        season: titleWithSeason.season,
+        episode,
+        episodeTitle: cleanEpisodeTitleSegment(trailingEpisode[3]),
+        hasExplicitSeason: titleWithSeason.hasExplicitSeason,
+        titleSource: "filename",
+      }
+    }
+  }
+
+  return parseStandaloneMovieFileName(filePath)
 }
 
 export function sanitizePathPart(value: string) {
@@ -985,7 +1574,19 @@ export function formatEpisodeFileName(input: {
     ? input.extension
     : `.${input.extension}`
 
-  return `${safeTitle} - S${season}${part}E${episode}${extension.toLowerCase()}`
+  return `${safeTitle} - S${season}${part}E${episode}${toCaseFold(extension)}`
+}
+
+export function formatStandaloneMediaFileName(input: {
+  title: string
+  extension: string
+}) {
+  const safeTitle = sanitizeExportPathPart(input.title) || "Anime"
+  const extension = input.extension.startsWith(".")
+    ? input.extension
+    : `.${input.extension}`
+
+  return `${safeTitle}${toCaseFold(extension)}`
 }
 
 export function formatSeasonFolderName(season: number, part?: number) {

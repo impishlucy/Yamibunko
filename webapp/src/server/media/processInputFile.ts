@@ -32,10 +32,13 @@ import {
 import {
   formatEpisodeFileName,
   formatSeasonFolderName,
+  formatStandaloneMediaFileName,
   getAnimeMetadataLookupSeason,
   getFolderTitleFallbackCandidates,
+  getStandaloneMediaTitleFallbackCandidates,
   parseAnimeFilePath,
   sanitizeExportPathPart,
+  type ParsedAnimeFileName,
 } from "@/server/media/filename"
 import {
   generateEpisodeThumbnail,
@@ -218,6 +221,37 @@ function debugError(jobId: string, message: string, error: unknown) {
 
 function isSeriesFormat(format?: string | null) {
   return !format || format === "TV" || format === "TV_SHORT" || format === "ONA"
+}
+
+function isSeriesMetadataFormat(format?: string | null) {
+  return format === "TV" || format === "TV_SHORT"
+}
+
+function isStandaloneMediaParsed(parsed: Pick<ParsedAnimeFileName, "mediaKind">) {
+  return parsed.mediaKind === "movie"
+}
+
+function isParsedMediaCompatibleWithMetadata(
+  parsed: Pick<ParsedAnimeFileName, "mediaKind" | "title">,
+  metadata: { format?: string | null }
+) {
+  return !isStandaloneMediaParsed(parsed) || !isSeriesMetadataFormat(metadata.format)
+}
+
+function standaloneMediaKindLabel(format?: string | null) {
+  if (format === "MOVIE") {
+    return "Movie"
+  }
+
+  if (format === "SPECIAL") {
+    return "Special"
+  }
+
+  if (format === "OVA") {
+    return "OVA"
+  }
+
+  return "Standalone media"
 }
 
 function seasonLabel(seasonNumber: number, partNumber?: number) {
@@ -687,17 +721,20 @@ function isInsideFailedImports(inputDir: string, current: string) {
 
   return relative
     .split(path.sep)
-    .some((part) => part === failedImportsFolderName)
+    .some((part) => part.toLowerCase() === failedImportsFolderName)
 }
 
-function sanitizeFailedImportRelativePath(relativePath: string) {
+function failedImportRelativePathParts(relativePath: string) {
   return relativePath
-    .split(path.sep)
+    .split(/[\\/]+/)
     .filter(Boolean)
     .map((part, index, parts) => {
       const fallback = index === parts.length - 1 ? "failed_file" : "unknown"
+      const trimmedPart = part.trim()
 
-      return sanitizeExportPathPart(part) || fallback
+      return trimmedPart && trimmedPart !== "." && trimmedPart !== ".."
+        ? part
+        : fallback
     })
 }
 
@@ -711,6 +748,23 @@ function formatDetectedEpisode(input: {
   const episodeName = input.episodeTitle?.trim()
 
   return `Anime: ${input.animeTitle}, ${seasonLabel(input.seasonNumber, input.partNumber)}, Episode ${input.episodeNumber}${episodeName ? ` (${episodeName})` : ""}`
+}
+
+function formatDetectedMedia(input: {
+  animeTitle: string
+  mediaTitle: string
+  seasonNumber: number
+  episodeNumber: number
+  partNumber?: number
+  episodeTitle?: string | null
+  mediaKind?: ParsedAnimeFileName["mediaKind"]
+  format?: string | null
+}) {
+  if (input.mediaKind === "movie") {
+    return `${standaloneMediaKindLabel(input.format)}: ${input.mediaTitle}`
+  }
+
+  return formatDetectedEpisode(input)
 }
 
 async function moveFailedInputToFailedImports(
@@ -732,7 +786,7 @@ async function moveFailedInputToFailedImports(
     throw new Error(`Refusing to quarantine a file outside the input folder: ${resolvedFilePath}`)
   }
 
-  const relativePath = sanitizeFailedImportRelativePath(
+  const relativePath = failedImportRelativePathParts(
     path.relative(inputDir, resolvedFilePath)
   )
   const destination = await uniqueDestinationPath(
@@ -1161,19 +1215,38 @@ export async function processInputFile(
       debugImport(jobId, "Starting AniList metadata lookup.")
 
       try {
-        metadata = await findAnimeMetadata(
+        const directMetadata = await findAnimeMetadata(
           parsed.title,
           getAnimeMetadataLookupSeason(parsed),
           parsed.episode,
-          parsed.part
+          parsed.part,
+          { mediaKind: parsed.mediaKind }
         )
 
-        if (!metadata) {
-          const fallbackTitles = getFolderTitleFallbackCandidates(
-            config.inputDir,
-            filePath,
-            parsed.title
+        if (directMetadata && isParsedMediaCompatibleWithMetadata(parsed, directMetadata)) {
+          metadata = directMetadata
+        } else if (directMetadata) {
+          console.warn(
+            `[Warn] [Media] Ignored unsafe standalone media AniList match - Filename title "${parsed.title}" matched ${directMetadata.format ?? "unknown format"} media - ${fileName(filePath)}`
           )
+          debugImport(
+            jobId,
+            `Ignored unsafe standalone media AniList match - Parsed title ${parsed.title}, matched format ${directMetadata.format ?? "unknown"}.`
+          )
+        }
+
+        if (!metadata) {
+          const fallbackTitles = isStandaloneMediaParsed(parsed)
+            ? getStandaloneMediaTitleFallbackCandidates(
+                config.inputDir,
+                filePath,
+                parsed.title
+              )
+            : getFolderTitleFallbackCandidates(
+                config.inputDir,
+                filePath,
+                parsed.title
+              )
 
           for (const fallbackTitle of fallbackTitles) {
             console.warn(
@@ -1191,10 +1264,22 @@ export async function processInputFile(
               fallbackTitle,
               getAnimeMetadataLookupSeason(parsed),
               parsed.episode,
-              parsed.part
+              parsed.part,
+              { mediaKind: parsed.mediaKind }
             )
 
             if (!fallbackMetadata) {
+              continue
+            }
+
+            if (!isParsedMediaCompatibleWithMetadata(parsed, fallbackMetadata)) {
+              console.warn(
+                `[Warn] [Media] Ignored unsafe folder fallback AniList match - Filename title "${parsed.title}" matched ${fallbackMetadata.format ?? "unknown format"} media through folder title "${fallbackTitle}" - ${fileName(filePath)}`
+              )
+              debugImport(
+                jobId,
+                `Ignored unsafe folder fallback AniList match - Parsed title ${parsed.title}, Folder title ${fallbackTitle}, matched format ${fallbackMetadata.format ?? "unknown"}.`
+              )
               continue
             }
 
@@ -1372,9 +1457,20 @@ export async function processInputFile(
 
     const library = resolvedLibrary
     const libraryTitle = library.title
+    const inputIsStandaloneMedia = isStandaloneMediaParsed(inputParsed)
+    const detectedMediaLabel = formatDetectedMedia({
+      animeTitle: libraryTitle,
+      mediaTitle,
+      seasonNumber: inputParsed.season,
+      partNumber: inputParsed.part,
+      episodeNumber: inputParsed.episode,
+      episodeTitle: inputParsed.episodeTitle,
+      mediaKind: inputParsed.mediaKind,
+      format: inputMetadata.format,
+    })
 
     console.log(
-      `[Info] [Media] Detected input episode - ${formatDetectedEpisode({ animeTitle: libraryTitle, seasonNumber: inputParsed.season, partNumber: inputParsed.part, episodeNumber: inputParsed.episode, episodeTitle: inputParsed.episodeTitle })} - ${fileName(filePath)}`
+      `[Info] [Media] Detected input media - ${detectedMediaLabel} - ${fileName(filePath)}`
     )
 
     function emitEpisodeAdded() {
@@ -1478,7 +1574,7 @@ export async function processInputFile(
         })
 
       console.log(
-        `[Info] [File Import] ${input.kind === "catalog-only" ? "Scheduled" : "Added to queue"} - ${label} - ${formatDetectedEpisode({ animeTitle: libraryTitle, seasonNumber: inputParsed.season, partNumber: inputParsed.part, episodeNumber: inputParsed.episode, episodeTitle: inputParsed.episodeTitle })} - ${fileName(filePath)}`
+        `[Info] [File Import] ${input.kind === "catalog-only" ? "Scheduled" : "Added to queue"} - ${label} - ${detectedMediaLabel} - ${fileName(filePath)}`
       )
 
       if (options.onDeferredWork) {
@@ -1602,7 +1698,7 @@ export async function processInputFile(
         emitEpisodeAdded()
 
         console.log(
-          `[Info] [Media] Database import completed - ${formatDetectedEpisode({ animeTitle: libraryTitle, seasonNumber: inputParsed.season, partNumber: inputParsed.part, episodeNumber: inputParsed.episode, episodeTitle: inputParsed.episodeTitle })} - ${fileName(resolvedInputPath)}`
+          `[Info] [Media] Database import completed - ${detectedMediaLabel} - ${fileName(resolvedInputPath)}`
         )
 
         const message = "Input file added to the library without moving, deleting, or transcoding."
@@ -1708,13 +1804,18 @@ export async function processInputFile(
     const safeLibraryTitle = safePathSegment(libraryTitle, "Library title")
     const safeMediaTitle = safePathSegment(mediaTitle, "Media title")
     const extension = mp4FileExtension
-    const finalName = formatEpisodeFileName({
-      title: safeMediaTitle,
-      season: inputParsed.season,
-      part: inputParsed.part,
-      episode: inputParsed.episode,
-      extension,
-    })
+    const finalName = inputIsStandaloneMedia
+      ? formatStandaloneMediaFileName({
+          title: safeMediaTitle,
+          extension,
+        })
+      : formatEpisodeFileName({
+          title: safeMediaTitle,
+          season: inputParsed.season,
+          part: inputParsed.part,
+          episode: inputParsed.episode,
+          extension,
+        })
     const finalPath = path.resolve(
       config.mediaDir,
       ...(nonAnimeInput ? [nonAnimeFolderName, safeLibraryTitle] : [safeLibraryTitle]),
@@ -1752,12 +1853,16 @@ export async function processInputFile(
       }),
       seasonNumber: inputParsed.season,
       episodeNumber: inputParsed.episode,
-      displaySeasonLabel: seasonLabel(inputParsed.season, inputParsed.part),
-      displayEpisodeLabel: episodeBadgeLabel({
-        seasonNumber: inputParsed.season,
-        partNumber: inputParsed.part,
-        episodeNumber: inputParsed.episode,
-      }),
+      displaySeasonLabel: inputIsStandaloneMedia
+        ? standaloneMediaKindLabel(inputMetadata.format)
+        : seasonLabel(inputParsed.season, inputParsed.part),
+      displayEpisodeLabel: inputIsStandaloneMedia
+        ? standaloneMediaKindLabel(inputMetadata.format)
+        : episodeBadgeLabel({
+            seasonNumber: inputParsed.season,
+            partNumber: inputParsed.part,
+            episodeNumber: inputParsed.episode,
+          }),
       fileName: finalName,
     }
 
@@ -1848,7 +1953,7 @@ export async function processInputFile(
         `Existing episode will be replaced after the new output is ready - Old path ${path.resolve(existingEpisode.filePath)}, New path ${finalPath}`
       )
       console.log(
-        `[Info] [Media] Replacement import detected - ${safeLibraryTitle} ${episodeBadgeLabel({ seasonNumber: inputParsed.season, partNumber: inputParsed.part, episodeNumber: inputParsed.episode }).replace(" ", "")} - ${fileName(filePath)}`
+        `[Info] [Media] Replacement import detected - ${detectedMediaLabel} - ${fileName(filePath)}`
       )
     }
 
@@ -1929,7 +2034,7 @@ export async function processInputFile(
       emitEpisodeAdded()
 
       console.log(
-        `[Info] [Media] Database import completed - ${formatDetectedEpisode({ animeTitle: libraryTitle, seasonNumber: inputParsed.season, partNumber: inputParsed.part, episodeNumber: importEpisodeNumber, episodeTitle: inputParsed.episodeTitle })} - ${fileName(finalPath)}`
+        `[Info] [Media] Database import completed - ${detectedMediaLabel} - ${fileName(finalPath)}`
       )
       debugImport(jobId, "Episode row saved.")
 

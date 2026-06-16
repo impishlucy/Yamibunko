@@ -1,6 +1,10 @@
+import path from "node:path"
+
 import { isLocalNonAnimeId } from "@/lib/local-media"
+import { slugifyAnimeTitle } from "@/lib/slug"
 import type { AnimeInfo, AnimeSummary, AnimeVariant, Episode } from "@/lib/types"
 import { getStoredEpisodeWatchedSeconds } from "@/lib/watch-progress"
+import { getServerConfigResult } from "@/server/config"
 import { getDb, nowIso } from "@/server/db/sqlite"
 import {
   fileName as baseFileName,
@@ -174,6 +178,1027 @@ function ensureLibraryEntry(input: {
     .run(input.slug, input.title, input.primaryAnimeId, now, now)
 
   return input.slug
+}
+
+
+type LibraryRootRelationRepairRow = {
+  anime_id: number
+  anime_library_slug: string | null
+  anime_relation_kind: string | null
+  root_id: number
+  root_library_slug: string | null
+  root_relation_kind: string | null
+  root_title_romaji: string | null
+  root_title_english: string | null
+  root_title_native: string | null
+  root_title_user_preferred: string
+}
+
+type LibraryIntegrityStats = {
+  repairedAssignments: number
+  repairedRootRows: number
+  removedStaleEntries: number
+}
+
+
+type StoredAnimeRelationRow = {
+  anime_id: number
+  related_anime_id: number
+  relation_type: string
+}
+
+type LibraryRootGraphAnimeRow = AnimeRow & {
+  local_episode_count: number
+  primary_entry_count: number
+}
+
+type PhysicalLibraryEpisodeRow = AnimeRow & {
+  file_path: string
+}
+
+type PhysicalLibraryRootRepair = {
+  animeId: number
+  folderSlug: string
+  entry: LibraryEntryRow
+  root: AnimeRow
+}
+
+const storedLibraryMediaFormats = new Set([
+  "TV",
+  "TV_SHORT",
+  "MOVIE",
+  "SPECIAL",
+  "OVA",
+  "ONA",
+])
+const rootGraphPrimaryRelationTypes = new Set(["PARENT", "PREQUEL"])
+const rootGraphSecondaryRelationTypes = new Set([
+  "SIDE_STORY",
+  "SUMMARY",
+  "SPIN_OFF",
+  "ALTERNATIVE",
+  "COMPILATION",
+  "CONTAINS",
+])
+const inverseStoredRootRelationTypes: Record<string, string> = {
+  PREQUEL: "SEQUEL",
+  SEQUEL: "PREQUEL",
+  SIDE_STORY: "SIDE_STORY",
+  SUMMARY: "SUMMARY",
+  SPIN_OFF: "SPIN_OFF",
+  ALTERNATIVE: "ALTERNATIVE",
+  COMPILATION: "COMPILATION",
+  CONTAINS: "PARENT",
+}
+
+function isStoredLibraryMedia(row: Pick<AnimeRow, "format">) {
+  return storedLibraryMediaFormats.has(row.format ?? "")
+}
+
+function isStoredSeriesMedia(row: Pick<AnimeRow, "format">) {
+  return seriesFormats.has(row.format ?? "")
+}
+
+function relationYearDirectionLooksValid(
+  source: Pick<AnimeRow, "format" | "season_year">,
+  target: Pick<AnimeRow, "format" | "season_year">,
+  relationType: string
+) {
+  const sourceYear = source.season_year ?? null
+  const targetYear = target.season_year ?? null
+
+  if (sourceYear === null || targetYear === null) {
+    return true
+  }
+
+  if (relationType === "PREQUEL") {
+    return targetYear <= sourceYear
+  }
+
+  if (relationType === "SEQUEL") {
+    return !isStoredSeriesMedia(source)
+  }
+
+  if (isStoredSeriesMedia(source) && isStoredSeriesMedia(target)) {
+    return targetYear <= sourceYear
+  }
+
+  return true
+}
+
+function stripRootResolutionSeasonMarkers(value: string) {
+  return value
+    .replace(/\b(?:season|part|cour|pt\.?|half)\s*\d+\b/gi, " ")
+    .replace(/\bs\s*\d+\b/gi, " ")
+    .replace(/\b\d+(?:st|nd|rd|th)\s+(?:season|part|cour|half)\b/gi, " ")
+    .replace(/\b(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(?:season|part|cour|half)\b/gi, " ")
+    .replace(/\b(?:part|pt\.?|cour)\s+(?:i|ii|iii|iv|v|vi|vii|viii|ix|x)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function uniqueTitleValues(values: Array<string | null | undefined>) {
+  const seen = new Set<string>()
+
+  return values.filter((value): value is string => {
+    const normalized = value?.trim()
+
+    if (!normalized) {
+      return false
+    }
+
+    const key = normalizeComparableTitle(normalized)
+
+    if (!key || seen.has(key)) {
+      return false
+    }
+
+    seen.add(key)
+    return true
+  })
+}
+
+function rowRootTitleValues(
+  row: Pick<
+    AnimeRow,
+    "title_user_preferred" | "title_english" | "title_romaji" | "title_native"
+  >
+) {
+  return uniqueTitleValues(rowTitles(row)).flatMap((title) => {
+    const titleHead = title.split(/[:：]/)[0] ?? title
+
+    return [
+      normalizeComparableTitle(titleHead),
+      normalizeComparableTitle(stripRootResolutionSeasonMarkers(titleHead)),
+    ]
+  })
+}
+
+function rowHasSharedTitleRoot(
+  source: Pick<
+    AnimeRow,
+    "title_user_preferred" | "title_english" | "title_romaji" | "title_native"
+  >,
+  target: Pick<
+    AnimeRow,
+    "title_user_preferred" | "title_english" | "title_romaji" | "title_native"
+  >
+) {
+  const sourceTitles = uniqueTitleValues(rowTitles(source)).map(normalizeComparableTitle)
+  const targetTitles = uniqueTitleValues(rowTitles(target)).map(normalizeComparableTitle)
+  const sourceRoots = rowRootTitleValues(source).filter((title) => titleTokens(title).length >= 2)
+  const targetRoots = rowRootTitleValues(target).filter((title) => titleTokens(title).length >= 2)
+
+  if (
+    sourceRoots.some((sourceRoot) =>
+      targetRoots.some((targetRoot) => sourceRoot === targetRoot)
+    )
+  ) {
+    return true
+  }
+
+  return sourceTitles.some((sourceTitle) =>
+    targetTitles.some(
+      (targetTitle) =>
+        sourceTitle === targetTitle ||
+        sourceTitle.startsWith(`${targetTitle} `) ||
+        targetTitle.startsWith(`${sourceTitle} `) ||
+        hasSharedTitleTokenPrefix(sourceTitle, targetTitle) ||
+        tokenOverlap(sourceTitle, targetTitle) >= 0.65 ||
+        tokenOverlap(targetTitle, sourceTitle) >= 0.65
+    )
+  )
+}
+
+function hasSharedTitleTokenPrefix(title: string, candidateTitle: string) {
+  const titleParts = titleTokens(title)
+  const candidateTitleParts = titleTokens(candidateTitle)
+  let sharedPrefixParts = 0
+
+  for (
+    let index = 0;
+    index < Math.min(titleParts.length, candidateTitleParts.length);
+    index += 1
+  ) {
+    if (titleParts[index] !== candidateTitleParts[index]) {
+      break
+    }
+
+    sharedPrefixParts += 1
+  }
+
+  return sharedPrefixParts >= 2
+}
+
+function storedRelationCanPointToLibraryRoot(
+  source: AnimeRow,
+  target: AnimeRow,
+  relationType: string
+) {
+  if (
+    !isStoredLibraryMedia(source) ||
+    !isStoredLibraryMedia(target) ||
+    !relationYearDirectionLooksValid(source, target, relationType)
+  ) {
+    return false
+  }
+
+  if (rootGraphPrimaryRelationTypes.has(relationType)) {
+    return isStoredSeriesMedia(target) || rowHasSharedTitleRoot(source, target)
+  }
+
+  if (relationType === "SEQUEL") {
+    return !isStoredSeriesMedia(source) && isStoredSeriesMedia(target)
+  }
+
+  if (rootGraphSecondaryRelationTypes.has(relationType)) {
+    return isStoredSeriesMedia(target) && rowHasSharedTitleRoot(source, target)
+  }
+
+  return false
+}
+
+function rootGraphRelationPriority(relationType: string) {
+  if (relationType === "PARENT") {
+    return 0
+  }
+
+  if (relationType === "PREQUEL") {
+    return 1
+  }
+
+  if (relationType === "SEQUEL") {
+    return 2
+  }
+
+  if (rootGraphSecondaryRelationTypes.has(relationType)) {
+    return 3
+  }
+
+  return 99
+}
+
+function pickStoredRootRelation(
+  source: AnimeRow,
+  rowsById: Map<number, AnimeRow>,
+  relationsByAnimeId: Map<number, StoredAnimeRelationRow[]>
+) {
+  const candidates = (relationsByAnimeId.get(source.id) ?? [])
+    .map((relation) => {
+      const target = rowsById.get(relation.related_anime_id)
+
+      if (!target || target.id === source.id) {
+        return null
+      }
+
+      if (!storedRelationCanPointToLibraryRoot(source, target, relation.relation_type)) {
+        return null
+      }
+
+      return { relation, target }
+    })
+    .filter(
+      (candidate): candidate is { relation: StoredAnimeRelationRow; target: AnimeRow } =>
+        Boolean(candidate)
+    )
+
+  return candidates.sort((left, right) => {
+    const priorityDelta =
+      rootGraphRelationPriority(left.relation.relation_type) -
+      rootGraphRelationPriority(right.relation.relation_type)
+
+    if (priorityDelta !== 0) {
+      return priorityDelta
+    }
+
+    if (isStoredSeriesMedia(left.target) !== isStoredSeriesMedia(right.target)) {
+      return isStoredSeriesMedia(left.target) ? -1 : 1
+    }
+
+    const leftYear = left.target.season_year ?? Number.MAX_SAFE_INTEGER
+    const rightYear = right.target.season_year ?? Number.MAX_SAFE_INTEGER
+
+    if (leftYear !== rightYear) {
+      return leftYear - rightYear
+    }
+
+    return left.target.id - right.target.id
+  })[0]?.target ?? null
+}
+
+function resolveStoredLibraryRoot(
+  source: AnimeRow,
+  rowsById: Map<number, AnimeRow>,
+  relationsByAnimeId: Map<number, StoredAnimeRelationRow[]>,
+  visited = new Set<number>()
+): AnimeRow {
+  if (visited.has(source.id) || visited.size >= 12) {
+    return source
+  }
+
+  const nextVisited = new Set(visited)
+  nextVisited.add(source.id)
+
+  const directRoot = (relationsByAnimeId.get(source.id) ?? [])
+    .filter((relation) => relation.relation_type === "LIBRARY_ROOT")
+    .map((relation) => rowsById.get(relation.related_anime_id) ?? null)
+    .find((row): row is AnimeRow => Boolean(row && isStoredLibraryMedia(row)))
+
+  const candidate = directRoot && directRoot.id !== source.id
+    ? directRoot
+    : pickStoredRootRelation(source, rowsById, relationsByAnimeId)
+
+  if (!candidate || candidate.id === source.id || nextVisited.has(candidate.id)) {
+    return source
+  }
+
+  const root = resolveStoredLibraryRoot(
+    candidate,
+    rowsById,
+    relationsByAnimeId,
+    nextVisited
+  )
+
+  if (root.id === source.id || !isStoredLibraryMedia(root)) {
+    return source
+  }
+
+  return isStoredSeriesMedia(root) || !isStoredSeriesMedia(source) ? root : source
+}
+
+function listStoredAnimeRowsForRootRepair() {
+  return getDb()
+    .query<LibraryRootGraphAnimeRow>(
+      `
+      SELECT
+        a.*,
+        COUNT(DISTINCT e.file_path) AS local_episode_count,
+        COUNT(DISTINCT le.slug) AS primary_entry_count
+      FROM anime a
+      LEFT JOIN episodes e ON e.anime_id = a.id
+      LEFT JOIN library_entries le ON le.primary_anime_id = a.id
+      GROUP BY a.id
+    `
+    )
+    .all()
+    .filter((row) => !isLocalNonAnimeId(row.id))
+}
+
+function listStoredAnimeRelationsForRootRepair() {
+  return getDb()
+    .query<StoredAnimeRelationRow>(
+      "SELECT anime_id, related_anime_id, relation_type FROM anime_relations"
+    )
+    .all()
+}
+
+function addStoredRootRepairRelation(
+  relationsByAnimeId: Map<number, StoredAnimeRelationRow[]>,
+  relation: StoredAnimeRelationRow
+) {
+  const relations = relationsByAnimeId.get(relation.anime_id) ?? []
+  relations.push(relation)
+  relationsByAnimeId.set(relation.anime_id, relations)
+}
+
+function getInverseStoredRootRepairRelation(relation: StoredAnimeRelationRow) {
+  const inverseType = inverseStoredRootRelationTypes[relation.relation_type]
+
+  if (!inverseType) {
+    return null
+  }
+
+  return {
+    anime_id: relation.related_anime_id,
+    related_anime_id: relation.anime_id,
+    relation_type: inverseType,
+  }
+}
+
+function insertLibraryRootRelation(animeId: number, rootAnimeId: number) {
+  return getDb()
+    .query(
+      "INSERT OR IGNORE INTO anime_relations (anime_id, related_anime_id, relation_type) VALUES (?, ?, 'LIBRARY_ROOT')"
+    )
+    .run(animeId, rootAnimeId).changes
+}
+
+function deleteConflictingLibraryRootRelations(animeId: number, rootAnimeId: number) {
+  return getDb()
+    .query(
+      `
+      DELETE FROM anime_relations
+      WHERE anime_id = ?
+        AND relation_type = 'LIBRARY_ROOT'
+        AND related_anime_id <> ?
+    `
+    )
+    .run(animeId, rootAnimeId).changes
+}
+
+function pathApiForLibraryPath(root: string, filePath: string) {
+  const usesWindowsPath = /^[a-z]:[\\/]/i.test(root) ||
+    /^[a-z]:[\\/]/i.test(filePath) ||
+    root.includes("\\") ||
+    filePath.includes("\\")
+
+  return usesWindowsPath ? path.win32 : path
+}
+
+function getPhysicalLibraryFolderSlug(filePath: string, mediaDir: string) {
+  const pathApi = pathApiForLibraryPath(mediaDir, filePath)
+  const root = pathApi.resolve(mediaDir)
+  const resolved = pathApi.resolve(filePath)
+  const relative = pathApi.relative(root, resolved)
+
+  if (!relative || relative.startsWith("..") || pathApi.isAbsolute(relative)) {
+    return null
+  }
+
+  const folderTitle = relative.split(/[\\/]+/).filter(Boolean)[0]?.trim()
+
+  if (!folderTitle) {
+    return null
+  }
+
+  const folderSlug = slugifyAnimeTitle(folderTitle)
+
+  if (!folderSlug || folderSlug === "notanime") {
+    return null
+  }
+
+  return { folderTitle, folderSlug }
+}
+
+function findAnimeRowByTitleSlug(folderSlug: string) {
+  return getDb()
+    .query<AnimeRow>("SELECT * FROM anime")
+    .all()
+    .filter(
+      (row) =>
+        !isLocalNonAnimeId(row.id) &&
+        isStoredSeriesMedia(row) &&
+        uniqueTitleValues(rowTitles(row)).some(
+          (title) => slugifyAnimeTitle(title) === folderSlug
+        )
+    )
+    .sort((left, right) => {
+      const leftYear = left.season_year ?? Number.MAX_SAFE_INTEGER
+      const rightYear = right.season_year ?? Number.MAX_SAFE_INTEGER
+
+      if (leftYear !== rightYear) {
+        return leftYear - rightYear
+      }
+
+      return left.id - right.id
+    })[0] ?? null
+}
+
+function getRepairLibraryEntryForPhysicalFolder(folderSlug: string) {
+  const existing = getDb()
+    .query<LibraryEntryRow>(
+      "SELECT slug, title, primary_anime_id FROM library_entries WHERE slug = ?"
+    )
+    .get(folderSlug)
+
+  if (existing) {
+    return existing
+  }
+
+  const matchingRoot = findAnimeRowByTitleSlug(folderSlug)
+
+  if (!matchingRoot) {
+    return null
+  }
+
+  const rootTitle = animeTitle({
+    id: matchingRoot.id,
+    title: {
+      romaji: matchingRoot.title_romaji,
+      english: matchingRoot.title_english,
+      native: matchingRoot.title_native,
+      userPreferred: matchingRoot.title_user_preferred,
+    },
+  })
+
+  if (
+    !ensureRepairLibraryEntry({
+      slug: folderSlug,
+      title: rootTitle,
+      primaryAnimeId: matchingRoot.id,
+    })
+  ) {
+    return null
+  }
+
+  return {
+    slug: folderSlug,
+    title: rootTitle,
+    primary_anime_id: matchingRoot.id,
+  }
+}
+
+function listPhysicalLibraryRootRepairs() {
+  const configResult = getServerConfigResult()
+
+  if (!configResult.ok || !configResult.config.mediaDir) {
+    return []
+  }
+
+  const mediaDir = configResult.config.mediaDir
+  const rows = getDb()
+    .query<PhysicalLibraryEpisodeRow>(
+      `
+      SELECT a.*, e.file_path
+      FROM episodes e
+      INNER JOIN anime a ON a.id = e.anime_id
+    `
+    )
+    .all()
+  const foldersByAnimeId = new Map<
+    number,
+    | {
+        row: AnimeRow
+        folderSlug: string
+      }
+    | null
+  >()
+
+  for (const row of rows) {
+    if (isLocalNonAnimeId(row.id)) {
+      continue
+    }
+
+    const folder = getPhysicalLibraryFolderSlug(row.file_path, mediaDir)
+
+    if (!folder) {
+      continue
+    }
+
+    const existing = foldersByAnimeId.get(row.id)
+
+    if (existing === null) {
+      continue
+    }
+
+    if (existing && existing.folderSlug !== folder.folderSlug) {
+      foldersByAnimeId.set(row.id, null)
+      continue
+    }
+
+    foldersByAnimeId.set(row.id, {
+      row,
+      folderSlug: folder.folderSlug,
+    })
+  }
+
+  const repairs: PhysicalLibraryRootRepair[] = []
+  const entryCache = new Map<string, LibraryEntryRow | null>()
+  const rootCache = new Map<number, AnimeRow | null>()
+
+  for (const folder of foldersByAnimeId.values()) {
+    if (!folder) {
+      continue
+    }
+
+    let entry = entryCache.get(folder.folderSlug)
+
+    if (entry === undefined) {
+      entry = getRepairLibraryEntryForPhysicalFolder(folder.folderSlug)
+      entryCache.set(folder.folderSlug, entry)
+    }
+
+    if (!entry || isLocalNonAnimeId(entry.primary_anime_id)) {
+      continue
+    }
+
+    let root = rootCache.get(entry.primary_anime_id)
+
+    if (root === undefined) {
+      root = getDb()
+        .query<AnimeRow>("SELECT * FROM anime WHERE id = ?")
+        .get(entry.primary_anime_id) ?? null
+      rootCache.set(entry.primary_anime_id, root)
+    }
+
+    if (!root || !isStoredLibraryMedia(root)) {
+      continue
+    }
+
+    repairs.push({
+      animeId: folder.row.id,
+      folderSlug: folder.folderSlug,
+      entry,
+      root,
+    })
+  }
+
+  return repairs
+}
+
+function repairLibraryAssignmentsFromPhysicalFolders(
+  now: string,
+  repairs: PhysicalLibraryRootRepair[]
+) {
+  let repairedAssignments = 0
+  let repairedRootRows = 0
+  const rowsById = new Map<number, AnimeRow>()
+
+  for (const repair of repairs) {
+    if (repair.root.library_slug !== repair.entry.slug || repair.root.relation_kind !== "self") {
+      repairedRootRows += getDb()
+        .query(
+          `
+          UPDATE anime
+          SET library_slug = ?,
+              relation_kind = 'self',
+              updated_at = ?
+          WHERE id = ?
+        `
+        )
+        .run(repair.entry.slug, now, repair.root.id).changes
+    }
+
+    let row = rowsById.get(repair.animeId)
+
+    if (!row) {
+      row = getDb().query<AnimeRow>("SELECT * FROM anime WHERE id = ?").get(repair.animeId)
+
+      if (!row) {
+        continue
+      }
+
+      rowsById.set(row.id, row)
+    }
+
+    const expectedKind = row.id === repair.entry.primary_anime_id ? "self" : "related"
+
+    if (row.library_slug !== repair.entry.slug || row.relation_kind !== expectedKind) {
+      const changes = getDb()
+        .query(
+          `
+          UPDATE anime
+          SET library_slug = ?,
+              relation_kind = ?,
+              updated_at = ?
+          WHERE id = ?
+        `
+        )
+        .run(repair.entry.slug, expectedKind, now, row.id).changes
+
+      if (expectedKind === "self") {
+        repairedRootRows += changes
+      } else {
+        repairedAssignments += changes
+      }
+    }
+
+    if (row.id !== repair.entry.primary_anime_id) {
+      deleteConflictingLibraryRootRelations(row.id, repair.entry.primary_anime_id)
+      insertLibraryRootRelation(row.id, repair.entry.primary_anime_id)
+    }
+  }
+
+  return { repairedAssignments, repairedRootRows }
+}
+
+function repairLibraryAssignmentsFromStoredRelations(now: string) {
+  const physicalRepairs = listPhysicalLibraryRootRepairs()
+  const physicalRepairsByAnimeId = new Map(
+    physicalRepairs.map((repair) => [repair.animeId, repair] as const)
+  )
+  const rows = listStoredAnimeRowsForRootRepair()
+  const rowsById = new Map<number, AnimeRow>(
+    rows.map((row) => [row.id, row] as const)
+  )
+  const relationsByAnimeId = new Map<number, StoredAnimeRelationRow[]>()
+  let repairedAssignments = 0
+  let repairedRootRows = 0
+
+  for (const relation of listStoredAnimeRelationsForRootRepair()) {
+    addStoredRootRepairRelation(relationsByAnimeId, relation)
+
+    const inverseRelation = getInverseStoredRootRepairRelation(relation)
+
+    if (inverseRelation) {
+      addStoredRootRepairRelation(relationsByAnimeId, inverseRelation)
+    }
+  }
+
+  for (const row of rows) {
+    if (row.local_episode_count <= 0 && row.primary_entry_count <= 0 && !row.library_slug) {
+      continue
+    }
+
+    const physicalRepair = physicalRepairsByAnimeId.get(row.id)
+    const physicalRoot = physicalRepair
+      ? rowsById.get(physicalRepair.entry.primary_anime_id) ?? null
+      : null
+    const root = physicalRoot && isStoredLibraryMedia(physicalRoot)
+      ? physicalRoot
+      : resolveStoredLibraryRoot(row, rowsById, relationsByAnimeId)
+
+    if (root.id === row.id) {
+      continue
+    }
+
+    const physicalRootEntry =
+      physicalRepair && physicalRepair.entry.primary_anime_id === root.id
+        ? physicalRepair.entry
+        : null
+    const rootTitle = physicalRootEntry
+      ? physicalRootEntry.title
+      : animeTitle({
+          id: root.id,
+          title: {
+            romaji: root.title_romaji,
+            english: root.title_english,
+            native: root.title_native,
+            userPreferred: root.title_user_preferred,
+          },
+        })
+    const rootSlug = physicalRootEntry
+      ? physicalRootEntry.slug
+      : slugifyAnimeTitle(rootTitle)
+
+    if (!rootSlug) {
+      continue
+    }
+
+    const repairedLibraryEntry = ensureRepairLibraryEntry({
+      slug: rootSlug,
+      title: rootTitle,
+      primaryAnimeId: root.id,
+    })
+
+    if (!repairedLibraryEntry) {
+      continue
+    }
+
+    if (root.library_slug !== rootSlug || root.relation_kind !== "self") {
+      repairedRootRows += getDb()
+        .query(
+          `
+          UPDATE anime
+          SET library_slug = ?,
+              relation_kind = 'self',
+              updated_at = ?
+          WHERE id = ?
+        `
+        )
+        .run(rootSlug, now, root.id).changes
+    }
+
+    if (row.library_slug !== rootSlug || row.relation_kind !== "related") {
+      repairedAssignments += getDb()
+        .query(
+          `
+          UPDATE anime
+          SET library_slug = ?,
+              relation_kind = 'related',
+              updated_at = ?
+          WHERE id = ?
+        `
+        )
+        .run(rootSlug, now, row.id).changes
+    }
+
+    insertLibraryRootRelation(row.id, root.id)
+  }
+
+  const physicalRepair = repairLibraryAssignmentsFromPhysicalFolders(
+    now,
+    physicalRepairs
+  )
+  repairedAssignments += physicalRepair.repairedAssignments
+  repairedRootRows += physicalRepair.repairedRootRows
+
+  return { repairedAssignments, repairedRootRows, physicalRepairsByAnimeId }
+}
+
+function rootTitleForRepair(
+  row: Pick<
+    LibraryRootRelationRepairRow,
+    | "root_id"
+    | "root_title_romaji"
+    | "root_title_english"
+    | "root_title_native"
+    | "root_title_user_preferred"
+  >
+) {
+  return animeTitle({
+    id: row.root_id,
+    title: {
+      romaji: row.root_title_romaji,
+      english: row.root_title_english,
+      native: row.root_title_native,
+      userPreferred: row.root_title_user_preferred,
+    },
+  })
+}
+
+function ensureRepairLibraryEntry(input: {
+  slug: string
+  title: string
+  primaryAnimeId: number
+}) {
+  const now = nowIso()
+  const existing = getDb()
+    .query<{ primary_anime_id: number }>(
+      "SELECT primary_anime_id FROM library_entries WHERE slug = ?"
+    )
+    .get(input.slug)
+
+  if (existing && existing.primary_anime_id !== input.primaryAnimeId) {
+    const localEpisodeCount =
+      getDb()
+        .query<{ count: number }>(
+          `
+          SELECT COUNT(e.file_path) AS count
+          FROM anime a
+          INNER JOIN episodes e ON e.anime_id = a.id
+          WHERE a.library_slug = ?
+        `
+        )
+        .get(input.slug)?.count ?? 0
+    const existingPrimaryRoot = getDb()
+      .query<{ related_anime_id: number }>(
+        `
+        SELECT related_anime_id
+        FROM anime_relations
+        WHERE anime_id = ?
+          AND relation_type = 'LIBRARY_ROOT'
+        LIMIT 1
+      `
+      )
+      .get(existing.primary_anime_id)
+
+    if (
+      localEpisodeCount > 0 &&
+      existingPrimaryRoot?.related_anime_id !== input.primaryAnimeId
+    ) {
+      console.warn(
+        `[Warn] [Library] Skipped library slug collision repair for "${input.slug}" - existing root ${existing.primary_anime_id}, new root ${input.primaryAnimeId}`
+      )
+      return false
+    }
+  }
+
+  getDb()
+    .query(
+      `
+      INSERT INTO library_entries (
+        slug,
+        title,
+        primary_anime_id,
+        created_at,
+        updated_at
+      )
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(slug) DO UPDATE SET
+        title = excluded.title,
+        primary_anime_id = excluded.primary_anime_id,
+        updated_at = excluded.updated_at
+    `
+    )
+    .run(input.slug, input.title, input.primaryAnimeId, now, now)
+
+  return true
+}
+
+function removeStaleLibraryEntries() {
+  return getDb()
+    .query(
+      `
+      DELETE FROM library_entries
+      WHERE slug IN (
+        SELECT le.slug
+        FROM library_entries le
+        LEFT JOIN anime a ON a.library_slug = le.slug
+        LEFT JOIN episodes e ON e.anime_id = a.id
+        GROUP BY le.slug
+        HAVING COUNT(e.file_path) = 0
+      )
+    `
+    )
+    .run().changes
+}
+
+export function repairLibraryIntegrity(reason = "maintenance"): LibraryIntegrityStats {
+  const stats: LibraryIntegrityStats = {
+    repairedAssignments: 0,
+    repairedRootRows: 0,
+    removedStaleEntries: 0,
+  }
+  const now = nowIso()
+  const relationGraphRepair = repairLibraryAssignmentsFromStoredRelations(now)
+  stats.repairedAssignments += relationGraphRepair.repairedAssignments
+  stats.repairedRootRows += relationGraphRepair.repairedRootRows
+
+  const rootRelations = getDb()
+    .query<LibraryRootRelationRepairRow>(
+      `
+      SELECT
+        child.id AS anime_id,
+        child.library_slug AS anime_library_slug,
+        child.relation_kind AS anime_relation_kind,
+        root.id AS root_id,
+        root.library_slug AS root_library_slug,
+        root.relation_kind AS root_relation_kind,
+        root.title_romaji AS root_title_romaji,
+        root.title_english AS root_title_english,
+        root.title_native AS root_title_native,
+        root.title_user_preferred AS root_title_user_preferred
+      FROM anime_relations ar
+      INNER JOIN anime child ON child.id = ar.anime_id
+      INNER JOIN anime root ON root.id = ar.related_anime_id
+      WHERE ar.relation_type = 'LIBRARY_ROOT'
+        AND child.id <> root.id
+    `
+    )
+    .all()
+
+  for (const relation of rootRelations) {
+    const physicalRepair = relationGraphRepair.physicalRepairsByAnimeId.get(
+      relation.anime_id
+    )
+
+    if (
+      physicalRepair &&
+      physicalRepair.entry.primary_anime_id !== relation.root_id
+    ) {
+      continue
+    }
+
+    const rootTitle = rootTitleForRepair(relation)
+    const rootSlug = slugifyAnimeTitle(rootTitle)
+
+    if (!rootSlug) {
+      continue
+    }
+
+    const repairedLibraryEntry = ensureRepairLibraryEntry({
+      slug: rootSlug,
+      title: rootTitle,
+      primaryAnimeId: relation.root_id,
+    })
+
+    if (!repairedLibraryEntry) {
+      continue
+    }
+
+    if (
+      relation.root_library_slug !== rootSlug ||
+      relation.root_relation_kind !== "self"
+    ) {
+      stats.repairedRootRows += getDb()
+        .query(
+          `
+          UPDATE anime
+          SET library_slug = ?,
+              relation_kind = 'self',
+              updated_at = ?
+          WHERE id = ?
+        `
+        )
+        .run(rootSlug, now, relation.root_id).changes
+    }
+
+    if (
+      relation.anime_library_slug !== rootSlug ||
+      relation.anime_relation_kind !== "related"
+    ) {
+      stats.repairedAssignments += getDb()
+        .query(
+          `
+          UPDATE anime
+          SET library_slug = ?,
+              relation_kind = 'related',
+              updated_at = ?
+          WHERE id = ?
+        `
+        )
+        .run(rootSlug, now, relation.anime_id).changes
+    }
+  }
+
+  stats.removedStaleEntries = removeStaleLibraryEntries()
+
+  if (
+    stats.repairedAssignments > 0 ||
+    stats.repairedRootRows > 0 ||
+    stats.removedStaleEntries > 0
+  ) {
+    console.log(
+      `[Info] [Library] ${reason} library integrity repair completed - Reassigned ${stats.repairedAssignments} anime row(s), repaired ${stats.repairedRootRows} root row(s), removed ${stats.removedStaleEntries} stale library entr${stats.removedStaleEntries === 1 ? "y" : "ies"}.`
+    )
+  } else {
+    debugLog(
+      `[Debug] [Library] ${reason} library integrity repair found no broken library entries.`
+    )
+  }
+
+  return stats
 }
 
 export type AnimeStreamingEpisodeInput = {
@@ -1727,7 +2752,11 @@ export function setEpisodeWatchState(input: {
 
 function normalizeComparableTitle(value: string) {
   return value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
+    .replace(/[?!*'"~`’´]/g, "_")
+    .replace(/_/g, " ")
     .replace(/[^a-z0-9]+/g, " ")
     .replace(/\b(season|part|cour)\s+\d+\b/g, " ")
     .replace(/\bs\d+\b/g, " ")
@@ -1764,6 +2793,22 @@ function hasUnrequestedTitleSuffix(normalizedTitle: string, normalizedSearch: st
   return normalizedTitle.startsWith(`${normalizedSearch} `)
 }
 
+function isTooGenericForSearch(normalizedTitle: string, normalizedSearch: string) {
+  if (!normalizedTitle || !normalizedSearch || normalizedTitle === normalizedSearch) {
+    return false
+  }
+
+  if (!normalizedSearch.startsWith(`${normalizedTitle} `)) {
+    return false
+  }
+
+  const titleTokens = normalizedTitle.split(" ").filter(Boolean)
+  const searchTokens = normalizedSearch.split(" ").filter(Boolean)
+  const extraTokens = searchTokens.slice(titleTokens.length)
+
+  return extraTokens.some((token) => token.length > 2)
+}
+
 function scoreTitleCandidate(search: string, titles: Array<string | null | undefined>) {
   const normalizedSearch = normalizeComparableTitle(search)
   const normalizedTitles = titles
@@ -1785,6 +2830,10 @@ function scoreTitleCandidate(search: string, titles: Array<string | null | undef
       .sort((left, right) => left.length - right.length)[0]
 
     return hasUnrequestedTitleSuffix(bestContainingTitle, normalizedSearch) ? 4 : 1
+  }
+
+  if (normalizedTitles.some((title) => isTooGenericForSearch(title, normalizedSearch))) {
+    return 4
   }
 
   const bestOverlap = Math.max(
@@ -2127,25 +3176,111 @@ export function findCachedAnimeMetadataForFile(
   return directMatch ? toMetadataFromRow(directMatch) : null
 }
 
-export function listAnimeIdsForAniListRefresh() {
-  return getDb()
-    .query<{ id: number }>(
+type AniListRefreshMode = "startup" | "daily" | "manual"
+
+type AniListRefreshCandidateRow = Pick<
+  AnimeRow,
+  | "id"
+  | "library_slug"
+  | "format"
+  | "relation_kind"
+  | "title_romaji"
+  | "title_english"
+  | "title_native"
+  | "title_user_preferred"
+  | "status"
+  | "anilist_raw_json"
+> & {
+  local_episode_count: number
+  primary_entry_count: number
+  relation_count: number
+  library_root_relation_count: number
+}
+
+function isInactiveAniListStatus(status: string | null) {
+  if (!status) {
+    return false
+  }
+
+  return ["FINISHED", "CANCELLED"].includes(status.toUpperCase())
+}
+
+function isSeriesFormat(format: string | null) {
+  return Boolean(format && seriesFormats.has(format))
+}
+
+function isRepairSensitiveAniListRow(row: AniListRefreshCandidateRow) {
+  const relationKind = row.relation_kind?.toLowerCase() ?? null
+  const selectedAsLibraryRoot = row.primary_entry_count > 0
+  const missingUsableRelations =
+    !row.anilist_raw_json ||
+    row.relation_count === 0 ||
+    row.library_root_relation_count === 0 ||
+    !relationKind
+
+  if (missingUsableRelations) {
+    return true
+  }
+
+  if (relationKind !== "self" || !selectedAsLibraryRoot) {
+    return false
+  }
+
+  if (!isSeriesFormat(row.format)) {
+    return true
+  }
+
+  const season = titleSeasonMarker(row)
+  const part = titlePartMarker(row)
+
+  return Boolean((season && season > 1) || (part && part > 1))
+}
+
+export function listAnimeIdsForAniListRefresh(mode: AniListRefreshMode = "daily") {
+  const rows = getDb()
+    .query<AniListRefreshCandidateRow>(
       `
-      SELECT DISTINCT a.id
+      SELECT
+        a.id,
+        a.library_slug,
+        a.format,
+        a.relation_kind,
+        a.title_romaji,
+        a.title_english,
+        a.title_native,
+        a.title_user_preferred,
+        a.status,
+        a.anilist_raw_json,
+        COUNT(DISTINCT e.file_path) AS local_episode_count,
+        COUNT(DISTINCT le.slug) AS primary_entry_count,
+        COUNT(DISTINCT ar.related_anime_id || ':' || ar.relation_type) AS relation_count,
+        COUNT(DISTINCT root_ar.related_anime_id) AS library_root_relation_count
       FROM anime a
-      WHERE (a.status IS NULL OR UPPER(a.status) NOT IN ('FINISHED', 'CANCELLED'))
-        AND (
-          EXISTS (SELECT 1 FROM episodes e WHERE e.anime_id = a.id)
-          OR EXISTS (
-            SELECT 1
-            FROM library_entries le
-            WHERE le.primary_anime_id = a.id
-          )
-        )
+      LEFT JOIN episodes e ON e.anime_id = a.id
+      LEFT JOIN library_entries le ON le.primary_anime_id = a.id
+      LEFT JOIN anime_relations ar ON ar.anime_id = a.id
+      LEFT JOIN anime_relations root_ar
+        ON root_ar.anime_id = a.id
+       AND root_ar.relation_type = 'LIBRARY_ROOT'
+      GROUP BY a.id
+      HAVING local_episode_count > 0 OR primary_entry_count > 0
       ORDER BY a.id ASC
     `
     )
     .all()
+    .filter((row) => !isLocalNonAnimeId(row.id))
+
+  if (mode === "manual") {
+    return rows.map((row) => row.id)
+  }
+
+  return rows
+    .filter((row) => {
+      if (!isInactiveAniListStatus(row.status)) {
+        return true
+      }
+
+      return isRepairSensitiveAniListRow(row)
+    })
     .map((row) => row.id)
-    .filter((id) => !isLocalNonAnimeId(id))
 }
