@@ -23,7 +23,6 @@ import { listEpisodeFilePaths } from "@/server/db/library"
 import { resetAdminIgnoredAppUpdateVersions } from "@/server/db/users"
 import { getServerConfigResult } from "@/server/config"
 import { tryRunCacheMaintenance } from "@/server/media/cacheMaintenance"
-import { repairLibraryPathMismatches } from "@/server/media/libraryPathRepair"
 import { isMediaFile, pathExists } from "@/server/media/mediaFiles"
 import {
   isInputImportOutputActive,
@@ -1129,44 +1128,6 @@ export function startWorkers() {
     trackActiveWork(work, `directory-scan:${reason}`)
   }
 
-  async function runLibraryPathRepairForMaintenance(label: string) {
-    if (!config.importEnabled) {
-      return null
-    }
-
-    console.log(`[Info] [Workers] Starting ${label} library path repair.`)
-
-    try {
-      const result = await repairLibraryPathMismatches()
-      console.log(
-        `[Info] [Workers] ${label} library path repair completed - Scanned: ${result.scanned}, Repaired: ${result.repaired}, Missing: ${result.missing}, Skipped: ${result.skipped}.`
-      )
-      return result
-    } catch (error) {
-      console.error(
-        `[Error] [Workers] ${label} library path repair failed - startWorkers.ts - ${errorMessage(error)}`
-      )
-      return null
-    }
-  }
-
-  function queueRepairedLibrarySyncPaths(paths: string[], label: string) {
-    const uniquePaths = [...new Set(paths.map((filePath) => path.resolve(filePath)))]
-    let queued = 0
-
-    for (const filePath of uniquePaths) {
-      if (enqueue("library-sync", filePath, { log: false })) {
-        queued += 1
-      }
-    }
-
-    if (queued > 0) {
-      console.log(
-        `[Info] [Workers] Queued ${queued} repaired library media file(s) for ${label} resync.`
-      )
-    }
-  }
-
   async function runAniListRefreshForMaintenance(label: string) {
     console.log(`[Info] [Workers] Starting ${label} AniList sync.`)
 
@@ -1187,9 +1148,7 @@ export function startWorkers() {
     )
 
     try {
-      const repairResult = await runLibraryPathRepairForMaintenance("startup")
       await runAniListRefreshForMaintenance("startup")
-      queueRepairedLibrarySyncPaths(repairResult?.repairedPaths ?? [], "startup repair")
       await scanKnownDeletedFiles()
       await waitForQueuedWorkKindsToFinish(
         ["library-delete"],
@@ -1205,9 +1164,7 @@ export function startWorkers() {
 
   async function runDailyMaintenanceChecks() {
     await waitForActiveImportWorkToFinish("daily checks")
-    const repairResult = await runLibraryPathRepairForMaintenance("daily")
     await runAniListRefreshForMaintenance("daily")
-    queueRepairedLibrarySyncPaths(repairResult?.repairedPaths ?? [], "daily repair")
     await waitForDirectoryScanToFinish("daily checks")
     await scanKnownDeletedFiles()
     await waitForQueuedWorkKindsToFinish(

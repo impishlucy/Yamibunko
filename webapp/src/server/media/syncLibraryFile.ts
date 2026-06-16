@@ -255,18 +255,10 @@ function parseLibraryPath(filePath: string): ParsedLibraryPath | null {
   }
 }
 
-async function repairExistingLibraryEpisodeIfNeeded(
+function existingLibraryEpisodeResult(
   resolvedPath: string,
   existingEpisode: NonNullable<ReturnType<typeof getEpisodeByPath>>
 ) {
-  const parsed = parseLibraryPath(resolvedPath)
-
-  if (parsed && existingEpisode.episodeNumber !== parsed.episode) {
-    console.warn(
-      `[Warn] [Media] Existing library episode has a filename episode mismatch and will be left for library path repair - ${resolvedPath}`
-    )
-  }
-
   return {
     animeId: existingEpisode.animeId,
     seasonNr: existingEpisode.seasonNumber,
@@ -299,7 +291,7 @@ export async function syncLibraryFile(filePath: string) {
   )
 
   if (existingEpisode) {
-    return repairExistingLibraryEpisodeIfNeeded(resolvedPath, existingEpisode)
+    return existingLibraryEpisodeResult(resolvedPath, existingEpisode)
   }
 
   debugLibrarySync("Waiting for unknown library file to become stable.")
