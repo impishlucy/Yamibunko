@@ -98,6 +98,7 @@ const libraryRelationTypes = new Set([
   "SIDE_STORY",
   "SUMMARY",
   "SPIN_OFF",
+  "ALTERNATIVE",
   "COMPILATION",
   "CONTAINS",
 ])
@@ -403,12 +404,18 @@ function storedRelationCanPointToLibraryRoot(
     return false
   }
 
-  if (rootGraphPrimaryRelationTypes.has(relationType)) {
-    return isStoredSeriesMedia(target) || rowHasSharedTitleRoot(source, target)
+  const hasTrustedTitleRoot = rowHasSharedTitleRoot(source, target)
+
+  if (relationType === "PARENT") {
+    return isStoredSeriesMedia(target) || hasTrustedTitleRoot
+  }
+
+  if (relationType === "PREQUEL") {
+    return isStoredSeriesMedia(target) && hasTrustedTitleRoot
   }
 
   if (relationType === "SEQUEL") {
-    return !isStoredSeriesMedia(source) && isStoredSeriesMedia(target)
+    return !isStoredSeriesMedia(source) && isStoredSeriesMedia(target) && hasTrustedTitleRoot
   }
 
   if (rootGraphSecondaryRelationTypes.has(relationType)) {
@@ -2764,9 +2771,22 @@ function normalizeComparableTitle(value: string) {
     .trim()
 }
 
+function comparableTitleToken(value: string) {
+  if (value === "s") {
+    return ""
+  }
+
+  if (value.length > 3 && value.endsWith("s")) {
+    return value.slice(0, -1)
+  }
+
+  return value
+}
+
 function titleTokens(value: string) {
   return normalizeComparableTitle(value)
     .split(" ")
+    .map(comparableTitleToken)
     .filter((token) => token.length > 2)
 }
 

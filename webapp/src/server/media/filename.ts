@@ -120,6 +120,10 @@ function shouldStripParentheticalSegment(value: string) {
     return true
   }
 
+  if (/\b(?:complete|collection|batch|seasons?|movies?|films?|specials?|ovas?|onas?)\b/i.test(segment)) {
+    return true
+  }
+
   fileInfoPattern.lastIndex = 0
 
   if (fileInfoPattern.test(segment)) {
@@ -1128,15 +1132,19 @@ function parseMovieFileNameWithFallbackTitle(
     return parsedMovie
   }
 
-  if (!isMoviePathContext(filePath)) {
-    return null
-  }
-
   const baseName = path.basename(filePath, path.extname(filePath))
   const mainName = baseName.split("|")[0] ?? baseName
   const baseTitle = cleanTitleSegment(mainName)
 
   if (!baseTitle) {
+    return null
+  }
+
+  if (fallbackTitle && titleHasPrefix(baseTitle, fallbackTitle)) {
+    return createParsedMovieFileName(baseTitle)
+  }
+
+  if (!isMoviePathContext(filePath)) {
     return null
   }
 

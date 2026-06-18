@@ -805,15 +805,23 @@ function isTrustedTelevisionRootRelation(
     return false
   }
 
-  if (relation.relationType === "PARENT" || relation.relationType === "PREQUEL") {
+  const hasTrustedTitleRoot =
+    hasRootTitlePrefix(metadata, relation.media) ||
+    hasSharedRootTitle(metadata, relation.media)
+
+  if (relation.relationType === "PARENT") {
     return true
   }
 
-  if (relation.relationType === "SEQUEL") {
-    return !isSeriesRootMedia(metadata)
+  if (relation.relationType === "PREQUEL") {
+    return hasTrustedTitleRoot
   }
 
-  return hasRootTitlePrefix(metadata, relation.media) || hasSharedRootTitle(metadata, relation.media)
+  if (relation.relationType === "SEQUEL") {
+    return !isSeriesRootMedia(metadata) && hasTrustedTitleRoot
+  }
+
+  return hasTrustedTitleRoot
 }
 
 function pickBestTelevisionRootRelation(
@@ -988,9 +996,22 @@ function normalizeComparableTitle(value: string) {
     .trim()
 }
 
+function comparableTitleToken(value: string) {
+  if (value === "s") {
+    return ""
+  }
+
+  if (value.length > 3 && value.endsWith("s")) {
+    return value.slice(0, -1)
+  }
+
+  return value
+}
+
 function titleTokens(value: string) {
   return normalizeComparableTitle(value)
     .split(" ")
+    .map(comparableTitleToken)
     .filter((token) => token.length > 2)
 }
 
