@@ -990,6 +990,20 @@ function titleHasPrefix(title: string, prefix: string) {
   )
 }
 
+function isBareEpisodeMarkerTitle(value: string) {
+  const normalized = toCaseFold(normalizeTitle(value))
+    .replace(/[-–—:_]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+
+  return (
+    /^(?:season\s*\d{1,2}|s\s*\d{1,2})\s*(?:e|ep|episode)\s*\d{1,4}$/i.test(normalized) ||
+    /^(?:e|ep|episode)\s*\d{1,4}$/i.test(normalized) ||
+    /^0\d{1,3}$/.test(normalized) ||
+    /^\d{1,3}$/.test(normalized)
+  )
+}
+
 function createParsedMovieFileName(title: string): ParsedAnimeFileName | null {
   const cleanedTitle = cleanTitleSegment(title)
 
@@ -1106,6 +1120,7 @@ function parseStandaloneMovieFileName(filePath: string): ParsedAnimeFileName | n
     if (
       titlePrefix &&
       titleSuffix &&
+      !isBareEpisodeMarkerTitle(titlePrefix) &&
       (numericSpecialSuffix || !/^\d{1,4}\b/.test(titleSuffix))
     ) {
       return createParsedMovieFileName(`${titlePrefix} ${titleSuffix}`)
