@@ -215,15 +215,6 @@ export function AnimeDetailView({
     dataRef.current = data
   }, [data])
 
-  useEffect(() => {
-    dataRef.current = initialData
-    setData(initialData)
-    setEditOpen(false)
-    setEditError(null)
-    setCoverError(null)
-    setAnilistId("")
-  }, [initialData])
-
   const loadDetailForMedia = useCallback(async (animeId: number) => {
     const current = dataRef.current
     const params = new URLSearchParams()
