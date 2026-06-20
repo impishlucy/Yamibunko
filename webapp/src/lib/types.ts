@@ -7,6 +7,7 @@ export type AnimeSummary = {
   episodeCount: number
   mediaCount?: number
   year?: number
+  isLocalNonAnime?: boolean
 }
 
 export type AnimeVariant = {
@@ -33,6 +34,7 @@ export type AnimeInfo = AnimeSummary & {
   genres?: string[]
   averageScore?: number
   durationMinutes?: number
+  isLocalNonAnime?: boolean
   tags: Array<{
     id: number
     name: string

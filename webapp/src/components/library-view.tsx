@@ -35,6 +35,16 @@ function AnimeCardSkeleton({ index }: { index: number }) {
   )
 }
 
+function parseLibraryChangeEvent(event: Event) {
+  const message = event as MessageEvent<string>
+
+  try {
+    return JSON.parse(message.data) as LibraryChangeEvent
+  } catch {
+    return null
+  }
+}
+
 export function LibraryView() {
   const [query, setQuery] = useState("")
   const [items, setItems] = useState<AnimeSummary[]>([])
@@ -82,16 +92,9 @@ export function LibraryView() {
     }
 
     const onLibraryChange = (event: Event) => {
-      const message = event as MessageEvent<string>
-      let payload: LibraryChangeEvent
+      const payload = parseLibraryChangeEvent(event)
 
-      try {
-        payload = JSON.parse(message.data) as LibraryChangeEvent
-      } catch {
-        return
-      }
-
-      if (!payload.type) {
+      if (!payload?.type) {
         return
       }
 

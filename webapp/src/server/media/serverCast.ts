@@ -1016,7 +1016,11 @@ function mediaStatusFromPayload(payload: MediaStatusPayload): ServerCastMediaSta
   }
 }
 
-function isLoadedMediaState(state: ServerCastMediaState, candidate?: ServerCastCandidate) {
+function isLoadedMediaState(
+  state: ServerCastMediaState,
+  candidate?: ServerCastCandidate,
+  options?: { acceptBuffering?: boolean }
+) {
   if (!state.isAlive) {
     return false
   }
@@ -1028,7 +1032,7 @@ function isLoadedMediaState(state: ServerCastMediaState, candidate?: ServerCastC
   return (
     state.playerState === "PLAYING" ||
     state.playerState === "PAUSED" ||
-    state.playerState === "BUFFERING"
+    (options?.acceptBuffering === true && state.playerState === "BUFFERING")
   )
 }
 
@@ -1044,8 +1048,10 @@ async function waitForLoadedCandidateStatus(input: {
   socket: CastSocket
   transportId: string
 }) {
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    await wait(attempt === 0 ? 250 : 600)
+  let bufferingState: ServerCastMediaState | null = null
+
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    await wait(attempt === 0 ? 350 : 750)
 
     const payload = await input.socket.request<MediaStatusPayload>(
       mediaNamespace,
@@ -1063,9 +1069,13 @@ async function waitForLoadedCandidateStatus(input: {
     if (isLoadedMediaState(state, input.candidate)) {
       return state
     }
+
+    if (state.playerState === "BUFFERING" && state.contentId === input.candidate.url) {
+      bufferingState = state
+    }
   }
 
-  return null
+  return input.candidate.id === "transcode" ? bufferingState : null
 }
 
 function createLoadPayload(candidate: ServerCastCandidate, autoplay: boolean) {

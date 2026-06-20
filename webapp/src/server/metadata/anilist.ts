@@ -426,17 +426,43 @@ function getSearchTitleVariants(title: string) {
   ])
 }
 
+function getDirectionalMovieTitleVariants(title: string) {
+  const normalizedTitle = title.trim().replace(/\s+/g, " ")
+  const variants: string[] = []
+  const adventureMatch = /^(.+?)\s+adventures?\s+(?:on|in|of)\s+(.+)$/i.exec(normalizedTitle)
+
+  if (adventureMatch) {
+    const prefix = adventureMatch[1]?.trim() ?? ""
+    const subject = adventureMatch[2]?.trim() ?? ""
+
+    if (prefix && subject) {
+      variants.push(`${prefix} ${subject} Adventure`)
+      variants.push(`${prefix} ${subject}`)
+    }
+  }
+
+  const strangeAnimalIslandMatch = /^(.+?)\s+in\s+the\s+strange\s+animal\s+island$/i.exec(normalizedTitle)
+
+  if (strangeAnimalIslandMatch?.[1]) {
+    variants.push(`${strangeAnimalIslandMatch[1].trim()} on the Island of Strange Animals`)
+  }
+
+  return uniqueCandidates(variants)
+}
+
 function getStandaloneTitleSearchVariants(title: string) {
   const withoutMovieLabel = title
     .replace(/\b(?:the\s+)?movie(?:\s+\d{1,2})?\b/gi, " ")
     .replace(/\s+/g, " ")
     .trim()
 
-  if (!withoutMovieLabel || withoutMovieLabel === title.trim()) {
-    return []
-  }
+  const standaloneVariants = uniqueCandidates([
+    ...(withoutMovieLabel && withoutMovieLabel !== title.trim() ? [withoutMovieLabel] : []),
+    ...getDirectionalMovieTitleVariants(title),
+    ...(withoutMovieLabel ? getDirectionalMovieTitleVariants(withoutMovieLabel) : []),
+  ])
 
-  return getSearchTitleVariants(withoutMovieLabel)
+  return standaloneVariants.flatMap((variant) => getSearchTitleVariants(variant))
 }
 
 function stripParsedSeasonPartFromTitle(
@@ -1429,7 +1455,7 @@ async function findAnimeMetadataUncached(
         requirePartMarker,
       })
 
-      if (isAcceptableCandidateScore(fullScore)) {
+      if (isAcceptableCandidateScore(fullScore) || isStandaloneMetadataLookup(options)) {
         console.log(
           `[Info] [Anilist] Found single-result match ${
             metadata.title.english ??

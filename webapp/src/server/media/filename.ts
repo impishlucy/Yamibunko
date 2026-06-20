@@ -13,6 +13,7 @@ const ignoredLeadingStrings = [
   "EMBER",
   "TRC",
   "DKB",
+  "B0NES",
   "sam",
 ].sort((left, right) => right.length - left.length)
 
@@ -990,6 +991,61 @@ function titleHasPrefix(title: string, prefix: string) {
   )
 }
 
+function stripTitlePrefix(title: string, prefix: string) {
+  const normalizedTitle = normalizeTitle(title)
+  const normalizedPrefix = normalizeTitle(prefix)
+
+  if (toCaseFold(normalizedTitle) === toCaseFold(normalizedPrefix)) {
+    return ""
+  }
+
+  if (toCaseFold(normalizedTitle).startsWith(`${toCaseFold(normalizedPrefix)} `)) {
+    return cleanTitleSegment(normalizedTitle.slice(normalizedPrefix.length))
+  }
+
+  return null
+}
+
+function firstComparableTitleToken(value: string) {
+  return comparableTitleTokens(value)[0] ?? null
+}
+
+function fallbackTitleContainsParsedHead(fallbackTitle: string, parsedTitle: string) {
+  const parsedHead = firstComparableTitleToken(parsedTitle)
+
+  return Boolean(parsedHead && comparableTitleTokens(fallbackTitle).includes(parsedHead))
+}
+
+function getStandaloneFallbackTitleCombinations(fallbackTitle: string, parsedTitle: string) {
+  const combinations: string[] = []
+  const suffix = stripTitlePrefix(parsedTitle, fallbackTitle)
+
+  if (suffix) {
+    combinations.push(`${fallbackTitle} ${suffix}`)
+
+    const adventureTitle = /^adventures?\s+(?:on|in|of)\s+(.+)$/i.exec(suffix)
+
+    if (adventureTitle?.[1]) {
+      combinations.push(`${fallbackTitle} ${adventureTitle[1].trim()} Adventure`)
+      combinations.push(`${fallbackTitle} ${adventureTitle[1].trim()}`)
+    }
+  }
+
+  if (fallbackTitleContainsParsedHead(fallbackTitle, parsedTitle)) {
+    const parsedParts = parsedTitle.split(/\s+/).filter(Boolean)
+
+    if (parsedParts.length > 1) {
+      combinations.push(`${fallbackTitle} ${parsedParts.slice(1).join(" ")}`)
+    }
+  }
+
+  if (!titleHasPrefix(parsedTitle, fallbackTitle)) {
+    combinations.push(`${fallbackTitle} ${parsedTitle}`)
+  }
+
+  return combinations
+}
+
 function isBareEpisodeMarkerTitle(value: string) {
   const normalized = toCaseFold(normalizeTitle(value))
     .replace(/[-–—:_]+/g, " ")
@@ -1177,20 +1233,20 @@ export function getStandaloneMediaTitleFallbackCandidates(
 ) {
   const candidates: string[] = []
   const seen = new Set<string>()
+  const parsedKey = toCaseFold(cleanTitleSegment(parsedTitle))
 
   for (const fallbackTitle of getFolderTitleFallbackCandidates(rootDir, filePath, parsedTitle)) {
-    const combinedTitle = titleHasPrefix(parsedTitle, fallbackTitle)
-      ? parsedTitle
-      : `${fallbackTitle} ${parsedTitle}`
-    const cleaned = cleanTitleSegment(combinedTitle)
-    const key = toCaseFold(cleaned)
+    for (const combinedTitle of getStandaloneFallbackTitleCombinations(fallbackTitle, parsedTitle)) {
+      const cleaned = cleanTitleSegment(combinedTitle)
+      const key = toCaseFold(cleaned)
 
-    if (!cleaned || key === toCaseFold(parsedTitle) || seen.has(key)) {
-      continue
+      if (!cleaned || key === parsedKey || seen.has(key)) {
+        continue
+      }
+
+      seen.add(key)
+      candidates.push(cleaned)
     }
-
-    seen.add(key)
-    candidates.push(cleaned)
   }
 
   return candidates

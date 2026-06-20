@@ -12,8 +12,8 @@ type AnimeCardProps = {
 
 export function AnimeCard({ anime, priority = false }: AnimeCardProps) {
   return (
-    <Link href={`/anime/${anime.slug}`} prefetch={false} className="group block">
-      <Card className="rounded-lg border-white/10 bg-zinc-900/80 py-0 transition hover:-translate-y-0.5 hover:border-violet-400/40 hover:shadow-[0_18px_60px_rgba(124,58,237,0.18)]">
+    <Card className="group relative rounded-lg border-white/10 bg-zinc-900/80 py-0 transition hover:-translate-y-0.5 hover:border-violet-400/40 hover:shadow-[0_18px_60px_rgba(124,58,237,0.18)]">
+      <Link href={`/anime/${anime.slug}`} prefetch={false} className="block">
         <div className="relative aspect-[3/4] overflow-hidden bg-zinc-800">
           {anime.coverImage ? (
             <Image
@@ -21,6 +21,7 @@ export function AnimeCard({ anime, priority = false }: AnimeCardProps) {
               alt=""
               fill
               priority={priority}
+              unoptimized
               sizes="(min-width: 1536px) 14vw, (min-width: 1280px) 16vw, (min-width: 1024px) 20vw, (min-width: 640px) 20vw, 50vw"
               className="h-full w-full object-cover transition duration-300 group-hover:scale-105"
             />
@@ -43,7 +44,7 @@ export function AnimeCard({ anime, priority = false }: AnimeCardProps) {
             </span>
           </div>
         </CardContent>
-      </Card>
-    </Link>
+      </Link>
+    </Card>
   )
 }

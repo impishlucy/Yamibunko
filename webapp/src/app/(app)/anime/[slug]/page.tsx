@@ -37,6 +37,7 @@ export default async function AnimePage({
     <AnimeDetailView
       key={`${libraryEntry.slug}:${libraryEntry.selected.id}`}
       initialData={initialData}
+      isAdmin={Boolean(user?.isAdmin)}
     />
   )
 }

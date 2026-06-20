@@ -1,6 +1,10 @@
 import path from "node:path"
 
-import { isLocalNonAnimeId } from "@/lib/local-media"
+import {
+  isLocalNonAnimeId,
+  localNonAnimeIdBase,
+  localNonAnimeIdRange,
+} from "@/lib/local-media"
 import { slugifyAnimeTitle } from "@/lib/slug"
 import type { AnimeInfo, AnimeSummary, AnimeVariant, Episode } from "@/lib/types"
 import { getStoredEpisodeWatchedSeconds } from "@/lib/watch-progress"
@@ -90,6 +94,10 @@ type CachedAnimeCandidateRow = AnimeRow & {
 }
 
 const seriesFormats = new Set(["TV", "TV_SHORT", "ONA"])
+
+const localNonAnimeSqlCondition = `anime.id >= ${localNonAnimeIdBase} AND anime.id < ${
+  localNonAnimeIdBase + localNonAnimeIdRange
+}`
 const libraryRelationTypes = new Set([
   "LIBRARY_ROOT",
   "PARENT",
@@ -232,7 +240,7 @@ const storedLibraryMediaFormats = new Set([
   "OVA",
   "ONA",
 ])
-const rootGraphPrimaryRelationTypes = new Set(["PARENT", "PREQUEL"])
+const rootGraphPrimaryRelationTypes = new Set(["PARENT", "PREQUEL", "SEQUEL"])
 const rootGraphSecondaryRelationTypes = new Set([
   "SIDE_STORY",
   "SUMMARY",
@@ -406,15 +414,15 @@ function storedRelationCanPointToLibraryRoot(
 
   const hasTrustedTitleRoot = rowHasSharedTitleRoot(source, target)
 
-  if (relationType === "PARENT") {
-    return isStoredSeriesMedia(target) || hasTrustedTitleRoot
-  }
+  if (rootGraphPrimaryRelationTypes.has(relationType)) {
+    if (relationType === "PARENT") {
+      return isStoredSeriesMedia(target) || hasTrustedTitleRoot
+    }
 
-  if (relationType === "PREQUEL") {
-    return isStoredSeriesMedia(target) && hasTrustedTitleRoot
-  }
+    if (relationType === "PREQUEL") {
+      return isStoredSeriesMedia(target) && hasTrustedTitleRoot
+    }
 
-  if (relationType === "SEQUEL") {
     return !isStoredSeriesMedia(source) && isStoredSeriesMedia(target) && hasTrustedTitleRoot
   }
 
@@ -426,6 +434,10 @@ function storedRelationCanPointToLibraryRoot(
 }
 
 function rootGraphRelationPriority(relationType: string) {
+  if (!rootGraphPrimaryRelationTypes.has(relationType)) {
+    return rootGraphSecondaryRelationTypes.has(relationType) ? 3 : 99
+  }
+
   if (relationType === "PARENT") {
     return 0
   }
@@ -434,15 +446,7 @@ function rootGraphRelationPriority(relationType: string) {
     return 1
   }
 
-  if (relationType === "SEQUEL") {
-    return 2
-  }
-
-  if (rootGraphSecondaryRelationTypes.has(relationType)) {
-    return 3
-  }
-
-  return 99
+  return 2
 }
 
 function pickStoredRootRelation(
@@ -1351,6 +1355,7 @@ function toAnimeInfo(
     episodeCount: row.episodes ?? 0,
     year: row.season_year ?? undefined,
     durationMinutes: row.duration ?? undefined,
+    isLocalNonAnime: isLocalNonAnimeId(row.id),
     genres,
     averageScore: row.average_score ?? undefined,
     tags,
@@ -1708,17 +1713,17 @@ function upsertAnimeBase(metadata: AnimeMetadataInput) {
         library_slug = COALESCE(excluded.library_slug, anime.library_slug),
         format = excluded.format,
         relation_kind = COALESCE(excluded.relation_kind, anime.relation_kind),
-        title_romaji = excluded.title_romaji,
-        title_english = excluded.title_english,
-        title_native = excluded.title_native,
-        title_user_preferred = excluded.title_user_preferred,
+        title_romaji = CASE WHEN ${localNonAnimeSqlCondition} THEN anime.title_romaji ELSE excluded.title_romaji END,
+        title_english = CASE WHEN ${localNonAnimeSqlCondition} THEN anime.title_english ELSE excluded.title_english END,
+        title_native = CASE WHEN ${localNonAnimeSqlCondition} THEN anime.title_native ELSE excluded.title_native END,
+        title_user_preferred = CASE WHEN ${localNonAnimeSqlCondition} THEN anime.title_user_preferred ELSE excluded.title_user_preferred END,
         status = excluded.status,
-        description = excluded.description,
+        description = CASE WHEN ${localNonAnimeSqlCondition} THEN anime.description ELSE excluded.description END,
         season_year = excluded.season_year,
         episodes = excluded.episodes,
         duration = excluded.duration,
-        cover_image = excluded.cover_image,
-        banner_image = excluded.banner_image,
+        cover_image = CASE WHEN ${localNonAnimeSqlCondition} THEN COALESCE(anime.cover_image, excluded.cover_image) ELSE excluded.cover_image END,
+        banner_image = CASE WHEN ${localNonAnimeSqlCondition} THEN COALESCE(anime.banner_image, excluded.banner_image) ELSE excluded.banner_image END,
         average_score = excluded.average_score,
         anilist_raw_json = COALESCE(excluded.anilist_raw_json, anime.anilist_raw_json),
         anilist_synced_at = COALESCE(excluded.anilist_synced_at, anime.anilist_synced_at),
@@ -2133,6 +2138,7 @@ export function listAnime(): AnimeSummary[] {
           episodeCount: localEpisodeCount,
           mediaCount: variants.length,
           year: row.season_year ?? undefined,
+          isLocalNonAnime: isLocalNonAnimeId(row.primary_anime_id),
         },
       ]
     })

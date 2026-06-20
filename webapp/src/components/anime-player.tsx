@@ -1237,14 +1237,7 @@ function supportsCastDirectPlayback(input: {
     return false
   }
 
-  if (
-    videoCodec !== "h264" &&
-    videoCodec !== "avc1" &&
-    videoCodec !== "hevc" &&
-    videoCodec !== "h265" &&
-    videoCodec !== "hvc1" &&
-    videoCodec !== "hev1"
-  ) {
+  if (videoCodec !== "h264" && videoCodec !== "avc1") {
     return false
   }
 
@@ -2475,7 +2468,7 @@ export function AnimePlayer({
   const isIosDevice = isIosBrowser()
   const isInsideWebVideoCaster = isWebVideoCasterBrowser()
   const canExposeWebVideoCasterSources =
-    isIphoneBrowser() && isInsideWebVideoCaster && isCurrentPageHttpsOrigin()
+    isIosDevice && isInsideWebVideoCaster && isCurrentPageHttpsOrigin()
   const liveTranscodeEnabled = playback.liveTranscodeEnabled !== false
   const showQualityControl = false
   const selectedAudioStream = useMemo(
@@ -6527,7 +6520,7 @@ export function AnimePlayer({
           preload="auto"
           {...({ fetchPriority: "high" } as Record<string, string>)}
           poster={thumbnailUrl}
-          src={webVideoCasterSources ? webVideoCasterSources.directUrl : sourceUrl ?? undefined}
+          src={webVideoCasterSources ? undefined : sourceUrl ?? undefined}
           onDurationChange={(event) => {
             const nextDuration = getStableDuration(
               durationSeconds,
@@ -6631,6 +6624,28 @@ export function AnimePlayer({
           onProgress={handleProgress}
           onVolumeChange={(event) => syncLocalVolumeState(event.currentTarget)}
         >
+          {webVideoCasterSources ? (
+            <>
+              <source
+                src={webVideoCasterSources.directUrl}
+                type={webVideoCasterSources.directContentType}
+                title={webVideoCasterSources.directFileName}
+                data-yamibunko-wvc-source="direct-main-source"
+                data-yamibunko-wvc-label="Direct Play"
+                data-yamibunko-wvc-filename={webVideoCasterSources.directFileName}
+              />
+              {webVideoCasterSources.transcodeUrl ? (
+                <source
+                  src={webVideoCasterSources.transcodeUrl}
+                  type="video/mp4"
+                  title={webVideoCasterSources.transcodeFileName}
+                  data-yamibunko-wvc-source="transcode-main-source"
+                  data-yamibunko-wvc-label="Compatibility Transcode"
+                  data-yamibunko-wvc-filename={webVideoCasterSources.transcodeFileName}
+                />
+              ) : null}
+            </>
+          ) : null}
         </video>
 
         {shouldBlockMobilePortraitPlayback ? (
