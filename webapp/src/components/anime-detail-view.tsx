@@ -215,6 +215,26 @@ export function AnimeDetailView({
     dataRef.current = data
   }, [data])
 
+  useEffect(() => {
+    dataRef.current = initialData
+    setData(initialData)
+    setEditOpen(false)
+    setEditError(null)
+    setCoverError(null)
+    setAnilistId("")
+  }, [initialData])
+
+  const loadDetailForMedia = useCallback(async (animeId: number) => {
+    const current = dataRef.current
+    const params = new URLSearchParams()
+    params.set("media", String(animeId))
+    const nextData = await apiGet<AnimeDetailPayload>(
+      `/api/anime/library/${encodeURIComponent(current.libraryEntry.slug)}?${params.toString()}`
+    )
+    dataRef.current = nextData
+    setData(nextData)
+  }, [])
+
   const loadDetail = useCallback(async () => {
     if (loadingRef.current) {
       rerunAfterLoadRef.current = true
@@ -224,14 +244,7 @@ export function AnimeDetailView({
     loadingRef.current = true
 
     try {
-      const current = dataRef.current
-      const params = new URLSearchParams()
-      params.set("media", String(current.libraryEntry.selected.id))
-      const nextData = await apiGet<AnimeDetailPayload>(
-        `/api/anime/library/${encodeURIComponent(current.libraryEntry.slug)}?${params.toString()}`
-      )
-      dataRef.current = nextData
-      setData(nextData)
+      await loadDetailForMedia(dataRef.current.libraryEntry.selected.id)
     } catch {
     } finally {
       loadingRef.current = false
@@ -241,7 +254,7 @@ export function AnimeDetailView({
         void loadDetailRef.current()
       }
     }
-  }, [])
+  }, [loadDetailForMedia])
 
   useEffect(() => {
     loadDetailRef.current = loadDetail
@@ -295,10 +308,10 @@ export function AnimeDetailView({
   const openEditDialog = useCallback(() => {
     setEditTitle(anime.title)
     setEditDescription(anime.description ?? "")
-    setAnilistId("")
+    setAnilistId(anime.isLocalNonAnime ? "" : String(anime.id))
     setEditError(null)
     setEditOpen(true)
-  }, [anime.description, anime.title])
+  }, [anime.description, anime.id, anime.isLocalNonAnime, anime.title])
 
   const closeEditDialog = useCallback(() => {
     if (editSaving) {
@@ -362,6 +375,17 @@ export function AnimeDetailView({
       setEditSaving(false)
     }
   }, [anilistId, editDescription, editTitle, router])
+
+  const handleVariantSelect = useCallback(
+    (animeId: number) => {
+      setEditOpen(false)
+      setEditError(null)
+      setCoverError(null)
+      setAnilistId("")
+      void loadDetailForMedia(animeId)
+    },
+    [loadDetailForMedia]
+  )
 
   const openCoverUpload = useCallback(() => {
     setCoverError(null)
@@ -525,6 +549,7 @@ export function AnimeDetailView({
               variants={libraryEntry.variants}
               selectedId={anime.id}
               libraryTitle={libraryEntry.title}
+              onSelect={handleVariantSelect}
             />
             {anime.genres?.length ? (
               <div className="flex flex-wrap gap-2">
@@ -570,7 +595,9 @@ export function AnimeDetailView({
                 <h2 className="text-lg font-semibold text-zinc-50">
                   {anime.isLocalNonAnime ? "Edit non-anime entry" : "Correct AniList entry"}
                 </h2>
-                <p className="mt-1 text-sm text-zinc-400">{anime.title}</p>
+                <p className="mt-1 text-sm text-zinc-400">
+                  {anime.title} · ID {anime.id}
+                </p>
               </div>
               <button
                 type="button"
@@ -606,7 +633,7 @@ export function AnimeDetailView({
             ) : (
               <div className="space-y-3">
                 <label className="block space-y-1.5 text-sm">
-                  <span className="text-zinc-300">AniList ID</span>
+                  <span className="text-zinc-300">AniList ID for this selected entry</span>
                   <Input
                     value={anilistId}
                     onChange={(event) => setAnilistId(event.target.value.replace(/[^0-9]/g, ""))}

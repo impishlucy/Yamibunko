@@ -47,6 +47,8 @@ type ParsedLibraryPath = {
   metadataLookupSeason?: number
   mediaKind?: ParsedAnimeFileName["mediaKind"]
   isNonAnime?: boolean
+  nonAnimeMediaTitle?: string
+  nonAnimeParsed?: ParsedAnimeFileName
 }
 
 function debugLibrarySync(message: string) {
@@ -228,16 +230,19 @@ function parseLibraryPath(filePath: string): ParsedLibraryPath | null {
     const part = parsedFileName.part
 
     return {
-      animeTitle: nonAnimeParsed.title,
+      animeTitle: nonAnimeParsed.libraryTitle,
       season,
       episode: parsedFileName.episode,
       part,
+      mediaKind: parsedFileName.mediaKind,
       metadataLookupSeason: getAnimeMetadataLookupSeason({
         ...parsedFileName,
         season,
         part,
       }),
       isNonAnime: true,
+      nonAnimeMediaTitle: nonAnimeParsed.mediaTitle,
+      nonAnimeParsed: parsedFileName,
     }
   }
 
@@ -363,7 +368,15 @@ export async function syncLibraryFile(filePath: string) {
 
   const metadata = resolvedParsed.isNonAnime
     ? createNonAnimeMetadata({
-        title: resolvedParsed.animeTitle,
+        libraryTitle: resolvedParsed.animeTitle,
+        mediaTitle: resolvedParsed.nonAnimeMediaTitle ?? resolvedParsed.animeTitle,
+        parsed: resolvedParsed.nonAnimeParsed ?? {
+          title: resolvedParsed.animeTitle,
+          season: resolvedParsed.season,
+          episode: resolvedParsed.episode,
+          part: resolvedParsed.part,
+          mediaKind: resolvedParsed.mediaKind,
+        },
         episodeNumber: resolvedParsed.episode,
       })
     : await (async () => {

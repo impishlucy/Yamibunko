@@ -1138,7 +1138,7 @@ export async function processInputFile(
       const nonAnimeParsed = nonAnimeInput.parsed
       debugImport(
         jobId,
-        `Parsed ${nonAnimeFolderName} input file - Title ${nonAnimeInput.title}, Season ${nonAnimeParsed.season}${nonAnimeParsed.part ? `, Part ${nonAnimeParsed.part}` : ""}, Episode ${nonAnimeParsed.episode}`
+        `Parsed ${nonAnimeFolderName} input file - Library ${nonAnimeInput.libraryTitle}, Media ${nonAnimeInput.mediaTitle}, Season ${nonAnimeParsed.season}${nonAnimeParsed.part ? `, Part ${nonAnimeParsed.part}` : ""}, Episode ${nonAnimeParsed.episode}`
       )
     } else if (parsed?.titleSource === "folder") {
       debugImport(
@@ -1207,7 +1207,9 @@ export async function processInputFile(
 
     if (nonAnimeInput) {
       metadata = createNonAnimeMetadata({
-        title: nonAnimeInput.title,
+        libraryTitle: nonAnimeInput.libraryTitle,
+        mediaTitle: nonAnimeInput.mediaTitle,
+        parsed: nonAnimeInput.parsed,
         episodeNumber: nonAnimeInput.parsed.episode,
       })
       debugImport(jobId, `Prepared local non-anime metadata - Media id ${metadata.id}.`)

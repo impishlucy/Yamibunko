@@ -518,12 +518,6 @@ export function updateNonAnimeLibraryDetails(input: {
   getDb().exec("BEGIN IMMEDIATE")
 
   try {
-    if (anime.id === entry.primary_anime_id) {
-      getDb()
-        .query("UPDATE library_entries SET title = ?, updated_at = ? WHERE slug = ?")
-        .run(title, now, entry.slug)
-    }
-
     getDb()
       .query(
         `

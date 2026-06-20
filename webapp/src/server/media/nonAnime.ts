@@ -14,6 +14,8 @@ export const nonAnimeFolderName = "NotAnime"
 
 export type ParsedNonAnimeFilePath = {
   title: string
+  libraryTitle: string
+  mediaTitle: string
   parsed: ParsedAnimeFileName
 }
 
@@ -27,11 +29,11 @@ function getNotAnimeRoot(rootDir: string) {
   return path.resolve(rootDir, nonAnimeFolderName)
 }
 
-function getStableLocalMediaId(title: string) {
+function getStableLocalMediaId(key: string) {
   let hash = 0
 
-  for (let index = 0; index < title.length; index += 1) {
-    hash = (hash * 131 + title.charCodeAt(index)) % localNonAnimeIdRange
+  for (let index = 0; index < key.length; index += 1) {
+    hash = (hash * 131 + key.charCodeAt(index)) % localNonAnimeIdRange
   }
 
   return localNonAnimeIdBase + hash
@@ -59,6 +61,93 @@ function getNotAnimeFolderTitle(parts: string[]) {
   return title || null
 }
 
+function formatNonAnimeSeriesTitle(input: {
+  libraryTitle: string
+  season: number
+  part?: number
+}) {
+  if (input.season <= 1 && !input.part) {
+    return input.libraryTitle
+  }
+
+  return input.part
+    ? `${input.libraryTitle} Season ${input.season} Part ${input.part}`
+    : `${input.libraryTitle} Season ${input.season}`
+}
+
+function getNonAnimeMediaTitle(input: {
+  libraryTitle: string
+  parsed: ParsedAnimeFileName
+}) {
+  const title = input.parsed.mediaKind === "movie"
+    ? sanitizeExportPathPart(input.parsed.title)
+    : formatNonAnimeSeriesTitle({
+        libraryTitle: input.libraryTitle,
+        season: input.parsed.season,
+        part: input.parsed.part,
+      })
+
+  return title || input.libraryTitle
+}
+
+function getNonAnimeRootId(libraryTitle: string) {
+  return getStableLocalMediaId(libraryTitle.toLowerCase())
+}
+
+function getNonAnimeMediaId(input: {
+  libraryTitle: string
+  mediaTitle: string
+  parsed: ParsedAnimeFileName
+}) {
+  if (input.parsed.mediaKind === "movie") {
+    return getStableLocalMediaId(
+      `${input.libraryTitle.toLowerCase()}|movie|${input.mediaTitle.toLowerCase()}`
+    )
+  }
+
+  if (input.parsed.season <= 1 && !input.parsed.part) {
+    return getNonAnimeRootId(input.libraryTitle)
+  }
+
+  return getStableLocalMediaId(
+    `${input.libraryTitle.toLowerCase()}|series|season:${input.parsed.season}|part:${input.parsed.part ?? 0}`
+  )
+}
+
+function createLocalNonAnimeRootMetadata(input: {
+  libraryTitle: string
+  librarySlug: string
+  rootId: number
+}): AnimeMetadataInput {
+  return {
+    id: input.rootId,
+    format: "TV",
+    library: {
+      slug: input.librarySlug,
+      title: input.libraryTitle,
+      primaryAnimeId: input.rootId,
+      relationKind: "LIBRARY_ROOT",
+    },
+    title: {
+      english: input.libraryTitle,
+      romaji: input.libraryTitle,
+      userPreferred: input.libraryTitle,
+    },
+    status: null,
+    description: "Local non-anime library entry.",
+    episodes: null,
+    duration: null,
+    coverImage: null,
+    bannerImage: null,
+    genres: [],
+    tags: [],
+    relations: [],
+    streamingEpisodes: [],
+    rawMedia: null,
+    anilistSyncedAt: null,
+  }
+}
+
 export function parseNonAnimeFilePath(
   filePath: string,
   rootDir: string
@@ -69,63 +158,93 @@ export function parseNonAnimeFilePath(
     return null
   }
 
-  const folderTitle = getNotAnimeFolderTitle(parts)
+  const libraryTitle = getNotAnimeFolderTitle(parts)
   const parsed = parseAnimeFilePath(filePath, {
     rootDir: getNotAnimeRoot(rootDir),
-    fallbackTitles: folderTitle ? [folderTitle] : [],
+    fallbackTitles: libraryTitle ? [libraryTitle] : [],
   })
 
   if (!parsed) {
     return null
   }
 
-  const title = sanitizeExportPathPart(folderTitle ?? parsed.title)
+  const title = sanitizeExportPathPart(libraryTitle ?? parsed.title)
 
   if (!title) {
     return null
   }
 
+  const mediaTitle = getNonAnimeMediaTitle({ libraryTitle: title, parsed })
+
   return {
     title,
+    libraryTitle: title,
+    mediaTitle,
     parsed: {
       ...parsed,
-      title,
-      titleSource: folderTitle ? "folder" : parsed.titleSource,
+      title: parsed.mediaKind === "movie" ? mediaTitle : title,
+      titleSource: libraryTitle ? "folder" : parsed.titleSource,
     },
   }
 }
 
 export function createNonAnimeMetadata(input: {
-  title: string
+  libraryTitle: string
+  mediaTitle: string
+  parsed: ParsedAnimeFileName
   episodeNumber: number
 }): AnimeMetadataInput {
-  const safeTitle = sanitizeExportPathPart(input.title) || "NotAnime"
-  const id = getStableLocalMediaId(safeTitle.toLowerCase())
-  const slugBase = slugifyAnimeTitle(safeTitle) || String(id)
+  const libraryTitle = sanitizeExportPathPart(input.libraryTitle) || "NotAnime"
+  const mediaTitle = sanitizeExportPathPart(input.mediaTitle) || libraryTitle
+  const rootId = getNonAnimeRootId(libraryTitle)
+  const id = getNonAnimeMediaId({
+    libraryTitle,
+    mediaTitle,
+    parsed: input.parsed,
+  })
+  const slugBase = slugifyAnimeTitle(libraryTitle) || String(rootId)
+  const librarySlug = `not-anime-${slugBase}`
+  const rootMetadata = createLocalNonAnimeRootMetadata({
+    libraryTitle,
+    librarySlug,
+    rootId,
+  })
+  const isRoot = id === rootId
+  const format = input.parsed.mediaKind === "movie" ? "MOVIE" : "TV"
 
   return {
     id,
-    format: "TV",
+    format,
     library: {
-      slug: `not-anime-${slugBase}`,
-      title: safeTitle,
-      primaryAnimeId: id,
-      relationKind: "LIBRARY_ROOT",
+      slug: librarySlug,
+      title: libraryTitle,
+      primaryAnimeId: rootId,
+      relationKind: isRoot ? "LIBRARY_ROOT" : "related",
     },
     title: {
-      english: safeTitle,
-      romaji: safeTitle,
-      userPreferred: safeTitle,
+      english: mediaTitle,
+      romaji: mediaTitle,
+      userPreferred: mediaTitle,
     },
     status: null,
-    description: "Local non-anime library entry.",
-    episodes: input.episodeNumber,
+    description: isRoot
+      ? "Local non-anime library entry."
+      : `Local non-anime entry for ${libraryTitle}.`,
+    seasonYear: null,
+    episodes: format === "MOVIE" ? 1 : input.episodeNumber,
     duration: null,
     coverImage: null,
     bannerImage: null,
     genres: [],
     tags: [],
-    relations: [],
+    relations: isRoot
+      ? []
+      : [
+          {
+            relationType: "LIBRARY_ROOT",
+            media: rootMetadata,
+          },
+        ],
     streamingEpisodes: [],
     rawMedia: null,
     anilistSyncedAt: null,

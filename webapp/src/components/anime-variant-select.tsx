@@ -31,10 +31,12 @@ export function AnimeVariantSelect({
   variants,
   selectedId,
   libraryTitle,
+  onSelect,
 }: {
   variants: AnimeVariant[]
   selectedId: number
   libraryTitle: string
+  onSelect?: (animeId: number) => void
 }) {
   const router = useRouter()
   const pathname = usePathname()
@@ -50,8 +52,10 @@ export function AnimeVariantSelect({
       <select
         value={selectedId}
         onChange={(event) => {
+          const nextSelectedId = Number(event.target.value)
           const params = new URLSearchParams(searchParams)
           params.set("media", event.target.value)
+          onSelect?.(nextSelectedId)
           router.push(`${pathname}?${params.toString()}`)
         }}
         className="h-9 w-full rounded-lg border border-white/10 bg-zinc-950/80 px-3 text-sm text-zinc-100 outline-none"
