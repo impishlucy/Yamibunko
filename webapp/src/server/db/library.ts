@@ -6,6 +6,7 @@ import {
   localNonAnimeIdRange,
 } from "@/lib/local-media"
 import { slugifyAnimeTitle } from "@/lib/slug"
+import { resolveLibraryFamilyDisplayTitle } from "@/server/metadata/libraryFamilyDisplay"
 import type { AnimeInfo, AnimeSummary, AnimeVariant, Episode } from "@/lib/types"
 import { getStoredEpisodeWatchedSeconds } from "@/lib/watch-progress"
 import { getServerConfigResult } from "@/server/config"
@@ -249,6 +250,11 @@ const rootGraphSecondaryRelationTypes = new Set([
   "COMPILATION",
   "CONTAINS",
 ])
+const secondaryRootRelationTypesWithoutSharedTitle = new Set([
+  "SIDE_STORY",
+  "SPIN_OFF",
+  "SUMMARY",
+])
 const inverseStoredRootRelationTypes: Record<string, string> = {
   PREQUEL: "SEQUEL",
   SEQUEL: "PREQUEL",
@@ -366,6 +372,10 @@ function rowHasSharedTitleRoot(
     return true
   }
 
+  if (rowHasSharedTitleFamily(source, target)) {
+    return true
+  }
+
   return sourceTitles.some((sourceTitle) =>
     targetTitles.some(
       (targetTitle) =>
@@ -399,6 +409,101 @@ function hasSharedTitleTokenPrefix(title: string, candidateTitle: string) {
   return sharedPrefixParts >= 2
 }
 
+const titleFamilyStopWords = new Set([
+  "the",
+  "and",
+  "for",
+  "with",
+  "from",
+  "into",
+  "that",
+  "this",
+  "movie",
+  "season",
+  "series",
+  "ova",
+  "ona",
+  "special",
+])
+
+function compactComparableTitle(value: string) {
+  return value.replace(/[^a-z0-9]/g, "")
+}
+
+function commonPrefixLength(left: string, right: string) {
+  let index = 0
+
+  while (index < left.length && index < right.length && left[index] === right[index]) {
+    index += 1
+  }
+
+  return index
+}
+
+function commonSuffixLength(left: string, right: string) {
+  let index = 0
+
+  while (
+    index < left.length &&
+    index < right.length &&
+    left[left.length - 1 - index] === right[right.length - 1 - index]
+  ) {
+    index += 1
+  }
+
+  return index
+}
+
+function hasSharedDistinctiveTitleSegment(title: string, candidateTitle: string) {
+  const titleCompact = compactComparableTitle(title)
+  const candidateCompact = compactComparableTitle(candidateTitle)
+
+  if (!titleCompact || !candidateCompact || titleCompact === candidateCompact) {
+    return false
+  }
+
+  if (commonPrefixLength(titleCompact, candidateCompact) >= 5) {
+    return true
+  }
+
+  if (commonSuffixLength(titleCompact, candidateCompact) >= 6) {
+    return true
+  }
+
+  const candidateTokens = new Set(
+    titleTokens(candidateTitle).filter(
+      (token) => token.length >= 4 && !titleFamilyStopWords.has(token)
+    )
+  )
+
+  return titleTokens(title).some(
+    (token) =>
+      token.length >= 4 &&
+      !titleFamilyStopWords.has(token) &&
+      candidateTokens.has(token)
+  )
+}
+
+function rowHasSharedTitleFamily(
+  source: Pick<
+    AnimeRow,
+    "title_user_preferred" | "title_english" | "title_romaji" | "title_native"
+  >,
+  target: Pick<
+    AnimeRow,
+    "title_user_preferred" | "title_english" | "title_romaji" | "title_native"
+  >
+) {
+  const sourceTitles = uniqueTitleValues(rowTitles(source)).map(normalizeComparableTitle)
+  const targetTitles = uniqueTitleValues(rowTitles(target)).map(normalizeComparableTitle)
+
+  return sourceTitles.some((sourceTitle) =>
+    targetTitles.some((targetTitle) =>
+      hasSharedDistinctiveTitleSegment(sourceTitle, targetTitle)
+    )
+  )
+}
+
 function storedRelationCanPointToLibraryRoot(
   source: AnimeRow,
   target: AnimeRow,
@@ -427,7 +532,11 @@ function storedRelationCanPointToLibraryRoot(
   }
 
   if (rootGraphSecondaryRelationTypes.has(relationType)) {
-    return isStoredSeriesMedia(target) && rowHasSharedTitleRoot(source, target)
+    return (
+      isStoredSeriesMedia(target) &&
+      (hasTrustedTitleRoot ||
+        secondaryRootRelationTypesWithoutSharedTitle.has(relationType))
+    )
   }
 
   return false
@@ -2129,11 +2238,20 @@ export function listAnime(): AnimeSummary[] {
         return []
       }
 
+      const displayTitle = resolveLibraryFamilyDisplayTitle(row.library_title, [
+        row.library_title,
+        row.title_user_preferred,
+        row.title_english,
+        row.title_romaji,
+        row.title_native,
+        ...variants.map((variant) => variant.title),
+      ])
+
       return [
         {
           id: row.primary_anime_id,
           slug: row.slug,
-          title: row.library_title,
+          title: displayTitle,
           coverImage: row.cover_image ?? undefined,
           bannerImage: row.banner_image ?? undefined,
           episodeCount: localEpisodeCount,
@@ -2143,9 +2261,18 @@ export function listAnime(): AnimeSummary[] {
         },
       ]
     })
+    .sort((left, right) =>
+      left.title.localeCompare(right.title, undefined, {
+        numeric: true,
+        sensitivity: "base",
+      })
+    )
 }
 
-function toAnimeVariant(row: AnimeVariantRow): AnimeVariant {
+function toAnimeVariant(
+  row: AnimeVariantRow,
+  sortGroup: AnimeVariant["sortGroup"] = "related"
+): AnimeVariant {
   return {
     id: row.id,
     title: row.title_user_preferred,
@@ -2153,7 +2280,348 @@ function toAnimeVariant(row: AnimeVariantRow): AnimeVariant {
     year: row.season_year ?? undefined,
     episodeCount: row.local_episode_count,
     seasonNumber: row.first_season_nr ?? undefined,
+    sortGroup,
   }
+}
+
+function animeVariantFormatOrder(format: string | null) {
+  switch (format) {
+    case "TV":
+      return 0
+    case "TV_SHORT":
+      return 1
+    case "ONA":
+      return 2
+    case "MOVIE":
+      return 3
+    case "SPECIAL":
+      return 4
+    case "OVA":
+      return 5
+    default:
+      return 6
+  }
+}
+
+function compareAnimeVariantRows(left: AnimeVariantRow, right: AnimeVariantRow) {
+  const leftYear = left.season_year ?? Number.MAX_SAFE_INTEGER
+  const rightYear = right.season_year ?? Number.MAX_SAFE_INTEGER
+
+  if (leftYear !== rightYear) {
+    return leftYear - rightYear
+  }
+
+  const leftSeason = left.first_season_nr ?? Number.MAX_SAFE_INTEGER
+  const rightSeason = right.first_season_nr ?? Number.MAX_SAFE_INTEGER
+
+  if (leftSeason !== rightSeason) {
+    return leftSeason - rightSeason
+  }
+
+  const formatDelta =
+    animeVariantFormatOrder(left.format) - animeVariantFormatOrder(right.format)
+
+  if (formatDelta !== 0) {
+    return formatDelta
+  }
+
+  const titleDelta = left.title_user_preferred.localeCompare(
+    right.title_user_preferred,
+    undefined,
+    { numeric: true, sensitivity: "base" }
+  )
+
+  return titleDelta !== 0 ? titleDelta : left.id - right.id
+}
+
+const variantMainlineRelationTypes = new Set([
+  "PARENT",
+  "PREQUEL",
+  "SEQUEL",
+  "ALTERNATIVE",
+  "COMPILATION",
+  "CONTAINS",
+])
+
+function listVariantMainlineRelations(variantIds: number[]) {
+  if (variantIds.length === 0) {
+    return []
+  }
+
+  const placeholders = variantIds.map(() => "?").join(", ")
+  const relationTypes = [...variantMainlineRelationTypes]
+  const relationPlaceholders = relationTypes.map(() => "?").join(", ")
+
+  return getDb()
+    .query<StoredAnimeRelationRow>(
+      `
+      SELECT anime_id, related_anime_id, relation_type
+      FROM anime_relations
+      WHERE (anime_id IN (${placeholders}) OR related_anime_id IN (${placeholders}))
+        AND relation_type IN (${relationPlaceholders})
+    `
+    )
+    .all(...variantIds, ...variantIds, ...relationTypes)
+}
+
+function addVariantEdge(
+  map: Map<number, Set<number>>,
+  fromId: number,
+  toId: number
+) {
+  const values = map.get(fromId) ?? new Set<number>()
+  values.add(toId)
+  map.set(fromId, values)
+}
+
+function addMainlineVariantRelationEdges(
+  relation: StoredAnimeRelationRow,
+  rowsById: Map<number, AnimeVariantRow>,
+  successors: Map<number, Set<number>>,
+  predecessors: Map<number, Set<number>>
+) {
+  const source = rowsById.get(relation.anime_id)
+  const target = rowsById.get(relation.related_anime_id)
+
+  if (!source || !target) {
+    return
+  }
+
+  const addDirectedEdge = (fromId: number, toId: number) => {
+    addVariantEdge(successors, fromId, toId)
+    addVariantEdge(predecessors, toId, fromId)
+  }
+
+  if (relation.relation_type === "SEQUEL") {
+    addDirectedEdge(relation.anime_id, relation.related_anime_id)
+    return
+  }
+
+  if (relation.relation_type === "PREQUEL") {
+    addDirectedEdge(relation.related_anime_id, relation.anime_id)
+    return
+  }
+
+  if (relation.relation_type === "PARENT") {
+    addDirectedEdge(relation.related_anime_id, relation.anime_id)
+    return
+  }
+
+  if (
+    relation.relation_type === "CONTAINS" ||
+    relation.relation_type === "COMPILATION"
+  ) {
+    addDirectedEdge(relation.anime_id, relation.related_anime_id)
+    return
+  }
+
+  if (relation.relation_type === "ALTERNATIVE" && rowHasSharedTitleRoot(source, target)) {
+    if (compareAnimeVariantRows(source, target) <= 0) {
+      addDirectedEdge(source.id, target.id)
+    } else {
+      addDirectedEdge(target.id, source.id)
+    }
+  }
+}
+
+function sortedVariantIds(
+  ids: Iterable<number>,
+  rowsById: Map<number, AnimeVariantRow>
+) {
+  return [...ids].sort((leftId, rightId) => {
+    const left = rowsById.get(leftId)
+    const right = rowsById.get(rightId)
+
+    if (!left || !right) {
+      return leftId - rightId
+    }
+
+    return compareAnimeVariantRows(left, right)
+  })
+}
+
+function collectForwardMainlineIds(
+  startId: number,
+  successors: Map<number, Set<number>>,
+  rowsById: Map<number, AnimeVariantRow>
+) {
+  const result: number[] = []
+  const visited = new Set<number>()
+  const queue = [startId]
+
+  while (queue.length > 0) {
+    const currentId = queue.shift()
+
+    if (!currentId || visited.has(currentId) || !rowsById.has(currentId)) {
+      continue
+    }
+
+    visited.add(currentId)
+    result.push(currentId)
+    queue.push(...sortedVariantIds(successors.get(currentId) ?? [], rowsById))
+  }
+
+  return result
+}
+
+function collectConnectedMainlineIds(
+  startId: number,
+  successors: Map<number, Set<number>>,
+  predecessors: Map<number, Set<number>>,
+  rowsById: Map<number, AnimeVariantRow>
+) {
+  const result = new Set<number>()
+  const queue = [startId]
+
+  while (queue.length > 0) {
+    const currentId = queue.shift()
+
+    if (!currentId || result.has(currentId) || !rowsById.has(currentId)) {
+      continue
+    }
+
+    result.add(currentId)
+    queue.push(...(successors.get(currentId) ?? []))
+    queue.push(...(predecessors.get(currentId) ?? []))
+  }
+
+  return result
+}
+
+function orderMainlineVariantRows(
+  mainlineIds: Set<number>,
+  successors: Map<number, Set<number>>,
+  predecessors: Map<number, Set<number>>,
+  rowsById: Map<number, AnimeVariantRow>,
+  primaryAnimeId: number
+) {
+  const ordered: AnimeVariantRow[] = []
+  const emitted = new Set<number>()
+
+  const emitForward = (startId: number) => {
+    for (const id of collectForwardMainlineIds(startId, successors, rowsById)) {
+      if (mainlineIds.has(id) && !emitted.has(id)) {
+        const row = rowsById.get(id)
+
+        if (row) {
+          emitted.add(id)
+          ordered.push(row)
+        }
+      }
+    }
+  }
+
+  if (mainlineIds.has(primaryAnimeId)) {
+    emitForward(primaryAnimeId)
+  }
+
+  const remainingRootIds = sortedVariantIds(
+    [...mainlineIds].filter((id) => {
+      if (emitted.has(id)) {
+        return false
+      }
+
+      return [...(predecessors.get(id) ?? [])].every((predecessorId) =>
+        !mainlineIds.has(predecessorId)
+      )
+    }),
+    rowsById
+  )
+
+  for (const id of remainingRootIds) {
+    emitForward(id)
+  }
+
+  for (const id of sortedVariantIds(mainlineIds, rowsById)) {
+    if (!emitted.has(id)) {
+      const row = rowsById.get(id)
+
+      if (row) {
+        emitted.add(id)
+        ordered.push(row)
+      }
+    }
+  }
+
+  return ordered
+}
+
+function sortAnimeVariantRowsForDropdown(
+  rows: AnimeVariantRow[],
+  primaryAnimeId: number
+) {
+  const sortedRows = [...rows].sort(compareAnimeVariantRows)
+
+  if (isLocalNonAnimeId(primaryAnimeId)) {
+    return sortedRows.map((row) => toAnimeVariant(row, "mainline"))
+  }
+
+  const rowsById = new Map(sortedRows.map((row) => [row.id, row]))
+  const variantIds = sortedRows.map((row) => row.id)
+  const variantIdSet = new Set(variantIds)
+  const successors = new Map<number, Set<number>>()
+  const predecessors = new Map<number, Set<number>>()
+
+  for (const relation of listVariantMainlineRelations(variantIds)) {
+    if (
+      !variantIdSet.has(relation.anime_id) ||
+      !variantIdSet.has(relation.related_anime_id) ||
+      relation.anime_id === relation.related_anime_id
+    ) {
+      continue
+    }
+
+    addMainlineVariantRelationEdges(relation, rowsById, successors, predecessors)
+  }
+
+  const primaryRow = rowsById.get(primaryAnimeId)
+  const graphMemberIds = new Set([
+    ...successors.keys(),
+    ...predecessors.keys(),
+  ])
+  const mainlineIds = new Set<number>()
+
+  if (primaryRow) {
+    for (const id of collectConnectedMainlineIds(
+      primaryAnimeId,
+      successors,
+      predecessors,
+      rowsById
+    )) {
+      mainlineIds.add(id)
+    }
+  } else if (graphMemberIds.size > 0) {
+    const firstGraphId = sortedVariantIds(graphMemberIds, rowsById)[0]
+
+    if (firstGraphId) {
+      for (const id of collectConnectedMainlineIds(
+        firstGraphId,
+        successors,
+        predecessors,
+        rowsById
+      )) {
+        mainlineIds.add(id)
+      }
+    }
+  }
+
+  if (mainlineIds.size === 0 && sortedRows[0]) {
+    mainlineIds.add(sortedRows[0].id)
+  }
+
+  const mainlineRows = orderMainlineVariantRows(
+    mainlineIds,
+    successors,
+    predecessors,
+    rowsById,
+    primaryAnimeId
+  )
+  const relatedRows = sortedRows.filter((row) => !mainlineIds.has(row.id))
+
+  return [
+    ...mainlineRows.map((row) => toAnimeVariant(row, "mainline")),
+    ...relatedRows.map((row) => toAnimeVariant(row, "related")),
+  ]
 }
 
 function isLibraryMemberAnime(librarySlug: string, animeId: number) {
@@ -2197,7 +2665,17 @@ function isLibraryMemberAnime(librarySlug: string, animeId: number) {
 }
 
 function listAnimeVariants(librarySlug: string) {
-  return getDb()
+  const library = getDb()
+    .query<LibraryEntryRow>(
+      "SELECT slug, title, primary_anime_id FROM library_entries WHERE slug = ?"
+    )
+    .get(librarySlug)
+
+  if (!library) {
+    return []
+  }
+
+  const rows = getDb()
     .query<AnimeVariantRow>(
       `
       SELECT
@@ -2209,23 +2687,12 @@ function listAnimeVariants(librarySlug: string) {
       WHERE a.library_slug = ?
       GROUP BY a.id
       HAVING local_episode_count > 0
-      ORDER BY
-        CASE a.format
-          WHEN 'TV' THEN 0
-          WHEN 'TV_SHORT' THEN 1
-          WHEN 'ONA' THEN 2
-          WHEN 'MOVIE' THEN 3
-          WHEN 'SPECIAL' THEN 4
-          WHEN 'OVA' THEN 5
-          ELSE 6
-        END,
-        COALESCE(a.season_year, 9999),
-        a.title_user_preferred
     `
     )
     .all(librarySlug)
     .filter((row) => isLibraryMemberAnime(librarySlug, row.id))
-    .map(toAnimeVariant)
+
+  return sortAnimeVariantRowsForDropdown(rows, library.primary_anime_id)
 }
 
 function listCachedAnimeVariants(librarySlug: string) {

@@ -17,6 +17,7 @@ export type AnimeVariant = {
   year?: number
   episodeCount: number
   seasonNumber?: number
+  sortGroup?: "mainline" | "related"
 }
 
 export type AnimeInfo = AnimeSummary & {

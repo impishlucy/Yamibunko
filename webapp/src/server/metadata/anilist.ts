@@ -712,6 +712,98 @@ function hasSharedTitleTokenPrefix(title: string, candidateTitle: string) {
   return sharedPrefixParts >= 2
 }
 
+const titleFamilyStopWords = new Set([
+  "the",
+  "and",
+  "for",
+  "with",
+  "from",
+  "into",
+  "that",
+  "this",
+  "movie",
+  "season",
+  "series",
+  "ova",
+  "ona",
+  "special",
+])
+
+const secondaryRootRelationTypesWithoutSharedTitle = new Set([
+  "SIDE_STORY",
+  "SPIN_OFF",
+  "SUMMARY",
+])
+
+function compactComparableTitle(value: string) {
+  return value.replace(/[^a-z0-9]/g, "")
+}
+
+function commonPrefixLength(left: string, right: string) {
+  let index = 0
+
+  while (index < left.length && index < right.length && left[index] === right[index]) {
+    index += 1
+  }
+
+  return index
+}
+
+function commonSuffixLength(left: string, right: string) {
+  let index = 0
+
+  while (
+    index < left.length &&
+    index < right.length &&
+    left[left.length - 1 - index] === right[right.length - 1 - index]
+  ) {
+    index += 1
+  }
+
+  return index
+}
+
+function hasSharedDistinctiveTitleSegment(title: string, candidateTitle: string) {
+  const titleCompact = compactComparableTitle(title)
+  const candidateCompact = compactComparableTitle(candidateTitle)
+
+  if (!titleCompact || !candidateCompact || titleCompact === candidateCompact) {
+    return false
+  }
+
+  if (commonPrefixLength(titleCompact, candidateCompact) >= 5) {
+    return true
+  }
+
+  if (commonSuffixLength(titleCompact, candidateCompact) >= 6) {
+    return true
+  }
+
+  const candidateTokens = new Set(
+    titleTokens(candidateTitle).filter(
+      (token) => token.length >= 4 && !titleFamilyStopWords.has(token)
+    )
+  )
+
+  return titleTokens(title).some(
+    (token) =>
+      token.length >= 4 &&
+      !titleFamilyStopWords.has(token) &&
+      candidateTokens.has(token)
+  )
+}
+
+function hasSharedTitleFamily(metadata: AnimeMetadataInput, candidate: AnimeMetadataInput) {
+  const titles = normalizedTitleValuesForRootResolution(metadata)
+  const candidateTitles = normalizedTitleValuesForRootResolution(candidate)
+
+  return titles.some((title) =>
+    candidateTitles.some((candidateTitle) =>
+      hasSharedDistinctiveTitleSegment(title, candidateTitle)
+    )
+  )
+}
+
 function hasSharedRootTitle(metadata: AnimeMetadataInput, candidate: AnimeMetadataInput) {
   const titles = normalizedTitleValuesForRootResolution(metadata)
   const candidateTitles = normalizedTitleValuesForRootResolution(candidate)
@@ -723,6 +815,10 @@ function hasSharedRootTitle(metadata: AnimeMetadataInput, candidate: AnimeMetada
       candidateTitleRoots.some((candidateTitleRoot) => titleRoot === candidateTitleRoot)
     )
   ) {
+    return true
+  }
+
+  if (hasSharedTitleFamily(metadata, candidate)) {
     return true
   }
 
@@ -757,7 +853,8 @@ function hasRootTitlePrefix(metadata: AnimeMetadataInput, candidate: AnimeMetada
         (candidateTitleRoot) =>
           titleRoot === candidateTitleRoot ||
           titleRoot.startsWith(`${candidateTitleRoot} `) ||
-          hasSharedTitleTokenPrefix(titleRoot, candidateTitleRoot)
+          hasSharedTitleTokenPrefix(titleRoot, candidateTitleRoot) ||
+          hasSharedDistinctiveTitleSegment(titleRoot, candidateTitleRoot)
       )
     )
   )
@@ -814,8 +911,16 @@ function relationRootScore(
   const rootTitlePrefix = hasRootTitlePrefix(metadata, relation.media)
   const sharedRootTitle = hasSharedRootTitle(metadata, relation.media)
   const trustedParentRelation = relation.relationType === "PARENT"
+  const trustedSecondaryRelation =
+    relationIsRootFormat &&
+    secondaryRootRelationTypesWithoutSharedTitle.has(relation.relationType)
 
-  if (!trustedParentRelation && !rootTitlePrefix && !sharedRootTitle) {
+  if (
+    !trustedParentRelation &&
+    !trustedSecondaryRelation &&
+    !rootTitlePrefix &&
+    !sharedRootTitle
+  ) {
     return null
   }
 
@@ -829,6 +934,10 @@ function relationRootScore(
 
   if (relation.relationType === "PARENT") {
     score -= 35
+  }
+
+  if (trustedSecondaryRelation && !rootTitlePrefix && !sharedRootTitle) {
+    score += 45
   }
 
   if (rootTitlePrefix) {
@@ -898,6 +1007,13 @@ function isTrustedTelevisionRootRelation(
   const hasTrustedTitleRoot =
     hasRootTitlePrefix(metadata, relation.media) ||
     hasSharedRootTitle(metadata, relation.media)
+
+  if (
+    secondaryRootRelationTypesWithoutSharedTitle.has(relation.relationType) &&
+    isSeriesRootMedia(relation.media)
+  ) {
+    return true
+  }
 
   if (relation.relationType === "PARENT") {
     return true

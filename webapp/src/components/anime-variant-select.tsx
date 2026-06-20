@@ -1,5 +1,6 @@
 "use client"
 
+import { Fragment } from "react"
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
 
 import { formatSeriesEntryLabel, getAnimeRealTitleSuffix } from "@/lib/anime-title"
@@ -15,8 +16,9 @@ function variantLabel(variant: AnimeVariant, libraryTitle: string) {
   switch (variant.format) {
     case "MOVIE":
       return `[Movie] ${title}`
-    case "SPECIAL":
     case "OVA":
+      return `[OVA] ${title}`
+    case "SPECIAL":
       return `[Special] ${title}`
     default:
       return `[Series] ${formatSeriesEntryLabel({
@@ -53,6 +55,11 @@ export function AnimeVariantSelect({
         value={selectedId}
         onChange={(event) => {
           const nextSelectedId = Number(event.target.value)
+
+          if (!Number.isFinite(nextSelectedId) || nextSelectedId <= 0) {
+            return
+          }
+
           const params = new URLSearchParams(searchParams)
           params.set("media", event.target.value)
           onSelect?.(nextSelectedId)
@@ -60,10 +67,16 @@ export function AnimeVariantSelect({
         }}
         className="h-9 w-full rounded-lg border border-white/10 bg-zinc-950/80 px-3 text-sm text-zinc-100 outline-none"
       >
-        {variants.map((variant) => (
-          <option key={variant.id} value={variant.id}>
-            {variantLabel(variant, libraryTitle)}
-          </option>
+        {variants.map((variant, index) => (
+          <Fragment key={variant.id}>
+            {variant.sortGroup === "related" &&
+            variants[index - 1]?.sortGroup !== "related" ? (
+              <option disabled value="__related-separator">
+                ─────────────
+              </option>
+            ) : null}
+            <option value={variant.id}>{variantLabel(variant, libraryTitle)}</option>
+          </Fragment>
         ))}
       </select>
     </label>
