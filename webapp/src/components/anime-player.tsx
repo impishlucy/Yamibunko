@@ -1091,14 +1091,6 @@ function getIosExternalCastPageUrl() {
   return url.toString()
 }
 
-function isCurrentPageHttpsOrigin() {
-  if (typeof window === "undefined") {
-    return false
-  }
-
-  return window.location.protocol === "https:"
-}
-
 function isCurrentPageHttpPrivateLanOrigin() {
   if (typeof window === "undefined") {
     return false
@@ -2467,8 +2459,7 @@ export function AnimePlayer({
   }, [animeId, episodeNumber, seasonNumber])
   const isIosDevice = isIosBrowser()
   const isInsideWebVideoCaster = isWebVideoCasterBrowser()
-  const canExposeWebVideoCasterSources =
-    isIosDevice && isInsideWebVideoCaster && isCurrentPageHttpsOrigin()
+  const canExposeWebVideoCasterSources = isInsideWebVideoCaster
   const liveTranscodeEnabled = playback.liveTranscodeEnabled !== false
   const showQualityControl = false
   const selectedAudioStream = useMemo(
@@ -6648,6 +6639,49 @@ export function AnimePlayer({
           ) : null}
         </video>
 
+        {webVideoCasterSources ? (
+          <div
+            className="pointer-events-none absolute left-0 top-0 size-px overflow-hidden opacity-0"
+            aria-hidden="true"
+            data-yamibunko-wvc-sources="direct-transcode"
+          >
+            <a
+              href={webVideoCasterSources.directUrl}
+              download={webVideoCasterSources.directFileName}
+              data-yamibunko-wvc-source="direct-link"
+              data-yamibunko-wvc-label="Direct Play"
+            >
+              {webVideoCasterSources.directFileName}
+            </a>
+            <video
+              preload="none"
+              muted
+              src={webVideoCasterSources.directUrl}
+              title={webVideoCasterSources.directFileName}
+              data-yamibunko-wvc-source="direct-video"
+            />
+            {webVideoCasterSources.transcodeUrl ? (
+              <>
+                <a
+                  href={webVideoCasterSources.transcodeUrl}
+                  download={webVideoCasterSources.transcodeFileName}
+                  data-yamibunko-wvc-source="transcode-link"
+                  data-yamibunko-wvc-label="Compatibility Transcode"
+                >
+                  {webVideoCasterSources.transcodeFileName}
+                </a>
+                <video
+                  preload="none"
+                  muted
+                  src={webVideoCasterSources.transcodeUrl}
+                  title={webVideoCasterSources.transcodeFileName}
+                  data-yamibunko-wvc-source="transcode-video"
+                />
+              </>
+            ) : null}
+          </div>
+        ) : null}
+
         {shouldBlockMobilePortraitPlayback ? (
           <div
             className="absolute inset-0 z-40 grid place-items-center overflow-hidden bg-zinc-950 text-white"
@@ -7573,7 +7607,7 @@ export function AnimePlayer({
               <video
                 controls
                 playsInline
-                preload="auto"
+                preload="none"
                 poster={thumbnailUrl}
                 src={webVideoCasterSources.directUrl}
                 title={webVideoCasterSources.directFileName}
@@ -7609,7 +7643,7 @@ export function AnimePlayer({
                 <video
                   controls
                   playsInline
-                  preload="auto"
+                  preload="none"
                   poster={thumbnailUrl}
                   src={webVideoCasterSources.transcodeUrl}
                   title={webVideoCasterSources.transcodeFileName}

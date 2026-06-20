@@ -24,7 +24,7 @@ const mediaNamespace = "urn:x-cast:com.google.cast.media"
 const serverCastSourceId = `sender-${crypto.randomBytes(4).toString("hex")}`
 const sessionMaxIdleMs = 30 * 60_000
 const statusTimeoutMs = 7_000
-const loadTimeoutMs = 45_000
+const loadTimeoutMs = 60_000
 const localHostnames = new Set(["localhost", "::1", "[::1]"])
 
 const discoveredDevices = new Map<string, ServerCastDevice>()
@@ -1048,9 +1048,7 @@ async function waitForLoadedCandidateStatus(input: {
   socket: CastSocket
   transportId: string
 }) {
-  let bufferingState: ServerCastMediaState | null = null
-
-  for (let attempt = 0; attempt < 12; attempt += 1) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
     await wait(attempt === 0 ? 350 : 750)
 
     const payload = await input.socket.request<MediaStatusPayload>(
@@ -1070,12 +1068,9 @@ async function waitForLoadedCandidateStatus(input: {
       return state
     }
 
-    if (state.playerState === "BUFFERING" && state.contentId === input.candidate.url) {
-      bufferingState = state
-    }
   }
 
-  return input.candidate.id === "transcode" ? bufferingState : null
+  return null
 }
 
 function createLoadPayload(candidate: ServerCastCandidate, autoplay: boolean) {

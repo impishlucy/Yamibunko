@@ -1257,6 +1257,7 @@ export type AnimeMetadataInput = {
     isAdult?: boolean | null
   }>
   streamingEpisodes?: AnimeStreamingEpisodeInput[]
+  synonyms?: string[]
   rawMedia?: unknown
   anilistSyncedAt?: string | null
 }

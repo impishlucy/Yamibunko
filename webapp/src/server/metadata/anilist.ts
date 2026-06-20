@@ -52,6 +52,7 @@ type AniListMediaNode = {
     url?: string | null
     site?: string | null
   } | null> | null
+  synonyms?: Array<string | null> | null
   relations?: {
     edges?: Array<{
       relationType?: string | null
@@ -94,6 +95,7 @@ const AnimeWithStreamingEpisodesDocument = `
     }
     status
     description
+    synonyms
     seasonYear
     episodes
     duration
@@ -257,6 +259,7 @@ function toMetadata(media: AniListMediaNode, fullPayload = false): AnimeMetadata
       Boolean(item)
     ),
     streamingEpisodes: toStreamingEpisodes(media.streamingEpisodes),
+    synonyms: (media.synonyms ?? []).filter((item): item is string => Boolean(item)),
     relations: (media.relations?.edges ?? [])
       .filter(
         (
@@ -405,25 +408,63 @@ function getPossessiveSearchVariants(title: string) {
   return variants
 }
 
-function getRebuildVersionSearchVariants(title: string) {
+function getDecimalVersionSearchVariants(title: string) {
   const normalized = normalizeSearchUnicode(title)
-  const variants = [
-    normalized.replace(/\b(\d)\.\d{1,2}\b/g, "$1.0"),
-    normalized.replace(/\b(\d)\.\d{1,2}\s*\+\s*(\d)\.\d{1,2}\b/g, "$1.0+$2.0"),
-  ]
+  const fallback = normalized.replace(/\b(\d+)\.\d{1,2}\b/g, "$1.0")
 
-  return variants.filter((variant) => variant !== normalized)
+  return fallback === normalized ? [] : [fallback]
 }
 
 function getSearchTitleVariants(title: string) {
   const unicodeTitle = normalizeSearchUnicode(title)
-
-  return uniqueCandidates([
+  const exactTitleVariants = [
     normalizeSearchPunctuation(unicodeTitle),
     unicodeTitle,
-    ...getRebuildVersionSearchVariants(unicodeTitle),
     ...getPossessiveSearchVariants(unicodeTitle),
-  ])
+  ]
+  const decimalFallbackVariants = getDecimalVersionSearchVariants(unicodeTitle)
+    .flatMap((variant) => [
+      normalizeSearchPunctuation(variant),
+      variant,
+      ...getPossessiveSearchVariants(variant),
+    ])
+
+  return uniqueCandidates([...exactTitleVariants, ...decimalFallbackVariants])
+}
+
+function pluralizeSimpleSearchNoun(value: string) {
+  const trimmed = value.trim()
+
+  if (!trimmed || /s$/i.test(trimmed)) {
+    return trimmed
+  }
+
+  if (/[^aeiou]y$/i.test(trimmed)) {
+    return `${trimmed.slice(0, -1)}ies`
+  }
+
+  return `${trimmed}s`
+}
+
+function getDirectionalSubjectVariants(subject: string) {
+  const cleanedSubject = subject.trim().replace(/\s+/g, " ")
+
+  if (!cleanedSubject) {
+    return []
+  }
+
+  const words = cleanedSubject.split(/\s+/).filter(Boolean)
+  const variants = [cleanedSubject]
+
+  if (words.length > 1) {
+    const pluralizedLastWord = pluralizeSimpleSearchNoun(words[words.length - 1] ?? "")
+
+    if (pluralizedLastWord) {
+      variants.push([...words.slice(0, -1), pluralizedLastWord].join(" "))
+    }
+  }
+
+  return uniqueCandidates(variants)
 }
 
 function getDirectionalMovieTitleVariants(title: string) {
@@ -436,15 +477,38 @@ function getDirectionalMovieTitleVariants(title: string) {
     const subject = adventureMatch[2]?.trim() ?? ""
 
     if (prefix && subject) {
-      variants.push(`${prefix} ${subject} Adventure`)
-      variants.push(`${prefix} ${subject}`)
+      for (const subjectVariant of getDirectionalSubjectVariants(subject)) {
+        variants.push(`${prefix} ${subjectVariant} Adventure`)
+        variants.push(`${prefix} ${subjectVariant} Adventures`)
+        variants.push(`${prefix} ${subjectVariant}`)
+      }
     }
   }
 
-  const strangeAnimalIslandMatch = /^(.+?)\s+in\s+the\s+strange\s+animal\s+island$/i.exec(normalizedTitle)
+  const islandLocationMatch = /^(.+?)\s+(?:in|on)\s+the\s+(.+?)\s+island$/i.exec(normalizedTitle)
 
-  if (strangeAnimalIslandMatch?.[1]) {
-    variants.push(`${strangeAnimalIslandMatch[1].trim()} on the Island of Strange Animals`)
+  if (islandLocationMatch) {
+    const prefix = islandLocationMatch[1]?.trim() ?? ""
+    const subject = islandLocationMatch[2]?.trim() ?? ""
+
+    if (prefix && subject) {
+      for (const subjectVariant of getDirectionalSubjectVariants(subject)) {
+        variants.push(`${prefix} on the Island of ${subjectVariant}`)
+        variants.push(`${prefix} on ${subjectVariant} Island`)
+        variants.push(`${prefix} in ${subjectVariant} Island`)
+      }
+    }
+  }
+
+  const locationMatch = /^(.+?)\s+(?:in|on|at)\s+the\s+(.+)$/i.exec(normalizedTitle)
+
+  if (locationMatch) {
+    const prefix = locationMatch[1]?.trim() ?? ""
+    const subject = locationMatch[2]?.trim() ?? ""
+
+    if (prefix && subject) {
+      variants.push(`${prefix} ${subject}`)
+    }
   }
 
   return uniqueCandidates(variants)
@@ -1141,6 +1205,7 @@ function mediaTitleValues(media: AniListMediaNode): PreferredTitleValues {
   const fallback = uniqueTitleValues([
     media.title?.userPreferred,
     media.title?.native,
+    ...(media.synonyms ?? []),
   ])
 
   return {
@@ -1157,6 +1222,7 @@ function metadataTitleValues(metadata: AnimeMetadataInput): PreferredTitleValues
   const fallback = uniqueTitleValues([
     metadata.title.userPreferred,
     metadata.title.native,
+    ...(metadata.synonyms ?? []),
   ])
 
   return {
@@ -1175,7 +1241,11 @@ function titlesHavePartMarker(titles: PreferredTitleValues, part?: number) {
   return titles.all.some((title) => hasPartMarker(title, part))
 }
 
-function scoreTitleGroup(titles: string[], normalizedSearch: string) {
+function scoreTitleGroup(
+  titles: string[],
+  normalizedSearch: string,
+  options?: { allowSearchSuperset?: boolean }
+) {
   const normalizedTitles = titles.map(normalizeComparableTitle).filter(Boolean)
 
   if (normalizedTitles.length === 0 || !normalizedSearch) {
@@ -1203,7 +1273,30 @@ function scoreTitleGroup(titles: string[], normalizedSearch: string) {
     0
   )
 
-  return bestOverlap >= 0.65 ? 2 : 3
+  if (bestOverlap >= 0.65) {
+    return 2
+  }
+
+  if (options?.allowSearchSuperset) {
+    const bestSupersetOverlap = Math.max(
+      ...normalizedTitles.map((title) => {
+        const tokens = titleTokens(title)
+
+        if (tokens.length < 3 || title.length < 12) {
+          return 0
+        }
+
+        return tokenOverlap(title, normalizedSearch)
+      }),
+      0
+    )
+
+    if (bestSupersetOverlap >= 0.85) {
+      return 2.2
+    }
+  }
+
+  return 3
 }
 
 function isAcceptableCandidateScore(score: number) {
@@ -1216,6 +1309,7 @@ function scoreTitlesCandidate(
   options?: {
     part?: number
     requirePartMarker?: boolean
+    metadataLookupOptions?: MetadataLookupOptions
   }
 ) {
   if (options?.requirePartMarker && options.part && options.part > 1) {
@@ -1225,23 +1319,34 @@ function scoreTitlesCandidate(
   }
 
   const normalizedSearch = normalizeComparableTitle(search)
-  const englishScore = scoreTitleGroup(titles.english, normalizedSearch)
+  const titleScoreOptions = {
+    allowSearchSuperset: isStandaloneMetadataLookup(options?.metadataLookupOptions),
+  }
+  const englishScore = scoreTitleGroup(
+    titles.english,
+    normalizedSearch,
+    titleScoreOptions
+  )
 
   if (isAcceptableCandidateScore(englishScore)) {
     return englishScore
   }
 
-  const romajiScore = scoreTitleGroup(titles.romaji, normalizedSearch)
+  const romajiScore = scoreTitleGroup(
+    titles.romaji,
+    normalizedSearch,
+    titleScoreOptions
+  )
 
   if (isAcceptableCandidateScore(romajiScore)) {
     return romajiScore + 0.1
   }
 
-  if (titles.english.length > 0 || titles.romaji.length > 0) {
-    return 3
-  }
-
-  const fallbackScore = scoreTitleGroup(titles.fallback, normalizedSearch)
+  const fallbackScore = scoreTitleGroup(
+    titles.fallback,
+    normalizedSearch,
+    titleScoreOptions
+  )
 
   return isAcceptableCandidateScore(fallbackScore) ? fallbackScore + 0.2 : 3
 }
@@ -1252,6 +1357,7 @@ function scoreMediaCandidate(
   options?: {
     part?: number
     requirePartMarker?: boolean
+    metadataLookupOptions?: MetadataLookupOptions
   }
 ) {
   return scoreTitlesCandidate(mediaTitleValues(media), search, options)
@@ -1263,9 +1369,73 @@ function scoreMetadataCandidate(
   options?: {
     part?: number
     requirePartMarker?: boolean
+    metadataLookupOptions?: MetadataLookupOptions
   }
 ) {
   return scoreTitlesCandidate(metadataTitleValues(metadata), search, options)
+}
+
+async function findFullMetadataSearchMatch(
+  rankedMedia: Array<{ item: AniListMediaNode; score: number }>,
+  search: string,
+  options?: {
+    part?: number
+    requirePartMarker?: boolean
+    metadataLookupOptions?: MetadataLookupOptions
+  }
+) {
+  const scoredMetadata: Array<{
+    metadata: AnimeMetadataInput
+    score: number
+    searchScore: number
+  }> = []
+
+  for (const result of rankedMedia.slice(0, 5)) {
+    const metadata =
+      (await fetchAnimeMetadataById(result.item.id).catch((error) => {
+        console.warn(
+          `[Warn] [Anilist] Full metadata fetch failed after unresolved search result - ${result.item.id} - ${errorMessage(error)}`
+        )
+        return null
+      })) ?? toMetadata(result.item, false)
+
+    if (!isLookupCompatibleMediaFormat(metadata.format, options?.metadataLookupOptions)) {
+      debugLog(
+        `[Debug] [Anilist] Ignored full metadata search candidate with incompatible format ${metadata.format ?? "unknown"} for ${search} - id ${metadata.id}`
+      )
+      continue
+    }
+
+    scoredMetadata.push({
+      metadata,
+      score: scoreMetadataCandidate(metadata, search, {
+        part: options?.part,
+        requirePartMarker: options?.requirePartMarker,
+        metadataLookupOptions: options?.metadataLookupOptions,
+      }),
+      searchScore: result.score,
+    })
+  }
+
+  return (
+    scoredMetadata
+      .filter((result) => isAcceptableCandidateScore(result.score))
+      .sort((left, right) => {
+        const scoreDelta = left.score - right.score
+
+        if (scoreDelta !== 0) {
+          return scoreDelta
+        }
+
+        const searchScoreDelta = left.searchScore - right.searchScore
+
+        if (searchScoreDelta !== 0) {
+          return searchScoreDelta
+        }
+
+        return left.metadata.id - right.metadata.id
+      })[0] ?? null
+  )
 }
 
 function needsFullCachedRefresh(metadata: AnimeMetadataInput, episode?: number) {
@@ -1396,6 +1566,7 @@ async function findAnimeMetadataUncached(
         score: scoreMediaCandidate(item, candidate, {
           part,
           requirePartMarker,
+          metadataLookupOptions: options,
         }),
       }))
       .sort((left, right) => left.score - right.score)
@@ -1434,6 +1605,24 @@ async function findAnimeMetadataUncached(
       return attachLibraryInfo(metadata)
     }
 
+    const fullMetadataMatch = await findFullMetadataSearchMatch(rankedMedia, candidate, {
+      part,
+      requirePartMarker,
+      metadataLookupOptions: options,
+    })
+
+    if (fullMetadataMatch) {
+      console.log(
+        `[Info] [Anilist] Found full metadata match ${
+          fullMetadataMatch.metadata.title.english ??
+          fullMetadataMatch.metadata.title.romaji ??
+          fullMetadataMatch.metadata.title.userPreferred ??
+          candidate
+        } - id ${fullMetadataMatch.metadata.id}`
+      )
+      return attachLibraryInfo(fullMetadataMatch.metadata)
+    }
+
     if (rankedMedia.length === 1) {
       const onlyMedia = rankedMedia[0].item
       const metadata =
@@ -1453,6 +1642,7 @@ async function findAnimeMetadataUncached(
       const fullScore = scoreMetadataCandidate(metadata, candidate, {
         part,
         requirePartMarker,
+        metadataLookupOptions: options,
       })
 
       if (isAcceptableCandidateScore(fullScore) || isStandaloneMetadataLookup(options)) {

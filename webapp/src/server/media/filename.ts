@@ -160,13 +160,18 @@ function stripIgnoredBracketSegments(value: string) {
 }
 
 function normalizeTitle(value: string) {
-  return stripLeadingIgnoredReleaseGroups(
-    stripIgnoredBracketSegments(normalizeUnicode(value))
+  const { protectedValue, decimals } = protectDecimalVersionSegments(
+    normalizeUnicode(value)
+  )
+  const normalized = stripLeadingIgnoredReleaseGroups(
+    stripIgnoredBracketSegments(protectedValue)
       .replace(hashPattern, " ")
       .replace(/[._]+/g, " ")
       .replace(/\s+/g, " ")
       .trim()
   )
+
+  return restoreDecimalVersionSegments(normalized, decimals)
 }
 
 function cleanTitleSegment(value: string) {
@@ -191,6 +196,41 @@ function cleanTitleSegment(value: string) {
 
     title = nextTitle
   }
+}
+
+function protectDecimalVersionSegments(value: string) {
+  const decimals: string[] = []
+  const protectedValue = value.replace(/\b\d+\.\d{1,2}\b/g, (match) => {
+    const token = `YAMIBUNKODECIMAL${decimals.length}TOKEN`
+    decimals.push(match)
+    return token
+  })
+
+  return { protectedValue, decimals }
+}
+
+function restoreDecimalVersionSegments(value: string, decimals: string[]) {
+  return decimals
+    .reduce(
+      (title, decimal, index) =>
+        title.replace(
+          new RegExp(`\\bYAMIBUNKODECIMAL${index}TOKEN\\b`, "g"),
+          decimal
+        ),
+      value
+    )
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function cleanTitleSegmentPreservingDecimalVersions(value: string) {
+  const { protectedValue, decimals } = protectDecimalVersionSegments(value)
+
+  if (decimals.length === 0) {
+    return cleanTitleSegment(value)
+  }
+
+  return restoreDecimalVersionSegments(cleanTitleSegment(protectedValue), decimals)
 }
 
 export function cleanAnimeTitleCandidate(
@@ -1060,8 +1100,13 @@ function isBareEpisodeMarkerTitle(value: string) {
   )
 }
 
-function createParsedMovieFileName(title: string): ParsedAnimeFileName | null {
-  const cleanedTitle = cleanTitleSegment(title)
+function createParsedMovieFileName(
+  title: string,
+  options?: { preserveDecimalVersions?: boolean }
+): ParsedAnimeFileName | null {
+  const cleanedTitle = options?.preserveDecimalVersions
+    ? cleanTitleSegmentPreservingDecimalVersions(title)
+    : cleanTitleSegment(title)
 
   if (!cleanedTitle || /^\d+$/.test(cleanedTitle)) {
     return null
@@ -1149,7 +1194,7 @@ function rawComparableMovieName(filePath: string) {
 
 function parseDecimalMovieFileName(filePath: string): ParsedAnimeFileName | null {
   const rawName = rawComparableMovieName(filePath)
-  const decimalMovie = /^(.+?)\s+(\d(?:\.\d{1,2})(?:\s*\+?\s*\d(?:\.\d{1,2}))?)(?:\s*[-–—]?\s*(.+))?$/i.exec(
+  const decimalMovie = /^(.+?)\s+(\d+(?:\.\d{1,2})(?:\s*\+?\s*\d+(?:\.\d{1,2}))*)(?:\s*[-–—]?\s*(.+))?$/i.exec(
     rawName
   )
 
@@ -1158,7 +1203,8 @@ function parseDecimalMovieFileName(filePath: string): ParsedAnimeFileName | null
   }
 
   return createParsedMovieFileName(
-    `${decimalMovie[1] ?? ""} ${decimalMovie[2] ?? ""} ${decimalMovie[3] ?? ""}`
+    `${decimalMovie[1] ?? ""} ${decimalMovie[2] ?? ""} ${decimalMovie[3] ?? ""}`,
+    { preserveDecimalVersions: true }
   )
 }
 
