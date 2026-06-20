@@ -31,6 +31,7 @@ Yamibunko is a all in one local anime library and file processor, with a desktop
 ### File Processing
 * If enabled it can convert input files for smaller, more consistent MP4 files, using AV1 with HEVC as fallback.
 * If disabled it only servers your existing files and does not edit them.
+* For non Anime Files put them in a NonAnime Subfolder in the Input Folder. (e.g. /Input/NonAnime/TADC/files..)
 
 ## Install
 
