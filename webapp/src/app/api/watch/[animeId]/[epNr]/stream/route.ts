@@ -21,7 +21,7 @@ import { isLocalStreamBandwidthBypassRequest } from "@/server/http/request"
 import {
   ffprobe,
   getLcAacStereoArgs,
-  getLiveMp4AvcOpusArgs,
+  getLiveMp4AvcAacArgs,
   getLiveTranscodeInputArgs,
 } from "@/server/media/ffmpeg"
 import { validateCastStreamToken } from "@/server/media/castTokens"
@@ -66,7 +66,7 @@ function streamCorsHeaders() {
     "access-control-allow-methods": "GET, HEAD, OPTIONS",
     "access-control-allow-headers": "Range, Content-Type",
     "access-control-expose-headers":
-      "Accept-Ranges, Content-Disposition, Content-Duration, Content-Length, Content-Range, Content-Type, X-Content-Duration, X-Yamibunko-Stream-Source",
+      "Accept-Ranges, Content-Disposition, Content-Duration, Content-Length, Content-Range, Content-Type, X-Content-Duration",
   }
 }
 
@@ -161,13 +161,12 @@ export async function HEAD(request: Request, context: StreamContext) {
     ...streamCorsHeaders(),
     "accept-ranges": mode === "direct" && !directAudioMode ? "bytes" : "none",
     "cache-control": streamCacheControl,
-    "content-disposition": getInlineContentDispositionForRequest(request, resolved.file, mode),
+    "content-disposition": getInlineContentDispositionForRequest(resolved.file, mode),
     "content-type": mode === "direct" ? directResponseContentType : "video/mp4",
     "x-content-type-options": "nosniff",
   })
 
   setDurationHeaders(headers, resolved.durationSeconds)
-  setStreamSourceHeaders(headers, request, mode)
 
   if (mode === "direct" && !directAudioMode) {
     headers.set("content-length", String(resolved.size))
@@ -182,6 +181,7 @@ export async function HEAD(request: Request, context: StreamContext) {
 function getMode(value: string | null): PlaybackMode {
   return value === "transcode" ? "transcode" : "direct"
 }
+
 
 function getProfile(): PlaybackProfile {
   return "original"
@@ -548,25 +548,10 @@ function getInlineContentDispositionForGeneratedFile(file: string, extension: st
   return getInlineContentDispositionForName(`${baseName}${extension}`)
 }
 
-function getInlineContentDispositionForRequest(
-  request: Request,
-  file: string,
-  mode: PlaybackMode
-) {
-  const url = new URL(request.url)
-  const wvcSource = getWebVideoCasterSource(url, mode)
-
-  if (!wvcSource) {
-    return getInlineContentDisposition(file)
-  }
-
-  const baseName = fileName(file).replace(/\.[^.]+$/, "")
-  const extension = wvcSource === "transcode" ? ".mp4" : path.extname(file)
-  const sourceLabel = wvcSource === "transcode"
-    ? "Yamibunko Compatibility Transcode"
-    : "Yamibunko Direct Play"
-
-  return getInlineContentDispositionForName(`${sourceLabel} - ${baseName}${extension}`)
+function getInlineContentDispositionForRequest(file: string, mode: PlaybackMode) {
+  return mode === "transcode"
+    ? getInlineContentDispositionForGeneratedFile(file, ".mp4")
+    : getInlineContentDisposition(file)
 }
 
 function getInlineContentDispositionForName(name: string) {
@@ -577,33 +562,6 @@ function getInlineContentDispositionForName(name: string) {
   return `inline; filename="${asciiName}"; filename*=UTF-8''${encodedName}`
 }
 
-function getWebVideoCasterSource(url: URL, mode: PlaybackMode) {
-  const source = url.searchParams.get("wvc")
-
-  if (source === "direct") {
-    return "direct" as const
-  }
-
-  if (source === "transcode") {
-    return "transcode" as const
-  }
-
-  return mode === "transcode" ? "transcode" : null
-}
-
-function setStreamSourceHeaders(
-  headers: Headers,
-  request: Request,
-  mode: PlaybackMode
-) {
-  const source = getWebVideoCasterSource(new URL(request.url), mode)
-
-  if (!source) {
-    return
-  }
-
-  headers.set("x-yamibunko-stream-source", source)
-}
 
 type StreamProgressTarget = {
   animeIdNumber: number
@@ -690,12 +648,11 @@ async function handleDirect(input: StreamProgressTarget & {
     ...streamCorsHeaders(),
     "accept-ranges": "bytes",
     "cache-control": streamCacheControl,
-    "content-disposition": getInlineContentDispositionForRequest(request, file, "direct"),
+    "content-disposition": getInlineContentDispositionForRequest(file, "direct"),
     "content-type": getDirectContentType(file),
     "x-content-type-options": "nosniff",
   })
   setDurationHeaders(headers, input.durationSeconds)
-  setStreamSourceHeaders(headers, request, "direct")
 
   function bindFileStream(fileStream: ReturnType<typeof createReadStream>) {
     const abort = () => {
@@ -1049,7 +1006,6 @@ async function handleDirectAudioRemux(input: StreamProgressTarget & {
     "x-content-type-options": "nosniff",
   })
   setDurationHeaders(headers, input.durationSeconds)
-  setStreamSourceHeaders(headers, input.request, "direct")
 
   return new Response(body, { headers })
 }
@@ -1154,11 +1110,11 @@ async function handleTranscode(
       "-fflags",
       "+genpts",
       "-ignore_unknown",
-      ...getLiveTranscodeInputArgs({ inputVideoCodec }),
+      ...getLiveTranscodeInputArgs(),
       ...(startSeconds > 0 ? ["-ss", startSeconds.toFixed(3)] : []),
       "-i",
       file,
-      ...getLiveMp4AvcOpusArgs(profile, {
+      ...getLiveMp4AvcAacArgs(profile, {
         audioStreamIndex,
         sourceBitrateKbps,
       }),
@@ -1386,11 +1342,10 @@ async function handleTranscode(
   const headers = new Headers({
     ...streamCorsHeaders(),
     "cache-control": streamCacheControl,
-    "content-disposition": getInlineContentDispositionForRequest(request, file, "transcode"),
+    "content-disposition": getInlineContentDispositionForRequest(file, "transcode"),
     "content-type": "video/mp4",
   })
   setDurationHeaders(headers, durationSeconds)
-  setStreamSourceHeaders(headers, request, "transcode")
 
   return new Response(body, { headers })
 }
@@ -1449,6 +1404,7 @@ export async function GET(request: Request, context: StreamContext) {
   if (!streamUser.ok) {
     return streamUser.response
   }
+
 
   const activeStreamConflict = bypassUploadBandwidth
     ? null
@@ -1512,6 +1468,7 @@ export async function GET(request: Request, context: StreamContext) {
 
   const sourceBitrateKbps = calculateSourceBitrateKbps(resolved)
   const selectedDirectAudioStreamIndex = audioSelection.requestedAudioStreamIndex
+
   const directAudioRemuxRequested =
     mode === "direct" &&
     (directAudioMode !== null ||

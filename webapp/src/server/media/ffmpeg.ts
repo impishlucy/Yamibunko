@@ -345,29 +345,21 @@ export function getFileHardwareInputArgs(input: {
   }
 }
 
-export function getLiveTranscodeInputArgs(input: {
-  inputVideoCodec?: string | null
-} = {}) {
+export function getLiveTranscodeInputArgs() {
   const config = getServerConfig()
 
   switch (config.transcodeAccel) {
+    case "amd_gpu":
+    case "amd_cpu":
+      if (getAmdBackend() === "vaapi") {
+        return ["-vaapi_device", getAmdVaapiDevice()]
+      }
+
+      return getHardwareInputArgs()
+
     case "nvenc":
     case "intel_gpu":
     case "intel_cpu":
-      return getHardwareInputArgsForCodec({
-        inputVideoCodec: input.inputVideoCodec,
-      })
-
-    case "amd_gpu":
-    case "amd_cpu":
-      switch (getAmdBackend()) {
-        case "amf":
-          return getHardwareInputArgs()
-
-        case "vaapi":
-          return getHardwareInputArgs({ keepFramesOnDevice: true })
-      }
-
     case "cpu":
       return getHardwareInputArgs()
   }
@@ -396,7 +388,14 @@ export function getHardwareInputLabel() {
   }
 }
 
-function getLiveAvcEncoderArgs(acceleration: TranscodeAcceleration) {
+function getLiveAvcEncoderArgs(
+  acceleration: TranscodeAcceleration,
+  options: { castCompatible?: boolean } = {}
+) {
+  if (options.castCompatible) {
+    return getLiveCastAvcEncoderArgs(acceleration)
+  }
+
   switch (acceleration) {
     case "nvenc":
       return [
@@ -443,6 +442,49 @@ function getLiveAvcEncoderArgs(acceleration: TranscodeAcceleration) {
 
     case "cpu":
       return ["-c:v", "libx264", "-preset", "superfast"]
+  }
+}
+
+
+function getLiveCastAvcEncoderArgs(acceleration: TranscodeAcceleration) {
+  switch (acceleration) {
+    case "nvenc":
+      return [
+        "-c:v",
+        "h264_nvenc",
+        "-preset",
+        "p2",
+        "-tune",
+        "hq",
+        "-rc-lookahead",
+        "0",
+        "-bf",
+        "0",
+      ]
+
+    case "intel_gpu":
+    case "intel_cpu":
+      return ["-c:v", "h264_qsv", "-preset", "faster", "-async_depth", "8", "-bf", "0"]
+
+    case "amd_gpu":
+    case "amd_cpu":
+      switch (getAmdBackend()) {
+        case "amf":
+          return [
+            "-c:v",
+            "h264_amf",
+            "-usage",
+            "lowlatency_high_quality",
+            "-quality",
+            "balanced",
+          ]
+
+        case "vaapi":
+          return ["-c:v", "h264_vaapi"]
+      }
+
+    case "cpu":
+      return ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency", "-bf", "0"]
   }
 }
 
@@ -526,18 +568,21 @@ function getAmdHevcEncoderArgs(input: {
   }
 }
 
-export function getLiveMp4AvcOpusArgs(
-  _profile: PlaybackProfile,
-  options: { audioStreamIndex?: number; sourceBitrateKbps?: number } = {}
-) {
+function getLiveAvcAacArgs(input: {
+  castCompatible?: boolean
+  includeMp4Tag: boolean
+  options?: { audioStreamIndex?: number; sourceBitrateKbps?: number }
+}) {
   const config = getServerConfig()
-  const encoderArgs = getLiveAvcEncoderArgs(config.transcodeAccel)
+  const encoderArgs = getLiveAvcEncoderArgs(config.transcodeAccel, {
+    castCompatible: input.castCompatible,
+  })
   const qualityArgs = getLiveOriginalQualityArgs(
     config.transcodeAccel,
-    options.sourceBitrateKbps
+    input.options?.sourceBitrateKbps
   )
-  const audioMap = Number.isInteger(options.audioStreamIndex)
-    ? `0:${options.audioStreamIndex}?`
+  const audioMap = Number.isInteger(input.options?.audioStreamIndex)
+    ? `0:${input.options?.audioStreamIndex}?`
     : "0:a:0?"
 
   return [
@@ -555,13 +600,42 @@ export function getLiveMp4AvcOpusArgs(
     "48",
     "-keyint_min",
     "48",
-    ...getLiveBrowserAvcArgs(config.transcodeAccel),
-    "-tag:v",
-    "avc1",
-    ...getOpusStereoArgs(),
-    "-strict",
-    "-2",
+    "-sc_threshold",
+    "0",
+    ...getLiveBrowserAvcArgs(config.transcodeAccel, {
+      castCompatible: input.castCompatible,
+    }),
+    ...(input.includeMp4Tag ? ["-tag:v", "avc1"] : []),
+    ...getLcAacStereoArgs(),
   ]
+}
+
+export function getLiveMp4AvcAacArgs(
+  _profile: PlaybackProfile,
+  options: { audioStreamIndex?: number; sourceBitrateKbps?: number } = {}
+) {
+  return getLiveAvcAacArgs({ includeMp4Tag: true, options })
+}
+
+export function getLiveCastMp4AvcAacArgs(
+  _profile: PlaybackProfile,
+  options: { audioStreamIndex?: number; sourceBitrateKbps?: number } = {}
+) {
+  return getLiveAvcAacArgs({ castCompatible: true, includeMp4Tag: true, options })
+}
+
+export function getLiveHlsAvcAacArgs(
+  _profile: PlaybackProfile,
+  options: { audioStreamIndex?: number; sourceBitrateKbps?: number } = {}
+) {
+  return getLiveAvcAacArgs({ includeMp4Tag: false, options })
+}
+
+export function getLiveCastHlsAvcAacArgs(
+  _profile: PlaybackProfile,
+  options: { audioStreamIndex?: number; sourceBitrateKbps?: number } = {}
+) {
+  return getLiveAvcAacArgs({ castCompatible: true, includeMp4Tag: false, options })
 }
 
 function getLiveOriginalVideoBitrateKbps(sourceBitrateKbps?: number) {
@@ -649,8 +723,13 @@ function getLivePixelFormatArgs(acceleration: TranscodeAcceleration) {
   }
 }
 
-function getLiveBrowserAvcArgs(acceleration: TranscodeAcceleration) {
-  const args = ["-profile:v", "high"]
+function getLiveBrowserAvcArgs(
+  acceleration: TranscodeAcceleration,
+  options: { castCompatible?: boolean } = {}
+) {
+  const args = options.castCompatible
+    ? ["-profile:v", "high", "-level:v", "4.1"]
+    : ["-profile:v", "high"]
 
   switch (acceleration) {
     case "nvenc":

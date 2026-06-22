@@ -128,6 +128,7 @@ type ChromeCastApi = {
     DEFAULT_MEDIA_RECEIVER_APP_ID?: string
     StreamType?: {
       BUFFERED: string
+      LIVE?: string
     }
     MediaInfo: new (
       contentId: string,
@@ -514,6 +515,7 @@ export function createGoogleCastLoadRequest(input: {
   autoplay: boolean
   currentTime: number
   durationSeconds?: number
+  streamType?: "BUFFERED" | "LIVE"
   textTrack?: {
     id: number
     language?: string
@@ -531,10 +533,13 @@ export function createGoogleCastLoadRequest(input: {
     input.url,
     input.contentType
   )
+  const streamType = input.streamType === "LIVE" ? "LIVE" : "BUFFERED"
   mediaInfo.streamType =
-    apis.chromeCast.media.StreamType?.BUFFERED ?? "BUFFERED"
+    streamType === "LIVE"
+      ? apis.chromeCast.media.StreamType?.LIVE ?? "LIVE"
+      : apis.chromeCast.media.StreamType?.BUFFERED ?? "BUFFERED"
 
-  if (input.durationSeconds && input.durationSeconds > 0 && Number.isFinite(input.durationSeconds)) {
+  if (streamType !== "LIVE" && input.durationSeconds && input.durationSeconds > 0 && Number.isFinite(input.durationSeconds)) {
     mediaInfo.duration = input.durationSeconds
   }
 
