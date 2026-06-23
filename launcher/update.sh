@@ -6,6 +6,7 @@ install_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 webapp_dir="$install_dir/webapp"
 latest_release_api="https://api.github.com/repos/impishlucy/Yamibunko/releases/latest"
 release_url="https://github.com/impishlucy/Yamibunko/releases/latest/download/yamibunko-linux.zip"
+src_reset_version="5.5.0"
 temp_dir=""
 
 finish() {
@@ -144,6 +145,18 @@ is_newer_version() {
   return 1
 }
 
+should_reset_webapp_source_for_update() {
+  is_newer_version "$src_reset_version" "$current_version" && ! is_newer_version "$src_reset_version" "$latest_version"
+}
+
+remove_webapp_source_directory() {
+  local source_path="$webapp_dir/src"
+
+  if [ -d "$source_path" ]; then
+    rm -rf "$source_path"
+  fi
+}
+
 download_to_file() {
   local url="$1"
   local output_path="$2"
@@ -215,6 +228,11 @@ if ! is_newer_version "$latest_version" "$current_version"; then
   exit 0
 fi
 
+reset_webapp_source=0
+if should_reset_webapp_source_for_update; then
+  reset_webapp_source=1
+fi
+
 temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/yamibunko-update.XXXXXX")" || fail "Could not create a temporary update folder."
 trap finish EXIT
 
@@ -238,6 +256,11 @@ if [ ! -d "$source_dir" ]; then
   else
     source_dir="$extract_dir"
   fi
+fi
+
+if [ "$reset_webapp_source" = "1" ]; then
+  printf "Clearing legacy webapp source folder for 5.5.0 migration...\n"
+  remove_webapp_source_directory || fail "Could not remove webapp/src. Close any remaining process and run the updater again."
 fi
 
 printf "Updating files...\n"

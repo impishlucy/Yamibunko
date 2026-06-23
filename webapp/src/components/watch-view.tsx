@@ -5,8 +5,10 @@ import { useRouter } from "next/navigation"
 
 import { AnimePlayer } from "@/components/anime-player"
 import { StreamLimitDialog } from "@/components/stream-limit-dialog"
+import { useTvMode } from "@/components/tv-mode-provider"
 import { Skeleton } from "@/components/ui/skeleton"
 import { apiGet } from "@/lib/api"
+import { cn } from "@/lib/utils"
 import { formatWatchSeriesTitle } from "@/lib/anime-title"
 import {
   formatEpisodeDisplayTitle,
@@ -100,21 +102,34 @@ function getPhoneLandscapePlayerStyle(
 function WatchSkeleton({
   aspectRatio = DEFAULT_PLAYER_ASPECT_RATIO,
   viewportSize,
+  isTvLike,
 }: {
   aspectRatio?: string
   viewportSize: ViewportSize | null
+  isTvLike: boolean
 }) {
   const playerStyle = getPhoneLandscapePlayerStyle(aspectRatio, viewportSize)
 
   return (
-    <div className="yami-watch-view flex flex-col gap-4 lg:gap-6">
+    <div
+      className={cn(
+        "yami-watch-view flex flex-col gap-4 lg:gap-6",
+        isTvLike ? "yami-tv-watch-view" : null
+      )}
+    >
       <section className="yami-watch-heading mx-auto flex max-w-5xl flex-wrap items-center justify-center gap-2 text-center lg:gap-3">
         <Skeleton className="h-8 w-64 max-w-full rounded-lg bg-zinc-900 sm:h-9 sm:w-80 lg:h-8 lg:w-[22rem]" />
         <Skeleton className="h-6 w-20 rounded-full bg-zinc-900 lg:h-6 lg:w-[5.5rem]" />
         <Skeleton className="h-6 w-24 rounded-full bg-zinc-900 lg:h-6 lg:w-[6.5rem]" />
       </section>
 
-      <div className="yami-watch-player-shell yami-player-width mx-auto" style={playerStyle}>
+      <div
+        className={cn(
+          "yami-watch-player-shell yami-player-width mx-auto",
+          isTvLike ? "yami-tv-watch-player-shell" : null
+        )}
+        style={playerStyle}
+      >
         <div className="space-y-3">
           <div className="relative overflow-hidden rounded-lg border border-white/10 bg-black shadow-[0_28px_90px_rgba(0,0,0,0.45)]">
             <Skeleton
@@ -158,6 +173,7 @@ export function WatchView({
   const [replacing, setReplacing] = useState(false)
   const [clientStreamId] = useState(createClientStreamId)
   const viewportSize = useViewportSize()
+  const { isTvLike } = useTvMode()
 
   useEffect(() => {
     let cancelled = false
@@ -260,6 +276,7 @@ export function WatchView({
               : undefined
           }
           viewportSize={viewportSize}
+          isTvLike={isTvLike}
         />
         <StreamLimitDialog
           open={Boolean(payload && streamBlocked)}
@@ -293,14 +310,25 @@ export function WatchView({
   })
 
   return (
-    <div className="yami-watch-view flex flex-col gap-4 lg:gap-6">
+    <div
+      className={cn(
+        "yami-watch-view flex flex-col gap-4 lg:gap-6",
+        isTvLike ? "yami-tv-watch-view" : null
+      )}
+    >
       <section className="yami-watch-heading mx-auto flex max-w-5xl flex-wrap items-center justify-center gap-2 text-center lg:gap-3">
         <h1 className="min-w-0 truncate text-xl font-semibold text-zinc-50">
           {watchSeriesTitle} - {watchEpisodeTitle}
         </h1>
       </section>
 
-      <div className="yami-watch-player-shell yami-player-width mx-auto" style={playerStyle}>
+      <div
+        className={cn(
+          "yami-watch-player-shell yami-player-width mx-auto",
+          isTvLike ? "yami-tv-watch-player-shell" : null
+        )}
+        style={playerStyle}
+      >
         <AnimePlayer
           animeId={animeId}
           seasonNumber={payload.episode.seasonNumber}

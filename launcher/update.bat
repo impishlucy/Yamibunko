@@ -19,6 +19,8 @@ $installRoot = [System.IO.Path]::GetFullPath($env:INSTALL_ROOT).TrimEnd("\")
 $webappRoot = [System.IO.Path]::Combine($installRoot, "webapp")
 $latestReleaseApi = "https://api.github.com/repos/impishlucy/Yamibunko/releases/latest"
 $releaseUrl = "https://github.com/impishlucy/Yamibunko/releases/latest/download/yamibunko-win.zip"
+$sourceResetVersion = "5.5.0"
+$shouldRemoveWebappSource = $false
 $requestHeaders = @{ "User-Agent" = "Yamibunko-Updater"; "Accept" = "application/vnd.github+json" }
 
 function TextValue($value) {
@@ -221,6 +223,14 @@ function Remove-WebappBuildCache($webappPath) {
     }
 }
 
+function Remove-WebappSourceDirectory($webappPath) {
+    $sourcePath = [System.IO.Path]::Combine($webappPath, "src")
+
+    if (Test-Path -LiteralPath $sourcePath) {
+        Remove-Item -LiteralPath $sourcePath -Recurse -Force
+    }
+}
+
 $runningProcess = Get-RunningYamibunkoProcess
 if ($null -ne $runningProcess) {
     Write-Host ("Yamibunko is still running (" + (TextValue $runningProcess.Name) + ", PID " + $runningProcess.ProcessId + "). Close the launcher/server before updating.")
@@ -245,6 +255,10 @@ try {
         Write-Host "Yamibunko is already up to date."
         exit 0
     }
+
+    $shouldRemoveWebappSource = `
+        (Compare-VersionText $currentVersion $sourceResetVersion) -lt 0 -and `
+        (Compare-VersionText $latestVersion $sourceResetVersion) -ge 0
 } catch {
     Write-Host ("Update failed: " + $_.Exception.Message)
     exit 1
@@ -274,6 +288,11 @@ try {
         } else {
             $sourceRoot = $extractRoot
         }
+    }
+
+    if ($shouldRemoveWebappSource) {
+        Write-Host "Clearing legacy webapp source folder for 5.5.0 migration..."
+        Remove-WebappSourceDirectory $webappRoot
     }
 
     Write-Host "Updating files..."

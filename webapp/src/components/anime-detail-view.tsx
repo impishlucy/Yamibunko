@@ -11,6 +11,7 @@ import { EpisodeCard } from "@/components/episode-card"
 import { MobileDescription } from "@/components/mobile-description"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { useTvMode } from "@/components/tv-mode-provider"
 import { Input } from "@/components/ui/input"
 import { animeVariantSecondTitle, formatSeriesEntryLabel } from "@/lib/anime-title"
 import { apiGet } from "@/lib/api"
@@ -172,6 +173,7 @@ export function AnimeDetailView({
   isAdmin?: boolean
 }) {
   const router = useRouter()
+  const { isTvLike } = useTvMode()
   const [data, setData] = useState(initialData)
   const [editOpen, setEditOpen] = useState(false)
   const [editTitle, setEditTitle] = useState("")
@@ -454,7 +456,7 @@ export function AnimeDetailView({
                   className="h-full w-full object-cover"
                 />
               ) : null}
-              {isAdmin && anime.isLocalNonAnime ? (
+              {isAdmin && anime.isLocalNonAnime && !isTvLike ? (
                 <button
                   type="button"
                   onClick={openCoverUpload}
@@ -466,7 +468,7 @@ export function AnimeDetailView({
                 </button>
               ) : null}
             </div>
-            {isAdmin ? (
+            {isAdmin && !isTvLike ? (
               <Button
                 type="button"
                 variant="outline"
@@ -578,7 +580,7 @@ export function AnimeDetailView({
         ))}
       </section>
 
-      {editOpen ? (
+      {editOpen && !isTvLike ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-sm">
           <div className="w-full max-w-lg rounded-xl border border-white/10 bg-zinc-950 p-5 shadow-2xl">
             <div className="mb-4 flex items-start justify-between gap-3">

@@ -1,0 +1,30 @@
+<resources>
+    <string name="app_name">Yamibunko</string>
+    <string name="menu_title">Menü</string>
+    <string name="url_hint">URL eingeben</string>
+    <string name="save_url_button">URL speichern &amp; laden</string>
+    <string name="language_button">Sprache ändern</string>
+    <string name="info_button">Info</string>
+    <string name="ssl_checkbox_label">SSL-Fehler ignorieren</string>
+    <string name="close_menu_button">Menü schließen</string>
+    <string name="info_dialog_title">Über Yamibunko</string>
+    <string name="info_dialog_message">Yamibunko TV öffnet deinen Yamibunko-Medienserver auf Android-TV- und Google-TV-Geräten.</string>
+    <string name="select_language_title">Sprache auswählen</string>
+    <string name="dialog_ok">OK</string>
+    <string name="welcome_title">Willkommen!</string>
+    <string name="welcome_message">Yamibunko ist für deine TV-Fernbedienung bereit.</string>
+    <string name="server_setup_title">Mit Yamibunko verbinden</string>
+    <string name="server_setup_description">Wähle das Protokoll und gib die Adresse deines Yamibunko-Servers ein. HTTP wird nur für LAN-IP-Adressen akzeptiert. HTTPS wird für Domains akzeptiert.</string>
+    <string name="server_url_example">Beispiele: 192.168.1.50:3000 oder yamibunko.example.com</string>
+    <string name="server_url_hint">Host, IP oder Domain</string>
+    <string name="server_url_save_button">Speichern und Yamibunko öffnen</string>
+    <string name="server_url_error_required">Gib deine Yamibunko Basis-URL ein.</string>
+    <string name="server_url_error_scheme">Wähle http:// für eine LAN-IP oder https:// für eine Domain.</string>
+    <string name="server_url_error_localhost">Localhost funktioniert auf dem TV nicht. Nutze die LAN-IP des Server-Geräts.</string>
+    <string name="server_url_error_http_lan">HTTP ist nur für LAN-IPs erlaubt, zum Beispiel 192.168.1.50:3000.</string>
+    <string name="server_url_error_invalid">Gib eine gültige Yamibunko Basis-URL ein.</string>
+    <string-array name="server_url_schemes">
+        <item>https://</item>
+        <item>http://</item>
+    </string-array>
+</resources>

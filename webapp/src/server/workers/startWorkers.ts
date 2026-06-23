@@ -1227,13 +1227,12 @@ export function startWorkers() {
       }
     }
 
-    const repair = repairLibraryIntegrity(`${scanReason} library database cleanup`)
+    const repair = repairLibraryIntegrity(`${scanReason} library database cleanup`, {
+      logChanges: options.visible === true,
+    })
 
     if (
       queuedDeletedFiles > 0 ||
-      repair.repairedAssignments > 0 ||
-      repair.repairedRootRows > 0 ||
-      repair.removedStaleEntries > 0 ||
       options.visible
     ) {
       console.log(

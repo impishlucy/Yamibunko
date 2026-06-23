@@ -1,6 +1,10 @@
 import type { Metadata, Viewport } from "next"
 
+import { headers } from "next/headers"
+
 import { ThemeProvider } from "@/components/theme-provider"
+import { TvModeProvider } from "@/components/tv-mode-provider"
+import { detectDevice } from "@/lib/device"
 
 import "./globals.css"
 
@@ -25,17 +29,31 @@ export const viewport: Viewport = {
   themeColor: "#09090b",
 }
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode
 }>) {
+  const requestHeaders = await headers()
+  const initialDevice = detectDevice({
+    userAgent: requestHeaders.get("user-agent"),
+    override: requestHeaders.get("x-yamibunko-device"),
+  })
+
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html
+      lang="en"
+      data-yami-console={initialDevice.isGameConsole ? "true" : "false"}
+      data-yami-device={initialDevice.kind}
+      data-yami-tv={initialDevice.isTvLike ? "true" : "false"}
+      suppressHydrationWarning
+    >
       <body className="antialiased">
-        <ThemeProvider defaultTheme="dark" enableSystem={false}>
-          {children}
-        </ThemeProvider>
+        <TvModeProvider initialDevice={initialDevice}>
+          <ThemeProvider defaultTheme="dark" enableSystem={false}>
+            {children}
+          </ThemeProvider>
+        </TvModeProvider>
       </body>
     </html>
   )

@@ -6,7 +6,7 @@
   
 # Yamibunko
 
-Yamibunko is a all in one local anime library and file processor, with a desktop launcher and a web UI. <br/> It can optimize your files, organizes them and can play them back through the WebUI.
+Yamibunko is local anime library and file processor, with a launcher and a web UI. <br/> It can optimize your files, organizes them and can play them back through the WebUI.
 
 <img width="48%" alt="library" src="https://github.com/user-attachments/assets/fe05f186-7b1e-42e2-b154-da7c737952bb" />
 <img width="48%" alt="overview" src="https://github.com/user-attachments/assets/97a719da-e392-4089-82be-fc1d983a979b" />
@@ -18,20 +18,21 @@ Yamibunko is a all in one local anime library and file processor, with a desktop
 
 ### General
 
-* Custom player designed for animes, with custom subtitles, skip intro/outro button and Google casting.
+* Custom player, with custom subtitles, skip buttons and casting.</br>(Casting is not available via iOS.)
 * Responsive layouts for all pages, on desktop, tablets, and phones.
 * Direct-File play and transcoding for older devices are possible.
-* Per-series library grouping, no more specific searching, its grouped together per series.
-* AniList integration for metadata, tracking, watching progress and watching status.
-* Desktop launcher that prepares the runtime, starts the webapp, and keeps setup easier to use.
-* Bandwidth-aware streaming, uses a server limit and helps avoid overloading the host connection.
-* One active stream per user, with confirmation when switching playback to another episode or device.
-* VIP priority streaming so selected users can get better access when the server is under load.
+* Per-series grouping, no more specific searching, its grouped together per series.
+* AniList for metadata, tracking, watching progress and watching status.
+* Desktop launcher that prepares, starts, and keeps it easier to use.
+* Bandwidth-aware streaming, uses a limit to avoid overloading the connection.
+* One stream per user, with confirmation when switching to another device.
+* VIP priority streaming so selected users can get better access.
+* Now comes with a Android TV App, to avoid the need for casting.
 
 ### File Processing
-* If enabled it can convert input files for smaller, more consistent MP4 files, using AV1 with HEVC as fallback.
+* If enabled it can convert input files for smaller files, using AV1.
 * If disabled it only servers your existing files and does not edit them.
-* For non Anime Files put them in a NonAnime Subfolder in the Input Folder. (e.g. /Input/NonAnime/TADC/files..)
+* Support for non Anime, just put them in /NotAnime in the Input Folder.</br>(e.g. /Input/NotAnime/Series/files..)
 
 ## Install
 
@@ -53,8 +54,8 @@ The only required things are an 64bit OS and .NET 10.
    * AniList API client ID and secret if you want AniList tracking.
 6. Save the setup and wait for the launcher to start the web UI.
 
-The launcher prepares the local runtime, downloads whats needed and starts the webapp.<br/>
-You can close the Logs if you want, the app runs in the backround and has right clickable tray icon.
+The launcher prepares the runtime, downloads whats needed and starts the webapp.<br/>
+The app runs in the backround and has right clickable tray icon.
 
 ### Update (with Launcher)
 1. Stop any Yamibunko instance running and wait for shutdown.
@@ -116,11 +117,12 @@ Minimal argument notes:
 * `BASE_URL`: the URL users open in their browser, also used for the AniList callback.
 * `ANIME_INPUT_DIR`: folder watched for new files.
 * `ANIME_MEDIA_DIR`: output library folder, required when `IMPORT_ENABLED=true`.
-* `IMPORT_ENABLED`: `true` processes/moves files, `false` only catalogs existing input files.
-* `IMPORT_ENCODING`: `av1` or `hevc` based on hardware support, `none` when using unsupported hardware.
+* `IMPORT_ENABLED`: `true` processes/moves files, `false` does not.
+* `IMPORT_ENCODING`: `av1` or `hevc`, `none` when using unsupported hardware.
 * `FFMPEG_DIR`: folder containing `ffmpeg` and `ffprobe`.
-* `TRANSCODE_ACCEL`: `nvenc`, `intel_gpu`, `intel_cpu`, `amd_gpu`, `amd_cpu`, or `cpu`. Use `cpu` only when `IMPORT_ENABLED=false` and your hardware does not support `av1` or `hevc`.
-* `ANILIST_CLIENT_ID` and `ANILIST_CLIENT_SECRET`: optional, only needed for AniList tracking.
+* `TRANSCODE_ACCEL`: `nvenc`, `intel_gpu`, `intel_cpu`, `amd_gpu`, `amd_cpu`,`cpu`.</br>
+Use `cpu` only when `IMPORT_ENABLED=false` and your hardware does not support `av1` or `hevc`.
+* `ANILIST_CLIENT_ID` and `ANILIST_CLIENT_SECRET`: Needed for AniList tracking.
 
 ### Manual Webapp Update
 
@@ -133,12 +135,16 @@ Minimal argument notes:
 
 ## Disclaimer
 
-Yamibunko is intended for organizing, processing, and playing local files that you own or are allowed to use.
-
+Yamibunko is intended for organizing, processing, and playing local files.</br>
 <ins>Yamibunko does not include, download, or provide access to copyrighted media.</ins>
 
 ## License
 
-This project is licensed under the [Creative Commons Attribution-NonCommercial 4.0 International License](https://creativecommons.org/licenses/by-nc/4.0/deed.en).
+This project is licensed under the [CCA-NC 4.0 License](https://creativecommons.org/licenses/by-nc/4.0/deed.en).</br>
+You may share and adapt this project with attribution for non-commercial purposes.</br>
+Commercial use is <ins>not</ins> permitted in any way or form.
 
-You may share and adapt this project with attribution for non-commercial purposes. Commercial use is not permitted.
+## External Resources
+
+This project uses ffmpeg under the hood, specifically [this](https://github.com/btbn/ffmpeg-builds/) version.</br>
+The Android TV app was made using [this project](https://github.com/DedBash/AndroidTV-WebAPP) as a base. 

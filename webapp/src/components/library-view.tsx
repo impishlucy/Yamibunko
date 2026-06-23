@@ -1,9 +1,10 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Search } from "lucide-react"
 
 import { AnimeCard } from "@/components/anime-card"
+import { useTvMode } from "@/components/tv-mode-provider"
 import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -46,7 +47,10 @@ function parseLibraryChangeEvent(event: Event) {
 }
 
 export function LibraryView() {
+  const { isTvLike } = useTvMode()
+  const searchInputRef = useRef<HTMLInputElement | null>(null)
   const [query, setQuery] = useState("")
+  const [tvSearchEditing, setTvSearchEditing] = useState(false)
   const [items, setItems] = useState<AnimeSummary[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -120,6 +124,22 @@ export function LibraryView() {
     }
   }, [loadLibrary])
 
+
+  const activateTvSearch = useCallback(() => {
+    if (!isTvLike) {
+      return
+    }
+
+    setTvSearchEditing(true)
+    window.setTimeout(() => searchInputRef.current?.focus(), 0)
+  }, [isTvLike])
+
+  const deactivateTvSearch = useCallback(() => {
+    if (isTvLike) {
+      setTvSearchEditing(false)
+    }
+  }, [isTvLike])
+
   const filteredItems = useMemo(() => {
     const normalized = query.trim().toLowerCase()
 
@@ -142,8 +162,35 @@ export function LibraryView() {
         <label className="relative w-full sm:max-w-xs">
           <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-zinc-500" />
           <Input
+            ref={searchInputRef}
             value={query}
             onChange={(event) => setQuery(event.target.value)}
+            onClick={() => {
+              if (isTvLike && !tvSearchEditing) {
+                activateTvSearch()
+              }
+            }}
+            onKeyDown={(event) => {
+              if (!isTvLike) {
+                return
+              }
+
+              if (!tvSearchEditing && (event.key === "Enter" || event.key === " ")) {
+                event.preventDefault()
+                activateTvSearch()
+                return
+              }
+
+              if (tvSearchEditing && event.key === "Escape") {
+                event.preventDefault()
+                deactivateTvSearch()
+                searchInputRef.current?.blur()
+              }
+            }}
+            onBlur={deactivateTvSearch}
+            readOnly={isTvLike && !tvSearchEditing}
+            inputMode={isTvLike && !tvSearchEditing ? "none" : "search"}
+            enterKeyHint="search"
             placeholder="Search title or year"
             className="h-9 rounded-lg border-white/10 bg-zinc-950/70 pl-8 text-zinc-100"
           />

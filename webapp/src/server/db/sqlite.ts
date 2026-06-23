@@ -18,7 +18,7 @@ type YamibunkoDatabase = DatabaseSync & {
 
 let database: YamibunkoDatabase | undefined
 
-const currentSchemaVersion = 14
+const currentSchemaVersion = 15
 
 function getDatabasePath() {
   return path.join(
@@ -99,6 +99,16 @@ function initializeSchema(db: YamibunkoDatabase) {
       updated_at TEXT NOT NULL,
       expires_at TEXT NOT NULL,
       FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS tv_auth_codes (
+      code_hash TEXT PRIMARY KEY,
+      approved_username TEXT COLLATE NOCASE,
+      device_user_agent TEXT,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      approved_at TEXT,
+      FOREIGN KEY (approved_username) REFERENCES users(username) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS anime (
@@ -281,6 +291,8 @@ function initializeSchema(db: YamibunkoDatabase) {
       ON anilist_media_list_entries(username, anilist_user_id);
     CREATE INDEX IF NOT EXISTS sessions_username_idx ON sessions(username);
     CREATE INDEX IF NOT EXISTS sessions_expires_at_idx ON sessions(expires_at);
+    CREATE INDEX IF NOT EXISTS tv_auth_codes_expires_at_idx
+      ON tv_auth_codes(expires_at);
   `)
 }
 
@@ -732,6 +744,23 @@ function runSchemaMigrations(db: YamibunkoDatabase) {
       "completed",
       "completed INTEGER NOT NULL DEFAULT 0"
     )
+  }
+
+  if (version < 15) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS tv_auth_codes (
+        code_hash TEXT PRIMARY KEY,
+        approved_username TEXT COLLATE NOCASE,
+        device_user_agent TEXT,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        approved_at TEXT,
+        FOREIGN KEY (approved_username) REFERENCES users(username) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS tv_auth_codes_expires_at_idx
+        ON tv_auth_codes(expires_at);
+    `)
   }
 
   setUserVersion(db, currentSchemaVersion)

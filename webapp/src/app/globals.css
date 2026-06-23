@@ -296,3 +296,77 @@
   opacity: 0.45;
 }
 
+
+html[data-yami-tv="true"] .yami-tv-main {
+  padding: clamp(1rem, 3vw, 3rem);
+}
+
+html[data-yami-tv="true"] .yami-auth-card-container {
+  max-width: min(32rem, calc(100vw - 4rem));
+}
+
+html[data-yami-tv="true"] .yami-tv-watch-view {
+  min-height: calc(100dvh - clamp(2rem, 6vw, 6rem));
+  justify-content: center;
+}
+
+html[data-yami-tv="true"] .yami-tv-watch-player-shell.yami-player-width {
+  width: 80vw;
+  max-width: 80vw;
+}
+
+html[data-yami-tv="true"] .yami-watch-heading {
+  max-width: 80vw;
+}
+
+html[data-yami-tv="true"] .yami-anime-player {
+  width: 100%;
+}
+
+.yami-player-pseudo-fullscreen {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 9999 !important;
+  width: 100vw !important;
+  height: 100dvh !important;
+  max-width: none !important;
+  border-width: 0 !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+}
+
+.yami-player-pseudo-fullscreen .yamibunko-player-video {
+  height: 100%;
+}
+
+html[data-yami-tv="true"] :is(a, button, select, input, textarea, [tabindex]:not([tabindex="-1"])):focus,
+html[data-yami-tv="true"] :is(a, button, select, input, textarea, [tabindex]:not([tabindex="-1"])):focus-visible {
+  outline: 3px solid rgb(196 181 253 / 0.95);
+  outline-offset: 4px;
+  box-shadow: 0 0 0 7px rgb(124 58 237 / 0.38), 0 0 24px rgb(167 139 250 / 0.45);
+}
+
+html[data-yami-tv="true"] :is(a, button, select, input, textarea, [tabindex]:not([tabindex="-1"])):focus:not(:focus-visible) {
+  outline: 3px solid rgb(196 181 253 / 0.95);
+}
+
+
+html[data-yami-tv="true"] [data-yami-player-control="settings"]:focus,
+html[data-yami-tv="true"] [data-yami-player-control="settings"]:focus-visible {
+  border-color: rgb(196 181 253 / 0.9) !important;
+  background: rgb(124 58 237 / 0.95) !important;
+  color: white !important;
+  outline: 3px solid rgb(196 181 253 / 0.95) !important;
+  outline-offset: 3px;
+  box-shadow: 0 0 0 7px rgb(124 58 237 / 0.42), 0 0 24px rgb(167 139 250 / 0.5) !important;
+}
+
+html[data-yami-tv="true"] [data-slot="card"]:has(:is(a, button, select, input, textarea):focus),
+html[data-yami-tv="true"] .yami-anime-player-frame:focus-within {
+  border-color: rgb(196 181 253 / 0.75);
+  box-shadow: 0 0 0 3px rgb(124 58 237 / 0.35), 0 20px 60px rgb(124 58 237 / 0.24);
+}
+
+html[data-yami-tv="true"] [data-slot="card"]:has(:is(a, button, select, input, textarea):focus) {
+  transform: translateY(-2px) scale(1.015);
+}

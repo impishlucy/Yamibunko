@@ -18,6 +18,7 @@ type HoverHintProps = {
   side?: "top" | "bottom"
   align?: "start" | "center" | "end"
   clickVisibleMs?: number | null
+  playerControl?: boolean
 }
 
 type HintPosition = {
@@ -82,6 +83,7 @@ export function HoverHint({
   side = "top",
   align = "center",
   clickVisibleMs = CLICK_VISIBLE_MS,
+  playerControl = false,
 }: HoverHintProps) {
   const id = useId()
   const rootRef = useRef<HTMLSpanElement | null>(null)
@@ -210,6 +212,7 @@ export function HoverHint({
   return (
     <span
       ref={rootRef}
+      data-yami-player-control={playerControl ? "true" : undefined}
       className={cn("relative inline-flex", className)}
       onMouseEnter={openHint}
       onMouseLeave={() => {

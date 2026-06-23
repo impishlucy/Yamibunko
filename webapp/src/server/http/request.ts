@@ -117,8 +117,22 @@ export function isHttpLocalNetworkOrigin(origin: string) {
   }
 }
 
+export function isLocalNetworkOrigin(origin: string) {
+  try {
+    const url = new URL(origin)
+
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return false
+    }
+
+    return isDeviceLocalHost(url.hostname) || isPrivateLanIpv4Host(url.hostname)
+  } catch {
+    return false
+  }
+}
+
 export async function isLocalStreamBandwidthBypassRequest(request: Request) {
-  return isHttpLocalNetworkOrigin(await getHeaderDerivedOrigin(request))
+  return isLocalNetworkOrigin(await getHeaderDerivedOrigin(request))
 }
 
 function isCastReachableOrigin(origin: string) {

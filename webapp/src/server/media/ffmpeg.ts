@@ -345,7 +345,7 @@ export function getFileHardwareInputArgs(input: {
   }
 }
 
-export function getLiveTranscodeInputArgs() {
+export function getLiveTranscodeInputArgs(inputVideoCodec?: string | null) {
   const config = getServerConfig()
 
   switch (config.transcodeAccel) {
@@ -360,6 +360,8 @@ export function getLiveTranscodeInputArgs() {
     case "nvenc":
     case "intel_gpu":
     case "intel_cpu":
+      return getHardwareInputArgsForCodec({ inputVideoCodec })
+
     case "cpu":
       return getHardwareInputArgs()
   }
@@ -405,23 +407,15 @@ function getLiveAvcEncoderArgs(
         "p2",
         "-tune",
         "hq",
-        "-spatial-aq",
-        "1",
-        "-temporal-aq",
-        "1",
-        "-aq-strength",
-        "6",
         "-rc-lookahead",
-        "16",
+        "0",
         "-bf",
-        "3",
-        "-b_ref_mode",
-        "middle",
+        "0",
       ]
 
     case "intel_gpu":
     case "intel_cpu":
-      return ["-c:v", "h264_qsv", "-preset", "faster", "-async_depth", "8"]
+      return ["-c:v", "h264_qsv", "-preset", "faster", "-async_depth", "8", "-bf", "0"]
 
     case "amd_gpu":
     case "amd_cpu":
@@ -441,7 +435,7 @@ function getLiveAvcEncoderArgs(
       }
 
     case "cpu":
-      return ["-c:v", "libx264", "-preset", "superfast"]
+      return ["-c:v", "libx264", "-preset", "superfast", "-bf", "0"]
   }
 }
 
@@ -568,22 +562,150 @@ function getAmdHevcEncoderArgs(input: {
   }
 }
 
+type LiveTranscodeVideoShape = {
+  width?: number
+  height?: number
+  frameRate?: number
+}
+
+function getH264LevelForLiveTranscode(input: LiveTranscodeVideoShape = {}) {
+  const width = Math.ceil(input.width ?? 0)
+  const height = Math.ceil(input.height ?? 0)
+  const inputFrameRate = input.frameRate
+  const frameRate =
+    typeof inputFrameRate === "number" &&
+    Number.isFinite(inputFrameRate) &&
+    inputFrameRate > 0
+      ? inputFrameRate
+      : 30
+
+  if (width <= 0 || height <= 0) {
+    return "4.1"
+  }
+
+  const frameMacroblocks = Math.ceil(width / 16) * Math.ceil(height / 16)
+  const macroblocksPerSecond = frameMacroblocks * frameRate
+
+  if (frameMacroblocks <= 8192 && macroblocksPerSecond <= 245760) {
+    return "4.1"
+  }
+
+  if (frameMacroblocks <= 8704 && macroblocksPerSecond <= 522240) {
+    return "4.2"
+  }
+
+  if (frameMacroblocks <= 22080 && macroblocksPerSecond <= 589824) {
+    return "5.0"
+  }
+
+  if (frameMacroblocks <= 36864 && macroblocksPerSecond <= 983040) {
+    return "5.1"
+  }
+
+  return "5.2"
+}
+
+function evenDimension(value: number) {
+  const rounded = Math.max(Math.floor(value), 2)
+
+  return rounded % 2 === 0 ? rounded : rounded - 1
+}
+
+function getLiveOutputShape(input: {
+  sourceWidth?: number
+  sourceHeight?: number
+  maxWidth?: number
+  maxHeight?: number
+}) {
+  const sourceWidth = Math.trunc(input.sourceWidth ?? 0)
+  const sourceHeight = Math.trunc(input.sourceHeight ?? 0)
+  const maxWidth = Math.trunc(input.maxWidth ?? 0)
+  const maxHeight = Math.trunc(input.maxHeight ?? 0)
+
+  if (sourceWidth <= 0 || sourceHeight <= 0 || maxWidth <= 0 || maxHeight <= 0) {
+    return { width: sourceWidth || undefined, height: sourceHeight || undefined }
+  }
+
+  if (sourceWidth <= maxWidth && sourceHeight <= maxHeight) {
+    return { width: sourceWidth, height: sourceHeight }
+  }
+
+  const scale = Math.min(maxWidth / sourceWidth, maxHeight / sourceHeight)
+
+  return {
+    width: evenDimension(sourceWidth * scale),
+    height: evenDimension(sourceHeight * scale),
+  }
+}
+
+function getLiveVideoFilterArgs(
+  acceleration: TranscodeAcceleration,
+  outputShape: { width?: number; height?: number },
+  sourceShape: { width?: number; height?: number }
+) {
+  const shouldScale =
+    typeof outputShape.width === "number" &&
+    typeof outputShape.height === "number" &&
+    outputShape.width > 0 &&
+    outputShape.height > 0 &&
+    (outputShape.width !== sourceShape.width || outputShape.height !== sourceShape.height)
+
+  const scaleFilter = shouldScale ? `scale=${outputShape.width}:${outputShape.height}` : null
+
+  switch (acceleration) {
+    case "nvenc":
+      return ["-vf", [scaleFilter, "format=yuv420p"].filter(Boolean).join(",")]
+
+    case "amd_gpu":
+    case "amd_cpu":
+      if (getAmdBackend() === "vaapi") {
+        return shouldScale
+          ? ["-vf", `scale_vaapi=${outputShape.width}:${outputShape.height}:format=nv12`]
+          : ["-vf", "scale_vaapi=format=nv12"]
+      }
+
+      return ["-vf", [scaleFilter, "format=yuv420p"].filter(Boolean).join(",")]
+
+    case "intel_gpu":
+    case "intel_cpu":
+      return ["-vf", [scaleFilter, "format=nv12"].filter(Boolean).join(",")]
+
+    case "cpu":
+      return scaleFilter ? ["-vf", scaleFilter] : []
+  }
+}
+
 function getLiveAvcAacArgs(input: {
   castCompatible?: boolean
   includeMp4Tag: boolean
-  options?: { audioStreamIndex?: number; sourceBitrateKbps?: number }
+  options?: {
+    audioStreamIndex?: number
+    sourceBitrateKbps?: number
+    videoBitrateKbps?: number
+    videoWidth?: number
+    videoHeight?: number
+    videoFrameRate?: number
+    maxVideoWidth?: number
+    maxVideoHeight?: number
+  }
 }) {
   const config = getServerConfig()
   const encoderArgs = getLiveAvcEncoderArgs(config.transcodeAccel, {
     castCompatible: input.castCompatible,
   })
-  const qualityArgs = getLiveOriginalQualityArgs(
-    config.transcodeAccel,
-    input.options?.sourceBitrateKbps
-  )
+  const qualityArgs = getLiveOriginalQualityArgs(config.transcodeAccel, {
+    sourceBitrateKbps: input.options?.sourceBitrateKbps,
+    videoBitrateKbps: input.options?.videoBitrateKbps,
+  })
   const audioMap = Number.isInteger(input.options?.audioStreamIndex)
     ? `0:${input.options?.audioStreamIndex}?`
     : "0:a:0?"
+  const outputShape = getLiveOutputShape({
+    sourceWidth: input.options?.videoWidth,
+    sourceHeight: input.options?.videoHeight,
+    maxWidth: input.options?.maxVideoWidth,
+    maxHeight: input.options?.maxVideoHeight,
+  })
 
   return [
     "-map",
@@ -593,7 +715,11 @@ function getLiveAvcAacArgs(input: {
     "-sn",
     "-dn",
     ...encoderArgs,
-    ...getLiveAvcFormatArgs(config.transcodeAccel),
+    ...getLiveVideoFilterArgs(
+      config.transcodeAccel,
+      outputShape,
+      { width: input.options?.videoWidth, height: input.options?.videoHeight }
+    ),
     ...qualityArgs,
     ...getLivePixelFormatArgs(config.transcodeAccel),
     "-g",
@@ -603,7 +729,9 @@ function getLiveAvcAacArgs(input: {
     "-sc_threshold",
     "0",
     ...getLiveBrowserAvcArgs(config.transcodeAccel, {
-      castCompatible: input.castCompatible,
+      width: outputShape.width,
+      height: outputShape.height,
+      frameRate: input.options?.videoFrameRate,
     }),
     ...(input.includeMp4Tag ? ["-tag:v", "avc1"] : []),
     ...getLcAacStereoArgs(),
@@ -612,34 +740,76 @@ function getLiveAvcAacArgs(input: {
 
 export function getLiveMp4AvcAacArgs(
   _profile: PlaybackProfile,
-  options: { audioStreamIndex?: number; sourceBitrateKbps?: number } = {}
+  options: {
+    audioStreamIndex?: number
+    sourceBitrateKbps?: number
+    videoBitrateKbps?: number
+    videoWidth?: number
+    videoHeight?: number
+    videoFrameRate?: number
+    maxVideoWidth?: number
+    maxVideoHeight?: number
+  } = {}
 ) {
   return getLiveAvcAacArgs({ includeMp4Tag: true, options })
 }
 
 export function getLiveCastMp4AvcAacArgs(
   _profile: PlaybackProfile,
-  options: { audioStreamIndex?: number; sourceBitrateKbps?: number } = {}
+  options: {
+    audioStreamIndex?: number
+    sourceBitrateKbps?: number
+    videoBitrateKbps?: number
+    videoWidth?: number
+    videoHeight?: number
+    videoFrameRate?: number
+    maxVideoWidth?: number
+    maxVideoHeight?: number
+  } = {}
 ) {
   return getLiveAvcAacArgs({ castCompatible: true, includeMp4Tag: true, options })
 }
 
 export function getLiveHlsAvcAacArgs(
   _profile: PlaybackProfile,
-  options: { audioStreamIndex?: number; sourceBitrateKbps?: number } = {}
+  options: {
+    audioStreamIndex?: number
+    sourceBitrateKbps?: number
+    videoBitrateKbps?: number
+    videoWidth?: number
+    videoHeight?: number
+    videoFrameRate?: number
+    maxVideoWidth?: number
+    maxVideoHeight?: number
+  } = {}
 ) {
   return getLiveAvcAacArgs({ includeMp4Tag: false, options })
 }
 
 export function getLiveCastHlsAvcAacArgs(
   _profile: PlaybackProfile,
-  options: { audioStreamIndex?: number; sourceBitrateKbps?: number } = {}
+  options: {
+    audioStreamIndex?: number
+    sourceBitrateKbps?: number
+    videoBitrateKbps?: number
+    videoWidth?: number
+    videoHeight?: number
+    videoFrameRate?: number
+    maxVideoWidth?: number
+    maxVideoHeight?: number
+  } = {}
 ) {
   return getLiveAvcAacArgs({ castCompatible: true, includeMp4Tag: false, options })
 }
 
-function getLiveOriginalVideoBitrateKbps(sourceBitrateKbps?: number) {
-  return Math.min(Math.max(sourceBitrateKbps ?? 6000, 1500), 50_000)
+function getLiveOriginalVideoBitrateKbps(input: {
+  sourceBitrateKbps?: number
+  videoBitrateKbps?: number
+}) {
+  return Math.max(
+    Math.ceil(input.videoBitrateKbps ?? input.sourceBitrateKbps ?? 6000),
+    1
+  )
 }
 
 function getLiveVideoBitrateArgs(videoBitrateKbps: number) {
@@ -647,7 +817,7 @@ function getLiveVideoBitrateArgs(videoBitrateKbps: number) {
     "-b:v",
     `${videoBitrateKbps}k`,
     "-maxrate",
-    `${Math.ceil(videoBitrateKbps * 1.25)}k`,
+    `${videoBitrateKbps}k`,
     "-bufsize",
     `${videoBitrateKbps * 2}k`,
   ]
@@ -655,57 +825,33 @@ function getLiveVideoBitrateArgs(videoBitrateKbps: number) {
 
 function getLiveOriginalQualityArgs(
   acceleration: TranscodeAcceleration,
-  sourceBitrateKbps?: number
+  input: { sourceBitrateKbps?: number; videoBitrateKbps?: number }
 ) {
   const bitrateArgs = getLiveVideoBitrateArgs(
-    getLiveOriginalVideoBitrateKbps(sourceBitrateKbps)
+    getLiveOriginalVideoBitrateKbps(input)
   )
 
   switch (acceleration) {
     case "nvenc":
-      return ["-rc:v", "vbr", "-cq:v", "20", ...bitrateArgs]
+      return ["-rc:v", "vbr", ...bitrateArgs]
     case "intel_gpu":
     case "intel_cpu":
-      return ["-global_quality:v", "20", ...bitrateArgs]
+      return bitrateArgs
     case "amd_gpu":
     case "amd_cpu":
-      return [...getAmdLiveQualityArgs(), ...bitrateArgs]
+      return [...getAmdLiveRateControlArgs(), ...bitrateArgs]
     case "cpu":
-      return ["-crf", "20", ...bitrateArgs]
+      return bitrateArgs
   }
 }
 
-function getAmdLiveQualityArgs() {
+function getAmdLiveRateControlArgs() {
   switch (getAmdBackend()) {
     case "amf":
-      return ["-rc", "qvbr", "-qvbr_quality_level", "20"]
+      return ["-rc", "vbr_peak"]
 
     case "vaapi":
       return ["-rc_mode", "VBR"]
-  }
-}
-
-function getLiveAvcFormatArgs(acceleration: TranscodeAcceleration) {
-  switch (acceleration) {
-    case "nvenc":
-      return ["-vf", "format=yuv420p"]
-
-    case "intel_gpu":
-    case "intel_cpu":
-      return ["-vf", "format=nv12"]
-
-    case "amd_gpu":
-    case "amd_cpu":
-      switch (getAmdBackend()) {
-        case "amf":
-          return ["-vf", "format=yuv420p"]
-
-        case "vaapi":
-          return ["-vf", "scale_vaapi=format=nv12"]
-      }
-
-    case "cpu":
-      return []
   }
 }
 
@@ -725,11 +871,14 @@ function getLivePixelFormatArgs(acceleration: TranscodeAcceleration) {
 
 function getLiveBrowserAvcArgs(
   acceleration: TranscodeAcceleration,
-  options: { castCompatible?: boolean } = {}
+  videoShape: LiveTranscodeVideoShape = {}
 ) {
-  const args = options.castCompatible
-    ? ["-profile:v", "high", "-level:v", "4.1"]
-    : ["-profile:v", "high"]
+  const args = [
+    "-profile:v",
+    "high",
+    "-level:v",
+    getH264LevelForLiveTranscode(videoShape),
+  ]
 
   switch (acceleration) {
     case "nvenc":

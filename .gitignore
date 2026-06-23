@@ -1,11 +1,4 @@
 ```gitignore
-# =========================================================
-# Yamibunko monorepo .gitignore
-# Place this file at the repository root.
-# Patterns without a leading "/" apply recursively.
-# =========================================================
-
-
 # ---------------------------------------------------------
 # OS / misc
 # ---------------------------------------------------------
@@ -16,9 +9,15 @@ Desktop.ini
 
 
 # ---------------------------------------------------------
-# JetBrains IDEs: WebStorm / Rider / IntelliJ
+# JetBrains IDEs: WebStorm / Rider / IntelliJ / Android Studio
 # ---------------------------------------------------------
 .idea/
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
 .idea_modules/
 *.iml
 *.iws
@@ -76,11 +75,6 @@ coverage/
 .next/
 out/
 
-# production / build outputs
-build/
-dist/
-Builds/
-
 # caches
 .cache/
 .turbo/
@@ -132,13 +126,50 @@ appsettings.*.local.json
 
 
 # ---------------------------------------------------------
+# Android / Android Studio / Gradle
+# Applies to android/ and any nested Android project.
+# ---------------------------------------------------------
+
+# Gradle / Build caches
+.gradle/
+gradle-app.setting
+!gradle-wrapper.jar
+
+# Android Studio local configuration (SDK/NDK paths)
+local.properties
+/local.properties
+
+# Android build generated files
+captures/
+/captures
+.externalNativeBuild/
+.cxx/
+*.apk
+*.ap_
+*.aab
+*.dex
+*.class
+
+# Keystores / signing (crucial to keep local)
+*.keystore
+*.jks
+
+# NDK
+obj/local/
+
+
+# ---------------------------------------------------------
 # Release / packaged output
 # ---------------------------------------------------------
 release/
 releases/
 publish/
+build/
+dist/
+Builds/
 *.zip
 *.7z
 *.tar
 *.tar.gz
+*.apk
 ```

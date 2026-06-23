@@ -1,0 +1,30 @@
+<resources>
+    <string name="app_name">Yamibunko</string>
+    <string name="menu_title">Menu</string>
+    <string name="url_hint">Enter URL</string>
+    <string name="save_url_button">Save &amp; Load URL</string>
+    <string name="language_button">Change Language</string>
+    <string name="info_button">Info</string>
+    <string name="ssl_checkbox_label">Ignore SSL errors</string>
+    <string name="close_menu_button">Close Menu</string>
+    <string name="info_dialog_title">About Yamibunko</string>
+    <string name="info_dialog_message">Yamibunko TV opens your Yamibunko media server on Android TV and Google TV devices.</string>
+    <string name="select_language_title">Select Language</string>
+    <string name="dialog_ok">OK</string>
+    <string name="welcome_title">Welcome!</string>
+    <string name="welcome_message">Yamibunko is ready for your TV remote.</string>
+    <string name="server_setup_title">Connect to Yamibunko</string>
+    <string name="server_setup_description">Choose the protocol and enter your Yamibunko server address. HTTP is only accepted for LAN IP addresses. HTTPS is accepted for domains.</string>
+    <string name="server_url_example">Examples: 192.168.1.50:3000 or yamibunko.example.com</string>
+    <string name="server_url_hint">Host, IP, or domain</string>
+    <string name="server_url_save_button">Save and open Yamibunko</string>
+    <string name="server_url_error_required">Enter your Yamibunko base URL.</string>
+    <string name="server_url_error_scheme">Choose http:// for a LAN IP or https:// for a domain.</string>
+    <string name="server_url_error_localhost">Localhost cannot work from a TV. Use the LAN IP of the server device.</string>
+    <string name="server_url_error_http_lan">HTTP is only allowed for LAN IPs, for example 192.168.1.50:3000.</string>
+    <string name="server_url_error_invalid">Enter a valid Yamibunko base URL.</string>
+    <string-array name="server_url_schemes">
+        <item>https://</item>
+        <item>http://</item>
+    </string-array>
+</resources>

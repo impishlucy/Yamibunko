@@ -7,14 +7,19 @@ export type StreamPriorityAction = {
     | "bandwidthRecheckStarted"
     | "bandwidthRecheckFinished"
     | "serverShutdownStarted"
+    | "liveTranscodeBitrateChanged"
+    | "liveTranscodeFailed"
   message: string
   createdAt: string
+  currentVideoBitrateKbps?: number
+  nextVideoBitrateKbps?: number
 }
 
 export type StreamUploadLease = {
   id: string
   effectiveMode: PlaybackMode
   effectiveProfile: PlaybackProfile
+  isMetered: boolean
   observeUploadBytes: (bytes: number) => void
   waitForUploadBytes: (bytes: number, signal?: AbortSignal) => Promise<void>
   setForceClose: (handler: () => void) => void
@@ -51,13 +56,13 @@ type ActiveStreamGroup = {
   streamGroupKey: string
   streamCount: number
   minimumUploadKbps: number
+  weight: number
 }
 
 type UploadSample = {
   bytes: number
   sampledAt: number
 }
-
 
 type AcquireStreamUploadInput = {
   clientId: string | null
@@ -76,6 +81,7 @@ type StreamAdmissionInput = {
   username: string
   clientId: string | null
   isVip: boolean
+  mode: PlaybackMode
   contentKey: string
 }
 
@@ -116,6 +122,11 @@ const streamBandwidthStore = streamBandwidthGlobal.__yamibunkoStreamBandwidthSto
 }
 
 const capacityWaitMs = 1000
+const liveTranscodeAudioUploadKbps = 320
+const internetLiveTranscodeMinVideoKbps = 1_500
+const internetLiveTranscodeMaxVideoKbps = 3_000
+const lanLiveTranscodeMaxVideoKbps = 20_000
+const liveTranscodeBitrateRestartThresholdKbps = 256
 const minimumRegularStreamUploadKbps = 6_000
 const minimumVipStreamUploadKbps = 8_000
 const streamThrottleBucketSeconds = 1
@@ -197,8 +208,18 @@ function getContentKey(input: {
   return `${input.animeId}:${input.seasonNumber}:${input.episodeNumber}`
 }
 
-function getMinimumStreamUploadKbps(isVip: boolean) {
-  return isVip ? minimumVipStreamUploadKbps : minimumRegularStreamUploadKbps
+function getMinimumStreamUploadKbps(input: { isVip: boolean; mode: PlaybackMode }) {
+  if (input.mode === "transcode") {
+    return applyStreamEstimateOverhead(
+      internetLiveTranscodeMinVideoKbps + liveTranscodeAudioUploadKbps
+    )
+  }
+
+  return input.isVip ? minimumVipStreamUploadKbps : minimumRegularStreamUploadKbps
+}
+
+function getStreamGroupWeight(isVip: boolean) {
+  return isVip ? 2 : 1
 }
 
 function getStreamGroupKey(input: {
@@ -222,7 +243,11 @@ function getActiveStreamGroups(
     }
 
     const existing = groups.get(stream.streamGroupKey)
-    const minimumUploadKbps = getMinimumStreamUploadKbps(stream.isVip)
+    const minimumUploadKbps = getMinimumStreamUploadKbps({
+      isVip: stream.isVip,
+      mode: stream.mode,
+    })
+    const weight = getStreamGroupWeight(stream.isVip)
 
     if (existing) {
       existing.streamCount += 1
@@ -230,6 +255,7 @@ function getActiveStreamGroups(
         existing.minimumUploadKbps,
         minimumUploadKbps
       )
+      existing.weight = Math.max(existing.weight, weight)
       continue
     }
 
@@ -237,6 +263,7 @@ function getActiveStreamGroups(
       streamGroupKey: stream.streamGroupKey,
       streamCount: 1,
       minimumUploadKbps,
+      weight,
     })
   }
 
@@ -247,12 +274,17 @@ function getProjectedStreamGroups(input: {
   username: string
   clientId: string | null
   isVip: boolean
+  mode: PlaybackMode
   contentKey: string
 }) {
   const clientKey = getClientKey(input.username, input.clientId)
   const groups = getActiveStreamGroups({ excludeClientKey: clientKey })
   const streamGroupKey = getStreamGroupKey(input)
-  const minimumUploadKbps = getMinimumStreamUploadKbps(input.isVip)
+  const minimumUploadKbps = getMinimumStreamUploadKbps({
+    isVip: input.isVip,
+    mode: input.mode,
+  })
+  const weight = getStreamGroupWeight(input.isVip)
   const existing = groups.get(streamGroupKey)
 
   if (existing) {
@@ -261,11 +293,13 @@ function getProjectedStreamGroups(input: {
       existing.minimumUploadKbps,
       minimumUploadKbps
     )
+    existing.weight = Math.max(existing.weight, weight)
   } else {
     groups.set(streamGroupKey, {
       streamGroupKey,
       streamCount: 1,
       minimumUploadKbps,
+      weight,
     })
   }
 
@@ -282,10 +316,37 @@ function getFairStreamUploadKbps(streamGroupCount: number) {
   return Math.max(Math.floor(maxUploadKbps / streamGroupCount), 1)
 }
 
+function getWeightedStreamUploadKbps(
+  groups: Map<string, ActiveStreamGroup>,
+  streamGroupKey: string
+) {
+  const maxUploadKbps = getEffectiveMaxUploadKbps()
+  const group = groups.get(streamGroupKey)
+
+  if (!maxUploadKbps || !group || groups.size <= 0) {
+    return null
+  }
+
+  const totalWeight = [...groups.values()].reduce(
+    (total, candidate) => total + Math.max(candidate.weight, 1),
+    0
+  )
+
+  if (totalWeight <= 0) {
+    return null
+  }
+
+  return Math.max(
+    Math.floor((maxUploadKbps * Math.max(group.weight, 1)) / totalWeight),
+    1
+  )
+}
+
 function getProjectedFairUploadKbps(input: {
   username: string
   clientId: string | null
   isVip: boolean
+  mode: PlaybackMode
   contentKey: string
 }) {
   const groups = getProjectedStreamGroups(input)
@@ -298,6 +359,7 @@ function canFitMinimumStreamUpload(input: {
   username: string
   clientId: string | null
   isVip: boolean
+  mode: PlaybackMode
   contentKey: string
 }) {
   const maxUploadKbps = getEffectiveMaxUploadKbps()
@@ -312,9 +374,14 @@ function canFitMinimumStreamUpload(input: {
     return true
   }
 
-  return [...groups.values()].every(
-    (group) => group.minimumUploadKbps <= fairUploadKbps
-  )
+  return [...groups.values()].every((group) => {
+    const weightedUploadKbps = getWeightedStreamUploadKbps(
+      groups,
+      group.streamGroupKey
+    )
+
+    return group.minimumUploadKbps <= (weightedUploadKbps ?? fairUploadKbps)
+  })
 }
 
 function getActiveStreamGroupCount() {
@@ -328,7 +395,13 @@ function getActiveStreamGroupConnectionCount(streamGroupKey: string) {
 }
 
 function getActiveStreamThrottleKbps(stream: ActiveStream) {
-  const fairUploadKbps = getFairStreamUploadKbps(getActiveStreamGroupCount())
+  const groups = getActiveStreamGroups()
+  const weightedUploadKbps = getWeightedStreamUploadKbps(
+    groups,
+    stream.streamGroupKey
+  )
+  const fairUploadKbps =
+    weightedUploadKbps ?? getFairStreamUploadKbps(getActiveStreamGroupCount())
 
   if (!fairUploadKbps) {
     return null
@@ -1172,6 +1245,7 @@ function createLease(input: {
     id,
     effectiveMode: input.mode,
     effectiveProfile: input.profile,
+    isMetered: true,
     observeUploadBytes(bytes: number) {
       if (released || !Number.isFinite(bytes) || bytes <= 0) {
         return
@@ -1246,6 +1320,7 @@ export function createUnmeteredStreamUploadLease(input: {
     id: createId(),
     effectiveMode: input.mode,
     effectiveProfile: input.profile,
+    isMetered: false,
     observeUploadBytes() {},
     waitForUploadBytes() {
       return Promise.resolve()
@@ -1269,32 +1344,116 @@ function applyStreamEstimateOverhead(kbps: number) {
   return Math.max(Math.ceil(kbps * streamEstimateOverheadFactor), 1)
 }
 
+function getSafeSourceVideoBitrateKbps(sourceBitrateKbps?: number) {
+  return Math.max(Math.ceil(sourceBitrateKbps ?? 6000), 1)
+}
+
+function clampVideoBitrateToSource(
+  sourceBitrateKbps: number | undefined,
+  maxVideoBitrateKbps: number
+) {
+  return Math.max(
+    Math.min(getSafeSourceVideoBitrateKbps(sourceBitrateKbps), maxVideoBitrateKbps),
+    1
+  )
+}
+
+function getUnmeteredLiveTranscodeVideoBitrateKbps(sourceBitrateKbps?: number) {
+  return clampVideoBitrateToSource(sourceBitrateKbps, lanLiveTranscodeMaxVideoKbps)
+}
+
+function getMeteredLiveTranscodeVideoBitrateKbps(input: {
+  sourceBitrateKbps?: number
+  activeStream?: ActiveStream | null
+}) {
+  const streamUploadKbps = input.activeStream
+    ? getActiveStreamThrottleKbps(input.activeStream)
+    : getEffectiveMaxUploadKbps()
+  const uploadLimitedVideoKbps = streamUploadKbps
+    ? Math.max(streamUploadKbps - liveTranscodeAudioUploadKbps, internetLiveTranscodeMinVideoKbps)
+    : internetLiveTranscodeMaxVideoKbps
+
+  return Math.max(
+    clampVideoBitrateToSource(
+      input.sourceBitrateKbps,
+      Math.min(uploadLimitedVideoKbps, internetLiveTranscodeMaxVideoKbps)
+    ),
+    Math.min(
+      internetLiveTranscodeMinVideoKbps,
+      getSafeSourceVideoBitrateKbps(input.sourceBitrateKbps)
+    )
+  )
+}
 
 function estimateOriginalUploadKbps(input: {
+  bypassUploadBandwidth?: boolean
   mode?: PlaybackMode
   sourceBitrateKbps: number
 }) {
   if (input.mode === "transcode") {
-    const videoKbps = Math.min(Math.max(input.sourceBitrateKbps, 1500), 50_000)
-    return applyStreamEstimateOverhead(videoKbps + 192)
+    const videoBitrateKbps = input.bypassUploadBandwidth
+      ? getUnmeteredLiveTranscodeVideoBitrateKbps(input.sourceBitrateKbps)
+      : getMeteredLiveTranscodeVideoBitrateKbps({
+          sourceBitrateKbps: input.sourceBitrateKbps,
+        })
+
+    return applyStreamEstimateOverhead(videoBitrateKbps + liveTranscodeAudioUploadKbps)
   }
 
   return applyStreamEstimateOverhead(input.sourceBitrateKbps)
 }
 
 export function estimateUploadKbps(input: {
+  bypassUploadBandwidth?: boolean
   sourceBitrateKbps?: number
   profile: PlaybackProfile
   mode?: PlaybackMode
 }) {
-  const sourceBitrateKbps = Math.max(input.sourceBitrateKbps ?? 6000, 1)
+  const sourceBitrateKbps = getSafeSourceVideoBitrateKbps(input.sourceBitrateKbps)
 
   return estimateOriginalUploadKbps({
+    bypassUploadBandwidth: input.bypassUploadBandwidth,
     mode: input.mode,
     sourceBitrateKbps,
   })
 }
 
+export function getLiveTranscodeVideoBitrateKbps(input: {
+  bypassUploadBandwidth: boolean
+  sourceBitrateKbps?: number
+  uploadLease?: StreamUploadLease | null
+}) {
+  if (input.bypassUploadBandwidth || !input.uploadLease?.isMetered) {
+    return getUnmeteredLiveTranscodeVideoBitrateKbps(input.sourceBitrateKbps)
+  }
+
+  return getMeteredLiveTranscodeVideoBitrateKbps({
+    sourceBitrateKbps: input.sourceBitrateKbps,
+    activeStream: activeStreams.get(input.uploadLease.id) ?? null,
+  })
+}
+
+export function shouldRestartLiveTranscodeForBitrate(input: {
+  bypassUploadBandwidth: boolean
+  currentVideoBitrateKbps: number
+  sourceBitrateKbps?: number
+  uploadLease?: StreamUploadLease | null
+}) {
+  if (input.bypassUploadBandwidth || !input.uploadLease?.isMetered) {
+    return false
+  }
+
+  const nextVideoBitrateKbps = getLiveTranscodeVideoBitrateKbps({
+    bypassUploadBandwidth: input.bypassUploadBandwidth,
+    sourceBitrateKbps: input.sourceBitrateKbps,
+    uploadLease: input.uploadLease,
+  })
+
+  return (
+    Math.abs(nextVideoBitrateKbps - input.currentVideoBitrateKbps) >=
+    liveTranscodeBitrateRestartThresholdKbps
+  )
+}
 
 export async function acquireStreamUpload(input: AcquireStreamUploadInput) {
   const clientKey = getClientKey(input.username, input.clientId)
@@ -1336,6 +1495,7 @@ export async function acquireStreamUpload(input: AcquireStreamUploadInput) {
     username: input.username,
     clientId: input.clientId,
     isVip: input.isVip,
+    mode: input.mode,
     contentKey,
   }
 
@@ -1408,6 +1568,15 @@ export async function acquireStreamUpload(input: AcquireStreamUploadInput) {
     clearClientAction(input.username, input.clientId)
     throw error
   }
+}
+
+
+export function publishStreamPriorityAction(input: {
+  username: string
+  clientId: string | null
+  action: StreamPriorityAction
+}) {
+  setClientAction(input.username, input.clientId, input.action)
 }
 
 export function subscribeStreamPriorityActions(input: {
@@ -1489,6 +1658,9 @@ export function getActiveStreamBandwidthSnapshot() {
     fairUploadKbps,
     minimumRegularStreamUploadKbps,
     minimumVipStreamUploadKbps,
+    internetLiveTranscodeMinVideoKbps,
+    internetLiveTranscodeMaxVideoKbps,
+    lanLiveTranscodeMaxVideoKbps,
     temporaryUploadLimit: {
       active: temporaryUploadLimit.active,
       expiresAt: temporaryUploadLimit.expiresAt

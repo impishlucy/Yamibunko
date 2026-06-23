@@ -17,6 +17,8 @@ export type ProbeStream = {
   height?: number
   duration?: string
   bit_rate?: string
+  avg_frame_rate?: string
+  r_frame_rate?: string
   channels?: number
   disposition?: {
     default?: number

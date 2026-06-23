@@ -12,7 +12,10 @@ import {
   createUnmeteredStreamUploadLease,
   estimateUploadKbps,
   getActiveStreamConflict,
+  getLiveTranscodeVideoBitrateKbps,
   isStreamServerShutdownActive,
+  publishStreamPriorityAction,
+  shouldRestartLiveTranscodeForBitrate,
   type StreamUploadLease,
 } from "@/server/bandwidth/streamBandwidth"
 import { getUser } from "@/server/db/users"
@@ -51,6 +54,16 @@ type ByteRange =
 
 type DirectAudioMode = "copy" | "aac" | null
 type DirectContainerMode = "source" | "mp4" | null
+type VideoShape = {
+  width?: number
+  height?: number
+  frameRate?: number
+}
+
+type TranscodeOutputLimit = {
+  maxWidth?: number
+  maxHeight?: number
+}
 
 const streamLogTtlMs = 30 * 60 * 1000
 const maxStreamPreloadCacheSeconds = 10 * 60
@@ -58,6 +71,7 @@ const streamCacheControl = `private, max-age=${maxStreamPreloadCacheSeconds}, no
 const transcodeStartupTimeoutMs = 15_000
 const transcodeStartupByteThreshold = 64 * 1024
 const ffmpegShutdownGraceMs = 2_000
+const liveTranscodeBitrateMonitorMs = 3_000
 const loggedStreamStarts = new Map<string, number>()
 
 function streamCorsHeaders() {
@@ -238,6 +252,25 @@ function parseStartSeconds(value: string | null) {
   const seconds = Number(value)
 
   return Number.isFinite(seconds) && seconds > 0 ? seconds : 0
+}
+
+function parseOutputLimitDimension(value: string | null) {
+  if (!value) {
+    return undefined
+  }
+
+  const dimension = Number(value)
+
+  return Number.isInteger(dimension) && dimension >= 360 && dimension <= 8192
+    ? dimension
+    : undefined
+}
+
+function parseTranscodeOutputLimit(url: URL): TranscodeOutputLimit {
+  return {
+    maxWidth: parseOutputLimitDimension(url.searchParams.get("maxWidth")),
+    maxHeight: parseOutputLimitDimension(url.searchParams.get("maxHeight")),
+  }
 }
 
 function parseByteRange(
@@ -424,6 +457,10 @@ function compactStderr(stderr: string) {
   return uniqueLines.slice(-8).join(" | ")
 }
 
+function getUserFacingLiveTranscodeError() {
+  return "Server Error. Yamibunko could not start live transcoding. Try again or check the server logs."
+}
+
 function calculateSourceBitrateKbps(input: {
   size: number
   durationSeconds?: number
@@ -438,12 +475,60 @@ function calculateSourceBitrateKbps(input: {
   )
 }
 
+function getPrimaryVideoStream(probe: ProbeResult) {
+  return (probe.streams ?? []).find((stream) => stream.codec_type === "video")
+}
+
 function getPrimaryVideoCodec(probe: ProbeResult) {
-  return (
-    (probe.streams ?? [])
-      .find((stream) => stream.codec_type === "video")
-      ?.codec_name?.trim() || null
-  )
+  return getPrimaryVideoStream(probe)?.codec_name?.trim() || null
+}
+
+function parseFrameRate(value: string | undefined) {
+  if (!value || value === "0/0") {
+    return undefined
+  }
+
+  const [numeratorText, denominatorText] = value.split("/")
+  const numerator = Number(numeratorText)
+  const denominator = Number(denominatorText ?? "1")
+
+  if (
+    !Number.isFinite(numerator) ||
+    !Number.isFinite(denominator) ||
+    denominator <= 0
+  ) {
+    return undefined
+  }
+
+  const frameRate = numerator / denominator
+
+  return frameRate > 0 ? frameRate : undefined
+}
+
+function getPrimaryVideoShape(probe: ProbeResult): VideoShape {
+  const stream = getPrimaryVideoStream(probe)
+
+  if (!stream) {
+    return {}
+  }
+
+  return {
+    width: stream.width,
+    height: stream.height,
+    frameRate:
+      parseFrameRate(stream.avg_frame_rate) ??
+      parseFrameRate(stream.r_frame_rate),
+  }
+}
+
+function formatVideoShapeForLog(shape: VideoShape) {
+  const width = typeof shape.width === "number" ? shape.width : null
+  const height = typeof shape.height === "number" ? shape.height : null
+  const frameRate = typeof shape.frameRate === "number" && Number.isFinite(shape.frameRate)
+    ? `${shape.frameRate.toFixed(3)}fps`
+    : "unknown fps"
+
+  return width && height ? `${width}x${height} ${frameRate}` : `unknown size ${frameRate}`
 }
 
 function parseClientId(value: string | null) {
@@ -1043,21 +1128,32 @@ async function handleTranscode(
   seasonNumber: number,
   episodeNumber: number,
   username: string,
+  priorityUsername: string,
+  clientId: string | null,
   isVip: boolean,
   profile: PlaybackProfile,
   startSeconds: number,
   durationSeconds?: number,
   sourceBitrateKbps?: number,
   inputVideoCodec?: string | null,
+  videoShape: VideoShape = {},
+  outputLimit: TranscodeOutputLimit = {},
   audioStreamIndex?: number,
   uploadLease?: StreamUploadLease,
-  progressTarget?: StreamProgressTarget
+  progressTarget?: StreamProgressTarget,
+  bypassUploadBandwidth = false
 ) {
+  const streamName = fileName(file)
+
+  console.info(
+    `[Info] [Stream] Live transcode request received - stream/route.ts - User ${username} - ${streamName} - start ${startSeconds.toFixed(3)}s${bypassUploadBandwidth ? " - LAN/local bypass" : ""}`
+  )
+
   let waitLogged = false
   const waitLogTimer = setTimeout(() => {
     waitLogged = true
     console.warn(
-      `[Warn] [Stream] Waiting for live transcode slot - User ${username} - ${fileName(file)}`
+      `[Warn] [Stream] Waiting for live transcode slot - User ${username} - ${streamName}`
     )
   }, 2_000)
   waitLogTimer.unref?.()
@@ -1067,8 +1163,9 @@ async function handleTranscode(
     request.signal,
     { isVip }
   ).catch((error) => {
+    const aborted = request.signal.aborted
     console.warn(
-      `[Warn] [Stream] Live transcode request cancelled - stream/route.ts - Anime ${animeId}, Season ${seasonNumber}, Episode ${episodeNumber} - ${errorMessage(error)}`
+      `[Warn] [Stream] Live transcode request ${aborted ? "aborted before slot acquired" : "cancelled"} - stream/route.ts - Anime ${animeId}, Season ${seasonNumber}, Episode ${episodeNumber} - ${errorMessage(error)}`
     )
     return null
   })
@@ -1086,6 +1183,12 @@ async function handleTranscode(
   }
 
   const config = getServerConfig()
+  const videoBitrateKbps = getLiveTranscodeVideoBitrateKbps({
+    bypassUploadBandwidth,
+    sourceBitrateKbps,
+    uploadLease,
+  })
+
   logStreamStartOnce({
     username,
     type: "transcode",
@@ -1096,48 +1199,60 @@ async function handleTranscode(
     file,
   })
 
+  const ffmpegArgs = [
+    "-hide_banner",
+    "-nostdin",
+    "-loglevel",
+    "error",
+    "-probesize",
+    "16M",
+    "-analyzeduration",
+    "5M",
+    "-fflags",
+    "+genpts",
+    "-ignore_unknown",
+    ...getLiveTranscodeInputArgs(inputVideoCodec),
+    ...(startSeconds > 0 ? ["-ss", startSeconds.toFixed(3)] : []),
+    "-i",
+    file,
+    ...getLiveMp4AvcAacArgs(profile, {
+      audioStreamIndex,
+      sourceBitrateKbps,
+      videoBitrateKbps,
+      videoWidth: videoShape.width,
+      videoHeight: videoShape.height,
+      videoFrameRate: videoShape.frameRate,
+      maxVideoWidth: outputLimit.maxWidth,
+      maxVideoHeight: outputLimit.maxHeight,
+    }),
+    "-map_chapters",
+    "-1",
+    "-max_muxing_queue_size",
+    "2048",
+    "-avoid_negative_ts",
+    "make_zero",
+    "-flush_packets",
+    "1",
+    "-muxdelay",
+    "0",
+    "-muxpreload",
+    "0",
+    "-movflags",
+    "frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
+    "-frag_duration",
+    "1000000",
+    "-f",
+    "mp4",
+    "pipe:1",
+  ]
+
+  console.info(
+    `[Info] [Stream] Live transcode encoder starting - stream/route.ts - ${streamName} - video ${videoBitrateKbps}k, audio 320k, codec ${inputVideoCodec ?? "unknown"}, ${formatVideoShapeForLog(videoShape)}${outputLimit.maxWidth || outputLimit.maxHeight ? `, output cap ${outputLimit.maxWidth ?? "?"}x${outputLimit.maxHeight ?? "?"}` : ""}`
+  )
+
   const child = spawn(
     config.ffmpegPath,
-    [
-      "-hide_banner",
-      "-nostdin",
-      "-loglevel",
-      "error",
-      "-probesize",
-      "16M",
-      "-analyzeduration",
-      "5M",
-      "-fflags",
-      "+genpts",
-      "-ignore_unknown",
-      ...getLiveTranscodeInputArgs(),
-      ...(startSeconds > 0 ? ["-ss", startSeconds.toFixed(3)] : []),
-      "-i",
-      file,
-      ...getLiveMp4AvcAacArgs(profile, {
-        audioStreamIndex,
-        sourceBitrateKbps,
-      }),
-      "-map_chapters",
-      "-1",
-      "-max_muxing_queue_size",
-      "2048",
-      "-avoid_negative_ts",
-      "make_zero",
-      "-flush_packets",
-      "1",
-      "-muxdelay",
-      "0",
-      "-muxpreload",
-      "0",
-      "-movflags",
-      "frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
-      "-frag_duration",
-      "1000000",
-      "-f",
-      "mp4",
-      "pipe:1",
-    ],
+    ffmpegArgs,
     {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
@@ -1176,11 +1291,32 @@ async function handleTranscode(
   let clientClosed = false
   let startupTimer: ReturnType<typeof setTimeout> | null = null
   let shutdownTimer: ReturnType<typeof setTimeout> | null = null
+  let bitrateMonitorTimer: ReturnType<typeof setInterval> | null = null
+  let lastNotifiedVideoBitrateKbps = videoBitrateKbps
+
+  const publishLiveTranscodeFailure = (message = getUserFacingLiveTranscodeError()) => {
+    publishStreamPriorityAction({
+      username: priorityUsername,
+      clientId,
+      action: {
+        type: "liveTranscodeFailed",
+        message,
+        createdAt: new Date().toISOString(),
+      },
+    })
+  }
 
   const clearStartupTimer = () => {
     if (startupTimer) {
       clearTimeout(startupTimer)
       startupTimer = null
+    }
+  }
+
+  const clearBitrateMonitorTimer = () => {
+    if (bitrateMonitorTimer) {
+      clearInterval(bitrateMonitorTimer)
+      bitrateMonitorTimer = null
     }
   }
 
@@ -1208,6 +1344,7 @@ async function handleTranscode(
 
     released = true
     clearStartupTimer()
+    clearBitrateMonitorTimer()
     request.signal.removeEventListener("abort", onAbort)
     lease.release()
     progressTracker.stop()
@@ -1215,6 +1352,18 @@ async function handleTranscode(
   }
 
   const onAbort = () => {
+    if (!settled && bytesSent < transcodeStartupByteThreshold) {
+      const details = compactStderr(stderr)
+
+      console.warn(
+        `[Warn] [Stream] Live transcode request closed before startup completed - stream/route.ts - ${file}${details ? ` - ${details}` : ""}`
+      )
+    } else if (!settled) {
+      console.info(
+        `[Info] [Stream] Live transcode client closed stream - stream/route.ts - ${file} - sent ${bytesSent} byte(s)`
+      )
+    }
+
     clientClosed = true
     settled = true
     stopChild()
@@ -1242,10 +1391,62 @@ async function handleTranscode(
         console.error(
           `[Error] [Stream] Live transcoder produced insufficient media - stream/route.ts - ${file}${details ? ` - ${details}` : ""}`
         )
+        publishLiveTranscodeFailure()
         controller.error(error)
         stopChild()
         release()
       }, transcodeStartupTimeoutMs)
+
+      if (uploadLease?.isMetered && !bypassUploadBandwidth) {
+        bitrateMonitorTimer = setInterval(() => {
+          if (settled) {
+            clearBitrateMonitorTimer()
+            return
+          }
+
+          const nextVideoBitrateKbps = getLiveTranscodeVideoBitrateKbps({
+            bypassUploadBandwidth,
+            sourceBitrateKbps,
+            uploadLease,
+          })
+          const changedFromRunningBitrate = shouldRestartLiveTranscodeForBitrate({
+            bypassUploadBandwidth,
+            currentVideoBitrateKbps: videoBitrateKbps,
+            sourceBitrateKbps,
+            uploadLease,
+          })
+          const changedFromLastNotice =
+            Math.abs(nextVideoBitrateKbps - lastNotifiedVideoBitrateKbps) >= 256
+
+          if (!changedFromLastNotice) {
+            return
+          }
+
+          lastNotifiedVideoBitrateKbps = nextVideoBitrateKbps
+
+          const bitrateRestored = !changedFromRunningBitrate
+          const message = bitrateRestored
+            ? "Live transcode upload bitrate recovered. Keeping the current buffered stream."
+            : "Live transcode upload bitrate changed. Playback will switch at the buffered edge."
+
+          console.info(
+            `[Info] [Stream] Live transcode upload bitrate update - stream/route.ts - ${fileName(file)} - ${videoBitrateKbps}k -> ${nextVideoBitrateKbps}k`
+          )
+
+          publishStreamPriorityAction({
+            username: priorityUsername,
+            clientId,
+            action: {
+              type: "liveTranscodeBitrateChanged",
+              message,
+              createdAt: new Date().toISOString(),
+              currentVideoBitrateKbps: videoBitrateKbps,
+              nextVideoBitrateKbps,
+            },
+          })
+        }, liveTranscodeBitrateMonitorMs)
+        bitrateMonitorTimer.unref?.()
+      }
 
       child.stdout?.on("data", (chunk: Buffer) => {
         if (settled) {
@@ -1264,8 +1465,14 @@ async function handleTranscode(
             }
 
             try {
+              const previousBytesSent = bytesSent
               bytesSent += chunk.byteLength
               uploadLease?.observeUploadBytes(chunk.byteLength)
+              if (previousBytesSent === 0) {
+                console.info(
+                  `[Info] [Stream] Live transcode started sending media - stream/route.ts - ${streamName} - first chunk ${chunk.byteLength} bytes`
+                )
+              }
               if (bytesSent >= transcodeStartupByteThreshold) {
                 clearStartupTimer()
               }
@@ -1294,6 +1501,7 @@ async function handleTranscode(
 
         if (!settled) {
           settled = true
+          publishLiveTranscodeFailure()
           controller.error(error)
         }
 
@@ -1313,6 +1521,12 @@ async function handleTranscode(
           console.error(
             `[Error] [Stream] Live transcoder exited with an error - stream/route.ts - ${file} - code ${code}${signal ? `, signal ${signal}` : ""}${details ? ` - ${details}` : ""}`
           )
+
+          if (!settled) {
+            settled = true
+            publishLiveTranscodeFailure()
+            controller.error(new Error("Live transcoder exited with an error."))
+          }
         }
 
         if (!code && bytesSent < 1024 && !clientClosed) {
@@ -1321,6 +1535,12 @@ async function handleTranscode(
           console.error(
             `[Error] [Stream] Live transcoder exited without sending media - stream/route.ts - ${file}${details ? ` - ${details}` : ""}`
           )
+
+          if (!settled) {
+            settled = true
+            publishLiveTranscodeFailure()
+            controller.error(new Error("Live transcoder exited without sending media."))
+          }
         }
 
         if (!settled) {
@@ -1332,6 +1552,12 @@ async function handleTranscode(
       })
     },
     cancel() {
+      if (!settled) {
+        console.info(
+          `[Info] [Stream] Live transcode response cancelled - stream/route.ts - ${file} - sent ${bytesSent} byte(s)`
+        )
+      }
+
       clientClosed = true
       settled = true
       stopChild()
@@ -1374,6 +1600,7 @@ export async function GET(request: Request, context: StreamContext) {
     : null
   const profile = getProfile()
   const startSeconds = parseStartSeconds(url.searchParams.get("start"))
+  const transcodeOutputLimit = parseTranscodeOutputLimit(url)
   const clientId = parseClientId(url.searchParams.get("clientId"))
   const requestedAudioStreamIndex = parseOptionalStreamIndex(
     url.searchParams.get("audio")
@@ -1444,6 +1671,7 @@ export async function GET(request: Request, context: StreamContext) {
     defaultDirectAudioStreamIndex: undefined,
   }
   let inputVideoCodec: string | null = null
+  let inputVideoShape: VideoShape = {}
 
   const shouldInspectStreams =
     mode === "transcode" ||
@@ -1454,6 +1682,7 @@ export async function GET(request: Request, context: StreamContext) {
     try {
       const probe = (await ffprobe(resolved.file)) as ProbeResult
       inputVideoCodec = getPrimaryVideoCodec(probe)
+      inputVideoShape = getPrimaryVideoShape(probe)
       const metadata = getMediaStreamMetadata(probe)
       audioSelection = resolveAudioSelection({
         metadata,
@@ -1478,6 +1707,7 @@ export async function GET(request: Request, context: StreamContext) {
           defaultDirectAudioStreamIndex: audioSelection.defaultDirectAudioStreamIndex,
         })))
   const requestedUploadKbps = estimateUploadKbps({
+    bypassUploadBandwidth,
     sourceBitrateKbps,
     profile,
     mode,
@@ -1584,14 +1814,19 @@ export async function GET(request: Request, context: StreamContext) {
     seasonNumber,
     episodeNumber,
     streamUser.displayUsername,
+    streamUser.username,
+    clientId,
     streamUser.isVip,
     effectiveProfile,
     startSeconds,
     resolved.durationSeconds,
     sourceBitrateKbps,
     inputVideoCodec,
+    inputVideoShape,
+    transcodeOutputLimit,
     audioSelection.requestedAudioStreamIndex,
     uploadLease,
-    streamProgressTarget
+    streamProgressTarget,
+    bypassUploadBandwidth
   )
 }

@@ -1191,20 +1191,20 @@ function removeStaleLibraryEntries() {
     .query(
       `
       DELETE FROM library_entries
-      WHERE slug IN (
-        SELECT le.slug
-        FROM library_entries le
-        LEFT JOIN anime a ON a.library_slug = le.slug
-        LEFT JOIN episodes e ON e.anime_id = a.id
-        GROUP BY le.slug
-        HAVING COUNT(e.file_path) = 0
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM anime a
+        WHERE a.library_slug = library_entries.slug
       )
     `
     )
     .run().changes
 }
 
-export function repairLibraryIntegrity(reason = "maintenance"): LibraryIntegrityStats {
+export function repairLibraryIntegrity(
+  reason = "maintenance",
+  options: { logChanges?: boolean } = {}
+): LibraryIntegrityStats {
   const stats: LibraryIntegrityStats = {
     repairedAssignments: 0,
     repairedRootRows: 0,
@@ -1309,9 +1309,13 @@ export function repairLibraryIntegrity(reason = "maintenance"): LibraryIntegrity
     stats.repairedRootRows > 0 ||
     stats.removedStaleEntries > 0
   ) {
-    console.log(
-      `[Info] [Library] ${reason} library integrity repair completed - Reassigned ${stats.repairedAssignments} anime row(s), repaired ${stats.repairedRootRows} root row(s), removed ${stats.removedStaleEntries} stale library entr${stats.removedStaleEntries === 1 ? "y" : "ies"}.`
-    )
+    const message = `[Info] [Library] ${reason} library integrity repair completed - Reassigned ${stats.repairedAssignments} anime row(s), repaired ${stats.repairedRootRows} root row(s), removed ${stats.removedStaleEntries} stale library entr${stats.removedStaleEntries === 1 ? "y" : "ies"}.`
+
+    if (options.logChanges === false) {
+      debugLog(message.replace("[Info]", "[Debug]"))
+    } else {
+      console.log(message)
+    }
   } else {
     debugLog(
       `[Debug] [Library] ${reason} library integrity repair found no broken library entries.`
@@ -2096,6 +2100,11 @@ export function resolveLibrarySeasonNumberForAnime(input: {
       "SELECT slug, title, primary_anime_id FROM library_entries WHERE slug = ?"
     )
     .get(row.library_slug)
+
+  if (isLocalNonAnimeId(row.id)) {
+    return input.parsedSeason
+  }
+
   const requestedPart =
     input.parsedPart && input.parsedPart > 1
       ? input.parsedPart
@@ -2334,14 +2343,7 @@ function compareAnimeVariantRows(left: AnimeVariantRow, right: AnimeVariantRow) 
   return titleDelta !== 0 ? titleDelta : left.id - right.id
 }
 
-const variantMainlineRelationTypes = new Set([
-  "PARENT",
-  "PREQUEL",
-  "SEQUEL",
-  "ALTERNATIVE",
-  "COMPILATION",
-  "CONTAINS",
-])
+const variantMainlineRelationTypes = new Set(["PREQUEL", "SEQUEL"])
 
 function listVariantMainlineRelations(variantIds: number[]) {
   if (variantIds.length === 0) {
@@ -2380,10 +2382,10 @@ function addMainlineVariantRelationEdges(
   successors: Map<number, Set<number>>,
   predecessors: Map<number, Set<number>>
 ) {
-  const source = rowsById.get(relation.anime_id)
-  const target = rowsById.get(relation.related_anime_id)
-
-  if (!source || !target) {
+  if (
+    !rowsById.has(relation.anime_id) ||
+    !rowsById.has(relation.related_anime_id)
+  ) {
     return
   }
 
@@ -2399,28 +2401,6 @@ function addMainlineVariantRelationEdges(
 
   if (relation.relation_type === "PREQUEL") {
     addDirectedEdge(relation.related_anime_id, relation.anime_id)
-    return
-  }
-
-  if (relation.relation_type === "PARENT") {
-    addDirectedEdge(relation.related_anime_id, relation.anime_id)
-    return
-  }
-
-  if (
-    relation.relation_type === "CONTAINS" ||
-    relation.relation_type === "COMPILATION"
-  ) {
-    addDirectedEdge(relation.anime_id, relation.related_anime_id)
-    return
-  }
-
-  if (relation.relation_type === "ALTERNATIVE" && rowHasSharedTitleRoot(source, target)) {
-    if (compareAnimeVariantRows(source, target) <= 0) {
-      addDirectedEdge(source.id, target.id)
-    } else {
-      addDirectedEdge(target.id, source.id)
-    }
   }
 }
 
@@ -2511,25 +2491,21 @@ function orderMainlineVariantRows(
     }
   }
 
-  if (mainlineIds.has(primaryAnimeId)) {
-    emitForward(primaryAnimeId)
-  }
-
-  const remainingRootIds = sortedVariantIds(
-    [...mainlineIds].filter((id) => {
-      if (emitted.has(id)) {
-        return false
-      }
-
-      return [...(predecessors.get(id) ?? [])].every((predecessorId) =>
+  const rootIds = sortedVariantIds(
+    [...mainlineIds].filter((id) =>
+      [...(predecessors.get(id) ?? [])].every((predecessorId) =>
         !mainlineIds.has(predecessorId)
       )
-    }),
+    ),
     rowsById
   )
 
-  for (const id of remainingRootIds) {
+  for (const id of rootIds) {
     emitForward(id)
+  }
+
+  if (mainlineIds.has(primaryAnimeId) && !emitted.has(primaryAnimeId)) {
+    emitForward(primaryAnimeId)
   }
 
   for (const id of sortedVariantIds(mainlineIds, rowsById)) {
@@ -2575,33 +2551,28 @@ function sortAnimeVariantRowsForDropdown(
   }
 
   const primaryRow = rowsById.get(primaryAnimeId)
-  const graphMemberIds = new Set([
-    ...successors.keys(),
-    ...predecessors.keys(),
-  ])
+  const mainlineSeedIds = new Set<number>()
+
+  for (const row of sortedRows) {
+    if (seriesFormats.has(row.format ?? "")) {
+      mainlineSeedIds.add(row.id)
+    }
+  }
+
+  if (mainlineSeedIds.size === 0 && primaryRow) {
+    mainlineSeedIds.add(primaryAnimeId)
+  }
+
   const mainlineIds = new Set<number>()
 
-  if (primaryRow) {
-    for (const id of collectConnectedMainlineIds(
-      primaryAnimeId,
+  for (const id of sortedVariantIds(mainlineSeedIds, rowsById)) {
+    for (const connectedId of collectConnectedMainlineIds(
+      id,
       successors,
       predecessors,
       rowsById
     )) {
-      mainlineIds.add(id)
-    }
-  } else if (graphMemberIds.size > 0) {
-    const firstGraphId = sortedVariantIds(graphMemberIds, rowsById)[0]
-
-    if (firstGraphId) {
-      for (const id of collectConnectedMainlineIds(
-        firstGraphId,
-        successors,
-        predecessors,
-        rowsById
-      )) {
-        mainlineIds.add(id)
-      }
+      mainlineIds.add(connectedId)
     }
   }
 
@@ -3391,6 +3362,14 @@ function getRomanPartLabel(part: number) {
   return labels[part] ?? null
 }
 
+function escapePartMarkerRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function hasNormalizedPartMarker(value: string, marker: string) {
+  return new RegExp(`(?:^| )${escapePartMarkerRegExp(marker)}(?: |$)`).test(value)
+}
+
 function hasPartMarker(value: string, part: number) {
   const normalized = value
     .toLowerCase()
@@ -3404,8 +3383,6 @@ function hasPartMarker(value: string, part: number) {
     `part ${part}`,
     `pt ${part}`,
     `cour ${part}`,
-    `p ${part}`,
-    `c ${part}`,
     `${ordinalPart} cour`,
   ]
 
@@ -3414,10 +3391,10 @@ function hasPartMarker(value: string, part: number) {
   }
 
   if (romanPart) {
-    markers.push(`part ${romanPart}`, `pt ${romanPart}`, `p ${romanPart}`)
+    markers.push(`part ${romanPart}`, `pt ${romanPart}`)
   }
 
-  return markers.some((marker) => normalized.includes(marker))
+  return markers.some((marker) => hasNormalizedPartMarker(normalized, marker))
 }
 
 function rowHasPartMarker(
