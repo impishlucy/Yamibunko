@@ -535,6 +535,31 @@ function isConfirmControlKey(event: { key?: string; code?: string; keyCode?: num
   )
 }
 
+function isTvRemoteNavigationKey(event: { key?: string; code?: string; keyCode?: number; which?: number }) {
+  return (
+    event.key === "ArrowUp" ||
+    event.key === "ArrowDown" ||
+    event.key === "ArrowLeft" ||
+    event.key === "ArrowRight" ||
+    event.key === "Up" ||
+    event.key === "Down" ||
+    event.key === "Left" ||
+    event.key === "Right" ||
+    event.code === "ArrowUp" ||
+    event.code === "ArrowDown" ||
+    event.code === "ArrowLeft" ||
+    event.code === "ArrowRight" ||
+    event.keyCode === 19 ||
+    event.keyCode === 20 ||
+    event.keyCode === 21 ||
+    event.keyCode === 22 ||
+    event.which === 19 ||
+    event.which === 20 ||
+    event.which === 21 ||
+    event.which === 22
+  )
+}
+
 const castDirectContentTypesByExtension = new Map<string, string>([
   ["mp4", "video/mp4"],
   ["m4v", "video/mp4"],
@@ -1669,6 +1694,7 @@ export function AnimePlayer({
   const localPlaybackBeforeCastRef = useRef<LocalPlaybackSnapshot | null>(null)
   const resumeLocalAfterCastEndRef = useRef(false)
   const controlsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const tvFullscreenFocusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const hardwareWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const priorityInfoTimerRef = useRef<number | null>(null)
   const pendingPrioritySwitchRef = useRef(false)
@@ -1934,6 +1960,13 @@ export function AnimePlayer({
     if (controlsTimerRef.current) {
       clearTimeout(controlsTimerRef.current)
       controlsTimerRef.current = null
+    }
+  }, [])
+
+  const clearTvFullscreenFocusTimer = useCallback(() => {
+    if (tvFullscreenFocusTimerRef.current) {
+      clearTimeout(tvFullscreenFocusTimerRef.current)
+      tvFullscreenFocusTimerRef.current = null
     }
   }, [])
 
@@ -2468,6 +2501,32 @@ export function AnimePlayer({
     [clearControlsTimer, setControlsVisible, setSettingsOpen]
   )
 
+  const focusTvPlayerControl = useCallback(() => {
+    const control =
+      playerRef.current?.querySelector<HTMLButtonElement>(
+        '[data-yami-player-control="play"]:not(:disabled), button:not(:disabled), [data-yami-player-control]:not(:disabled)'
+      ) ?? settingsButtonRef.current
+
+    control?.focus({ preventScroll: true })
+  }, [])
+
+  const revealTvFullscreenControls = useCallback(
+    (focusControl = false) => {
+      showControls()
+
+      if (!focusControl) {
+        return
+      }
+
+      clearTvFullscreenFocusTimer()
+      tvFullscreenFocusTimerRef.current = setTimeout(() => {
+        tvFullscreenFocusTimerRef.current = null
+        focusTvPlayerControl()
+      }, 0)
+    },
+    [clearTvFullscreenFocusTimer, focusTvPlayerControl, showControls]
+  )
+
   const showServerPlaybackError = useCallback(
     (message = genericServerPlaybackErrorMessage) => {
       isPlayingRef.current = false
@@ -2679,6 +2738,69 @@ export function AnimePlayer({
   }, [isPseudoFullscreen])
 
   useEffect(() => {
+    if (!isTvLike || (!isFullscreen && !isPseudoFullscreen)) {
+      return
+    }
+
+    revealTvFullscreenControls(true)
+  }, [isFullscreen, isPseudoFullscreen, isTvLike, revealTvFullscreenControls])
+
+  useEffect(() => {
+    if (!isTvLike || isCastingRef.current) {
+      return
+    }
+
+    function onKeyDown(event: globalThis.KeyboardEvent) {
+      if (!isConfirmControlKey(event) && !isTvRemoteNavigationKey(event)) {
+        return
+      }
+
+      const player = playerRef.current
+      const activeElement = document.activeElement
+      const playerHasFocus =
+        Boolean(player) &&
+        (!activeElement ||
+          activeElement === document.body ||
+          player?.contains(activeElement) ||
+          isFullscreen ||
+          isPseudoFullscreen)
+
+      if (!playerHasFocus) {
+        return
+      }
+
+      if (settingsOpen || tvSeekTarget) {
+        showControls(true)
+        return
+      }
+
+      if (!controlsVisible) {
+        event.preventDefault()
+        event.stopPropagation()
+        revealTvFullscreenControls(true)
+        return
+      }
+
+      showControls()
+    }
+
+    window.addEventListener("keydown", onKeyDown, true)
+
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, true)
+    }
+  }, [
+    controlsVisible,
+    isFullscreen,
+    isPseudoFullscreen,
+    isTvLike,
+    revealTvFullscreenControls,
+    settingsOpen,
+    showControls,
+    tvSeekTarget,
+  ])
+
+  useEffect(() => {
     if (!isMobilePortraitViewport || isCasting || isFullscreen) {
       return
     }
@@ -2860,6 +2982,7 @@ export function AnimePlayer({
     () => () => {
       clearControlsTimer()
       clearHardwareWaitTimer()
+      clearTvFullscreenFocusTimer()
       clearPriorityInfoTimer()
       clearCastErrorFlashTimer()
       clearCastMediaSync()
@@ -2871,6 +2994,7 @@ export function AnimePlayer({
     [
       clearControlsTimer,
       clearHardwareWaitTimer,
+      clearTvFullscreenFocusTimer,
       clearPriorityInfoTimer,
       clearCastErrorFlashTimer,
       clearCastMediaSync,
@@ -4402,16 +4526,17 @@ export function AnimePlayer({
       video.load()
     }
 
-    if (isIosBrowser() && requestNativeVideoFullscreen(video)) {
+    if (!isTvLike && isIosBrowser() && requestNativeVideoFullscreen(video)) {
       return
     }
 
-    const fullscreenTargets = isTvLike ? [video, target] : [target, video]
+    const fullscreenTargets = isTvLike ? [target] : [target, video]
 
     for (const fullscreenTarget of fullscreenTargets) {
       try {
         if (await requestElementFullscreen(fullscreenTarget)) {
           setIsPseudoFullscreen(false)
+          showControls()
           return
         }
       } catch {
@@ -4419,12 +4544,12 @@ export function AnimePlayer({
       }
     }
 
-    if (requestNativeVideoFullscreen(video)) {
+    if (!isTvLike && requestNativeVideoFullscreen(video)) {
       return
     }
 
     setIsPseudoFullscreen(true)
-    showControls(true)
+    showControls()
   }
 
   function getCastPreflightError() {
@@ -6091,6 +6216,7 @@ export function AnimePlayer({
               <Button
                 type="button"
                 size="icon"
+                data-yami-player-control="play"
                 onClick={(event) => {
                   event.stopPropagation()
                   void togglePlay()

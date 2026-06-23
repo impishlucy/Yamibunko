@@ -361,6 +361,20 @@ html[data-yami-tv="true"] [data-yami-player-control="settings"]:focus-visible {
   box-shadow: 0 0 0 7px rgb(124 58 237 / 0.42), 0 0 24px rgb(167 139 250 / 0.5) !important;
 }
 
+
+html[data-yami-tv="true"] .yami-anime-player-frame:focus,
+html[data-yami-tv="true"] .yami-anime-player-frame:focus-visible,
+html[data-yami-tv="true"] .yami-anime-player-frame:fullscreen,
+html[data-yami-tv="true"] .yami-anime-player-frame:-webkit-full-screen {
+  outline: none !important;
+}
+
+html[data-yami-tv="true"] .yami-anime-player-frame:fullscreen,
+html[data-yami-tv="true"] .yami-anime-player-frame:-webkit-full-screen,
+html[data-yami-tv="true"] .yami-player-pseudo-fullscreen {
+  border-radius: 0 !important;
+}
+
 html[data-yami-tv="true"] [data-slot="card"]:has(:is(a, button, select, input, textarea):focus),
 html[data-yami-tv="true"] .yami-anime-player-frame:focus-within {
   border-color: rgb(196 181 253 / 0.75);
