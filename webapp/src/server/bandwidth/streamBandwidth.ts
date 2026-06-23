@@ -47,6 +47,15 @@ type ActiveStream = {
   throttle: StreamThrottleState
 }
 
+type ActiveUnmeteredStream = {
+  id: string
+  clientKey: string | null
+  username: string
+  mode: PlaybackMode
+  contentKey: string
+  forceClose: (() => void) | null
+}
+
 type StreamThrottleState = {
   availableBytes: number
   updatedAt: number
@@ -141,6 +150,7 @@ const bandwidthRecheckStreamDrainPollMs = 100
 const serverShutdownClientPauseGraceMs = 750
 const serverShutdownStreamDrainTimeoutMs = 5_000
 const activeStreams = new Map<string, ActiveStream>()
+const activeUnmeteredStreams = new Map<string, ActiveUnmeteredStream>()
 const clientActions = new Map<string, StreamPriorityAction>()
 const clientActionSubscribers = new Map<
   string,
@@ -839,6 +849,9 @@ function getKnownClientKeys() {
     ...[...activeStreams.values()]
       .map((stream) => stream.clientKey)
       .filter((clientKey): clientKey is string => Boolean(clientKey)),
+    ...[...activeUnmeteredStreams.values()]
+      .map((stream) => stream.clientKey)
+      .filter((clientKey): clientKey is string => Boolean(clientKey)),
     ...clientActionSubscribers.keys(),
   ])
 }
@@ -865,18 +878,24 @@ function closeActiveStreamsMatching(predicate: (stream: ActiveStream) => boolean
 
 function closeAllActiveStreams() {
   closeActiveStreamsMatching(() => true)
+
+  for (const stream of [...activeUnmeteredStreams.values()]) {
+    closeActiveUnmeteredStream(stream)
+  }
 }
 
 async function waitForServerShutdownStreamsToDrain() {
   const deadline = Date.now() + serverShutdownStreamDrainTimeoutMs
 
-  while (activeStreams.size > 0 && Date.now() < deadline) {
+  while (activeStreams.size + activeUnmeteredStreams.size > 0 && Date.now() < deadline) {
     await sleep(bandwidthRecheckStreamDrainPollMs)
   }
 
-  if (activeStreams.size > 0) {
+  const activeStreamCount = activeStreams.size + activeUnmeteredStreams.size
+
+  if (activeStreamCount > 0) {
     console.warn(
-      `[Warn] [Stream] Continuing server shutdown while ${activeStreams.size} client stream(s) are still closing.`
+      `[Warn] [Stream] Continuing server shutdown while ${activeStreamCount} client stream(s) are still closing.`
     )
   }
 }
@@ -1027,9 +1046,29 @@ function closeActiveStream(stream: ActiveStream) {
   }
 }
 
+function closeActiveUnmeteredStream(stream: ActiveUnmeteredStream) {
+  try {
+    stream.forceClose?.()
+  } finally {
+    activeUnmeteredStreams.delete(stream.id)
+  }
+}
+
+function shouldKeepExistingClientStream(
+  stream: { contentKey: string; mode: PlaybackMode },
+  options: { exceptContentKey?: string; keepSameContentDirect?: boolean }
+) {
+  return Boolean(
+    options.keepSameContentDirect &&
+      options.exceptContentKey &&
+      stream.contentKey === options.exceptContentKey &&
+      stream.mode === "direct"
+  )
+}
+
 function closeActiveStreamsForClientKey(
   clientKey: string | null,
-  options: { exceptContentKey?: string } = {}
+  options: { exceptContentKey?: string; keepSameContentDirect?: boolean } = {}
 ) {
   if (!clientKey) {
     return
@@ -1040,14 +1079,23 @@ function closeActiveStreamsForClientKey(
       continue
     }
 
-    if (
-      options.exceptContentKey &&
-      stream.contentKey === options.exceptContentKey
-    ) {
+    if (shouldKeepExistingClientStream(stream, options)) {
       continue
     }
 
     closeActiveStream(stream)
+  }
+
+  for (const stream of [...activeUnmeteredStreams.values()]) {
+    if (stream.clientKey !== clientKey) {
+      continue
+    }
+
+    if (shouldKeepExistingClientStream(stream, options)) {
+      continue
+    }
+
+    closeActiveUnmeteredStream(stream)
   }
 }
 
@@ -1058,6 +1106,11 @@ export function closeActiveStreamsForUser(username: string) {
     }
   }
 
+  for (const stream of [...activeUnmeteredStreams.values()]) {
+    if (stream.username === username) {
+      closeActiveUnmeteredStream(stream)
+    }
+  }
 
   for (const key of [...clientActions.keys()]) {
     if (key.startsWith(`${username}:`)) {
@@ -1212,7 +1265,10 @@ function createLease(input: {
   })
   let released = false
 
-  closeActiveStreamsForClientKey(clientKey, { exceptContentKey: contentKey })
+  closeActiveStreamsForClientKey(clientKey, {
+    exceptContentKey: contentKey,
+    keepSameContentDirect: input.mode === "direct",
+  })
 
   clearClientAction(input.username, input.clientId)
 
@@ -1309,15 +1365,28 @@ export function createUnmeteredStreamUploadLease(input: {
   seasonNumber: number
   episodeNumber: number
 }): StreamUploadLease {
+  const id = createId()
   const clientKey = getClientKey(input.username, input.clientId)
   const contentKey = getContentKey(input)
   let released = false
 
-  closeActiveStreamsForClientKey(clientKey, { exceptContentKey: contentKey })
+  closeActiveStreamsForClientKey(clientKey, {
+    exceptContentKey: contentKey,
+    keepSameContentDirect: input.mode === "direct",
+  })
   clearClientAction(input.username, input.clientId)
 
+  activeUnmeteredStreams.set(id, {
+    id,
+    clientKey,
+    username: input.username,
+    mode: input.mode,
+    contentKey,
+    forceClose: null,
+  })
+
   return {
-    id: createId(),
+    id,
     effectiveMode: input.mode,
     effectiveProfile: input.profile,
     isMetered: false,
@@ -1330,12 +1399,26 @@ export function createUnmeteredStreamUploadLease(input: {
         return
       }
 
+      const stream = activeUnmeteredStreams.get(id)
+
+      if (!stream) {
+        queueMicrotask(handler)
+        return
+      }
+
+      stream.forceClose = handler
+
       if (streamServerShutdownActive) {
         queueMicrotask(handler)
       }
     },
     release() {
+      if (released) {
+        return
+      }
+
       released = true
+      activeUnmeteredStreams.delete(id)
     },
   }
 }

@@ -2742,7 +2742,13 @@ export function AnimePlayer({
       return
     }
 
-    revealTvFullscreenControls(true)
+    const timer = window.setTimeout(() => {
+      revealTvFullscreenControls(true)
+    }, 0)
+
+    return () => {
+      window.clearTimeout(timer)
+    }
   }, [isFullscreen, isPseudoFullscreen, isTvLike, revealTvFullscreenControls])
 
   useEffect(() => {
