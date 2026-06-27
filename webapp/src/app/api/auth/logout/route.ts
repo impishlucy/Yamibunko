@@ -5,10 +5,18 @@ import { closeActiveStreamsForUser } from "@/server/bandwidth/streamBandwidth"
 import { deleteSessionsByUsername } from "@/server/db/sessions"
 import { deleteCastStreamTokensForUser } from "@/server/media/castTokens"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
 export async function POST(request: Request) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const originError = await requireSameOriginRequest(request)
 
   if (originError) {

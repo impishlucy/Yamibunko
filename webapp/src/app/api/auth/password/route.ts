@@ -8,6 +8,8 @@ import { deleteOtherCastStreamTokensForUser } from "@/server/media/castTokens"
 import { setUserPasswordHash } from "@/server/db/users"
 import { isSecureRequest } from "@/server/http/request"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -16,6 +18,12 @@ const passwordSchema = z.object({
 })
 
 export async function POST(request: Request) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const originError = await requireSameOriginRequest(request)
 
   if (originError) {

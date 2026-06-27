@@ -6,6 +6,8 @@ import {
   setUserSpoilerSettings,
 } from "@/server/db/users"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -58,6 +60,12 @@ function parseDisableUpdateBadges(payload: unknown) {
 }
 
 export async function GET() {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const auth = await requireApiUser()
 
   if (!auth.ok) {
@@ -68,6 +76,12 @@ export async function GET() {
 }
 
 export async function PATCH(request: Request) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const sameOriginError = await requireSameOriginRequest(request)
 
   if (sameOriginError) {

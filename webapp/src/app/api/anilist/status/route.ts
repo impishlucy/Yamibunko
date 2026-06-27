@@ -3,10 +3,18 @@ import { requireApiUser } from "@/server/auth/api"
 import { getAniListTrackingState } from "@/server/anilist/client"
 import { errorMessage, parsePositiveInt } from "@/server/utils/format"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
 export async function GET(request: Request) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const auth = await requireApiUser()
 
   if (!auth.ok) {

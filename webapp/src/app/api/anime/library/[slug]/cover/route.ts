@@ -10,6 +10,8 @@ import {
 } from "@/server/media/libraryAdmin"
 import { parsePositiveInt } from "@/server/utils/format"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -40,6 +42,12 @@ function selectedAnimeId(request: Request) {
 }
 
 export async function GET(request: Request, context: LibraryCoverContext) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const auth = await requireApiUser()
 
   if (!auth.ok) {
@@ -65,6 +73,12 @@ export async function GET(request: Request, context: LibraryCoverContext) {
 }
 
 export async function POST(request: Request, context: LibraryCoverContext) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const originError = await requireSameOriginRequest(request)
 
   if (originError) {

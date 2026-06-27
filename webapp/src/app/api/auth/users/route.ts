@@ -14,6 +14,8 @@ import {
   setUserVip,
 } from "@/server/db/users"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -42,6 +44,12 @@ function serializeUsers() {
 }
 
 export async function GET() {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const auth = await requireAdminApiUser()
 
   if (!auth.ok) {
@@ -54,6 +62,12 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const originError = await requireSameOriginRequest(request)
 
   if (originError) {
@@ -97,6 +111,12 @@ export async function POST(request: Request) {
 }
 
 export async function PATCH(request: Request) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const originError = await requireSameOriginRequest(request)
 
   if (originError) {
@@ -137,6 +157,12 @@ export async function PATCH(request: Request) {
 }
 
 export async function DELETE(request: Request) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const originError = await requireSameOriginRequest(request)
 
   if (originError) {

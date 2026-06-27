@@ -6,6 +6,8 @@ import {
   type StreamPriorityAction,
 } from "@/server/bandwidth/streamBandwidth"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -22,6 +24,12 @@ function encodeRetry(milliseconds: number) {
 }
 
 export async function GET(request: Request) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const auth = await requireApiUser(request)
 
   if (!auth.ok) {

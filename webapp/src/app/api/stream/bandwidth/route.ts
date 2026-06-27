@@ -4,10 +4,18 @@ import {
   toggleTemporaryUploadLimit,
 } from "@/server/bandwidth/streamBandwidth"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
 export async function GET(request: Request) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const auth = await requireAdminApiUser(request)
 
   if (!auth.ok) {
@@ -21,6 +29,12 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const sameOriginError = await requireSameOriginRequest(request)
 
   if (sameOriginError) {

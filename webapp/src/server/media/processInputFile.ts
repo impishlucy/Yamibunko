@@ -75,7 +75,6 @@ import {
 import { errorMessage, fileName } from "@/server/utils/format"
 import { debugLog } from "@/server/utils/debugLog"
 
-const targetAv1BytesPerMinute = 22 * 1024 * 1024
 const targetHevcBytesPerMinute = 32 * 1024 * 1024
 const targetAudioKbps = 320
 const failedImportsFolderName = "_failed_imports"
@@ -383,24 +382,15 @@ function normalizeVideoCodec(value: string | null | undefined) {
   return (value ?? "").trim().toLowerCase().replace(/[^a-z0-9_]+/g, "_")
 }
 
-function isTargetVideoCodec(
-  codec: string | null | undefined,
-  importEncoding: "av1" | "hevc"
-) {
+function isTargetVideoCodec(codec: string | null | undefined) {
   const normalized = normalizeVideoCodec(codec)
-
-  if (importEncoding === "av1") {
-    return normalized === "av1"
-  }
 
   return normalized === "hevc" || normalized === "h265"
 }
 
-function hasTargetImportVideo(probe: ProbeResult, importEncoding: "av1" | "hevc") {
+function hasTargetImportVideo(probe: ProbeResult) {
   return (probe.streams ?? []).some(
-    (stream) =>
-      stream.codec_type === "video" &&
-      isTargetVideoCodec(stream.codec_name, importEncoding)
+    (stream) => stream.codec_type === "video" && isTargetVideoCodec(stream.codec_name)
   )
 }
 
@@ -434,17 +424,13 @@ function usesMp4OutputContainer(filePath: string, probe: ProbeResult) {
   )
 }
 
-function assertValidMp4ImportOutput(
-  filePath: string,
-  probe: ProbeResult,
-  importEncoding: "av1" | "hevc"
-) {
+function assertValidMp4ImportOutput(filePath: string, probe: ProbeResult) {
   if (!usesMp4OutputContainer(filePath, probe)) {
     throw new Error(`FFmpeg output is not an MP4 container: ${filePath}`)
   }
 
-  if (!hasTargetImportVideo(probe, importEncoding)) {
-    throw new Error(`FFmpeg output is not ${importEncoding.toUpperCase()} video: ${filePath}`)
+  if (!hasTargetImportVideo(probe)) {
+    throw new Error(`FFmpeg output is not HEVC video: ${filePath}`)
   }
 
   const invalidAudioCodec = (probe.streams ?? []).find(
@@ -523,9 +509,6 @@ function getFileSubtitleOutputStreams(input: {
   ]
 }
 
-function targetBytesPerMinuteForImportEncoding(importEncoding: "av1" | "hevc") {
-  return importEncoding === "av1" ? targetAv1BytesPerMinute : targetHevcBytesPerMinute
-}
 
 function calculateVideoBitrateKbps(bytesPerMinute: number) {
   const totalKbps = Math.floor((bytesPerMinute * 8) / 60 / 1000)
@@ -1013,7 +996,6 @@ async function transcodeFile(
   inputPath: string,
   outputPath: string,
   options: {
-    importEncoding: "av1" | "hevc"
     convertVideo: boolean
     audioOutputIndexesToOpus: number[]
     subtitleStream?: FileSubtitleOutputStream | null
@@ -1055,7 +1037,7 @@ async function transcodeFile(
   }
 
   await runFfmpeg(args, {
-    priorityRole: options.convertVideo ? "import-encoding" : undefined,
+    priorityRole: options.convertVideo ? "file-encoding" : undefined,
     protectFromParentSignals: true,
   })
 
@@ -1064,7 +1046,7 @@ async function transcodeFile(
   }
 
   const outputProbe = (await ffprobe(outputPath)) as ProbeResult
-  assertValidMp4ImportOutput(outputPath, outputProbe, options.importEncoding)
+  assertValidMp4ImportOutput(outputPath, outputProbe)
 
   if (options.subtitleStream && options.subtitleOutputPath) {
     await extractSubtitleSidecar({
@@ -1736,18 +1718,13 @@ export async function processInputFile(
       })
     }
 
-    if (config.importEncoding === "none") {
-      throw new Error("Import encoding is disabled while import processing is enabled.")
-    }
-
-    const importEncoding = config.importEncoding
     const inputBytesPerMinute = calculateBytesPerMinute(
       inputStat.size,
       durationSeconds
     )
-    const maxTargetBytesPerMinute = targetBytesPerMinuteForImportEncoding(importEncoding)
+    const maxTargetBytesPerMinute = targetHevcBytesPerMinute
     const inputVideoCodec = getPrimaryVideoCodec(probe)
-    const inputHasTargetVideo = hasTargetImportVideo(probe, importEncoding)
+    const inputHasTargetVideo = hasTargetImportVideo(probe)
     const inputUsesMp4Container = usesMp4OutputContainer(filePath, probe)
     const subtitleStreams = getFileSubtitleOutputStreams({
       probe,
@@ -1799,8 +1776,8 @@ export async function processInputFile(
     debugImport(
       jobId,
       skippedDetailedEditChecks
-        ? `Processing decision - inputCodec ${inputVideoCodec ?? "unknown"}, target ${importEncoding}, targetVideo false, action ${importFileEditKind}, videoTranscodeReason ${videoTranscodeReason}, needsFfmpegProcessing ${needsFfmpegProcessing}; skipped MP4/audio/subtitle/shrink decision checks because full processing is required. Audio tracks to Opus for output [${audioOutputIndexesToOpus.join(", ")}], subtitleTrack ${subtitleStream ? `${subtitleStream.inputIndex}:${subtitleStream.streamIndex}:${subtitleStream.codec}` : "none"}`
-        : `Processing decision - inputCodec ${inputVideoCodec ?? "unknown"}, target ${importEncoding}, targetVideo ${inputHasTargetVideo}, mp4Container ${inputUsesMp4Container}, opusAudio ${!convertAudioToOpus}, sidecarSubtitleNeeded ${requiresSubtitleSidecarExtraction}, conformsBeforeShrink ${inputMatchesMp4Target}, belowMaxSize ${!requiresVideoShrink}, audioTracksToOpus [${audioOutputIndexesToOpus.join(", ")}], subtitleTrack ${subtitleStream ? `${subtitleStream.inputIndex}:${subtitleStream.streamIndex}:${subtitleStream.codec}` : "none"}, requiredFormatEdits ${requiredSingleStepEdits}, action ${importFileEditKind}, videoTranscodeReason ${videoTranscodeReason}, needsFfmpegProcessing ${needsFfmpegProcessing}`
+        ? `Processing decision - inputCodec ${inputVideoCodec ?? "unknown"}, target HEVC, targetVideo false, action ${importFileEditKind}, videoTranscodeReason ${videoTranscodeReason}, needsFfmpegProcessing ${needsFfmpegProcessing}; skipped MP4/audio/subtitle/shrink decision checks because full processing is required. Audio tracks to Opus for output [${audioOutputIndexesToOpus.join(", ")}], subtitleTrack ${subtitleStream ? `${subtitleStream.inputIndex}:${subtitleStream.streamIndex}:${subtitleStream.codec}` : "none"}`
+        : `Processing decision - inputCodec ${inputVideoCodec ?? "unknown"}, target HEVC, targetVideo ${inputHasTargetVideo}, mp4Container ${inputUsesMp4Container}, opusAudio ${!convertAudioToOpus}, sidecarSubtitleNeeded ${requiresSubtitleSidecarExtraction}, conformsBeforeShrink ${inputMatchesMp4Target}, belowMaxSize ${!requiresVideoShrink}, audioTracksToOpus [${audioOutputIndexesToOpus.join(", ")}], subtitleTrack ${subtitleStream ? `${subtitleStream.inputIndex}:${subtitleStream.streamIndex}:${subtitleStream.codec}` : "none"}, requiredFormatEdits ${requiredSingleStepEdits}, action ${importFileEditKind}, videoTranscodeReason ${videoTranscodeReason}, needsFfmpegProcessing ${needsFfmpegProcessing}`
     )
 
     const safeLibraryTitle = safePathSegment(libraryTitle, "Library title")
@@ -2075,7 +2052,6 @@ export async function processInputFile(
 
       try {
         await transcodeFile(filePath, tempPath, {
-          importEncoding,
           convertVideo,
           inputVideoCodec,
           audioOutputIndexesToOpus,

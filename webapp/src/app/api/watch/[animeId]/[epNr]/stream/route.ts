@@ -35,6 +35,8 @@ import { createElapsedPlaybackProgressTracker } from "@/server/media/watchProgre
 import { acquireLiveTranscode } from "@/server/transcode/transcodeCapacity"
 import { errorMessage, fileName, parsePositiveInt } from "@/server/utils/format"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -85,6 +87,12 @@ function streamCorsHeaders() {
 }
 
 export function OPTIONS() {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   return new Response(null, {
     status: 204,
     headers: streamCorsHeaders(),
@@ -1577,6 +1585,12 @@ async function handleTranscode(
 }
 
 export async function GET(request: Request, context: StreamContext) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const abuseError = await guardStreamRequest(request)
 
   if (abuseError) {

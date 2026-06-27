@@ -13,6 +13,8 @@ import {
 import { getEpisode } from "@/server/media/libraryStore"
 import { getServerConfig } from "@/server/config"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -134,6 +136,12 @@ function fallbackThumbnailResponse() {
 }
 
 export async function GET(request: Request, context: ThumbnailContext) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const auth = await requireApiUser()
 
   if (!auth.ok) {

@@ -6,6 +6,8 @@ import { parsePositiveInt } from "@/server/utils/format"
 import { isEpisodeCompleteByProgress } from "@/lib/watch-progress"
 import { saveEpisodePlaybackProgress } from "@/server/media/watchProgress"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -24,6 +26,12 @@ const progressSchema = z.object({
 })
 
 export async function POST(request: Request, context: ProgressContext) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const originError = await requireSameOriginRequest(request)
 
   if (originError) {

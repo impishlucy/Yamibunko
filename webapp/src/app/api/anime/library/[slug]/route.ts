@@ -13,6 +13,8 @@ import {
   updateNonAnimeLibraryDetails,
 } from "@/server/media/libraryAdmin"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -53,6 +55,12 @@ function libraryAdminErrorResponse(error: unknown) {
 }
 
 export async function GET(request: Request, context: AnimeLibraryEntryContext) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const auth = await requireApiUser()
 
   if (!auth.ok) {
@@ -77,6 +85,12 @@ export async function GET(request: Request, context: AnimeLibraryEntryContext) {
 }
 
 export async function PATCH(request: Request, context: AnimeLibraryEntryContext) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const originError = await requireSameOriginRequest(request)
 
   if (originError) {

@@ -12,8 +12,8 @@ namespace Launcher;
 
 public static class HardwareAccelerationDetector
 {
-    public const string ImportHardwareUnsupportedMessage = "HW encoding is not supported for AV1 or HEVC on your device";
-    public const string ImportCatalogModeTooltip = "HW encoding is not supported for AV1 or HEVC on your device, encode mode is disabled";
+    public const string ImportHardwareUnsupportedMessage = "HW encoding is not supported for HEVC on your device";
+    public const string ImportCatalogModeTooltip = "HW encoding is not supported for HEVC on your device, encode mode is disabled";
 
     public static string FormatAccelerationForDisplay(string? acceleration)
     {
@@ -34,13 +34,6 @@ public static class HardwareAccelerationDetector
             : NormalizeLiveAccelerationForExport(detection.LiveTranscodeAcceleration);
     }
 
-    public static string SelectServerImportEncoding(HardwareAccelerationDetection detection, bool importEnabled)
-    {
-        return ShouldUseImportAcceleration(detection, importEnabled)
-            ? detection.ImportEncoding
-            : "none";
-    }
-
     public static bool IsUnsupportedAcceleration(string? acceleration)
     {
         return string.IsNullOrWhiteSpace(acceleration)
@@ -49,8 +42,7 @@ public static class HardwareAccelerationDetector
 
     public static bool SupportsImportAcceleration(HardwareAccelerationDetection detection)
     {
-        return !IsUnsupportedAcceleration(detection.ImportAcceleration)
-            && !string.Equals(detection.ImportEncoding, "none", StringComparison.OrdinalIgnoreCase);
+        return !IsUnsupportedAcceleration(detection.ImportAcceleration);
     }
 
     private static bool ShouldUseImportAcceleration(HardwareAccelerationDetection detection, bool importEnabled)
@@ -86,30 +78,19 @@ public static class HardwareAccelerationDetector
             : await DetectUnixHardwareAsync();
         var ffmpegPath = ResolveFfmpegPath(ffmpegDir);
         var usableFfmpegPath = probeEncoders && File.Exists(ffmpegPath) ? ffmpegPath : null;
-        var av1Acceleration = await ResolveWithOptionalProbeAsync(
+        var hevcAcceleration = await ResolveWithOptionalProbeAsync(
             usableFfmpegPath,
-            GetAv1Candidates(hardware),
-            EncoderProbeKind.Av1);
-        var hevcAcceleration = av1Acceleration is null
-            ? await ResolveWithOptionalProbeAsync(
-                usableFfmpegPath,
-                GetHevcCandidates(hardware),
-                EncoderProbeKind.Hevc)
-            : null;
-        var importAcceleration = av1Acceleration ?? hevcAcceleration;
+            GetHevcCandidates(hardware),
+            EncoderProbeKind.Hevc);
+        var importAcceleration = hevcAcceleration;
         var liveAcceleration = await ResolveWithOptionalProbeAsync(
             usableFfmpegPath,
             PrioritizeLiveCandidates(GetLiveCandidates(hardware), importAcceleration),
             EncoderProbeKind.Live);
 
         return new HardwareAccelerationDetection(
-            av1Acceleration is not null ? "av1" : hevcAcceleration is not null ? "hevc" : "none",
             importAcceleration?.Acceleration,
             importAcceleration?.Device,
-            av1Acceleration?.Acceleration,
-            av1Acceleration?.Device,
-            hevcAcceleration?.Acceleration,
-            hevcAcceleration?.Device,
             liveAcceleration?.Acceleration ?? "cpu",
             liveAcceleration?.Device,
             hardware.GpuInfo,
@@ -350,64 +331,6 @@ public static class HardwareAccelerationDetector
         };
     }
 
-    private static bool SupportsNvidiaAv1Encode(string value)
-    {
-        var normalized = Normalize(value);
-
-        return Regex.IsMatch(normalized, @"\brtx\s*(40|50)\d{2}\b")
-            || Regex.IsMatch(normalized, @"\brtx\s*(40|50)\d{2}\s*(ti|super|laptop)?\b")
-            || Regex.IsMatch(normalized, @"\brtx\s*(20|40|45|50|60)00\b.*\bada\b")
-            || Regex.IsMatch(normalized, @"\bada\b")
-            || Regex.IsMatch(normalized, @"\bblackwell\b")
-            || Regex.IsMatch(normalized, @"\bl4\b")
-            || Regex.IsMatch(normalized, @"\bl40s?\b")
-            || Regex.IsMatch(normalized, @"\bgb\d{3}\b");
-    }
-
-    private static bool SupportsIntelGpuAv1Encode(string value)
-    {
-        var normalized = Normalize(value);
-
-        return Regex.IsMatch(normalized, @"\barc\s*(a|b)\d{3}\b")
-            || Regex.IsMatch(normalized, @"\barc\s*pro\s*(a|b)\d{2,4}\b")
-            || Regex.IsMatch(normalized, @"\bintel\s*arc\b")
-            || Regex.IsMatch(normalized, @"\bcore\s*ultra\b.*\barc\b")
-            || Regex.IsMatch(normalized, @"\barc\b.*\bcore\s*ultra\b")
-            || Regex.IsMatch(normalized, @"\bmeteor\s*lake\b.*\barc\b")
-            || Regex.IsMatch(normalized, @"\blunar\s*lake\b")
-            || Regex.IsMatch(normalized, @"\barrow\s*lake\b.*\barc\b");
-    }
-
-    private static bool SupportsIntelCpuAv1Encode(string value)
-    {
-        var normalized = Normalize(value);
-
-        return Regex.IsMatch(normalized, @"\bcore\s*ultra\b")
-            || Regex.IsMatch(normalized, @"\bmeteor\s*lake\b")
-            || Regex.IsMatch(normalized, @"\blunar\s*lake\b")
-            || Regex.IsMatch(normalized, @"\barrow\s*lake\b");
-    }
-
-    private static bool SupportsAmdAv1Encode(string value)
-    {
-        var normalized = Normalize(value);
-
-        return Regex.IsMatch(normalized, @"\bradeon\b.*\brx\s*[789]\d{3}\b")
-            || Regex.IsMatch(normalized, @"\brx\s*[789]\d{3}\b")
-            || Regex.IsMatch(normalized, @"\bradeon\b.*\bpro\s*w[789]\d{3}\b")
-            || Regex.IsMatch(normalized, @"\bpro\s*w[789]\d{3}\b")
-            || Regex.IsMatch(normalized, @"\bradeon\b.*\b(740m|760m|780m|780m graphics|880m|890m)\b")
-            || Regex.IsMatch(normalized, @"\bryzen\s*ai\b")
-            || Regex.IsMatch(normalized, @"\bryzen\s*[3579]\s*(7040|8040|8\d{3}g?)\w*\b")
-            || Regex.IsMatch(normalized, @"\bryzen\s*z1\b")
-            || Regex.IsMatch(normalized, @"\bvcn\s*(4|5)(\.\d*)?\b")
-            || Regex.IsMatch(normalized, @"\bnavi\s*(3|4)\d\b")
-            || Regex.IsMatch(normalized, @"\brdna\s*(3|4)\b")
-            || Regex.IsMatch(normalized, @"\bstrix\b")
-            || Regex.IsMatch(normalized, @"\bphoenix\b")
-            || Regex.IsMatch(normalized, @"\bhawk\s*point\b");
-    }
-
     private static bool SupportsNvidiaHevcEncode(string value)
     {
         var normalized = Normalize(value);
@@ -538,48 +461,6 @@ public static class HardwareAccelerationDetector
             "intel_cpu" => 4,
             _ => 100
         };
-    }
-
-    private static IReadOnlyList<EncoderCandidate> GetAv1Candidates(HardwareInfo hardware)
-    {
-        var candidates = new List<EncoderCandidate>();
-
-        foreach (var line in SplitHardwareLines(hardware.GpuInfo))
-        {
-            var normalized = Normalize(line);
-
-            if (HasNvidiaGpu(normalized) && SupportsNvidiaAv1Encode(normalized))
-            {
-                candidates.AddRange(MakeCandidates(hardware, "nvenc", HardwareSource.Gpu));
-            }
-
-            if (HasIntelGpu(normalized) && SupportsIntelGpuAv1Encode(normalized))
-            {
-                candidates.AddRange(MakeCandidates(hardware, "intel_gpu", HardwareSource.Gpu));
-            }
-
-            if (HasAmdGpu(normalized) && SupportsAmdAv1Encode(normalized))
-            {
-                candidates.AddRange(MakeCandidates(hardware, "amd_gpu", HardwareSource.Gpu));
-            }
-        }
-
-        foreach (var line in SplitHardwareLines(hardware.CpuInfo))
-        {
-            var normalized = Normalize(line);
-
-            if (normalized.Contains("intel") && SupportsIntelCpuAv1Encode(normalized))
-            {
-                candidates.AddRange(MakeCandidates(hardware, "intel_cpu", HardwareSource.Cpu));
-            }
-
-            if (normalized.Contains("amd") && SupportsAmdAv1Encode(normalized))
-            {
-                candidates.AddRange(MakeCandidates(hardware, "amd_cpu", HardwareSource.Cpu));
-            }
-        }
-
-        return PrioritizeCandidates(candidates);
     }
 
     private static IReadOnlyList<EncoderCandidate> GetHevcCandidates(HardwareInfo hardware)
@@ -733,7 +614,7 @@ public static class HardwareAccelerationDetector
         }
     }
 
-    private static IReadOnlyList<string> GetAv1ProbeQualityArgs(string acceleration)
+    private static IReadOnlyList<string> GetHevcProbeQualityArgs(string acceleration)
     {
         switch (acceleration.ToLowerInvariant())
         {
@@ -815,7 +696,6 @@ public static class HardwareAccelerationDetector
         {
             return kind switch
             {
-                EncoderProbeKind.Av1 => "av1_nvenc",
                 EncoderProbeKind.Hevc => "hevc_nvenc",
                 _ => "h264_nvenc"
             };
@@ -825,7 +705,6 @@ public static class HardwareAccelerationDetector
         {
             return kind switch
             {
-                EncoderProbeKind.Av1 => "av1_qsv",
                 EncoderProbeKind.Hevc => "hevc_qsv",
                 _ => "h264_qsv"
             };
@@ -835,7 +714,6 @@ public static class HardwareAccelerationDetector
         {
             return kind switch
             {
-                EncoderProbeKind.Av1 => "av1_vaapi",
                 EncoderProbeKind.Hevc => "hevc_vaapi",
                 _ => "h264_vaapi"
             };
@@ -843,7 +721,6 @@ public static class HardwareAccelerationDetector
 
         return kind switch
         {
-            EncoderProbeKind.Av1 => "av1_amf",
             EncoderProbeKind.Hevc => "hevc_amf",
             _ => "h264_amf"
         };
@@ -851,9 +728,9 @@ public static class HardwareAccelerationDetector
 
     private static IReadOnlyList<string> EncoderProbeQualityArgs(EncoderCandidate candidate, EncoderProbeKind kind)
     {
-        if (kind is EncoderProbeKind.Av1 or EncoderProbeKind.Hevc)
+        if (kind is EncoderProbeKind.Hevc)
         {
-            return GetAv1ProbeQualityArgs(candidate.Acceleration);
+            return GetHevcProbeQualityArgs(candidate.Acceleration);
         }
 
         if (IsNvidiaAcceleration(candidate.Acceleration))
@@ -938,7 +815,6 @@ public static class HardwareAccelerationDetector
 
     private enum EncoderProbeKind
     {
-        Av1,
         Hevc,
         Live
     }
@@ -955,13 +831,8 @@ public static class HardwareAccelerationDetector
 }
 
 public sealed record HardwareAccelerationDetection(
-    string ImportEncoding,
     string? ImportAcceleration,
     string? ImportDevice,
-    string? Av1ImportAcceleration,
-    string? Av1ImportDevice,
-    string? HevcImportAcceleration,
-    string? HevcImportDevice,
     string LiveTranscodeAcceleration,
     string? LiveTranscodeDevice,
     string GpuInfo,

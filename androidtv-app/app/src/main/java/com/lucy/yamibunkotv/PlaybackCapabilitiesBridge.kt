@@ -4,10 +4,17 @@ import android.webkit.JavascriptInterface
 
 class PlaybackCapabilitiesBridge(
     private val capabilities: VideoCodecCapabilities,
+    private val onPlaybackActiveChanged: (Boolean) -> Unit = {},
 ) {
     @JavascriptInterface
     fun getVideoCapabilities(): String {
         return capabilities.toJson()
+    }
+
+
+    @JavascriptInterface
+    fun setPlaybackActive(active: Boolean) {
+        onPlaybackActiveChanged(active)
     }
 
     @JavascriptInterface

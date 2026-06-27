@@ -13,6 +13,8 @@ import {
 import { isSecureRequest } from "@/server/http/request"
 import { guardApiRequest } from "@/server/security/abuseGuard"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -32,6 +34,12 @@ async function readCode(context: RouteContext) {
 }
 
 export async function GET(request: Request, context: RouteContext) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const originError = await requireSameOriginRequest(request)
 
   if (originError) {
@@ -79,6 +87,12 @@ export async function GET(request: Request, context: RouteContext) {
 }
 
 export async function POST(request: Request, context: RouteContext) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const originError = await requireSameOriginRequest(request)
 
   if (originError) {

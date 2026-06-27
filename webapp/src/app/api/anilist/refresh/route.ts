@@ -13,6 +13,8 @@ import {
 } from "@/server/db/users"
 import { errorMessage } from "@/server/utils/format"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -42,6 +44,12 @@ function getRefreshState(username: string, isAdmin: boolean) {
 }
 
 export async function GET() {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const auth = await requireApiUser()
 
   if (!auth.ok) {
@@ -52,6 +60,12 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const originError = await requireSameOriginRequest(request)
 
   if (originError) {

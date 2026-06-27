@@ -3,16 +3,16 @@ import os from "node:os"
 import path from "node:path"
 import { spawnSync } from "node:child_process"
 
-import type { FileEncodeAcceleration, ImportEncoding, TranscodeAcceleration } from "@/server/config"
+import type { FileEncodeAcceleration, TranscodeAcceleration } from "@/server/config"
 
 export const importHardwareUnsupportedMessage =
-  "HW encoding is not supported for AV1 or HEVC on your device"
+  "HW encoding is not supported for HEVC on your device"
 
 const commandTimeoutMs = 8_000
 const probeTimeoutMs = 10_000
 
 export type HardwareAcceleration = FileEncodeAcceleration
-type EncoderProbeKind = "av1" | "hevc" | "live"
+type EncoderProbeKind = "hevc" | "live"
 type HardwareSource = "gpu" | "cpu"
 
 type HardwareInfo = {
@@ -34,13 +34,8 @@ type EncoderCandidate = {
 }
 
 export type HardwareAccelerationDetection = {
-  importEncoding: ImportEncoding
   importAcceleration: HardwareAcceleration | null
   importDevice?: string
-  av1ImportAcceleration: HardwareAcceleration | null
-  av1ImportDevice?: string
-  hevcImportAcceleration: HardwareAcceleration | null
-  hevcImportDevice?: string
   liveTranscodeAcceleration: TranscodeAcceleration
   liveTranscodeDevice?: string
   gpuInfo: string
@@ -208,68 +203,6 @@ function isIntelAcceleration(acceleration: TranscodeAcceleration) {
 
 function isAmdAcceleration(acceleration: TranscodeAcceleration) {
   return acceleration === "amd_gpu" || acceleration === "amd_cpu"
-}
-
-function supportsNvidiaAv1Encode(value: string) {
-  const normalized = normalize(value)
-
-  return (
-    /\brtx\s*(40|50)\d{2}\b/.test(normalized) ||
-    /\brtx\s*(40|50)\d{2}\s*(ti|super|laptop)?\b/.test(normalized) ||
-    /\brtx\s*(20|40|45|50|60)00\b.*\bada\b/.test(normalized) ||
-    /\bada\b/.test(normalized) ||
-    /\bblackwell\b/.test(normalized) ||
-    /\bl4\b/.test(normalized) ||
-    /\bl40s?\b/.test(normalized) ||
-    /\bgb\d{3}\b/.test(normalized)
-  )
-}
-
-function supportsIntelAv1Encode(value: string) {
-  const normalized = normalize(value)
-
-  return (
-    /\barc\s*(a|b)\d{3}\b/.test(normalized) ||
-    /\barc\s*pro\s*(a|b)\d{2,4}\b/.test(normalized) ||
-    /\bintel\s*arc\b/.test(normalized) ||
-    /\bcore\s*ultra\b.*\barc\b/.test(normalized) ||
-    /\barc\b.*\bcore\s*ultra\b/.test(normalized) ||
-    /\bmeteor\s*lake\b.*\barc\b/.test(normalized) ||
-    /\blunar\s*lake\b/.test(normalized) ||
-    /\barrow\s*lake\b.*\barc\b/.test(normalized)
-  )
-}
-
-function supportsIntelCpuAv1Encode(value: string) {
-  const normalized = normalize(value)
-
-  return (
-    /\bcore\s*ultra\b/.test(normalized) ||
-    /\bmeteor\s*lake\b/.test(normalized) ||
-    /\blunar\s*lake\b/.test(normalized) ||
-    /\barrow\s*lake\b/.test(normalized)
-  )
-}
-
-function supportsAmdAv1Encode(value: string) {
-  const normalized = normalize(value)
-
-  return (
-    /\bradeon\b.*\brx\s*[789]\d{3}\b/.test(normalized) ||
-    /\brx\s*[789]\d{3}\b/.test(normalized) ||
-    /\bradeon\b.*\bpro\s*w[789]\d{3}\b/.test(normalized) ||
-    /\bpro\s*w[789]\d{3}\b/.test(normalized) ||
-    /\bradeon\b.*\b(740m|760m|780m|780m graphics|880m|890m)\b/.test(normalized) ||
-    /\bryzen\s*ai\b/.test(normalized) ||
-    /\bryzen\s*[3579]\s*(7040|8040|8\d{3}g?)\w*\b/.test(normalized) ||
-    /\bryzen\s*z1\b/.test(normalized) ||
-    /\bvcn\s*(4|5)(\.\d*)?\b/.test(normalized) ||
-    /\bnavi\s*(3|4)\d\b/.test(normalized) ||
-    /\brdna\s*(3|4)\b/.test(normalized) ||
-    /\bstrix\b/.test(normalized) ||
-    /\bphoenix\b/.test(normalized) ||
-    /\bhawk\s*point\b/.test(normalized)
-  )
 }
 
 function supportsNvidiaHevcEncode(value: string) {
@@ -449,51 +382,6 @@ function preferredCandidatePriority(
     : 1
 }
 
-function getAv1Candidates(
-  hardware: HardwareInfo,
-  accelerationFilter?: HardwareAcceleration
-) {
-  const gpuCandidates = splitHardwareLines(hardware.gpuInfo).flatMap((line) => {
-    const normalized = normalize(line)
-    const candidates: EncoderCandidate[] = []
-
-    if (hasNvidiaGpu(normalized) && supportsNvidiaAv1Encode(normalized)) {
-      candidates.push(...makeCandidates(hardware, "nvenc", "gpu"))
-    }
-
-    if (hasIntelGpu(normalized) && supportsIntelAv1Encode(normalized)) {
-      candidates.push(...makeCandidates(hardware, "intel_gpu", "gpu"))
-    }
-
-    if (hasAmdGpu(normalized) && supportsAmdAv1Encode(normalized)) {
-      candidates.push(...makeCandidates(hardware, "amd_gpu", "gpu"))
-    }
-
-    return candidates
-  })
-
-  const cpuCandidates = splitHardwareLines(hardware.cpuInfo).flatMap((line) => {
-    const normalized = normalize(line)
-    const candidates: EncoderCandidate[] = []
-
-    if (normalized.includes("intel") && supportsIntelCpuAv1Encode(normalized)) {
-      candidates.push(...makeCandidates(hardware, "intel_cpu", "cpu"))
-    }
-
-    if (normalized.includes("amd") && supportsAmdAv1Encode(normalized)) {
-      candidates.push(...makeCandidates(hardware, "amd_cpu", "cpu"))
-    }
-
-    return candidates
-  })
-
-  const candidates = prioritizeCandidates([...gpuCandidates, ...cpuCandidates])
-
-  return accelerationFilter
-    ? candidates.filter((candidate) => candidate.acceleration === accelerationFilter)
-    : candidates
-}
-
 function getHevcCandidates(
   hardware: HardwareInfo,
   accelerationFilter?: HardwareAcceleration
@@ -580,7 +468,7 @@ function getLiveCandidates(hardware: HardwareInfo) {
   return prioritizeCandidates([...gpuCandidates, ...cpuCandidates])
 }
 
-function getAv1ProbeQualityArgs(acceleration: HardwareAcceleration) {
+function getHevcProbeQualityArgs(acceleration: HardwareAcceleration) {
   if (isNvidiaAcceleration(acceleration)) {
     return [
       "-preset",
@@ -648,9 +536,6 @@ function getAv1ProbeQualityArgs(acceleration: HardwareAcceleration) {
   ]
 }
 
-function getHevcProbeQualityArgs(acceleration: HardwareAcceleration) {
-  return getAv1ProbeQualityArgs(acceleration)
-}
 
 function getQsvDeviceArgs(candidate: EncoderCandidate) {
   return process.platform === "linux" && candidate.device
@@ -664,25 +549,21 @@ function getVaapiDeviceArgs(candidate: EncoderCandidate) {
 
 function encoderName(candidate: EncoderCandidate, kind: EncoderProbeKind) {
   if (isNvidiaAcceleration(candidate.acceleration)) {
-    return kind === "av1" ? "av1_nvenc" : kind === "hevc" ? "hevc_nvenc" : "h264_nvenc"
+    return kind === "hevc" ? "hevc_nvenc" : "h264_nvenc"
   }
 
   if (isIntelAcceleration(candidate.acceleration)) {
-    return kind === "av1" ? "av1_qsv" : kind === "hevc" ? "hevc_qsv" : "h264_qsv"
+    return kind === "hevc" ? "hevc_qsv" : "h264_qsv"
   }
 
   if (process.platform === "linux") {
-    return kind === "av1" ? "av1_vaapi" : kind === "hevc" ? "hevc_vaapi" : "h264_vaapi"
+    return kind === "hevc" ? "hevc_vaapi" : "h264_vaapi"
   }
 
-  return kind === "av1" ? "av1_amf" : kind === "hevc" ? "hevc_amf" : "h264_amf"
+  return kind === "hevc" ? "hevc_amf" : "h264_amf"
 }
 
 function encoderProbeQualityArgs(candidate: EncoderCandidate, kind: EncoderProbeKind) {
-  if (kind === "av1") {
-    return getAv1ProbeQualityArgs(candidate.acceleration)
-  }
-
   if (kind === "hevc") {
     return getHevcProbeQualityArgs(candidate.acceleration)
   }
@@ -796,31 +677,21 @@ export function detectHardwareAcceleration(input: {
   ffmpegDir?: string
   probeEncoders?: boolean
   importAccelerationFilter?: HardwareAcceleration | null
-  av1AccelerationFilter?: HardwareAcceleration | null
 }): HardwareAccelerationDetection {
   const hardware = detectHardwareInfo()
   const ffmpegPath = input.probeEncoders && input.ffmpegDir
     ? path.join(input.ffmpegDir, executableName("ffmpeg"))
     : null
   const usableFfmpegPath = ffmpegPath && existsSync(ffmpegPath) ? ffmpegPath : null
-  const accelerationFilter = input.importAccelerationFilter ?? input.av1AccelerationFilter
-  const av1Candidates = accelerationFilter === null
-    ? []
-    : getAv1Candidates(hardware, accelerationFilter)
-  const av1ImportCandidate = resolveWithOptionalProbe(
-    usableFfmpegPath,
-    av1Candidates,
-    "av1"
-  )
-  const hevcCandidates = av1ImportCandidate || accelerationFilter === null
+  const accelerationFilter = input.importAccelerationFilter
+  const hevcCandidates = accelerationFilter === null
     ? []
     : getHevcCandidates(hardware, accelerationFilter)
-  const hevcImportCandidate = resolveWithOptionalProbe(
+  const importCandidate = resolveWithOptionalProbe(
     usableFfmpegPath,
     hevcCandidates,
     "hevc"
   )
-  const importCandidate = av1ImportCandidate ?? hevcImportCandidate
   const liveTranscodeCandidate = resolveWithOptionalProbe(
     usableFfmpegPath,
     prioritizeLiveCandidates(getLiveCandidates(hardware), importCandidate),
@@ -828,13 +699,8 @@ export function detectHardwareAcceleration(input: {
   )
 
   return {
-    importEncoding: av1ImportCandidate ? "av1" : hevcImportCandidate ? "hevc" : "none",
     importAcceleration: importCandidate?.acceleration ?? null,
     importDevice: importCandidate?.device,
-    av1ImportAcceleration: av1ImportCandidate?.acceleration ?? null,
-    av1ImportDevice: av1ImportCandidate?.device,
-    hevcImportAcceleration: hevcImportCandidate?.acceleration ?? null,
-    hevcImportDevice: hevcImportCandidate?.device,
     liveTranscodeAcceleration: liveTranscodeCandidate?.acceleration ?? "cpu",
     liveTranscodeDevice: liveTranscodeCandidate?.device,
     gpuInfo: hardware.gpuInfo,

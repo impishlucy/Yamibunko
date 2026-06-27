@@ -1,6 +1,8 @@
 import { getAnimeInfo, getEpisodes } from "@/server/media/libraryStore"
 import { requireApiUser } from "@/server/auth/api"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -11,6 +13,12 @@ type EpisodesContext = {
 }
 
 export async function GET(_request: Request, context: EpisodesContext) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const auth = await requireApiUser()
 
   if (!auth.ok) {

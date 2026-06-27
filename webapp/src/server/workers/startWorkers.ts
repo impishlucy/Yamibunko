@@ -22,6 +22,10 @@ import { updateJob } from "@/server/db/jobs"
 import { listEpisodeFilePaths, repairLibraryIntegrity } from "@/server/db/library"
 import { resetAdminIgnoredAppUpdateVersions } from "@/server/db/users"
 import { getServerConfigResult } from "@/server/config"
+import {
+  beginVersionDependentStartupUpgradeShutdown,
+  v6CompatibilityFailedFolderName,
+} from "@/server/startup/versionUpgrades"
 import { tryRunCacheMaintenance } from "@/server/media/cacheMaintenance"
 import { isMediaFile, pathExists } from "@/server/media/mediaFiles"
 import {
@@ -50,7 +54,8 @@ type WorkerRuntime = {
   activeWork: Set<Promise<void>>
   watchers: FSWatcher[]
   startupChecksReady: Promise<void>
-  startImportProcessing: () => void
+  startupReady: Promise<void>
+  startImportProcessing: () => Promise<void>
   stop: () => Promise<void>
 }
 
@@ -215,11 +220,15 @@ function normalizeFilePathKey(filePath: string) {
 }
 
 const failedImportsFolderName = "_failed_imports"
-const failedImportsFolderNames = new Set([failedImportsFolderName])
 
 function normalizeDirectoryName(value: string) {
   return value.trim().toLowerCase()
 }
+
+const failedImportsFolderNames = new Set([normalizeDirectoryName(failedImportsFolderName)])
+const ignoredLibraryFolderNames = new Set([
+  normalizeDirectoryName(v6CompatibilityFailedFolderName),
+])
 
 function isNamedDirectorySegment(value: string, directoryNames: Set<string>) {
   return directoryNames.has(normalizeDirectoryName(value))
@@ -325,6 +334,10 @@ export function startWorkers() {
   let startupChecksResolve: () => void = () => undefined
   const startupChecksReady = new Promise<void>((resolve) => {
     startupChecksResolve = resolve
+  })
+  let startupReadyResolve: () => void = () => undefined
+  const startupReady = new Promise<void>((resolve) => {
+    startupReadyResolve = resolve
   })
 
   const runtimeWatchers: FSWatcher[] = []
@@ -972,6 +985,15 @@ export function startWorkers() {
       return
     }
 
+    if (
+      kind === "library-sync" &&
+      config.mediaDir &&
+      isInsideNamedDirectory(config.mediaDir, resolvedPath, ignoredLibraryFolderNames)
+    ) {
+      debugWorkers(`Ignoring library quarantine path - ${resolvedPath}`)
+      return false
+    }
+
     if (kind === "library-sync" && isInputImportOutputActive(resolvedPath)) {
       queuedWork.delete(key)
       debugWorkers(`Skipping library sync for active input output - ${resolvedPath}`)
@@ -1084,6 +1106,15 @@ export function startWorkers() {
       isInsideNamedDirectory(config.inputDir, resolvedPath, failedImportsFolderNames)
     ) {
       debugWorkers(`Ignoring failed-import quarantine path - ${resolvedPath}`)
+      return false
+    }
+
+    if (
+      kind === "library-sync" &&
+      config.mediaDir &&
+      isInsideNamedDirectory(config.mediaDir, resolvedPath, ignoredLibraryFolderNames)
+    ) {
+      debugWorkers(`Ignoring library quarantine path - ${resolvedPath}`)
       return false
     }
 
@@ -1303,7 +1334,9 @@ export function startWorkers() {
         )
       }
 
-      const files = await walkFiles(config.mediaDir)
+      const files = await walkFiles(config.mediaDir, {
+        ignoredDirectoryNames: ignoredLibraryFolderNames,
+      })
       const mediaFiles = files.filter(isMediaFile)
       const knownLibraryPaths = new Set(
         listEpisodeFilePaths().map((filePath) => normalizeFilePathKey(filePath))
@@ -1382,7 +1415,13 @@ export function startWorkers() {
     console.log(`[Info] [Workers] Starting ${label} AniList sync.`)
 
     try {
-      await runFullAniListRefresh(label)
+      const result = await runFullAniListRefresh(label)
+
+      if (result.skipped) {
+        console.log(`[Info] [Workers] ${label} AniList sync skipped - ${result.reason}`)
+        return
+      }
+
       console.log(`[Info] [Workers] ${label} AniList sync completed.`)
     } catch (error) {
       console.error(
@@ -1537,6 +1576,12 @@ export function startWorkers() {
     if (config.importEnabled) {
       libraryWatcher = chokidar.watch(config.mediaDir, {
         ignoreInitial: true,
+        ignored: (watchPath) =>
+          isInsideNamedDirectory(
+            config.mediaDir,
+            watchPath.toString(),
+            ignoredLibraryFolderNames
+          ),
         awaitWriteFinish: {
           stabilityThreshold: 3000,
           pollInterval: 1000,
@@ -1570,7 +1615,7 @@ export function startWorkers() {
 
   function startImportProcessing() {
     if (importProcessingStarted || shuttingDown) {
-      return
+      return startupReady
     }
 
     importProcessingStarted = true
@@ -1589,6 +1634,7 @@ export function startWorkers() {
         scanTimer.unref?.()
 
         scheduleDailyAniListSync()
+        startupReadyResolve()
         void runDeferredStartupMaintenance().catch((error) => {
           console.error(
             `[Error] [Workers] Deferred startup maintenance failed - startWorkers.ts - ${errorMessage(error)}`
@@ -1597,6 +1643,8 @@ export function startWorkers() {
       }
     })()
     trackActiveWork(startupScan, "directory-scan:startup-force")
+
+    return startupReady
   }
 
   const startupChecks = runStartupChecks().catch((error) => {
@@ -1716,6 +1764,7 @@ export function startWorkers() {
 
     await beginStreamServerShutdown()
     await Promise.all(runtimeWatchers.map((watcher) => watcher.close()))
+    await beginVersionDependentStartupUpgradeShutdown()
 
     await waitForActiveShutdownWork()
 
@@ -1736,6 +1785,7 @@ export function startWorkers() {
     activeWork,
     watchers: runtimeWatchers,
     startupChecksReady,
+    startupReady,
     startImportProcessing,
     stop,
   }

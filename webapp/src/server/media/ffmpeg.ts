@@ -3,13 +3,12 @@ import path from "node:path"
 
 import { execa } from "execa"
 
-import { registerImportEncodingProcess } from "@/server/transcode/processPriority"
+import { registerFileEncodingProcess } from "@/server/transcode/processPriority"
 
 import type { PlaybackProfile } from "@/lib/types"
 import {
   getServerConfig,
   type FileEncodeAcceleration,
-  type ImportEncoding,
   type TranscodeAcceleration,
 } from "@/server/config"
 
@@ -75,11 +74,34 @@ export async function ffprobe(file: string) {
 const ffmpegFatalStderrPatterns = [/cannot allocate memory/i]
 const ffmpegStderrTailMaxLength = 8000
 
+export type FfmpegProgress = {
+  outTimeSeconds: number
+  speed: number | null
+  status: string | null
+}
+
+function parseFfmpegProgressSeconds(value: string | undefined) {
+  const parsed = Number.parseInt(value ?? "", 10)
+
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return 0
+  }
+
+  return parsed / 1_000_000
+}
+
+function parseFfmpegProgressSpeed(value: string | undefined) {
+  const parsed = Number.parseFloat((value ?? "").replace(/x$/i, ""))
+
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null
+}
+
 export function runFfmpeg(
   args: string[],
   options: {
-    priorityRole?: "import-encoding"
+    priorityRole?: "file-encoding"
     protectFromParentSignals?: boolean
+    onProgress?: (progress: FfmpegProgress) => void
   } = {}
 ) {
   const config = getServerConfig()
@@ -96,6 +118,8 @@ export function runFfmpeg(
   let stderrTail = ""
   let fatalStderrDetected = false
   let processExited = false
+  let progressLineBuffer = ""
+  const progressFields: Record<string, string> = {}
 
   const terminateFfmpeg = () => {
     if (processExited) {
@@ -114,9 +138,57 @@ export function runFfmpeg(
     processExited = true
   })
 
+  const emitProgress = () => {
+    if (!options.onProgress) {
+      return
+    }
+
+    try {
+      options.onProgress({
+        outTimeSeconds: parseFfmpegProgressSeconds(progressFields.out_time_ms),
+        speed: parseFfmpegProgressSpeed(progressFields.speed),
+        status: progressFields.progress ?? null,
+      })
+    } catch (error) {
+      void error
+    }
+  }
+
+  const consumeProgressOutput = (text: string) => {
+    if (!options.onProgress) {
+      return
+    }
+
+    progressLineBuffer += text
+    const lines = progressLineBuffer.split(/\r?\n/)
+    progressLineBuffer = lines.pop() ?? ""
+
+    for (const line of lines) {
+      const separatorIndex = line.indexOf("=")
+
+      if (separatorIndex <= 0) {
+        continue
+      }
+
+      const key = line.slice(0, separatorIndex).trim()
+      const value = line.slice(separatorIndex + 1).trim()
+
+      if (!key) {
+        continue
+      }
+
+      progressFields[key] = value
+
+      if (key === "progress") {
+        emitProgress()
+      }
+    }
+  }
+
   child.stderr?.on("data", (chunk: Buffer | string) => {
     const text = chunk.toString()
     stderrTail = `${stderrTail}${text}`.slice(-ffmpegStderrTailMaxLength)
+    consumeProgressOutput(text)
 
     if (fatalStderrDetected) {
       return
@@ -144,8 +216,8 @@ export function runFfmpeg(
     }
   })
 
-  if (options.priorityRole === "import-encoding") {
-    registerImportEncodingProcess(child)
+  if (options.priorityRole === "file-encoding") {
+    registerFileEncodingProcess(child)
   }
 
   return child
@@ -494,39 +566,6 @@ function getFileVideoBitrateArgs(input: {
     "-bufsize",
     `${input.maxVideoBitrateKbps * 2}k`,
   ]
-}
-
-function getAmdAv1EncoderArgs(input: {
-  videoBitrateKbps: number
-  maxVideoBitrateKbps: number
-}) {
-  const bitrateArgs = getFileVideoBitrateArgs(input)
-
-  switch (getAmdBackend()) {
-    case "amf":
-      return [
-        "-c:v",
-        "av1_amf",
-        "-usage",
-        "high_quality",
-        "-quality",
-        "balanced",
-        "-rc",
-        "vbr_peak",
-        ...bitrateArgs,
-      ]
-
-    case "vaapi":
-      return [
-        "-c:v",
-        "av1_vaapi",
-        "-rc_mode",
-        "VBR",
-        "-compression_level",
-        "3",
-        ...bitrateArgs,
-      ]
-  }
 }
 
 function getAmdHevcEncoderArgs(input: {
@@ -899,68 +938,6 @@ function isFileEncodeAcceleration(
   return isHardwareAcceleration(acceleration)
 }
 
-function getAv1FileEncoderArgs(input: {
-  videoBitrateKbps: number
-  maxVideoBitrateKbps: number
-}) {
-  const { transcodeAccel } = getServerConfig()
-
-  if (!isFileEncodeAcceleration(transcodeAccel)) {
-    throw new Error(
-      "AV1 file encoding requires hardware acceleration. CPU AV1 encoding is deprecated."
-    )
-  }
-
-  const bitrateArgs = getFileVideoBitrateArgs(input)
-
-  switch (transcodeAccel) {
-    case "nvenc":
-      return [
-        "-c:v",
-        "av1_nvenc",
-        "-preset",
-        "p4",
-        "-tune",
-        "hq",
-        "-rc:v",
-        "vbr",
-        "-cq:v",
-        "24",
-        ...bitrateArgs,
-        "-multipass",
-        "fullres",
-        "-spatial-aq",
-        "1",
-        "-temporal-aq",
-        "1",
-        "-aq-strength",
-        "8",
-        "-rc-lookahead",
-        "32",
-        "-bf",
-        "4",
-      ]
-
-    case "intel_gpu":
-    case "intel_cpu":
-      return [
-        "-c:v",
-        "av1_qsv",
-        "-preset",
-        "medium",
-        "-async_depth",
-        "6",
-        "-global_quality:v",
-        "24",
-        ...bitrateArgs,
-      ]
-
-    case "amd_gpu":
-    case "amd_cpu":
-      return getAmdAv1EncoderArgs(input)
-  }
-}
-
 function getHevcFileEncoderArgs(input: {
   videoBitrateKbps: number
   maxVideoBitrateKbps: number
@@ -1022,29 +999,14 @@ function getHevcFileEncoderArgs(input: {
 }
 
 function getFileVideoEncoderArgs(input: {
-  importEncoding: ImportEncoding
   videoBitrateKbps: number
   maxVideoBitrateKbps: number
 }) {
-  switch (input.importEncoding) {
-    case "av1":
-      return getAv1FileEncoderArgs(input)
-    case "hevc":
-      return getHevcFileEncoderArgs(input)
-    case "none":
-      throw new Error("File encoding is disabled.")
-  }
+  return getHevcFileEncoderArgs(input)
 }
 
-function getFileVideoTagArgs(importEncoding: ImportEncoding) {
-  switch (importEncoding) {
-    case "av1":
-      return ["-tag:v", "av01"]
-    case "hevc":
-      return ["-tag:v", "hvc1"]
-    case "none":
-      return []
-  }
+function getFileVideoTagArgs() {
+  return ["-tag:v", "hvc1"]
 }
 
 function getFileVideoFilterArgs(acceleration: TranscodeAcceleration) {
@@ -1082,7 +1044,6 @@ export function getFileSubtitleInputArgs() {
 }
 
 export function getMp4FileArgs(input: {
-  importEncoding: ImportEncoding
   videoBitrateKbps: number
   maxVideoBitrateKbps: number
   convertVideo: boolean
@@ -1094,9 +1055,9 @@ export function getMp4FileArgs(input: {
     ? [
         ...getFileVideoFilterArgs(config.transcodeAccel),
         ...getFileVideoEncoderArgs(input),
-        ...getFileVideoTagArgs(input.importEncoding),
+        ...getFileVideoTagArgs(),
       ]
-    : ["-c:v", "copy", ...getFileVideoTagArgs(input.importEncoding)]
+    : ["-c:v", "copy", ...getFileVideoTagArgs()]
   const audioArgs = [
     "-c:a",
     "copy",

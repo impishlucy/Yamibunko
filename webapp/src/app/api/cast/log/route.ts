@@ -3,6 +3,8 @@ import { z } from "zod"
 import { requireApiUser, requireSameOriginRequest } from "@/server/auth/api"
 import { sanitizeLogText } from "@/server/security/input"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -11,6 +13,12 @@ const castLogSchema = z.object({
 })
 
 export async function POST(request: Request) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const sameOriginError = await requireSameOriginRequest(request)
 
   if (sameOriginError) {

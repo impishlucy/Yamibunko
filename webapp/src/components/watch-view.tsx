@@ -216,8 +216,6 @@ export function WatchView({
 
     setAutoPlay(shouldAutoPlay)
     setError(null)
-    setPayload(null)
-    setStreamBlocked(null)
     setCurrent({ seasonNr: nextSeasonNr, epNr: nextEpNr })
     window.history.replaceState(
       null,

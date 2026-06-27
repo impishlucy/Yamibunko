@@ -2,9 +2,11 @@ import type { Metadata, Viewport } from "next"
 
 import { headers } from "next/headers"
 
+import { StartupScreen } from "@/components/startup-screen"
 import { ThemeProvider } from "@/components/theme-provider"
 import { TvModeProvider } from "@/components/tv-mode-provider"
 import { detectDevice } from "@/lib/device"
+import { getServerStartupStatus } from "@/server/startup/readiness"
 
 import "./globals.css"
 
@@ -25,6 +27,8 @@ export const metadata: Metadata = {
   },
 }
 
+export const dynamic = "force-dynamic"
+
 export const viewport: Viewport = {
   themeColor: "#09090b",
 }
@@ -35,6 +39,7 @@ export default async function RootLayout({
   children: React.ReactNode
 }>) {
   const requestHeaders = await headers()
+  const startupStatus = getServerStartupStatus()
   const initialDevice = detectDevice({
     userAgent: requestHeaders.get("user-agent"),
     override: requestHeaders.get("x-yamibunko-device"),
@@ -51,7 +56,11 @@ export default async function RootLayout({
       <body className="antialiased">
         <TvModeProvider initialDevice={initialDevice}>
           <ThemeProvider defaultTheme="dark" enableSystem={false}>
-            {children}
+            {startupStatus.ready ? (
+              children
+            ) : (
+              <StartupScreen initialStatus={startupStatus} />
+            )}
           </ThemeProvider>
         </TvModeProvider>
       </body>

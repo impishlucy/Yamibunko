@@ -15,6 +15,8 @@ import { getMediaStreamMetadata } from "@/server/media/streamMetadata"
 import { findPlaybackSubtitleSidecar } from "@/server/media/subtitles"
 import { errorMessage, parsePositiveInt } from "@/server/utils/format"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -26,6 +28,12 @@ type WatchContext = {
 }
 
 export async function GET(request: Request, context: WatchContext) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const auth = await requireApiUser()
 
   if (!auth.ok) {

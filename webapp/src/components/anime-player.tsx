@@ -350,6 +350,7 @@ const preloadRangeWarmupMinChunkBytes = 96 * 1024 * 1024
 const preloadRangeWarmupMaxChunkBytes = 1024 * 1024 * 1024
 const preloadRangeWarmupMinimumMissingSeconds = 0.5
 const castClockTickMs = 1_000
+const tvSeekStepSeconds = 10
 
 function createClientStreamId() {
   return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`
@@ -558,6 +559,30 @@ function isTvRemoteNavigationKey(event: { key?: string; code?: string; keyCode?:
     event.which === 21 ||
     event.which === 22
   )
+}
+
+function getTvSeekDirection(event: { key?: string; code?: string; keyCode?: number; which?: number }) {
+  if (
+    event.key === "ArrowLeft" ||
+    event.key === "Left" ||
+    event.code === "ArrowLeft" ||
+    event.keyCode === 21 ||
+    event.which === 21
+  ) {
+    return -1
+  }
+
+  if (
+    event.key === "ArrowRight" ||
+    event.key === "Right" ||
+    event.code === "ArrowRight" ||
+    event.keyCode === 22 ||
+    event.which === 22
+  ) {
+    return 1
+  }
+
+  return 0
 }
 
 const castDirectContentTypesByExtension = new Map<string, string>([
@@ -1704,6 +1729,8 @@ export function AnimePlayer({
   const deferredLiveTranscodeBitrateSwitchTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const handledPriorityActionsRef = useRef<Set<string>>(new Set())
   const seekPreviewFrameTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const tvSeekPreviewRef = useRef<number | null>(null)
+  const restoreFullscreenAfterEpisodeChangeRef = useRef(false)
   const tvLocalSeekInputRef = useRef<HTMLInputElement | null>(null)
   const tvCastSeekInputRef = useRef<HTMLInputElement | null>(null)
   const subtitleAnimationFrameRef = useRef<number | null>(null)
@@ -3270,6 +3297,8 @@ export function AnimePlayer({
       const episodeChanged = playbackKeyRef.current !== playbackKey
 
       if (episodeChanged) {
+        restoreFullscreenAfterEpisodeChangeRef.current =
+          isFullscreen || isPseudoFullscreen || Boolean(getFullscreenElement())
         playbackKeyRef.current = playbackKey
         setPriorityInfo(null)
         clearPriorityInfoTimer()
@@ -3365,7 +3394,9 @@ export function AnimePlayer({
     fileName,
     getDirectUrl,
     getTranscodeUrl,
+    isFullscreen,
     isIosDevice,
+    isPseudoFullscreen,
     liveTranscodeEnabled,
     media,
     playbackKey,
@@ -3394,6 +3425,38 @@ export function AnimePlayer({
       return () => window.clearTimeout(timer)
     }
   }, [beginMediaWait, sourceUrl])
+
+  useEffect(() => {
+    if (!sourceUrl || !restoreFullscreenAfterEpisodeChangeRef.current) {
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      if (!restoreFullscreenAfterEpisodeChangeRef.current) {
+        return
+      }
+
+      restoreFullscreenAfterEpisodeChangeRef.current = false
+
+      if (getFullscreenElement() || isPseudoFullscreen) {
+        return
+      }
+
+      void requestElementFullscreen(playerRef.current)
+        .then((fullscreenRestored) => {
+          if (!fullscreenRestored && !getFullscreenElement()) {
+            setIsPseudoFullscreen(true)
+          }
+        })
+        .catch(() => {
+          if (!getFullscreenElement()) {
+            setIsPseudoFullscreen(true)
+          }
+        })
+    }, 50)
+
+    return () => window.clearTimeout(timer)
+  }, [isPseudoFullscreen, sourceUrl])
 
   useEffect(() => {
     const requestId = subtitleRequestIdRef.current + 1
@@ -4411,6 +4474,7 @@ export function AnimePlayer({
     }
 
     const startTime = clampTime(seekPreview ?? currentTimeRef.current, duration)
+    tvSeekPreviewRef.current = startTime
     setTvSeekTarget(target)
     setSeekPreview(startTime)
     scheduleSeekPreviewFrame(startTime)
@@ -4423,6 +4487,7 @@ export function AnimePlayer({
   }
 
   function cancelTvSeekInput() {
+    tvSeekPreviewRef.current = null
     setTvSeekTarget(null)
     setSeekPreview(null)
     clearSeekPreviewFrame()
@@ -4430,12 +4495,34 @@ export function AnimePlayer({
   }
 
   function confirmTvSeekInput(value: string) {
+    const target = tvSeekPreviewRef.current
+    tvSeekPreviewRef.current = null
     setTvSeekTarget(null)
-    commitSeekInput(value)
+    commitSeekInput(target === null ? value : String(target))
   }
 
   function handleTvSeekKeyDown(event: KeyboardEvent<HTMLInputElement>) {
     if (!isTvLike) {
+      return
+    }
+
+    const seekDirection = getTvSeekDirection(event)
+
+    if (seekDirection !== 0) {
+      event.preventDefault()
+      event.stopPropagation()
+
+      const currentInputValue = Number(event.currentTarget.value)
+      const baseTime =
+        tvSeekPreviewRef.current ??
+        seekPreview ??
+        (Number.isFinite(currentInputValue) ? currentInputValue : currentTimeRef.current)
+      const nextTime = clampTime(baseTime + seekDirection * tvSeekStepSeconds, duration)
+
+      tvSeekPreviewRef.current = nextTime
+      setSeekPreview(nextTime)
+      scheduleSeekPreviewFrame(nextTime)
+      showControls(true)
       return
     }
 
@@ -4461,6 +4548,7 @@ export function AnimePlayer({
   function commitSeekInput(value: string) {
     const nextValue = Number(value)
 
+    tvSeekPreviewRef.current = null
     setTvSeekTarget(null)
     setSeekPreview(null)
     clearSeekPreviewFrame()

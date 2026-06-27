@@ -28,7 +28,6 @@ import {
 import { errorMessage, fileName } from "@/server/utils/format"
 
 const migrationStateKey = "migration.webm_to_mp4_sidecar_vtt.pending"
-const targetAv1BytesPerMinute = 22 * 1024 * 1024
 const targetHevcBytesPerMinute = 32 * 1024 * 1024
 const targetAudioKbps = 320
 const migrationTempPrefix = "migration-webm-to-mp4-"
@@ -212,30 +211,14 @@ function primaryVideoCodec(probe: ProbeResult) {
   return (probe.streams ?? []).find((stream) => stream.codec_type === "video")?.codec_name
 }
 
-function canCopyVideoToTargetMp4(probe: ProbeResult, importEncoding: "av1" | "hevc") {
+function canCopyVideoToTargetMp4(probe: ProbeResult) {
   const codec = normalizeCodecName(primaryVideoCodec(probe))
 
-  switch (importEncoding) {
-    case "av1":
-      return codec === "av1"
-
-    case "hevc":
-      return codec === "hevc" || codec === "h265"
-  }
+  return codec === "hevc" || codec === "h265"
 }
 
-function migrationTargetBytesPerMinute(importEncoding: "av1" | "hevc") {
-  switch (importEncoding) {
-    case "av1":
-      return targetAv1BytesPerMinute
-
-    case "hevc":
-      return targetHevcBytesPerMinute
-  }
-}
-
-function migrationVideoBitrateKbps(importEncoding: "av1" | "hevc") {
-  const totalKbps = Math.floor((migrationTargetBytesPerMinute(importEncoding) * 8) / 60 / 1000)
+function migrationVideoBitrateKbps() {
+  const totalKbps = Math.floor((targetHevcBytesPerMinute * 8) / 60 / 1000)
   return Math.max(totalKbps - targetAudioKbps, 500)
 }
 
@@ -253,8 +236,8 @@ function audioOutputIndexesToOpus(probe: ProbeResult) {
     .filter((index): index is number => index !== null)
 }
 
-function migrationConvertsVideo(probe: ProbeResult, importEncoding: "av1" | "hevc") {
-  return !canCopyVideoToTargetMp4(probe, importEncoding)
+function migrationConvertsVideo(probe: ProbeResult) {
+  return !canCopyVideoToTargetMp4(probe)
 }
 
 function migrationSubtitleOutputArgs(input: {
@@ -281,10 +264,9 @@ function mp4MigrationArgs(input: {
   subtitleOutputPath?: string
   subtitleStream?: ProbeStream
   probe: ProbeResult
-  importEncoding: "av1" | "hevc"
 }) {
-  const videoBitrateKbps = migrationVideoBitrateKbps(input.importEncoding)
-  const convertVideo = migrationConvertsVideo(input.probe, input.importEncoding)
+  const videoBitrateKbps = migrationVideoBitrateKbps()
+  const convertVideo = migrationConvertsVideo(input.probe)
   const subtitleStream =
     input.subtitleOutputPath && input.subtitleStream && Number.isInteger(input.subtitleStream.index)
       ? input.subtitleStream
@@ -308,7 +290,6 @@ function mp4MigrationArgs(input: {
     "-i",
     input.inputPath,
     ...getMp4FileArgs({
-      importEncoding: input.importEncoding,
       videoBitrateKbps,
       maxVideoBitrateKbps: videoBitrateKbps,
       convertVideo,
@@ -326,8 +307,8 @@ function mp4MigrationArgs(input: {
   ]
 }
 
-function migrationModeLabel(probe: ProbeResult, importEncoding: "av1" | "hevc") {
-  const copyVideo = canCopyVideoToTargetMp4(probe, importEncoding)
+function migrationModeLabel(probe: ProbeResult) {
+  const copyVideo = canCopyVideoToTargetMp4(probe)
   const audioTranscodeCount = audioOutputIndexesToOpus(probe).length
 
   switch (true) {
@@ -338,7 +319,7 @@ function migrationModeLabel(probe: ProbeResult, importEncoding: "av1" | "hevc") 
       return "copying video and converting audio"
 
     default:
-      return `re-encoding to ${importEncoding.toUpperCase()}`
+      return "re-encoding to HEVC"
   }
 }
 
@@ -499,10 +480,6 @@ async function reconcileDatabaseWebmEpisodePaths(shutdownState: MigrationShutdow
 async function migrateWebmFile(webmPath: string) {
   const config = getServerConfig()
 
-  if (config.importEncoding === "none") {
-    throw new Error("WebM to MP4 migration requires IMPORT_ENCODING to be av1 or hevc.")
-  }
-
   const parsed = path.parse(webmPath)
   const mp4Path = path.join(parsed.dir, `${parsed.name}.mp4`)
   const finalSubtitlePath = subtitleSidecarPathForMediaFile(mp4Path)
@@ -534,14 +511,11 @@ async function migrateWebmFile(webmPath: string) {
     const probe = (await ffprobe(tempInputPath)) as ProbeResult
     const subtitleStream = firstConvertibleSubtitleStream(probe)
     const hasSubtitleOutput = Boolean(subtitleStream && Number.isInteger(subtitleStream.index))
-    const convertsVideo = migrationConvertsVideo(probe, config.importEncoding)
+    const convertsVideo = migrationConvertsVideo(probe)
     const acceleratorLabel = convertsVideo ? ` using ${config.transcodeAccel}` : ""
 
     console.log(
-      `[Info] [Migration] ${migrationModeLabel(
-        probe,
-        config.importEncoding
-      )} old WebM library file to MP4${acceleratorLabel} - ${fileName(webmPath)}`
+      `[Info] [Migration] ${migrationModeLabel(probe)} old WebM library file to MP4${acceleratorLabel} - ${fileName(webmPath)}`
     )
 
     if (hasSubtitleOutput) {
@@ -555,10 +529,9 @@ async function migrateWebmFile(webmPath: string) {
         subtitleOutputPath: hasSubtitleOutput ? tempSubtitlePath : undefined,
         subtitleStream,
         probe,
-        importEncoding: config.importEncoding,
       }),
       {
-        priorityRole: convertsVideo ? "import-encoding" : undefined,
+        priorityRole: convertsVideo ? "file-encoding" : undefined,
         protectFromParentSignals: true,
       }
     )

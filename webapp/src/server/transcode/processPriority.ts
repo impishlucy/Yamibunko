@@ -5,12 +5,12 @@ type TrackedProcess = {
   once: (event: "exit", listener: () => void) => unknown
 }
 
-type ImportEncodingProcess = {
+type FileEncodingProcess = {
   process: TrackedProcess
   lowered: boolean
 }
 
-const importEncodingProcesses = new Map<number, ImportEncodingProcess>()
+const fileEncodingProcesses = new Map<number, FileEncodingProcess>()
 
 function getPriorityValues() {
   const priority = os.constants.priority
@@ -39,7 +39,7 @@ function setProcessPriority(pid: number, priority: number) {
   }
 }
 
-function applyImportEncodingPriority(entry: ImportEncodingProcess) {
+function applyFileEncodingPriority(entry: FileEncodingProcess) {
   const pid = entry.process.pid
 
   if (!pid) {
@@ -58,35 +58,35 @@ function applyImportEncodingPriority(entry: ImportEncodingProcess) {
   }
 }
 
-function refreshImportEncodingPriorities() {
-  for (const entry of importEncodingProcesses.values()) {
-    applyImportEncodingPriority(entry)
+function refreshFileEncodingPriorities() {
+  for (const entry of fileEncodingProcesses.values()) {
+    applyFileEncodingPriority(entry)
   }
 }
 
 export function registerLiveTranscodeProcessPriority() {
-  refreshImportEncodingPriorities()
+  refreshFileEncodingPriorities()
 
   return () => {
-    refreshImportEncodingPriorities()
+    refreshFileEncodingPriorities()
   }
 }
 
-export function registerImportEncodingProcess(process: TrackedProcess) {
+export function registerFileEncodingProcess(process: TrackedProcess) {
   const pid = process.pid
 
   if (!pid) {
     return
   }
 
-  const entry: ImportEncodingProcess = {
+  const entry: FileEncodingProcess = {
     process,
     lowered: false,
   }
 
-  importEncodingProcesses.set(pid, entry)
-  applyImportEncodingPriority(entry)
+  fileEncodingProcesses.set(pid, entry)
+  applyFileEncodingPriority(entry)
   process.once("exit", () => {
-    importEncodingProcesses.delete(pid)
+    fileEncodingProcesses.delete(pid)
   })
 }

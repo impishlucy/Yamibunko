@@ -153,7 +153,6 @@ public partial class SetupWindow : Window
             InputFolderPath = GetTextBoxValue("InputFolderBox"),
             OutputFolderPath = GetTextBoxValue("OutputFolderBox"),
             ImportEnabled = importEnabled,
-            ImportEncoding = ResolveSavedImportEncoding(importEnabled),
             FfmpegDir = _initialSettings?.FfmpegDir ?? "",
             TranscodeAccel = ResolveSavedTranscodeAcceleration(importEnabled),
             AnilistClientId = GetTextBoxValue("ClientIdBox"),
@@ -180,16 +179,6 @@ public partial class SetupWindow : Window
     private bool IsFileProcessingDisabled()
     {
         return _catalogModeForced || this.FindControl<CheckBox>("DisableFileProcessingBox")?.IsChecked == true;
-    }
-
-    private string ResolveSavedImportEncoding(bool importEnabled)
-    {
-        if (_hardwareDetection != null)
-        {
-            return HardwareAccelerationDetector.SelectServerImportEncoding(_hardwareDetection, importEnabled);
-        }
-
-        return importEnabled ? AppSettings.NormalizeImportEncoding(_initialSettings?.ImportEncoding) : "none";
     }
 
     private string ResolveSavedTranscodeAcceleration(bool importEnabled)
@@ -239,7 +228,7 @@ public partial class SetupWindow : Window
 
         var encodeAcceleration = !HardwareAccelerationDetector.SupportsImportAcceleration(detection)
             ? "unsupported"
-            : $"{detection.ImportEncoding.ToLower()} / {HardwareAccelerationDetector.FormatAccelerationForDisplay(detection.ImportAcceleration)}";
+            : $"hevc / {HardwareAccelerationDetector.FormatAccelerationForDisplay(detection.ImportAcceleration)}";
         var liveAcceleration = HardwareAccelerationDetector.FormatAccelerationForDisplay(detection.LiveTranscodeAcceleration);
 
         statusText.Text = $"Video Accelerator: Encoder: {encodeAcceleration} · Live transcoder: {liveAcceleration}";

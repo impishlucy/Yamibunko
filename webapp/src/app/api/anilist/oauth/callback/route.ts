@@ -11,6 +11,8 @@ import { joinBaseUrl } from "@/server/http/baseUrl"
 import { getPublicBaseUrl, getRequestOrigin } from "@/server/http/request"
 import { errorMessage } from "@/server/utils/format"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -28,6 +30,12 @@ async function settingsRedirect(
 }
 
 export async function GET(request: Request) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const user = await getCurrentUser()
 
   if (!user) {

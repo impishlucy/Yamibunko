@@ -1,10 +1,7 @@
 import { existsSync, rmSync, statSync } from "node:fs"
 import path from "node:path"
 
-import {
-  normalizeTranscodeAccelerationValue,
-  type ImportEncoding,
-} from "@/server/config"
+import { normalizeTranscodeAccelerationValue } from "@/server/config"
 import { normalizeBaseUrl } from "@/server/http/baseUrl"
 
 const baseRequiredEnvironmentKeys = [
@@ -13,7 +10,6 @@ const baseRequiredEnvironmentKeys = [
   "TRANSCODE_ACCEL",
   "BASE_URL",
   "IMPORT_ENABLED",
-  "IMPORT_ENCODING",
 ] as const
 
 const importRequiredEnvironmentKeys = ["ANIME_MEDIA_DIR"] as const
@@ -34,7 +30,6 @@ const launcherAliases = new Map<string, string>([
   ["FFMPEG_BIN_DIR", "FFMPEG_DIR"],
   ["TRANSCODE_ACCEL", "TRANSCODE_ACCEL"],
   ["IMPORT_ENABLED", "IMPORT_ENABLED"],
-  ["IMPORT_ENCODING", "IMPORT_ENCODING"],
   ["ANILIST_CLIENT_ID", "ANILIST_CLIENT_ID"],
   ["ANILIST_CLIENT_SECRET", "ANILIST_CLIENT_SECRET"],
   ["BASE_URL", "BASE_URL"],
@@ -180,15 +175,6 @@ function normalizeImportEnabled() {
   process.env.IMPORT_ENABLED = cleanValue(value).toLowerCase()
 }
 
-function normalizeImportEncoding() {
-  const value = process.env.IMPORT_ENCODING
-
-  if (!value) {
-    return
-  }
-
-  process.env.IMPORT_ENCODING = cleanValue(value).toLowerCase()
-}
 
 function hasRuntimeEnvironment() {
   return [...requiredCanonicalKeys].some((key) => Boolean(process.env[key]))
@@ -281,18 +267,6 @@ function executableName(name: "ffmpeg" | "ffprobe") {
   return process.platform === "win32" ? `${name}.exe` : name
 }
 
-function assertValidImportEncoding(value: string | undefined): asserts value is ImportEncoding {
-  if (value === "av1" || value === "hevc" || value === "none") {
-    return
-  }
-
-  console.error(
-    `[Error] [Startup] IMPORT_ENCODING validation failed - environment.ts - ${value}`
-  )
-  throw new Error(
-    "CRITICAL STARTUP ERROR: IMPORT_ENCODING must be one of av1, hevc, or none."
-  )
-}
 
 export function bootstrapEnvironment() {
   if (bootstrapped) {
@@ -317,7 +291,6 @@ export function bootstrapEnvironment() {
 
   normalizeTranscodeAcceleration()
   normalizeImportEnabled()
-  normalizeImportEncoding()
 
   console.log(
     `[Info] [Startup] Loaded startup configuration - ${formatKnownEnvironmentSnapshot()}`
@@ -340,9 +313,6 @@ export function bootstrapEnvironment() {
     }
   }
 
-  if (!isImportEnabled()) {
-    process.env.IMPORT_ENCODING = "none"
-  }
 
   if (!["true", "false"].includes(process.env.IMPORT_ENABLED ?? "")) {
     console.error(
@@ -353,16 +323,6 @@ export function bootstrapEnvironment() {
     )
   }
 
-  assertValidImportEncoding(process.env.IMPORT_ENCODING)
-
-  if (isImportEnabled() && process.env.IMPORT_ENCODING === "none") {
-    console.error(
-      "[Error] [Startup] IMPORT_ENCODING=none is invalid while import mode is enabled - environment.ts"
-    )
-    throw new Error(
-      "CRITICAL STARTUP ERROR: IMPORT_ENCODING must be av1 or hevc when IMPORT_ENABLED is true."
-    )
-  }
 
   if (
     ![
@@ -421,7 +381,7 @@ export function bootstrapEnvironment() {
       "[Error] [Startup] CPU file encoding is unsupported while import mode is enabled - environment.ts"
     )
     throw new Error(
-      "CRITICAL STARTUP ERROR: CPU file encoding is not supported. Use hardware AV1/HEVC encoding or disable import mode."
+      "CRITICAL STARTUP ERROR: CPU file encoding is not supported. Use hardware HEVC encoding or disable import mode."
     )
   }
 

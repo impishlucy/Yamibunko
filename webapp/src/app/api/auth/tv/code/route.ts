@@ -5,6 +5,8 @@ import { createTvAuthCode } from "@/server/db/tvAuthCodes"
 import { getPublicBaseUrl, isSecureRequest } from "@/server/http/request"
 import { guardAuthRequest } from "@/server/security/abuseGuard"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -13,6 +15,12 @@ function createLoginCode() {
 }
 
 export async function POST(request: Request) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const originError = await requireSameOriginRequest(request)
 
   if (originError) {

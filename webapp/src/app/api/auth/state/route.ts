@@ -6,6 +6,8 @@ import { getUser, hasAnyUsers } from "@/server/db/users"
 import { guardAuthRequest } from "@/server/security/abuseGuard"
 import { optionalUsernameSchema } from "@/server/security/input"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -14,6 +16,12 @@ const authStateQuerySchema = z.object({
 })
 
 export async function GET(request: Request) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const originError = await requireSameOriginRequest(request)
 
   if (originError) {

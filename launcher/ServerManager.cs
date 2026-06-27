@@ -530,11 +530,10 @@ public class ServerManager
         if (settings.ImportEnabled && !HardwareAccelerationDetector.SupportsImportAcceleration(detection))
         {
             Log(HardwareAccelerationDetector.ImportHardwareUnsupportedMessage);
-            Log("Catalog mode was enabled automatically because AV1/HEVC hardware encoding is unavailable.");
+            Log("Catalog mode was enabled automatically because HEVC hardware encoding is unavailable.");
             settings.ImportEnabled = false;
         }
 
-        settings.ImportEncoding = HardwareAccelerationDetector.SelectServerImportEncoding(detection, settings.ImportEnabled);
         settings.TranscodeAccel = HardwareAccelerationDetector.SelectServerTranscodeAcceleration(detection, settings.ImportEnabled);
 
         var selectedAccelerationLabel = HardwareAccelerationDetector.FormatAccelerationForDisplay(settings.TranscodeAccel);
@@ -548,11 +547,11 @@ public class ServerManager
 
         if (HardwareAccelerationDetector.SupportsImportAcceleration(detection))
         {
-            Log($"{detection.ImportEncoding.ToUpperInvariant()} hardware file encoding acceleration: {importAccelerationLabel}. Live transcoding acceleration: {liveTranscodeAccelerationLabel}.");
+            Log($"HEVC hardware file encoding acceleration: {importAccelerationLabel}. Live transcoding acceleration: {liveTranscodeAccelerationLabel}.");
         }
         else
         {
-            Log($"AV1/HEVC hardware encoding unavailable. Live transcoding acceleration: {selectedAccelerationLabel}.");
+            Log($"HEVC hardware encoding unavailable. Live transcoding acceleration: {selectedAccelerationLabel}.");
         }
 
         settings.Save();
@@ -1104,7 +1103,6 @@ public class ServerManager
             ["ANIME_INPUT_DIR"] = settings.InputFolderPath,
             ["ANIME_MEDIA_DIR"] = settings.OutputFolderPath,
             ["IMPORT_ENABLED"] = settings.ImportEnabled ? "true" : "false",
-            ["IMPORT_ENCODING"] = AppSettings.NormalizeImportEncoding(settings.ImportEncoding),
             ["FFMPEG_DIR"] = settings.FfmpegDir,
             ["TRANSCODE_ACCEL"] = settings.TranscodeAccel,
             ["ANILIST_CLIENT_ID"] = settings.AnilistClientId,

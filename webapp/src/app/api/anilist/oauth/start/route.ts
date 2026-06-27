@@ -7,10 +7,18 @@ import { getAniListAuthorizationUrl } from "@/server/anilist/client"
 import { getRequestOrigin } from "@/server/http/request"
 import { errorMessage } from "@/server/utils/format"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
 export async function GET(request: Request) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const originError = await requireSameOriginRequest(request)
 
   if (originError) {

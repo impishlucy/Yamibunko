@@ -19,6 +19,8 @@ import {
 } from "@/server/media/subtitles"
 import { errorMessage, fileName, parsePositiveInt } from "@/server/utils/format"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -59,6 +61,12 @@ function subtitleCorsHeaders() {
 }
 
 export function OPTIONS() {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   return new Response(null, {
     status: 204,
     headers: subtitleCorsHeaders(),
@@ -532,6 +540,12 @@ async function extractSidecarWebVtt(input: {
 }
 
 export async function GET(request: Request, context: SubtitleContext) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const abuseError = await guardApiRequest(request)
 
   if (abuseError) {

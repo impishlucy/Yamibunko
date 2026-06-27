@@ -12,6 +12,8 @@ import {
 } from "@/server/db/users"
 import type { AppUpdateStatus } from "@/lib/app-update"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -53,6 +55,12 @@ async function getAdminUpdateStatus(username: string) {
 }
 
 export async function GET() {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const auth = await requireAdminApiUser()
 
   if (!auth.ok) {
@@ -63,6 +71,12 @@ export async function GET() {
 }
 
 export async function PATCH(request: Request) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const originError = await requireSameOriginRequest(request)
 
   if (originError) {

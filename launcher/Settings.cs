@@ -14,7 +14,6 @@ public class AppSettings
         nameof(InputFolderPath),
         nameof(OutputFolderPath),
         nameof(ImportEnabled),
-        nameof(ImportEncoding),
         nameof(FfmpegDir),
         nameof(TranscodeAccel),
         nameof(AnilistClientId),
@@ -26,7 +25,6 @@ public class AppSettings
     public string InputFolderPath { get; set; } = "";
     public string OutputFolderPath { get; set; } = "";
     public bool ImportEnabled { get; set; } = true;
-    public string ImportEncoding { get; set; } = "none";
     public string FfmpegDir { get; set; } = "";
     public string TranscodeAccel { get; set; } = "cpu";
     public string AnilistClientId { get; set; } = "";
@@ -57,16 +55,6 @@ public class AppSettings
         };
 
         return replacement.Length > 0;
-    }
-
-    public static string NormalizeImportEncoding(string? value)
-    {
-        return value?.Trim().ToLowerInvariant() switch
-        {
-            "av1" => "av1",
-            "hevc" => "hevc",
-            _ => "none"
-        };
     }
 
     public static string NormalizeTranscodeAccel(string? value)

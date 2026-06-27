@@ -1,18 +1,14 @@
 import { getDb, nowIso } from "@/server/db/sqlite"
 
-export function getAppStateBoolean(key: string, defaultValue: boolean) {
+export function getAppStateValue(key: string) {
   const row = getDb()
     .query<{ value: string }>("SELECT value FROM app_state WHERE key = ?")
     .get(key)
 
-  if (!row) {
-    return defaultValue
-  }
-
-  return row.value === "true"
+  return row?.value ?? null
 }
 
-export function setAppStateBoolean(key: string, value: boolean) {
+export function setAppStateValue(key: string, value: string) {
   const now = nowIso()
 
   getDb()
@@ -25,5 +21,19 @@ export function setAppStateBoolean(key: string, value: boolean) {
         updated_at = excluded.updated_at
     `
     )
-    .run(key, value ? "true" : "false", now)
+    .run(key, value, now)
+}
+
+export function getAppStateBoolean(key: string, defaultValue: boolean) {
+  const value = getAppStateValue(key)
+
+  if (value === null) {
+    return defaultValue
+  }
+
+  return value === "true"
+}
+
+export function setAppStateBoolean(key: string, value: boolean) {
+  setAppStateValue(key, value ? "true" : "false")
 }

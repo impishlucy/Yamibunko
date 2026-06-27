@@ -6,6 +6,8 @@ import { setEpisodeWatchState } from "@/server/db/library"
 import { getEpisode } from "@/server/media/libraryStore"
 import { errorMessage, parsePositiveInt } from "@/server/utils/format"
 
+import { getStartupBlockedResponse } from "@/server/startup/requestGuard"
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -22,6 +24,12 @@ const watchStateSchema = z.object({
 })
 
 export async function POST(request: Request, context: WatchStateContext) {
+  const startupBlocked = getStartupBlockedResponse()
+
+  if (startupBlocked) {
+    return startupBlocked
+  }
+
   const originError = await requireSameOriginRequest(request)
 
   if (originError) {

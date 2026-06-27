@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.webkit.CookieManager
@@ -48,6 +49,7 @@ class MainActivity : AppCompatActivity() {
     private var fullscreenView: View? = null
     private var fullscreenCallback: WebChromeClient.CustomViewCallback? = null
     private var webViewConfigured = false
+    private var playbackActive = false
     private val videoCodecCapabilities by lazy { VideoCodecSupport.detectDeviceCapabilities() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -87,8 +89,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        applyPlaybackScreenWakeLock()
+    }
+
     override fun onDestroy() {
         exitFullscreenView()
+        playbackActive = false
+        applyPlaybackScreenWakeLock()
         super.onDestroy()
     }
 
@@ -205,10 +214,17 @@ class MainActivity : AppCompatActivity() {
 
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
         webView.addJavascriptInterface(
-            PlaybackCapabilitiesBridge(videoCodecCapabilities),
+            PlaybackCapabilitiesBridge(videoCodecCapabilities) { active ->
+                setPlaybackActive(active)
+            },
             "YamibunkoAndroidTv",
         )
-        webView.webViewClient = object : WebViewClient() {}
+        webView.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView?, url: String?) {
+                super.onPageFinished(view, url)
+                injectPlaybackObserver()
+            }
+        }
         webView.webChromeClient = object : WebChromeClient() {
             override fun onShowCustomView(view: View, callback: CustomViewCallback) {
                 if (fullscreenView != null) {
@@ -249,6 +265,84 @@ class MainActivity : AppCompatActivity() {
             loadsImagesAutomatically = true
             userAgentString = YamibunkoUserAgent.build(userAgentString, videoCodecCapabilities)
         }
+    }
+
+
+    private fun setPlaybackActive(active: Boolean) {
+        runOnUiThread {
+            if (playbackActive == active) {
+                return@runOnUiThread
+            }
+
+            playbackActive = active
+            applyPlaybackScreenWakeLock()
+        }
+    }
+
+    private fun applyPlaybackScreenWakeLock() {
+        webView.keepScreenOn = playbackActive
+
+        if (playbackActive) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
+    private fun injectPlaybackObserver() {
+        val script = """
+            (function() {
+                if (window.__yamibunkoPlaybackObserverInstalled) {
+                    if (typeof window.__yamibunkoNotifyPlaybackActive === 'function') {
+                        window.__yamibunkoNotifyPlaybackActive();
+                    }
+                    return;
+                }
+
+                window.__yamibunkoPlaybackObserverInstalled = true;
+
+                var lastActive = null;
+
+                function isActiveVideo(video) {
+                    return video instanceof HTMLVideoElement && !video.paused && !video.ended && video.readyState > 0;
+                }
+
+                function notifyPlaybackActive() {
+                    var videos = Array.prototype.slice.call(document.getElementsByTagName('video'));
+                    var active = videos.some(isActiveVideo);
+
+                    if (lastActive === active) {
+                        return;
+                    }
+
+                    lastActive = active;
+
+                    if (window.YamibunkoAndroidTv && typeof window.YamibunkoAndroidTv.setPlaybackActive === 'function') {
+                        window.YamibunkoAndroidTv.setPlaybackActive(active);
+                    }
+                }
+
+                window.__yamibunkoNotifyPlaybackActive = notifyPlaybackActive;
+
+                document.addEventListener('play', notifyPlaybackActive, true);
+                document.addEventListener('playing', notifyPlaybackActive, true);
+                document.addEventListener('pause', notifyPlaybackActive, true);
+                document.addEventListener('ended', notifyPlaybackActive, true);
+                document.addEventListener('emptied', notifyPlaybackActive, true);
+                document.addEventListener('abort', notifyPlaybackActive, true);
+                document.addEventListener('error', notifyPlaybackActive, true);
+
+                new MutationObserver(notifyPlaybackActive).observe(document.documentElement, {
+                    childList: true,
+                    subtree: true,
+                });
+
+                window.setInterval(notifyPlaybackActive, 2000);
+                notifyPlaybackActive();
+            })();
+        """.trimIndent()
+
+        webView.evaluateJavascript(script, null)
     }
 
     private fun exitFullscreenView() {
