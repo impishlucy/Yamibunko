@@ -131,10 +131,12 @@ Use `cpu` only when `IMPORT_ENABLED=false` and your hardware does not support `a
 4. Run `bun run build` before starting it.
 5. Start it.
 
-## Disclaimer
+## Notice
+This project does not distribute, include, or endorse any copyrighted or pirated content. The software is provided for legitimate and lawful use.
 
-Yamibunko is intended for organizing, processing, and playing local files.</br>
-<ins>Yamibunko does not include, download, or provide access to copyrighted media.</ins>
+Users are solely responsible for ensuring that any copyrighted material they use with this software is obtained legally and in accordance with applicable law. The developers disclaim all responsibility for any misuse of the software or for any legal consequences resulting from the use of illegally obtained content.
+
+Any third-party distribution of this app bundled with copyrighted content is done without permission and is not associated with orendorsed by this project.
 
 ## License
 
