@@ -53,8 +53,12 @@ const seasonPartOnlyPattern = new RegExp(
   "i"
 )
 
+function stripVersionTags(value: string) {
+  return value.replace(/(?:^|[^a-z0-9])v\s*\d{1,4}(?:\.[0-9]+)*(?=$|[^a-z0-9])/gi, " ")
+}
+
 function normalizeMarkerText(value: string) {
-  return value
+  return stripVersionTags(value)
     .replace(/\\/g, "/")
     .replace(/\.[A-Za-z0-9]{1,8}$/g, " ")
     .replace(/[\[\](){}]/g, " ")

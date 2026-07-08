@@ -2006,7 +2006,7 @@ function extractSeasonMarkerFromTitle(value: string | null | undefined) {
     return null
   }
 
-  const normalized = value
+  const normalized = stripVersionTags(value)
     .toLowerCase()
     .replace(/([a-z])([0-9])/gi, "$1 $2")
     .replace(/([0-9])([a-z])/gi, "$1 $2")
@@ -3371,7 +3371,7 @@ function hasNormalizedPartMarker(value: string, marker: string) {
 }
 
 function hasPartMarker(value: string, part: number) {
-  const normalized = value
+  const normalized = stripVersionTags(value)
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, " ")
     .replace(/\s+/g, " ")
