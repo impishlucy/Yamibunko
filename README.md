@@ -30,7 +30,7 @@ Yamibunko is local anime library and file processor, with a launcher and a web U
 * Now comes with a Android TV App, to avoid the need for casting.
 
 ### File Processing
-* If enabled it can convert input files for smaller files, using AV1.
+* If enabled it can convert input files for smaller files, using HEVC.
 * If disabled it only servers your existing files and does not edit them.
 * Support for non Anime, just put them in /NotAnime in the Input Folder.</br>(e.g. /Input/NotAnime/Series/files..)
 
@@ -105,7 +105,6 @@ bun run start -- \
   --ANIME_INPUT_DIR=/path/to/input \
   --ANIME_MEDIA_DIR=/path/to/output \
   --IMPORT_ENABLED=true \
-  --IMPORT_ENCODING=av1 \
   --FFMPEG_DIR=/path/to/ffmpeg/bin \
   --TRANSCODE_ACCEL=nvenc \
   --ANILIST_CLIENT_ID=optional-client-id \
@@ -118,7 +117,6 @@ Minimal argument notes:
 * `ANIME_INPUT_DIR`: folder watched for new files.
 * `ANIME_MEDIA_DIR`: output library folder, required when `IMPORT_ENABLED=true`.
 * `IMPORT_ENABLED`: `true` processes/moves files, `false` does not.
-* `IMPORT_ENCODING`: `av1` or `hevc`, `none` when using unsupported hardware.
 * `FFMPEG_DIR`: folder containing `ffmpeg` and `ffprobe`.
 * `TRANSCODE_ACCEL`: `nvenc`, `intel_gpu`, `intel_cpu`, `amd_gpu`, `amd_cpu`,`cpu`.</br>
 Use `cpu` only when `IMPORT_ENABLED=false` and your hardware does not support `av1` or `hevc`.
@@ -133,10 +131,12 @@ Use `cpu` only when `IMPORT_ENABLED=false` and your hardware does not support `a
 4. Run `bun run build` before starting it.
 5. Start it.
 
-## Disclaimer
+## Notice
+This project does not distribute, include, or endorse any copyrighted or pirated content. The software is provided for legitimate and lawful use.
 
-Yamibunko is intended for organizing, processing, and playing local files.</br>
-<ins>Yamibunko does not include, download, or provide access to copyrighted media.</ins>
+Users are solely responsible for ensuring that any copyrighted material they use with this software is obtained legally and in accordance with applicable law. The developers disclaim all responsibility for any misuse of the software or for any legal consequences resulting from the use of illegally obtained content.
+
+Any third-party distribution of this app bundled with copyrighted content is done without permission and is not associated with orendorsed by this project.
 
 ## License
 
