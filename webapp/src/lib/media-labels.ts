@@ -1,3 +1,10 @@
+export function stripVersionTags(value: string) {
+  return value.replace(
+    /(?:^|[^a-z0-9])v\s*\d{1,4}(?:\.[0-9]+)*(?=$|[^a-z0-9])/gi,
+    " "
+  )
+}
+
 export type ParsedSeasonPart = {
   season: number
   part?: number
@@ -52,10 +59,6 @@ const seasonPartOnlyPattern = new RegExp(
   String.raw`^\s*(?:season|s)\s*0*\d{1,2}(?:(?:${seasonPartSeparatorPattern}(?:part|pt\.?|p|cour|c)\s*${partNumberPattern})|(?:${seasonPartSeparatorPattern}${partNumberPattern}\s*(?:cour|half)))?\s*$`,
   "i"
 )
-
-function stripVersionTags(value: string) {
-  return value.replace(/(?:^|[^a-z0-9])v\s*\d{1,4}(?:\.[0-9]+)*(?=$|[^a-z0-9])/gi, " ")
-}
 
 function normalizeMarkerText(value: string) {
   return stripVersionTags(value)

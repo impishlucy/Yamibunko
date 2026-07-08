@@ -1,4 +1,5 @@
 import path from "node:path"
+import { stripVersionTags } from "@/lib/media-labels";
 
 import {
   isLocalNonAnimeId,
